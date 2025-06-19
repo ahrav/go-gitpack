@@ -1000,8 +1000,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 
 	var buf bytes.Buffer
 	buf.Grow(int(size)) // Pre-allocate
-	_, err = buf.ReadFrom(zr)
-	if err != nil {
+	if _, err = buf.ReadFrom(zr); err != nil {
 		return ObjBad, nil, err
 	}
 
