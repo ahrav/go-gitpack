@@ -85,31 +85,6 @@ func ParseHash(s string) (Hash, error) {
 // identifier.
 func (h Hash) Uint64() uint64 { return *(*uint64)(unsafe.Pointer(&h[0])) }
 
-// FastEqual reports whether h and other contain the same 20 byte object ID.
-//
-// The comparison is optimized for speed:
-// it loads two uint64 words (16 bytes) and one uint32 word (4 bytes) instead
-// of iterating over all 20 bytes.
-// This is ~3–4 × faster than bytes.Equal on typical amd64 and arm64 systems.
-// The implementation relies on the target architecture allowing unaligned
-// word reads, which is true for all platforms officially supported by Go.
-func (h Hash) FastEqual(other Hash) bool {
-	// Compare 8 + 8 + 4 bytes using uint64 and uint32
-	h1 := (*[3]uint64)(unsafe.Pointer(&h[0]))
-	h2 := (*[3]uint64)(unsafe.Pointer(&other[0]))
-
-	// Most hashes differ in first 8 bytes.
-	if h1[0] != h2[0] {
-		return false
-	}
-	if h1[1] != h2[1] {
-		return false
-	}
-
-	// Compare the remaining 4 bytes.
-	return *(*uint32)(unsafe.Pointer(&h[16])) == *(*uint32)(unsafe.Pointer(&other[16]))
-}
-
 // ObjectType enumerates the kinds of Git objects that can appear in a pack
 // or loose-object store.
 //
@@ -461,12 +436,9 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 // getWithContext handles object retrieval with delta cycle detection.
 func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	// Small cache.
-	s.mu.Lock()
 	if b, ok := s.cache.Get(oid); ok {
-		s.mu.Unlock()
 		return b, detectType(b), nil
 	}
-	s.mu.Unlock()
 
 	ref, ok := s.index[oid]
 	if !ok {
@@ -485,9 +457,7 @@ func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 				return nil, ObjBad, err
 			}
 		}
-		s.mu.Lock()
 		s.cache.Add(oid, data)
-		s.mu.Unlock()
 		return data, objType, nil
 	case ObjOfsDelta, ObjRefDelta:
 		baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, data)
@@ -515,9 +485,7 @@ func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 			return nil, ObjBad, err
 		}
 		full := applyDelta(baseData, deltaBuf)
-		s.mu.Lock()
 		s.cache.Add(oid, full)
-		s.mu.Unlock()
 		return full, detectType(full), nil
 	default:
 		return nil, ObjBad, fmt.Errorf("unknown obj type %d", objType)
