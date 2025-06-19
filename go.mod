@@ -2,7 +2,12 @@ module github.com/ahrav/go-gitpack
 
 go 1.24.4
 
-require golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
+require (
+	github.com/hashicorp/golang-lru/arc/v2 v2.0.7
+	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
+)
+
+require github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect

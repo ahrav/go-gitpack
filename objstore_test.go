@@ -126,7 +126,6 @@ func TestOpen(t *testing.T) {
 		assert.NotNil(t, store)
 		assert.Len(t, store.packs, 1)
 		assert.Greater(t, len(store.index), 0)
-		assert.Equal(t, 256, store.maxCacheSize)
 		assert.Equal(t, 50, store.maxDeltaDepth)
 	})
 
@@ -700,21 +699,26 @@ func TestCacheEviction(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
-	store.SetMaxCacheSize(1)
-
 	blob1Data := []byte("base content")
 	blob1Hash := calculateHash(ObjBlob, blob1Data)
 	blob2Data := []byte("modified data")
 	blob2Hash := calculateHash(ObjBlob, blob2Data)
 
-	store.Get(blob1Hash)
-	store.Get(blob2Hash)
+	// Test that cache stores and retrieves objects correctly.
+	data1, objType1, err := store.Get(blob1Hash)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, objType1)
+	assert.Equal(t, blob1Data, data1)
 
-	store.mu.Lock()
-	cacheSize := len(store.cache)
-	store.mu.Unlock()
+	data2, objType2, err := store.Get(blob2Hash)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, objType2)
+	assert.Equal(t, blob2Data, data2)
 
-	assert.LessOrEqual(t, cacheSize, 1)
+	data1Again, objType1Again, err := store.Get(blob1Hash)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, objType1Again)
+	assert.Equal(t, blob1Data, data1Again)
 }
 
 func TestDeltaCycleDetection(t *testing.T) {

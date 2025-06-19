@@ -40,6 +40,7 @@ import (
 	"sync"
 	"unsafe"
 
+	"github.com/hashicorp/golang-lru/arc/v2"
 	"golang.org/x/exp/mmap"
 )
 
@@ -205,12 +206,20 @@ type idxFile struct {
 // demand.  Delta chains are resolved transparently subject to a configurable
 // depth limit.  All methods are safe for concurrent use by multiple goroutines.
 type Store struct {
-	packs         []*idxFile
-	index         map[Hash]ref
-	mu            sync.Mutex      // guards cache and configuration
-	cache         map[Hash][]byte // inflated objects
-	maxCacheSize  int             // maximum cache entries
-	maxDeltaDepth int             // maximum delta chain depth
+	packs []*idxFile
+	index map[Hash]ref
+
+	mu sync.Mutex // guards cache and configuration
+
+	// cache stores fully-inflated objects.
+	// It is implemented as an Adaptive Replacement Cache (ARC), which
+	// automatically balances between recency (LRU) and frequency (LFU)
+	// to achieve high hit rates across a wide range of access patterns.
+	// ARC is a high-performance cache that is well-suited for Git object
+	// access patterns.
+	cache *arc.ARCCache[Hash, []byte]
+
+	maxDeltaDepth int // maximum delta chain depth
 
 	// VerifyCRC enables CRC-32 validation of every object that is read from a
 	// packfile.  It is disabled by default because the extra checksum step adds
@@ -354,9 +363,15 @@ func Open(dir string) (*Store, error) {
 
 	store := &Store{
 		index:         make(map[Hash]ref, 1<<20),
-		cache:         make(map[Hash][]byte, 256),
-		maxCacheSize:  256,
 		maxDeltaDepth: 50, // Git's default maximum
+	}
+
+	const defaultCacheSize = 1 << 14 // 16K
+	store.cache, err = arc.NewARC[Hash, []byte](defaultCacheSize)
+	if err != nil {
+		// This should not happen with a positive default size, but it is
+		// best practice to handle the error from any constructor.
+		return nil, fmt.Errorf("failed to create ARC cache: %w", err)
 	}
 
 	for id, packPath := range packs {
@@ -387,22 +402,6 @@ func Open(dir string) (*Store, error) {
 	return store, nil
 }
 
-// SetMaxCacheSize sets the maximum number of cached objects.
-//
-// SetMaxCacheSize adjusts the upper bound of the in-memory cache that stores
-// fully inflated objects.
-// Shrinking the limit triggers an immediate best-effort eviction that keeps
-// at most size entries.
-// Expanding the limit simply allows more entries to accumulate over time.
-//
-// This method is safe for concurrent use with Get.
-func (s *Store) SetMaxCacheSize(size int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.maxCacheSize = size
-	s.evictCache()
-}
-
 // SetMaxDeltaDepth sets the maximum delta chain depth.
 //
 // SetMaxDeltaDepth changes the maximum number of recursive delta hops
@@ -419,24 +418,6 @@ func (s *Store) SetMaxDeltaDepth(depth int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maxDeltaDepth = depth
-}
-
-// evictCache implements a simple LRU-like eviction by clearing excess entries.
-func (s *Store) evictCache() {
-	if len(s.cache) <= s.maxCacheSize {
-		return
-	}
-	// Simple strategy: clear half the cache when it's full.
-	// A proper LRU would track access times.
-	toDelete := len(s.cache) - s.maxCacheSize/2
-	count := 0
-	for k := range s.cache {
-		if count >= toDelete {
-			break
-		}
-		delete(s.cache, k)
-		count++
-	}
 }
 
 // Close unmaps all pack and idx files.
@@ -483,7 +464,7 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	// Small cache.
 	s.mu.Lock()
-	if b, ok := s.cache[oid]; ok {
+	if b, ok := s.cache.Get(oid); ok {
 		s.mu.Unlock()
 		return b, detectType(b), nil
 	}
@@ -507,8 +488,7 @@ func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 			}
 		}
 		s.mu.Lock()
-		s.cache[oid] = data
-		s.evictCache()
+		s.cache.Add(oid, data)
 		s.mu.Unlock()
 		return data, objType, nil
 	case ObjOfsDelta, ObjRefDelta:
@@ -538,8 +518,7 @@ func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		}
 		full := applyDelta(baseData, deltaBuf)
 		s.mu.Lock()
-		s.cache[oid] = full
-		s.evictCache()
+		s.cache.Add(oid, full)
 		s.mu.Unlock()
 		return full, detectType(full), nil
 	default:
