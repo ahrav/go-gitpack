@@ -545,20 +545,17 @@ func isLittleEndian() bool {
 //
 // Git pack index (.idx) file format (version 2):
 // - 8-byte header: magic bytes (0xff744f63) + version (2)
-// - 1024-byte fanout table: 256 entries of 4 bytes each, cumulative object counts
+// - 1024-byte fanout table: 256 entries, cumulative object counts for hash prefixes
 // - N×20-byte object IDs: SHA-1 hashes in sorted order
-// - N×4-byte CRC-32 checksums: one per object
-// - N×4-byte offsets: pack file positions (or large offset table indices)
+// - N×4-byte CRC-32 checksums + N×4-byte offsets
 // - Optional large offset table: 8-byte offsets for objects beyond 2GB
 //
 // WARNING: This implementation uses unsafe operations and should only be used when
 // performance is critical and the code has been thoroughly tested.
 func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
-	// Detect system endianness once. Git stores data in big-endian format,
-	// so we need to byte-swap on little-endian systems.
+	// Git stores data in big-endian format, so we need to byte-swap on little-endian systems.
 	littleEndian := isLittleEndian()
 
-	// Read and validate the 8-byte header.
 	header := make([]byte, headerSize)
 	if _, err := ix.ReadAt(header, 0); err != nil {
 		return nil, err
@@ -569,17 +566,15 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, fmt.Errorf("unsupported idx version or v1 not handled")
 	}
 
-	// Extract version number from bytes 4-7 (big-endian uint32).
 	version := *(*uint32)(unsafe.Pointer(&header[4]))
 	if littleEndian {
-		version = bswap32(version) // Convert from big-endian to host byte order.
+		version = bswap32(version)
 	}
 	if version != 2 {
 		return nil, fmt.Errorf("unsupported idx version %d", version)
 	}
 
-	// Read the fanout table: 256×4-byte entries containing cumulative object counts.
-	// fanout[i] = total number of objects whose first byte is ≤ i.
+	// Fanout table: fanout[i] = total number of objects whose first byte is ≤ i.
 	// This enables O(1) range queries for object lookup by hash prefix.
 	fanoutData := make([]byte, fanoutSize)
 	if _, err := ix.ReadAt(fanoutData, headerSize); err != nil {
@@ -587,31 +582,25 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 
 	// Use unsafe casting to avoid allocating and copying 1024 bytes.
-	// Cast byte slice directly to uint32 slice for efficient access.
 	fanoutPtr := (*[fanoutEntries]uint32)(unsafe.Pointer(&fanoutData[0]))
 	fanout := fanoutPtr[:]
 
-	// Convert from big-endian to host byte order if needed.
 	if littleEndian {
 		for i := range fanout {
 			fanout[i] = bswap32(fanout[i])
 		}
 	}
 
-	// Total object count is the last fanout entry (cumulative count for all objects).
 	objCount := fanout[255]
 	if objCount == 0 {
 		return &idxFile{entries: nil, oidTable: nil}, nil
 	}
 
-	// Calculate file offsets for each data section.
-	// Layout after fanout table: [object IDs][CRCs][offsets][large offsets].
-	oidBase := int64(headerSize + fanoutSize)     // Start of 20-byte SHA-1 hashes.
-	crcBase := oidBase + int64(objCount*hashSize) // Start of 4-byte CRC-32 values.
-	offBase := crcBase + int64(objCount*crcSize)  // Start of 4-byte pack offsets.
+	oidBase := int64(headerSize + fanoutSize)
+	crcBase := oidBase + int64(objCount*hashSize)
+	offBase := crcBase + int64(objCount*crcSize)
 
-	// Performance optimization: read all fixed-size data in a single syscall.
-	// This reduces I/O overhead compared to reading each section separately.
+	// Read all fixed-size data in a single syscall to reduce I/O overhead.
 	allDataSize := objCount*hashSize + objCount*crcSize + objCount*offsetSize
 	allData := make([]byte, allDataSize)
 
@@ -619,32 +608,23 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, err
 	}
 
-	// Slice the single buffer into logical sections - no additional copying needed.
-	oidData := allData[:objCount*hashSize]                                     // Object ID bytes.
-	crcData := allData[objCount*hashSize : objCount*hashSize+objCount*crcSize] // CRC bytes.
-	offsetData := allData[objCount*hashSize+objCount*crcSize:]                 // Offset bytes.
+	oidData := allData[:objCount*hashSize]
+	crcData := allData[objCount*hashSize : objCount*hashSize+objCount*crcSize]
+	offsetData := allData[objCount*hashSize+objCount*crcSize:]
 
-	// Convert raw bytes to Hash structs using unsafe operations.
-	// This avoids the overhead of parsing each 20-byte hash individually.
+	// Convert raw bytes to Hash structs using unsafe operations to avoid parsing overhead.
 	oids := make([]Hash, objCount)
 	if len(oids) > 0 {
-		// Cast Hash slice to byte slice and copy directly.
-		// Each Hash is exactly 20 bytes, so this is a safe operation.
 		oidBytes := (*[1 << 30]byte)(unsafe.Pointer(&oids[0]))
 		copy(oidBytes[:objCount*hashSize], oidData)
 	}
 
-	// Convert CRC data from bytes to uint32s using unsafe casting.
 	crcs := make([]uint32, objCount)
 	if len(crcs) > 0 {
-		// Create aligned buffer for uint32 values.
 		alignedCrcData := make([]uint32, objCount)
 		crcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&alignedCrcData[0]))
-
-		// Cast source bytes to uint32 slice for efficient access.
 		srcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&crcData[0]))
 
-		// Copy with endianness conversion - CRCs are stored big-endian.
 		if littleEndian {
 			for i := uint32(0); i < objCount; i++ {
 				crcPtr[i] = bswap32(srcPtr[i])
@@ -655,36 +635,29 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		crcs = alignedCrcData
 	}
 
-	// Process pack file offsets - these can be either direct offsets or large offset indices.
 	entries := make([]idxEntry, objCount)
 	offsetPtr := (*[1 << 28]uint32)(unsafe.Pointer(&offsetData[0]))
 
 	// Track objects that reference the large offset table (for packs > 2GB).
-	// Pre-allocate assuming ~0.1% of objects need large offsets (typical case).
 	largeOffsetList := make([]largeOffsetEntry, 0, objCount/1000)
 	maxLargeIdx := uint32(0)
 
-	// Process all offsets in a tight loop for maximum performance.
 	for i := uint32(0); i < objCount; i++ {
 		offset := offsetPtr[i]
 		if littleEndian {
-			offset = bswap32(offset) // Convert from big-endian.
+			offset = bswap32(offset)
 		}
 
 		entries[i].crc = crcs[i]
 
-		// Check if this is a direct offset or large offset table index.
-		// If MSB is 0, it's a direct 31-bit offset (< 2GB).
-		// If MSB is 1, the lower 31 bits index into the large offset table.
+		// If MSB is 0, it's a direct 31-bit offset. If MSB is 1, it's an index into the large offset table.
 		if offset&0x80000000 == 0 {
-			// Direct offset: object is within first 2GB of pack file.
 			entries[i].offset = uint64(offset)
 		} else {
-			// Large offset: need to look up actual 64-bit offset from table.
-			largeIdx := offset & 0x7fffffff // Remove MSB to get table index.
+			largeIdx := offset & 0x7fffffff
 			largeOffsetList = append(largeOffsetList, largeOffsetEntry{i, largeIdx})
 			if largeIdx > maxLargeIdx {
-				maxLargeIdx = largeIdx // Track highest index for table size.
+				maxLargeIdx = largeIdx
 			}
 		}
 	}
@@ -692,20 +665,16 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	// Handle large offsets if any objects require them.
 	var largeOffsets []uint64
 	if len(largeOffsetList) > 0 {
-		// Read the large offset table: 8-byte big-endian uint64 values.
 		largeOffsetCount := maxLargeIdx + 1
 		largeOffsetData := make([]byte, largeOffsetCount*largeOffSize)
 
-		// Large offset table starts immediately after the regular offset table.
 		if _, err := ix.ReadAt(largeOffsetData, offBase+int64(objCount*offsetSize)); err != nil {
 			return nil, err
 		}
 
-		// Convert bytes to uint64 slice using unsafe operations.
 		largeOffsets = make([]uint64, largeOffsetCount)
 		largePtr := (*[1 << 26]uint64)(unsafe.Pointer(&largeOffsetData[0]))
 
-		// Handle endianness conversion for 64-bit values.
 		if littleEndian {
 			for i := uint32(0); i < largeOffsetCount; i++ {
 				largeOffsets[i] = bswap64(largePtr[i])
@@ -714,20 +683,18 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 			copy(largeOffsets, largePtr[:largeOffsetCount])
 		}
 
-		// Apply the large offsets to the appropriate entries.
 		for _, entry := range largeOffsetList {
 			if entry.largeIdx >= uint32(len(largeOffsets)) {
 				return nil, fmt.Errorf("invalid large offset index %d", entry.largeIdx)
 			}
-			// Replace the placeholder with the actual 64-bit offset.
 			entries[entry.objIdx].offset = largeOffsets[entry.largeIdx]
 		}
 	}
 
 	return &idxFile{
-		entries:      entries,      // Object metadata (offset + CRC).
-		oidTable:     oids,         // SHA-1 object identifiers in index order.
-		largeOffsets: largeOffsets, // 64-bit offsets for objects beyond 2GB.
+		entries:      entries,
+		oidTable:     oids,
+		largeOffsets: largeOffsets,
 	}, nil
 }
 
