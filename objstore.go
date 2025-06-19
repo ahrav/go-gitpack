@@ -274,18 +274,31 @@ func newDeltaContext(maxDepth int) *deltaContext {
 	}
 }
 
-// checkRefDelta checks if we can safely resolve a ref delta
+// (ctx *deltaContext) checkRefDelta validates that resolving a ref-delta will
+// neither overflow the caller-supplied maximum delta-chain depth nor re-visit
+// the same base object.
+//
+// The method returns a descriptive error when the next hop would exceed
+// ctx.maxDepth or when the referenced base hash is already present in
+// ctx.visited, which indicates a ref-delta cycle.
 func (ctx *deltaContext) checkRefDelta(hash Hash) error {
+	// Guard against unbounded recursion.
 	if ctx.depth >= ctx.maxDepth {
 		return fmt.Errorf("delta chain too deep (max %d)", ctx.maxDepth)
 	}
+	// Detect ref-delta cycles.
 	if ctx.visited[hash] {
 		return fmt.Errorf("circular delta reference detected for %x", hash)
 	}
 	return nil
 }
 
-// checkOfsDelta checks if we can safely resolve an ofs delta
+// (ctx *deltaContext) checkOfsDelta performs the same safety validations as
+// checkRefDelta but for ofs-deltas, which reference their base object by pack
+// offset rather than object ID.
+//
+// It reports an error when the delta chain would become too deep or when the
+// same offset appears twice in the current resolution path.
 func (ctx *deltaContext) checkOfsDelta(offset uint64) error {
 	if ctx.depth >= ctx.maxDepth {
 		return fmt.Errorf("delta chain too deep (max %d)", ctx.maxDepth)
@@ -296,19 +309,22 @@ func (ctx *deltaContext) checkOfsDelta(offset uint64) error {
 	return nil
 }
 
-// enterRefDelta marks a ref delta as being resolved.
+// (ctx *deltaContext) enterRefDelta records that the ref-delta identified by
+// hash is being processed and bumps the recursion depth counter.
 func (ctx *deltaContext) enterRefDelta(hash Hash) {
 	ctx.visited[hash] = true
 	ctx.depth++
 }
 
-// enterOfsDelta marks an ofs delta as being resolved.
+// (ctx *deltaContext) enterOfsDelta records that the ofs-delta starting at
+// offset is being processed and bumps the recursion depth counter.
 func (ctx *deltaContext) enterOfsDelta(offset uint64) {
 	ctx.offsets[offset] = true
 	ctx.depth++
 }
 
-// exit decrements the depth counter.
+// (ctx *deltaContext) exit decrements the recursion depth counter when the
+// caller leaves a delta resolution frame.
 func (ctx *deltaContext) exit() { ctx.depth-- }
 
 // Open scans dir for *.pack; matching *.idx must exist.
