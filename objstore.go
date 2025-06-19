@@ -406,7 +406,7 @@ func (s *Store) SetMaxCacheSize(size int) {
 // SetMaxDeltaDepth sets the maximum delta chain depth.
 //
 // SetMaxDeltaDepth changes the maximum number of recursive delta hops
-// (ref-delta or ofs-delta) that the Store will follow when materialising an
+// (ref-delta or ofs-delta) that the Store will follow when materializing an
 // object.
 // The default of 50 matches Git's own hard limit.
 //
@@ -604,15 +604,21 @@ func detectType(data []byte) ObjectType {
 	return ObjBlob
 }
 
-// Constants for the unsafe parser
+// Parser size constants.
+//
+// These bytes-count constants describe the fixed-width sections of a Git
+// pack-index (v2) file. The unsafe idx parser relies on them to compute exact
+// offsets inside the memory-mapped file. Do not modify these values unless the
+// on-disk format itself changes.
 const (
-	headerSize    = 8
-	fanoutEntries = 256
-	fanoutSize    = fanoutEntries * 4
-	hashSize      = 20
-	crcSize       = 4
-	offsetSize    = 4
-	largeOffSize  = 8
+	headerSize    = 8                 // 4-byte magic + 4-byte version.
+	fanoutEntries = 256               // One entry for every possible first byte of a SHA-1.
+	fanoutSize    = fanoutEntries * 4 // 256 × uint32 → 1 024 bytes.
+
+	hashSize     = 20 // Full SHA-1 hash.
+	crcSize      = 4  // Big-endian CRC-32 value per object.
+	offsetSize   = 4  // 31-bit offset or MSB-set index into large-offset table.
+	largeOffSize = 8  // 64-bit offset for objects beyond the 2 GiB boundary.
 )
 
 // largeOffsetEntry relates an object index to its entry in the large-offset
@@ -653,22 +659,6 @@ func bswap32(v uint32) uint32 {
 		(v&0x0000FF00)<<8 |
 		(v&0x00FF0000)>>8 |
 		(v&0xFF000000)>>24
-}
-
-// bswap64 is the 64-bit sibling of bswap32.
-//
-// It performs an unconditional eight-byte reversal that is used when
-// reading "large" pack offsets (objects that live beyond the 2 GiB
-// mark).  The logic is kept separate for clarity and to avoid
-// conditionals inside hot-path loops.
-func bswap64(v uint64) uint64 {
-	return (v&0x00000000000000FF)<<56 |
-		(v&0x000000000000FF00)<<40 |
-		(v&0x0000000000FF0000)<<24 |
-		(v&0x000000FF00000000)<<8 |
-		(v&0x0000FF0000000000)>>8 |
-		(v&0x00FF000000000000)>>24 |
-		(v&0xFF00000000000000)>>56
 }
 
 // isLittleEndian reports whether the current CPU uses little-endian byte order.
