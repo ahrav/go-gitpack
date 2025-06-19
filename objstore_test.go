@@ -776,11 +776,26 @@ func BenchmarkGetCold(b *testing.B) { benchmarkGet(b, false) }
 func BenchmarkGetWarm(b *testing.B) { benchmarkGet(b, true) }
 
 func BenchmarkApplyDelta(b *testing.B) {
-	base := make([]byte, 8<<10)
-	delta := make([]byte, 4<<10)
+	base := []byte("Hello World! This is a test base content for benchmarking delta operations.")
+	target := []byte("Hello Go! This is a test modified content for benchmarking delta operations.")
+
+	var delta bytes.Buffer
+	writeVarInt(&delta, uint64(len(base)))
+	writeVarInt(&delta, uint64(len(target)))
+
+	// Copy first 6 bytes ("Hello ").
+	delta.WriteByte(0x90) // copy operation: length follows, offset is 0
+	delta.WriteByte(6)    // copy 6 bytes
+
+	// Insert "Go! This is a test modified content for benchmarking delta operations."
+	remaining := target[6:]
+	delta.WriteByte(byte(len(remaining))) // insert operation
+	delta.Write(remaining)
+
+	deltaBytes := delta.Bytes()
 
 	for b.Loop() {
-		applyDelta(base, delta)
+		applyDelta(base, deltaBytes)
 	}
 }
 
