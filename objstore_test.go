@@ -17,6 +17,301 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestOpen(t *testing.T) {
+	t.Run("no packfiles found", func(t *testing.T) {
+		emptyDir := t.TempDir()
+		_, err := Open(emptyDir)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "no packfiles found")
+	})
+
+	t.Run("missing idx file", func(t *testing.T) {
+		dir := t.TempDir()
+		packPath := filepath.Join(dir, "test.pack")
+
+		require.NoError(t, os.WriteFile(packPath, []byte("PACK"), 0644))
+
+		_, err := Open(dir)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "mmap idx")
+	})
+
+	t.Run("invalid pack file", func(t *testing.T) {
+		dir := t.TempDir()
+		packPath := filepath.Join(dir, "test.pack")
+		idxPath := filepath.Join(dir, "test.idx")
+
+		require.NoError(t, os.WriteFile(packPath, []byte("invalid"), 0644))
+		require.NoError(t, os.WriteFile(idxPath, []byte("invalid"), 0644))
+
+		_, err := Open(dir)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "parse idx")
+	})
+
+	t.Run("successful open", func(t *testing.T) {
+		packPath, _, cleanup := createTestPackWithDelta(t)
+		defer cleanup()
+
+		store, err := Open(filepath.Dir(packPath))
+		require.NoError(t, err)
+		defer store.Close()
+
+		assert.NotNil(t, store)
+		assert.Len(t, store.packs, 1)
+		assert.Greater(t, len(store.index), 0)
+		assert.Equal(t, 256, store.maxCacheSize)
+		assert.Equal(t, 50, store.maxDeltaDepth)
+	})
+
+	t.Run("multiple pack files", func(t *testing.T) {
+		dir := t.TempDir()
+
+		for i := range 2 {
+			packPath := filepath.Join(dir, fmt.Sprintf("test%d.pack", i))
+			idxPath := filepath.Join(dir, fmt.Sprintf("test%d.idx", i))
+
+			blob := []byte(fmt.Sprintf("content %d", i))
+			hash := calculateHash(ObjBlob, blob)
+
+			require.NoError(t, createMinimalPack(packPath, blob))
+			require.NoError(t, createV2IndexFile(idxPath, []Hash{hash}, []uint64{12}))
+		}
+
+		store, err := Open(dir)
+		require.NoError(t, err)
+		defer store.Close()
+
+		assert.Len(t, store.packs, 2)
+		assert.Equal(t, 2, len(store.index))
+	})
+}
+
+func TestParseIdx(t *testing.T) {
+	t.Run("invalid magic bytes", func(t *testing.T) {
+		data := make([]byte, 8)
+		copy(data, []byte("INVALID!"))
+
+		r := bytes.NewReader(data)
+		ra := &testReaderAt{r}
+
+		_, err := parseIdx(ra)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported idx version")
+	})
+
+	t.Run("unsupported version", func(t *testing.T) {
+		data := make([]byte, 8)
+		copy(data[0:4], []byte{0xff, 0x74, 0x4f, 0x63}) // correct magic
+		binary.BigEndian.PutUint32(data[4:8], 3)        // version 3 (unsupported)
+
+		r := bytes.NewReader(data)
+		ra := &testReaderAt{r}
+
+		_, err := parseIdx(ra)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported idx version 3")
+	})
+
+	t.Run("minimal valid index", func(t *testing.T) {
+		hash1, _ := ParseHash("1234567890abcdef1234567890abcdef12345678")
+		hashes := []Hash{hash1}
+		offsets := []uint64{42}
+
+		data := createValidIdxData(t, hashes, offsets)
+		r := bytes.NewReader(data)
+		ra := &testReaderAt{r}
+
+		idx, err := parseIdx(ra)
+		require.NoError(t, err)
+
+		assert.Len(t, idx.oidTable, 1)
+		assert.Equal(t, hash1, idx.oidTable[0])
+		assert.Len(t, idx.entries, 1)
+		assert.Equal(t, uint64(42), idx.entries[0].offset)
+		assert.Nil(t, idx.largeOffsets) // no large offsets needed
+	})
+
+	t.Run("index with large offsets", func(t *testing.T) {
+		hash1, _ := ParseHash("1234567890abcdef1234567890abcdef12345678")
+		hashes := []Hash{hash1}
+		largeOffset := uint64(0x80000000) // > 2GB, requires large offset table
+		offsets := []uint64{largeOffset}
+
+		data := createValidIdxDataWithLargeOffsets(t, hashes, offsets)
+		r := bytes.NewReader(data)
+		ra := &testReaderAt{r}
+
+		idx, err := parseIdx(ra)
+		require.NoError(t, err)
+
+		assert.Len(t, idx.oidTable, 1)
+		assert.Equal(t, hash1, idx.oidTable[0])
+		assert.Len(t, idx.entries, 1)
+		assert.Equal(t, largeOffset, idx.entries[0].offset)
+		assert.NotNil(t, idx.largeOffsets)
+		assert.Len(t, idx.largeOffsets, 1)
+		assert.Equal(t, largeOffset, idx.largeOffsets[0])
+	})
+
+	t.Run("multiple objects sorted order", func(t *testing.T) {
+		// Create hashes in reverse order to test sorting.
+		hash1, _ := ParseHash("abcdef1234567890abcdef1234567890abcdef12")
+		hash2, _ := ParseHash("1234567890abcdef1234567890abcdef12345678")
+		hashes := []Hash{hash1, hash2} // hash2 should come first when sorted
+		offsets := []uint64{100, 200}
+
+		data := createValidIdxData(t, hashes, offsets)
+		r := bytes.NewReader(data)
+		ra := &testReaderAt{r}
+
+		idx, err := parseIdx(ra)
+		require.NoError(t, err)
+
+		assert.Len(t, idx.oidTable, 2)
+		assert.Len(t, idx.entries, 2)
+		assert.Equal(t, hash1, idx.oidTable[0])
+		assert.Equal(t, hash2, idx.oidTable[1])
+	})
+
+	t.Run("truncated file", func(t *testing.T) {
+		data := []byte{0xff, 0x74, 0x4f, 0x63} // just magic, no version
+		r := bytes.NewReader(data)
+		ra := &testReaderAt{r}
+
+		_, err := parseIdx(ra)
+		assert.Error(t, err)
+	})
+}
+
+// testReaderAt wraps a bytes.Reader to implement ReadAtCloser.
+type testReaderAt struct{ *bytes.Reader }
+
+func (t *testReaderAt) Close() error { return nil }
+
+// createValidIdxData creates a minimal valid idx file data for testing.
+func createValidIdxData(t *testing.T, hashes []Hash, offsets []uint64) []byte {
+	var buf bytes.Buffer
+
+	// Header: magic + version.
+	buf.Write([]byte{0xff, 0x74, 0x4f, 0x63})       // magic
+	binary.Write(&buf, binary.BigEndian, uint32(2)) // version
+
+	// Fanout table (256 entries)..
+	objCount := uint32(len(hashes))
+	for i := range 256 {
+		count := uint32(0)
+		// For simplicity, just set the last entry to objCount.
+		if i == 255 {
+			count = objCount
+		} else if len(hashes) > 0 && i >= int(hashes[0][0]) {
+			count = objCount
+		}
+		binary.Write(&buf, binary.BigEndian, count)
+	}
+
+	// Object hashes.
+	for _, hash := range hashes {
+		buf.Write(hash[:])
+	}
+
+	// CRC32s (dummy values).
+	for range hashes {
+		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
+	}
+
+	// Offsets (all small offsets for this version).
+	for _, offset := range offsets {
+		binary.Write(&buf, binary.BigEndian, uint32(offset))
+	}
+
+	// Pack checksum + index checksum (dummy).
+	buf.Write(make([]byte, 40))
+
+	return buf.Bytes()
+}
+
+// createValidIdxDataWithLargeOffsets creates idx data with large offset table.
+func createValidIdxDataWithLargeOffsets(t *testing.T, hashes []Hash, offsets []uint64) []byte {
+	var buf bytes.Buffer
+
+	// Header: magic + version.
+	buf.Write([]byte{0xff, 0x74, 0x4f, 0x63})       // magic
+	binary.Write(&buf, binary.BigEndian, uint32(2)) // version
+
+	// Fanout table.
+	objCount := uint32(len(hashes))
+	for i := range 256 {
+		count := uint32(0)
+		if i == 255 {
+			count = objCount
+		} else if len(hashes) > 0 && i >= int(hashes[0][0]) {
+			count = objCount
+		}
+		binary.Write(&buf, binary.BigEndian, count)
+	}
+
+	// Object hashes.
+	for _, hash := range hashes {
+		buf.Write(hash[:])
+	}
+
+	// CRC32s.
+	for range hashes {
+		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
+	}
+
+	// Offsets with large offset references.
+	largeOffsetIndex := uint32(0)
+	for _, offset := range offsets {
+		if offset > 0x7fffffff {
+			// Use large offset table reference.
+			binary.Write(&buf, binary.BigEndian, uint32(0x80000000|largeOffsetIndex))
+			largeOffsetIndex++
+		} else {
+			binary.Write(&buf, binary.BigEndian, uint32(offset))
+		}
+	}
+
+	// Large offset table.
+	for _, offset := range offsets {
+		if offset > 0x7fffffff {
+			binary.Write(&buf, binary.BigEndian, offset)
+		}
+	}
+
+	// Pack checksum + index checksum.
+	buf.Write(make([]byte, 40))
+
+	return buf.Bytes()
+}
+
+func createMinimalPack(path string, content []byte) error {
+	file, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Pack header.
+	file.Write([]byte("PACK"))                      // signature
+	binary.Write(file, binary.BigEndian, uint32(2)) // version
+	binary.Write(file, binary.BigEndian, uint32(1)) // 1 object
+
+	// Object header (blob, size fits in 4 bits).
+	objHeader := byte((byte(ObjBlob) << 4) | byte(len(content)&0x0f))
+	file.Write([]byte{objHeader})
+
+	// Compressed content.
+	var buf bytes.Buffer
+	zw := zlib.NewWriter(&buf)
+	zw.Write(content)
+	zw.Close()
+	file.Write(buf.Bytes())
+
+	return nil
+}
+
 func TestHash(t *testing.T) {
 	tests := []struct {
 		name        string
