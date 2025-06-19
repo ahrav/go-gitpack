@@ -763,6 +763,7 @@ func BenchmarkDecodeVarInt(b *testing.B) {
 func BenchmarkOpen(b *testing.B) {
 	packDir := setupBenchmarkRepo(b)
 
+	b.SetBytes(int64(len(packDir)))
 	for b.Loop() {
 		s, err := Open(packDir)
 		require.NoError(b, err)
