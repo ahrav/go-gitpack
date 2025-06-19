@@ -764,6 +764,7 @@ func benchmarkGet(b *testing.B, cacheWarm bool) {
 	someHash := store.packs[0].oidTable[0]
 
 	if cacheWarm {
+		b.ResetTimer()
 		store.Get(someHash)
 	}
 
