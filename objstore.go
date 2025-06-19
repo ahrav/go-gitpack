@@ -29,6 +29,7 @@ package objstore
 import (
 	"bytes"
 	"compress/zlib"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -76,7 +77,7 @@ func ParseHash(s string) (Hash, error) {
 // The value is taken verbatim from the underlying byte slice; no byte-order
 // conversion is performed.
 // The conversion is implemented via an unsafe cast which is safe because
-// Hash’ backing array is 20 bytes and therefore long-word aligned on every
+// Hash' backing array is 20 bytes and therefore long-word aligned on every
 // platform that Go supports.
 // The numeric representation is only meant for in-memory shortcuts such as
 // hash-table look-ups and must not be persisted or used as a portable
@@ -625,10 +626,10 @@ type largeOffsetEntry struct {
 
 // bswap32 reverses the byte order of v.
 //
-// Git’s on-disk formats are big-endian, whereas most modern hardware
+// Git's on-disk formats are big-endian, whereas most modern hardware
 // that runs Go is little-endian.
 // The helper converts a 32-bit value that was read directly from an
-// index or pack file into the host’s native order, allowing the rest
+// index or pack file into the host's native order, allowing the rest
 // of the code to use ordinary arithmetic without sprinkling byte-swaps
 // everywhere.
 func bswap32(v uint32) uint32 {
@@ -641,7 +642,7 @@ func bswap32(v uint32) uint32 {
 // bswap64 is the 64-bit sibling of bswap32.
 //
 // It performs an unconditional eight-byte reversal that is used when
-// reading “large” pack offsets (objects that live beyond the 2 GiB
+// reading "large" pack offsets (objects that live beyond the 2 GiB
 // mark).  The logic is kept separate for clarity and to avoid
 // conditionals inside hot-path loops.
 func bswap64(v uint64) uint64 {
@@ -798,14 +799,13 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 
 		largeOffsets = make([]uint64, largeOffsetCount)
-		largePtr := (*[1 << 26]uint64)(unsafe.Pointer(&largeOffsetData[0]))
 
-		if littleEndian {
-			for i := uint32(0); i < largeOffsetCount; i++ {
-				largeOffsets[i] = bswap64(largePtr[i])
+		// Read uint64 values properly respecting byte order.
+		for i := uint32(0); i < largeOffsetCount; i++ {
+			offset := i * largeOffSize
+			if int(offset+largeOffSize) <= len(largeOffsetData) {
+				largeOffsets[i] = binary.BigEndian.Uint64(largeOffsetData[offset : offset+largeOffSize])
 			}
-		} else {
-			copy(largeOffsets, largePtr[:largeOffsetCount])
 		}
 
 		for _, entry := range largeOffsetList {
@@ -913,7 +913,7 @@ func parseObjectHeaderUnsafe(data []byte) (ObjectType, uint64, int) {
 //     This avoids the extra allocation incurred by io.SectionReader and is
 //     measurably faster for the common case of small blobs and trees.
 //
-//   - Large objects are streamed directly from the mmap’ed file through an
+//   - Large objects are streamed directly from the mmap'ed file through an
 //     io.SectionReader to keep the memory footprint bounded.
 //
 // The returned slice contains the fully-inflated object data and is safe for
@@ -1137,7 +1137,7 @@ func parseDeltaHeader(t ObjectType, data []byte) (Hash, uint64, []byte, error) {
 	return h, off, data[i:], nil
 }
 
-// applyDelta materializes a delta by interpreting Git’s copy/insert opcode
+// applyDelta materializes a delta by interpreting Git's copy/insert opcode
 // stream.
 //
 // The function pre-allocates the exact output size that is encoded at the
