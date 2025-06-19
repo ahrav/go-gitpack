@@ -502,30 +502,50 @@ func detectType(data []byte) ObjectType {
 	return ObjBlob // fallback
 }
 
-// parseIdx reads a v2 index and fills oid table + entries with large offset support.
+// parseIdx reads a Git pack index file (*.idx) and extracts object locations.
+//
+// Git pack index files use a specific binary format (version 2) that allows
+// fast lookup of objects by their SHA-1 hash. The file structure is:
+// 1. 8-byte header (magic + version)
+// 2. 256-entry fanout table (4 bytes each) for hash prefix optimization
+// 3. N object SHA-1 hashes (20 bytes each) in sorted order
+// 4. N CRC-32 checksums (4 bytes each) parallel to the hashes
+// 5. N pack offsets (4 bytes each) - may reference large offset table
+// 6. Optional large offset table (8 bytes per large offset)
+// 7. Pack checksum + index checksum (40 bytes total)
 func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
+	// Read and validate the 8-byte header: 4-byte magic + 4-byte version.
 	const headerSize = 8
 	header := make([]byte, headerSize)
 	if _, err := ix.ReadAt(header, 0); err != nil {
 		return nil, err
 	}
+
+	// Check magic bytes: 0xff744f63 ("\377tOc") identifies a pack index.
 	if !bytes.Equal(header[0:4], []byte{0xff, 0x74, 0x4f, 0x63}) {
 		return nil, fmt.Errorf("unsupported idx version or v1 not handled")
 	}
+
+	// Only version 2 is supported (version 1 has a different, simpler format).
 	version := binary.BigEndian.Uint32(header[4:])
 	if version != 2 {
 		return nil, fmt.Errorf("unsupported idx version %d", version)
 	}
 
-	// Fanout table.
+	// Read the fanout table: 256 entries showing cumulative object counts.
+	// fanout[i] = number of objects whose first hash byte is <= i.
+	// This enables fast hash prefix lookups without scanning all objects.
 	fanout := make([]uint32, 256)
 	if err := readInto(ix, 8, fanout); err != nil {
 		return nil, err
 	}
+	// fanout[255] contains the total number of objects in the pack.
 	objCount := fanout[255]
 
+	// Read all object SHA-1 hashes (20 bytes each) in lexicographic order.
+	// The sorted order enables binary search for object lookup.
 	oids := make([]Hash, objCount)
-	oidBase := int64(8 + 256*4)
+	oidBase := int64(8 + 256*4) // Skip header + fanout table
 	for i := uint32(0); i < objCount; i++ {
 		var h Hash
 		if _, err := ix.ReadAt(h[:], oidBase+int64(i*20)); err != nil {
@@ -533,35 +553,46 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 		oids[i] = h
 	}
+
+	// Read CRC-32 checksums (4 bytes each) parallel to the object hashes.
+	// These checksums validate the compressed object data in the pack file.
 	crcBase := oidBase + int64(objCount*20)
 	crcs := make([]uint32, objCount)
 	if err := readInto(ix, crcBase, crcs); err != nil {
 		return nil, err
 	}
+
+	// Read pack file offsets (4 bytes each) where objects are stored.
+	// The offset table is parallel to the hashes and CRCs.
 	offBase := crcBase + int64(objCount*4)
 
 	entries := make([]idxEntry, objCount)
 	var largeOffsets []uint64
 	var needsLargeOffsets bool
 
-	// First pass: determine if we need to read large offsets.
+	// First pass: scan offset table to determine if large offsets are needed.
+	// If the high bit (0x80000000) of an offset is set, it's an index into
+	// the large offset table rather than a direct 31-bit offset.
 	for i := uint32(0); i < objCount; i++ {
 		raw := make([]byte, 4)
 		if _, err := ix.ReadAt(raw, offBase+int64(i*4)); err != nil {
 			return nil, err
 		}
 		v := binary.BigEndian.Uint32(raw)
+		// Check if high bit is set, indicating this is a large offset reference.
 		if v&0x80000000 != 0 {
 			needsLargeOffsets = true
 			break
 		}
 	}
 
-	// Read large offsets table if needed.
+	// If any objects use large offsets (> 2GB), read the large offset table.
 	if needsLargeOffsets {
+		// Large offset table immediately follows the regular offset table.
 		largeOffsetBase := offBase + int64(objCount*4)
 
-		// Count how many large offsets we need.
+		// Count how many large offsets exist to allocate the right size slice.
+		// We need to scan again because large offsets are stored compactly.
 		largeOffsetCount := 0
 		for i := uint32(0); i < objCount; i++ {
 			raw := make([]byte, 4)
@@ -574,7 +605,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 			}
 		}
 
-		// Read the large offsets (they're stored as 64-bit values).
+		// Read the large offset table: 64-bit offsets for objects beyond 2GB.
 		largeOffsets = make([]uint64, largeOffsetCount)
 		for i := 0; i < largeOffsetCount; i++ {
 			raw := make([]byte, 8)
@@ -585,29 +616,33 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 	}
 
-	// Second pass: populate entries with proper offset handling.
+	// Second pass: populate the final entries slice with proper offset resolution.
+	// For each object, determine if it uses a direct offset or large offset.
 	for i := uint32(0); i < objCount; i++ {
 		raw := make([]byte, 4)
 		if _, err := ix.ReadAt(raw, offBase+int64(i*4)); err != nil {
 			return nil, err
 		}
 		v := binary.BigEndian.Uint32(raw)
-		if v&0x80000000 == 0 { // 31-bit offset
+
+		if v&0x80000000 == 0 {
+			// Direct 31-bit offset: can store offsets up to 2GB.
 			entries[i] = idxEntry{offset: uint64(v), crc: crcs[i]}
 		} else {
-			// Large offset: use index into large offset table.
-			largeIndex := v & 0x7fffffff
+			// Large offset reference: lower 31 bits are an index into largeOffsets.
+			largeIndex := v & 0x7fffffff // Clear the high bit to get the index
 			if largeIndex >= uint32(len(largeOffsets)) {
 				return nil, fmt.Errorf("invalid large offset index %d", largeIndex)
 			}
+			// Use the 64-bit offset from the large offset table.
 			entries[i] = idxEntry{offset: largeOffsets[largeIndex], crc: crcs[i]}
 		}
 	}
 
 	return &idxFile{
-		entries:      entries,
-		oidTable:     oids,
-		largeOffsets: largeOffsets,
+		entries:      entries,      // Object metadata (offset + CRC) parallel to oidTable
+		oidTable:     oids,         // Sorted SHA-1 hashes for binary search lookup
+		largeOffsets: largeOffsets, // 64-bit offsets for packs > 2GB (may be nil)
 	}, nil
 }
 
