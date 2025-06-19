@@ -15,6 +15,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/mmap"
 )
 
 func TestOpen(t *testing.T) {
@@ -92,10 +93,14 @@ func TestParseIdx(t *testing.T) {
 		data := make([]byte, 8)
 		copy(data, []byte("INVALID!"))
 
-		r := bytes.NewReader(data)
-		ra := &testReaderAt{r}
+		tempFile := createTempFileWithData(t, data)
+		defer os.Remove(tempFile)
 
-		_, err := parseIdx(ra)
+		ra, err := mmap.Open(tempFile)
+		require.NoError(t, err)
+		defer ra.Close()
+
+		_, err = parseIdx(ra)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported idx version")
 	})
@@ -105,10 +110,14 @@ func TestParseIdx(t *testing.T) {
 		copy(data[0:4], []byte{0xff, 0x74, 0x4f, 0x63}) // correct magic
 		binary.BigEndian.PutUint32(data[4:8], 3)        // version 3 (unsupported)
 
-		r := bytes.NewReader(data)
-		ra := &testReaderAt{r}
+		tempFile := createTempFileWithData(t, data)
+		defer os.Remove(tempFile)
 
-		_, err := parseIdx(ra)
+		ra, err := mmap.Open(tempFile)
+		require.NoError(t, err)
+		defer ra.Close()
+
+		_, err = parseIdx(ra)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported idx version 3")
 	})
@@ -119,8 +128,12 @@ func TestParseIdx(t *testing.T) {
 		offsets := []uint64{42}
 
 		data := createValidIdxData(t, hashes, offsets)
-		r := bytes.NewReader(data)
-		ra := &testReaderAt{r}
+		tempFile := createTempFileWithData(t, data)
+		defer os.Remove(tempFile)
+
+		ra, err := mmap.Open(tempFile)
+		require.NoError(t, err)
+		defer ra.Close()
 
 		idx, err := parseIdx(ra)
 		require.NoError(t, err)
@@ -139,8 +152,12 @@ func TestParseIdx(t *testing.T) {
 		offsets := []uint64{largeOffset}
 
 		data := createValidIdxDataWithLargeOffsets(t, hashes, offsets)
-		r := bytes.NewReader(data)
-		ra := &testReaderAt{r}
+		tempFile := createTempFileWithData(t, data)
+		defer os.Remove(tempFile)
+
+		ra, err := mmap.Open(tempFile)
+		require.NoError(t, err)
+		defer ra.Close()
 
 		idx, err := parseIdx(ra)
 		require.NoError(t, err)
@@ -162,8 +179,12 @@ func TestParseIdx(t *testing.T) {
 		offsets := []uint64{100, 200}
 
 		data := createValidIdxData(t, hashes, offsets)
-		r := bytes.NewReader(data)
-		ra := &testReaderAt{r}
+		tempFile := createTempFileWithData(t, data)
+		defer os.Remove(tempFile)
+
+		ra, err := mmap.Open(tempFile)
+		require.NoError(t, err)
+		defer ra.Close()
 
 		idx, err := parseIdx(ra)
 		require.NoError(t, err)
@@ -176,18 +197,29 @@ func TestParseIdx(t *testing.T) {
 
 	t.Run("truncated file", func(t *testing.T) {
 		data := []byte{0xff, 0x74, 0x4f, 0x63} // just magic, no version
-		r := bytes.NewReader(data)
-		ra := &testReaderAt{r}
+		tempFile := createTempFileWithData(t, data)
+		defer os.Remove(tempFile)
 
-		_, err := parseIdx(ra)
+		ra, err := mmap.Open(tempFile)
+		require.NoError(t, err)
+		defer ra.Close()
+
+		_, err = parseIdx(ra)
 		assert.Error(t, err)
 	})
 }
 
-// testReaderAt wraps a bytes.Reader to implement ReadAtCloser.
-type testReaderAt struct{ *bytes.Reader }
+// createTempFileWithData creates a temporary file with the given data
+func createTempFileWithData(t *testing.T, data []byte) string {
+	tempFile, err := os.CreateTemp("", "test-idx-*.idx")
+	require.NoError(t, err)
+	defer tempFile.Close()
 
-func (t *testReaderAt) Close() error { return nil }
+	_, err = tempFile.Write(data)
+	require.NoError(t, err)
+
+	return tempFile.Name()
+}
 
 // createValidIdxData creates a minimal valid idx file data for testing.
 func createValidIdxData(t *testing.T, hashes []Hash, offsets []uint64) []byte {
