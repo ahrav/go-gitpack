@@ -83,9 +83,7 @@ func ParseHash(s string) (Hash, error) {
 // The numeric representation is only meant for in-memory shortcuts such as
 // hash-table look-ups and must not be persisted or used as a portable
 // identifier.
-func (h Hash) Uint64() uint64 {
-	return *(*uint64)(unsafe.Pointer(&h[0]))
-}
+func (h Hash) Uint64() uint64 { return *(*uint64)(unsafe.Pointer(&h[0])) }
 
 // FastEqual reports whether h and other contain the same 20 byte object ID.
 //
