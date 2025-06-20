@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -974,6 +976,619 @@ func TestFindObject(t *testing.T) {
 		for i := 1; i < len(idx.oidTable); i++ {
 			assert.True(t, bytes.Compare(idx.oidTable[i-1][:], idx.oidTable[i][:]) < 0,
 				"Hash table should be sorted for binary search efficiency")
+		}
+	})
+}
+
+// createValidMidxFile creates a minimal, *single‑pack* multi‑pack‑index
+// covering exactly the <hashes> it is given.
+//
+// Preconditions
+//   - len(hashes) == len(offsets)
+//   - Every offset < 2 GiB (so the LOFF chunk is unnecessary)
+func createValidMidxFile(
+	t *testing.T,
+	packDir string, // "…/objects/pack"
+	packName string, // e.g. "test.pack"
+	hashes []Hash,
+	offsets []uint64,
+) string {
+	require.Equal(t, len(hashes), len(offsets), "hash/offset slice mismatch")
+
+	// Sort objects by hash (required by the spec).
+	type obj struct {
+		h     Hash
+		off32 uint32
+	}
+	objs := make([]obj, len(hashes))
+	for i := range hashes {
+		require.Less(t, offsets[i], uint64(0x80000000), "offset must fit in 31 bits")
+		objs[i] = obj{hashes[i], uint32(offsets[i])}
+	}
+	sort.Slice(objs, func(i, j int) bool {
+		return bytes.Compare(objs[i].h[:], objs[j].h[:]) < 0
+	})
+
+	// Build PNAM.
+	var pnam bytes.Buffer
+	pnam.WriteString(packName)
+	pnam.WriteByte(0) // NUL terminator
+
+	// Build OIDF.
+	var fanout [256]uint32
+	for i, o := range objs {
+		idx := o.h[0]
+		for j := int(idx); j < 256; j++ {
+			fanout[j] = uint32(i + 1)
+		}
+	}
+	var oidf bytes.Buffer
+	for _, c := range fanout {
+		binary.Write(&oidf, binary.BigEndian, c)
+	}
+
+	// Build OIDL.
+	var oidl bytes.Buffer
+	for _, o := range objs {
+		oidl.Write(o.h[:])
+	}
+
+	// Build OOFF.
+	var ooff bytes.Buffer
+	for _, o := range objs {
+		// Pack‑id (uint32, always 0 because we have one pack).
+		binary.Write(&ooff, binary.BigEndian, uint32(0))
+		// Offset (uint32 with MSB = 0 → "small offset").
+		binary.Write(&ooff, binary.BigEndian, o.off32)
+	}
+
+	// Assemble file.
+	type chunk struct {
+		id   string
+		data []byte
+	}
+	chunks := []chunk{
+		{"OIDF", oidf.Bytes()},
+		{"OIDL", oidl.Bytes()},
+		{"OOFF", ooff.Bytes()},
+		{"PNAM", pnam.Bytes()},
+	}
+	const headerSize = 12
+	chunkTableSize := (len(chunks) + 1) * 12 // +1 sentinel
+	offset := headerSize + chunkTableSize
+
+	for i := range chunks {
+		chunks[i].id = fmt.Sprintf("%-4s", chunks[i].id)[:4]
+	}
+
+	var file bytes.Buffer
+
+	// Header.
+	file.WriteString("MIDX")                         // signature
+	file.WriteByte(1)                                // version
+	file.WriteByte(1)                                // hash‑id: 1 = SHA‑1
+	file.WriteByte(byte(len(chunks)))                // #chunks
+	file.WriteByte(0)                                // reserved
+	binary.Write(&file, binary.BigEndian, uint32(1)) // pack‑count
+
+	// Chunk‑table.
+	for _, c := range chunks {
+		file.WriteString(c.id)
+		binary.Write(&file, binary.BigEndian, uint64(offset))
+		offset += len(c.data)
+	}
+	// Sentinel row.
+	file.Write([]byte{0, 0, 0, 0})
+	binary.Write(&file, binary.BigEndian, uint64(offset))
+
+	// Payload.
+	for _, c := range chunks {
+		file.Write(c.data)
+	}
+
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	require.NoError(t, os.WriteFile(midxPath, file.Bytes(), 0644))
+	return midxPath
+}
+
+func TestParseMidx(t *testing.T) {
+	dir := t.TempDir()
+
+	// Minimal pack + companion idx.
+	packPath := filepath.Join(dir, "test.pack")
+	blob := []byte("hello midx")
+	hash := calculateHash(ObjBlob, blob)
+
+	require.NoError(t, createMinimalPack(packPath, blob))
+	require.NoError(t, createV2IndexFile(
+		strings.TrimSuffix(packPath, ".pack")+".idx",
+		[]Hash{hash},
+		[]uint64{12},
+	))
+
+	// Build minimal .midx.
+	createValidMidxFile(t, dir, filepath.Base(packPath), []Hash{hash}, []uint64{12})
+
+	midxRA, err := mmap.Open(filepath.Join(dir, "multi-pack-index"))
+	require.NoError(t, err)
+	defer midxRA.Close()
+
+	midx, err := parseMidx(dir, midxRA)
+	require.NoError(t, err)
+
+	assert.Equal(t, uint32(1), midx.fanout[255], "object count in fanout")
+	assert.Len(t, midx.objectIDs, 1)
+	assert.Equal(t, hash, midx.objectIDs[0])
+
+	// FindObject must return the mmap.ReaderAt of *our* pack plus offset 12.
+	p, off, ok := midx.findObject(hash)
+	assert.True(t, ok)
+	assert.Equal(t, uint64(12), off)
+	assert.NotNil(t, p)
+}
+
+func TestStoreWithMidx(t *testing.T) {
+	dir := t.TempDir()
+
+	// 1 pack, 1 object.
+	packPath := filepath.Join(dir, "test.pack")
+	content := []byte("hello via midx")
+	oid := calculateHash(ObjBlob, content)
+
+	require.NoError(t, createMinimalPack(packPath, content))
+	require.NoError(t, createV2IndexFile(
+		strings.TrimSuffix(packPath, ".pack")+".idx",
+		[]Hash{oid},
+		[]uint64{12},
+	))
+
+	// Create multi‑pack‑index pointing at that single pack.
+	createValidMidxFile(t, dir, filepath.Base(packPath), []Hash{oid}, []uint64{12})
+
+	// Open() must pick the .midx automatically.
+	store, err := Open(dir)
+	require.NoError(t, err)
+	defer store.Close()
+
+	assert.NotNil(t, store.midx, "Store should contain parsed midx")
+	assert.True(t, len(store.midx.objectIDs) > 0, "midx should index at least one object")
+
+	data, typ, err := store.Get(oid)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, content, data)
+}
+
+func TestParseMidx_InvalidFiles(t *testing.T) {
+	dir := t.TempDir()
+
+	// Basic empty file → bad magic.
+	midx := filepath.Join(dir, "multi-pack-index")
+	require.NoError(t, os.WriteFile(midx, []byte("bogus"), 0644))
+
+	ra, _ := mmap.Open(midx)
+	defer ra.Close()
+
+	_, err := parseMidx(dir, ra)
+	assert.Error(t, err, "should reject file with invalid magic")
+}
+
+// setupBenchmarkRepoWithMidx creates a Git repository with multiple pack files and
+// a multi-pack index for benchmarking midx operations. It generates three separate
+// pack files by creating commits incrementally, then attempts to generate a
+// multi-pack index using git commands, falling back to manual creation if needed.
+func setupBenchmarkRepoWithMidx(b *testing.B) string {
+	tempDir := b.TempDir()
+
+	// Create multiple directories with files to ensure we get separate pack files
+	// when we create incremental commits.
+	for packNum := 0; packNum < 3; packNum++ {
+		subDir := filepath.Join(tempDir, fmt.Sprintf("pack%d", packNum))
+		require.NoError(b, os.MkdirAll(subDir, 0755))
+
+		for i := range 5 {
+			filename := filepath.Join(subDir, fmt.Sprintf("file%d.txt", i))
+			content := fmt.Sprintf("Pack %d - File %d content with benchmark data.\nMultiple lines for realistic size.\nLine 3 of pack %d file %d\n", packNum, i, packNum, i)
+			require.NoError(b, os.WriteFile(filename, []byte(content), 0644))
+		}
+	}
+
+	packDir := filepath.Join(tempDir, ".git", "objects", "pack")
+	require.NoError(b, os.MkdirAll(packDir, 0755))
+
+	// Initialize the Git repository with required configuration.
+	cmd := exec.Command("git", "-C", tempDir, "init")
+	require.NoError(b, cmd.Run(), "git init failed - ensure git is installed")
+
+	exec.Command("git", "-C", tempDir, "config", "user.name", "Benchmark").Run()
+	exec.Command("git", "-C", tempDir, "config", "user.email", "bench@example.com").Run()
+
+	// Create multiple commits incrementally to generate separate pack files.
+	// Each commit adds files from one subdirectory and triggers a repack.
+	for packNum := 0; packNum < 3; packNum++ {
+		subDir := fmt.Sprintf("pack%d", packNum)
+		cmd = exec.Command("git", "-C", tempDir, "add", subDir)
+		require.NoError(b, cmd.Run(), "git add failed")
+
+		cmd = exec.Command("git", "-C", tempDir, "commit", "-m", fmt.Sprintf("benchmark commit %d", packNum))
+		require.NoError(b, cmd.Run(), "git commit failed")
+
+		// Force creation of a new pack file for this commit.
+		cmd = exec.Command("git", "-C", tempDir, "repack", "-a", "-d")
+		require.NoError(b, cmd.Run(), "git repack failed")
+	}
+
+	// Generate multi-pack index using Git's built-in command, with fallback.
+	cmd = exec.Command("git", "-C", tempDir, "multi-pack-index", "write")
+	if err := cmd.Run(); err != nil {
+		// Git multi-pack-index command may not be available in older versions,
+		// so we create a minimal midx file manually for testing purposes.
+		b.Logf("git multi-pack-index failed, creating manually: %v", err)
+		createManualMidx(b, packDir)
+	}
+
+	return packDir
+}
+
+// createManualMidx generates a minimal multi-pack index file when Git's built-in
+// command is unavailable. This creates a simplified midx that indexes objects
+// from the first pack file only, which is sufficient for benchmark testing.
+func createManualMidx(b *testing.B, packDir string) {
+	// Discover all pack files in the directory.
+	pattern := filepath.Join(packDir, "*.pack")
+	packs, err := filepath.Glob(pattern)
+	require.NoError(b, err)
+
+	if len(packs) == 0 {
+		b.Skip("No pack files found for midx creation")
+		return
+	}
+
+	// Extract object information from existing pack index files.
+	var allHashes []Hash
+	var allOffsets []uint64
+	packNames := make([]string, 0, len(packs))
+
+	for _, packPath := range packs {
+		packName := filepath.Base(packPath)
+		packNames = append(packNames, packName)
+
+		idxPath := strings.TrimSuffix(packPath, ".pack") + ".idx"
+
+		// Parse the companion index file to extract object metadata.
+		ra, err := mmap.Open(idxPath)
+		if err != nil {
+			continue
+		}
+
+		idx, err := parseIdx(ra)
+		ra.Close()
+		if err != nil {
+			continue
+		}
+
+		// For simplicity in benchmarks, only index objects from the first pack.
+		// A full implementation would merge objects from all packs.
+		if len(packNames) == 1 {
+			allHashes = append(allHashes, idx.oidTable...)
+			for _, entry := range idx.entries {
+				allOffsets = append(allOffsets, entry.offset)
+			}
+		}
+	}
+
+	if len(allHashes) > 0 && len(packNames) > 0 {
+		createManualMidxFile(b, packDir, packNames[0], allHashes, allOffsets)
+	}
+}
+
+// createManualMidxFile creates a minimal multi-pack index file following the
+// Git midx format specification. This is adapted from createValidMidxFile
+// but works with testing.B instead of testing.T for benchmark contexts.
+func createManualMidxFile(
+	b *testing.B,
+	packDir string,
+	packName string,
+	hashes []Hash,
+	offsets []uint64,
+) {
+	require.Equal(b, len(hashes), len(offsets), "hash/offset slice mismatch")
+
+	// Sort objects by hash as required by the midx specification.
+	type obj struct {
+		h     Hash
+		off32 uint32
+	}
+	objs := make([]obj, len(hashes))
+	for i := range hashes {
+		require.Less(b, offsets[i], uint64(0x80000000), "offset must fit in 31 bits")
+		objs[i] = obj{hashes[i], uint32(offsets[i])}
+	}
+	sort.Slice(objs, func(i, j int) bool {
+		return bytes.Compare(objs[i].h[:], objs[j].h[:]) < 0
+	})
+
+	// Build PNAM chunk containing pack file names.
+	var pnam bytes.Buffer
+	pnam.WriteString(packName)
+	pnam.WriteByte(0) // NUL terminator required by format
+
+	// Build OIDF chunk containing the fanout table for fast hash prefix lookup.
+	var fanout [256]uint32
+	for i, o := range objs {
+		idx := o.h[0]
+		for j := int(idx); j < 256; j++ {
+			fanout[j] = uint32(i + 1)
+		}
+	}
+	var oidf bytes.Buffer
+	for _, c := range fanout {
+		binary.Write(&oidf, binary.BigEndian, c)
+	}
+
+	// Build OIDL chunk containing sorted object IDs.
+	var oidl bytes.Buffer
+	for _, o := range objs {
+		oidl.Write(o.h[:])
+	}
+
+	// Build OOFF chunk containing pack ID and offset pairs.
+	var ooff bytes.Buffer
+	for _, o := range objs {
+		// Pack ID is always 0 since we only have one pack in this simplified version.
+		binary.Write(&ooff, binary.BigEndian, uint32(0))
+		// Object offset within the pack file.
+		binary.Write(&ooff, binary.BigEndian, o.off32)
+	}
+
+	// Assemble the complete midx file structure.
+	type chunk struct {
+		id   string
+		data []byte
+	}
+	chunks := []chunk{
+		{"OIDF", oidf.Bytes()},
+		{"OIDL", oidl.Bytes()},
+		{"OOFF", ooff.Bytes()},
+		{"PNAM", pnam.Bytes()},
+	}
+	const headerSize = 12
+	chunkTableSize := (len(chunks) + 1) * 12 // +1 for sentinel entry
+	offset := headerSize + chunkTableSize
+
+	// Ensure chunk IDs are exactly 4 characters as required by format.
+	for i := range chunks {
+		chunks[i].id = fmt.Sprintf("%-4s", chunks[i].id)[:4]
+	}
+
+	var file bytes.Buffer
+
+	// Write midx file header with magic signature and version information.
+	file.WriteString("MIDX")                         // magic signature
+	file.WriteByte(1)                                // version number
+	file.WriteByte(1)                                // hash algorithm ID (SHA-1)
+	file.WriteByte(byte(len(chunks)))                // number of chunks
+	file.WriteByte(0)                                // reserved byte
+	binary.Write(&file, binary.BigEndian, uint32(1)) // number of packs
+
+	// Write chunk directory table mapping chunk IDs to file offsets.
+	for _, c := range chunks {
+		file.WriteString(c.id)
+		binary.Write(&file, binary.BigEndian, uint64(offset))
+		offset += len(c.data)
+	}
+	// Sentinel entry marking end of chunk table.
+	file.Write([]byte{0, 0, 0, 0})
+	binary.Write(&file, binary.BigEndian, uint64(offset))
+
+	// Write chunk payloads in the order specified by the chunk table.
+	for _, c := range chunks {
+		file.Write(c.data)
+	}
+
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	require.NoError(b, os.WriteFile(midxPath, file.Bytes(), 0644))
+}
+
+// BenchmarkParseMidx measures the performance of parsing multi-pack index files.
+// This benchmark focuses on the midx file parsing overhead, which includes
+// reading the header, chunk table, and constructing in-memory lookup structures.
+func BenchmarkParseMidx(b *testing.B) {
+	packDir := setupBenchmarkRepoWithMidx(b)
+
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	if _, err := os.Stat(midxPath); os.IsNotExist(err) {
+		b.Skip("No multi-pack-index file found")
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		ra, err := mmap.Open(midxPath)
+		require.NoError(b, err)
+
+		_, err = parseMidx(packDir, ra)
+		require.NoError(b, err)
+
+		ra.Close()
+	}
+}
+
+// BenchmarkOpenWithMidx measures the performance of opening a Store when a
+// multi-pack index is present. This includes the overhead of midx parsing
+// plus normal pack file discovery and mapping.
+func BenchmarkOpenWithMidx(b *testing.B) {
+	packDir := setupBenchmarkRepoWithMidx(b)
+
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	if _, err := os.Stat(midxPath); os.IsNotExist(err) {
+		b.Skip("No multi-pack-index file found")
+	}
+
+	b.ResetTimer()
+	for b.Loop() {
+		store, err := Open(packDir)
+		require.NoError(b, err)
+
+		// Verify that the midx was successfully loaded and utilized.
+		if store.midx == nil {
+			b.Fatal("Store should have loaded midx")
+		}
+
+		store.Close()
+	}
+}
+
+// BenchmarkGetMidxCold measures object retrieval performance through the multi-pack
+// index with cold cache. This benchmark clears the cache before each lookup to
+// measure worst-case performance including decompression overhead.
+func BenchmarkGetMidxCold(b *testing.B) {
+	packDir := setupBenchmarkRepoWithMidx(b)
+
+	store, err := Open(packDir)
+	require.NoError(b, err)
+	defer store.Close()
+
+	if store.midx == nil {
+		b.Skip("No midx loaded")
+	}
+
+	if len(store.midx.objectIDs) == 0 {
+		b.Skip("No objects in midx")
+	}
+
+	someHash := store.midx.objectIDs[0]
+
+	b.ResetTimer()
+	for b.Loop() {
+		// Force cold cache lookup by purging cached objects.
+		store.cache.Purge()
+		_, _, err := store.Get(someHash)
+		require.NoError(b, err)
+	}
+}
+
+// BenchmarkGetMidxWarm measures object retrieval performance through the multi-pack
+// index with warm cache. This represents best-case performance when objects are
+// already decompressed and cached in memory.
+func BenchmarkGetMidxWarm(b *testing.B) {
+	packDir := setupBenchmarkRepoWithMidx(b)
+
+	store, err := Open(packDir)
+	require.NoError(b, err)
+	defer store.Close()
+
+	if store.midx == nil {
+		b.Skip("No midx loaded")
+	}
+
+	if len(store.midx.objectIDs) == 0 {
+		b.Skip("No objects in midx")
+	}
+
+	someHash := store.midx.objectIDs[0]
+
+	// Warm the cache with an initial lookup.
+	_, _, err = store.Get(someHash)
+	require.NoError(b, err)
+
+	b.ResetTimer()
+	for b.Loop() {
+		_, _, err := store.Get(someHash)
+		require.NoError(b, err)
+	}
+}
+
+// BenchmarkFindObject_MidxVsIdx compares the performance of object lookup using
+// multi-pack index versus traditional individual pack index files. This helps
+// quantify the performance benefits of midx for object location.
+func BenchmarkFindObject_MidxVsIdx(b *testing.B) {
+	packDir := setupBenchmarkRepoWithMidx(b)
+
+	store, err := Open(packDir)
+	require.NoError(b, err)
+	defer store.Close()
+
+	if store.midx == nil || len(store.packs) == 0 {
+		b.Skip("Need both midx and regular packs for comparison")
+	}
+
+	// Select a test object that exists in both lookup mechanisms.
+	var testHash Hash
+	if len(store.midx.objectIDs) > 0 {
+		testHash = store.midx.objectIDs[0]
+	} else if len(store.packs) > 0 && len(store.packs[0].oidTable) > 0 {
+		testHash = store.packs[0].oidTable[0]
+	} else {
+		b.Skip("No objects found for benchmark")
+	}
+
+	b.Run("midx", func(b *testing.B) {
+		for b.Loop() {
+			_, _, found := store.midx.findObject(testHash)
+			if !found {
+				b.Fatal("Object should be found in midx")
+			}
+		}
+	})
+
+	b.Run("idx", func(b *testing.B) {
+		for b.Loop() {
+			found := false
+			// Simulate the linear search through multiple pack files that
+			// would be required without a multi-pack index.
+			for _, pack := range store.packs {
+				if _, found = pack.findObject(testHash); found {
+					break
+				}
+			}
+			if !found {
+				b.Fatal("Object should be found in regular idx")
+			}
+		}
+	})
+}
+
+// BenchmarkMemoryUsage_MidxVsMultipleIdx compares memory allocation patterns
+// when using multi-pack index versus multiple individual index files. This
+// benchmark uses b.ReportAllocs() to track allocation overhead.
+func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
+	packDir := setupBenchmarkRepoWithMidx(b)
+
+	b.Run("with_midx", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			store, err := Open(packDir)
+			require.NoError(b, err)
+
+			// Exercise the data structures to ensure realistic allocation patterns.
+			if store.midx != nil && len(store.midx.objectIDs) > 0 {
+				hash := store.midx.objectIDs[0]
+				store.Get(hash)
+			}
+
+			store.Close()
+		}
+	})
+
+	// Remove midx file to force fallback to individual index files.
+	midxPath := filepath.Join(packDir, "multi-pack-index")
+	if err := os.Remove(midxPath); err != nil && !os.IsNotExist(err) {
+		b.Fatalf("Failed to remove midx: %v", err)
+	}
+
+	b.Run("without_midx", func(b *testing.B) {
+		b.ReportAllocs()
+		for b.Loop() {
+			store, err := Open(packDir)
+			require.NoError(b, err)
+
+			// Perform equivalent operations using traditional pack index lookup.
+			if len(store.packs) > 0 && len(store.packs[0].oidTable) > 0 {
+				hash := store.packs[0].oidTable[0]
+				store.Get(hash)
+			}
+
+			store.Close()
 		}
 	})
 }

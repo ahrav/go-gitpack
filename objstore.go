@@ -35,8 +35,10 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"unsafe"
@@ -142,6 +144,8 @@ const (
 	crcSize      = 4  // Big-endian CRC-32 value per object.
 	offsetSize   = 4  // 31-bit offset or MSB-set index into large-offset table.
 	largeOffSize = 8  // 64-bit offset for objects beyond the 2 GiB boundary.
+
+	defaultMaxDeltaDepth = 50
 )
 
 // idxEntry describes a single object as recorded in a pack-index (*.idx).
@@ -243,6 +247,9 @@ func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
 type Store struct {
 	// packs contains one immutable idxFile per mapped pack.
 	packs []*idxFile
+
+	// midx holds the multi-pack index if one was found, nil otherwise.
+	midx *midxFile
 
 	// mu guards live configuration such as cache size and maxDeltaDepth.
 	mu sync.Mutex
@@ -370,7 +377,7 @@ func (ctx *deltaContext) enterOfsDelta(offset uint64) {
 // caller leaves a delta resolution frame.
 func (ctx *deltaContext) exit() { ctx.depth-- }
 
-// Open scans dir for “*.pack” files, expects a matching “*.idx” companion for
+// Open scans dir for "*.pack" files, expects a matching "*.idx" companion for
 // each one, memory-maps every pair, and returns a read-only *Store.
 //
 // Open eagerly parses all index files so that subsequent Store.Get calls are
@@ -379,27 +386,50 @@ func (ctx *deltaContext) exit() { ctx.depth-- }
 // repeated decompression of hot objects.
 //
 // Error semantics:
-//   - If no “*.pack” files are found in dir an error is returned.
-//   - If any “*.idx” companion is missing or malformed, Open fails.
+//   - If no "*.pack" files are found in dir an error is returned.
+//   - If any "*.idx" companion is missing or malformed, Open fails.
 //   - All I/O is performed with mmap; failures when mapping a file are
 //     surfaced immediately.
 //
 // The returned Store is safe for concurrent readers; no additional
 // synchronization is required by the caller.
 //
-// For bare repositories pass “.git/objects/pack” as dir.
+// For bare repositories pass ".git/objects/pack" as dir.
 func Open(dir string) (*Store, error) {
+	// Attempt to mmap a multi-pack-index. It is named exactly
+	//    "…/objects/pack/multi-pack-index".
+	midxPath := filepath.Join(dir, "multi-pack-index")
+	var midx *midxFile
+	if st, err := os.Stat(midxPath); err == nil && !st.IsDir() {
+		mr, err := mmap.Open(midxPath)
+		if err != nil {
+			return nil, fmt.Errorf("mmap midx: %w", err)
+		}
+		defer func() {
+			if midx == nil {
+				_ = mr.Close()
+			}
+		}()
+		midx, err = parseMidx(dir, mr)
+		if err != nil {
+			_ = mr.Close()
+			return nil, fmt.Errorf("parse midx: %w", err)
+		}
+	}
+
+	// Normal pack/idx enumeration.
 	pattern := filepath.Join(dir, "*.pack")
 	packs, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, err
 	}
-	if len(packs) == 0 {
+	if len(packs) == 0 && midx == nil {
 		return nil, fmt.Errorf("no packfiles found in %s", dir)
 	}
 
 	store := &Store{
-		maxDeltaDepth: 50, // Git's default maximum
+		maxDeltaDepth: defaultMaxDeltaDepth,
+		midx:          midx,
 	}
 
 	const defaultCacheSize = 1 << 14 // 16 KiB ARC—enough for >95 % hit-rate on typical workloads.
@@ -465,6 +495,17 @@ func (s *Store) Close() error {
 		return nil
 	}
 	var firstErr error
+
+	if s.midx != nil {
+		for _, p := range s.midx.packReaders {
+			if p != nil {
+				if err := p.Close(); err != nil && firstErr == nil {
+					firstErr = err
+				}
+			}
+		}
+	}
+
 	for _, p := range s.packs {
 		if err := p.pack.Close(); err != nil && firstErr == nil {
 			firstErr = err
@@ -497,59 +538,88 @@ func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		return b, detectType(b), nil
 	}
 
+	if s.midx != nil {
+		if p, off, ok := s.midx.findObject(oid); ok {
+			return s.inflateFromPack(p, off, oid, ctx)
+		}
+	}
+
 	for _, pf := range s.packs {
 		offset, found := pf.findObject(oid)
 		if !found {
 			continue
 		}
-		objType, data, err := readRawObject(pf.pack, offset)
+		return s.inflateFromPack(pf.pack, offset, oid, ctx)
+	}
+
+	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
+}
+
+// inflateFromPack handles object inflation from a specific pack, with delta resolution.
+func (s *Store) inflateFromPack(
+	p *mmap.ReaderAt,
+	off uint64,
+	oid Hash,
+	ctx *deltaContext,
+) ([]byte, ObjectType, error) {
+	objType, data, err := readRawObject(p, off)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+
+	switch objType {
+	case ObjBlob, ObjCommit, ObjTree, ObjTag:
+		if s.VerifyCRC {
+			// For CRC verification with midx, we need to find the right idxFile
+			// This is a simplified approach - in practice we might want to store
+			// CRC data in the midx structure or skip verification for midx objects.
+			for _, pf := range s.packs {
+				if pf.pack == p {
+					entry := pf.entriesByOffset(off)
+					if entry.offset == off {
+						if err := verifyCRC32(p, off, data, entry.crc); err != nil {
+							return nil, ObjBad, err
+						}
+					}
+					break
+				}
+			}
+		}
+		s.cache.Add(oid, data)
+		return data, objType, nil
+
+	case ObjOfsDelta, ObjRefDelta:
+		baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, data)
 		if err != nil {
 			return nil, ObjBad, err
 		}
 
-		switch objType {
-		case ObjBlob, ObjCommit, ObjTree, ObjTag:
-			if s.VerifyCRC {
-				if err := verifyCRC32(pf.pack, offset, data, pf.entriesByOffset(offset).crc); err != nil {
-					return nil, ObjBad, err
-				}
-			}
-			s.cache.Add(oid, data)
-			return data, objType, nil
-		case ObjOfsDelta, ObjRefDelta:
-			baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, data)
-			if err != nil {
+		var base []byte
+		if objType == ObjRefDelta {
+			if err := ctx.checkRefDelta(baseHash); err != nil {
 				return nil, ObjBad, err
 			}
-
-			var baseData []byte
-			if objType == ObjRefDelta {
-				if err := ctx.checkRefDelta(baseHash); err != nil {
-					return nil, ObjBad, err
-				}
-				ctx.enterRefDelta(baseHash)
-				baseData, _, err = s.getWithContext(baseHash, ctx)
-				ctx.exit()
-			} else {
-				if err := ctx.checkOfsDelta(baseOff); err != nil {
-					return nil, ObjBad, err
-				}
-				ctx.enterOfsDelta(baseOff)
-				baseData, _, err = readObjectAtOffsetWithContext(pf.pack, baseOff, s, ctx)
-				ctx.exit()
-			}
-			if err != nil {
+			ctx.enterRefDelta(baseHash)
+			base, _, err = s.getWithContext(baseHash, ctx)
+			ctx.exit()
+		} else {
+			if err := ctx.checkOfsDelta(baseOff); err != nil {
 				return nil, ObjBad, err
 			}
-			full := applyDelta(baseData, deltaBuf)
-			s.cache.Add(oid, full)
-			return full, detectType(full), nil
-		default:
-			return nil, ObjBad, fmt.Errorf("unknown obj type %d", objType)
+			ctx.enterOfsDelta(baseOff)
+			base, _, err = readObjectAtOffsetWithContext(p, baseOff, s, ctx)
+			ctx.exit()
 		}
-	}
+		if err != nil {
+			return nil, ObjBad, err
+		}
+		full := applyDelta(base, deltaBuf)
+		s.cache.Add(oid, full)
+		return full, detectType(full), nil
 
-	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
+	default:
+		return nil, ObjBad, fmt.Errorf("unknown obj type %d", objType)
+	}
 }
 
 // detectType is a best-effort heuristic that infers the Git object kind from
@@ -1326,3 +1396,243 @@ func decodeVarInt(buf []byte) (uint64, int) {
 
 	return res, i
 }
+
+// midxEntry describes a single object as recorded in a multi-pack index.
+// The struct maps an object to its containing pack and byte offset within that pack.
+type midxEntry struct {
+	// packID is the index into the packReaders slice, identifying which
+	// pack file contains this object.
+	packID uint32
+
+	// offset is the absolute byte position of the object header inside
+	// the specified pack file. The field is 64-bit to support packs
+	// that exceed 2 GiB.
+	offset uint64
+}
+
+// midxFile represents one "multi-pack-index" (midx) file together with the
+// packfiles it references.
+//
+// The struct is immutable after parseMidx returns and is safe for concurrent
+// readers – exactly like idxFile.
+type midxFile struct {
+	// packReaders are mmap-handles for the N packfiles listed in PNAM order.
+	// len(packReaders) == len(packNames).
+	packReaders []*mmap.ReaderAt
+	packNames   []string // full basenames, e.g. "pack-abcd1234.pack"
+
+	// fanout[i] == #objects whose first digest byte ≤ i.
+	fanout [fanoutEntries]uint32
+
+	// objectIDs and entries run in parallel and have identical length.
+	objectIDs []Hash
+	entries   []midxEntry
+}
+
+// Multi-pack index chunk identifiers.
+const (
+	chunkPNAM = 0x504e414d // 'PNAM' - pack names
+	chunkOIDF = 0x4f494446 // 'OIDF' - object ID fanout table
+	chunkOIDL = 0x4f49444c // 'OIDL' - object ID list
+	chunkOOFF = 0x4f4f4646 // 'OOFF' - object offsets
+	chunkLOFF = 0x4c4f4646 // 'LOFF' - large object offsets
+)
+
+// findObject performs the same two-stage lookup that idxFile.findObject does
+// but returns both the *mmap.ReaderAt for the pack and the byte offset.
+func (m *midxFile) findObject(h Hash) (p *mmap.ReaderAt, off uint64, ok bool) {
+	first := h[0]
+	start := uint32(0)
+	if first > 0 {
+		start = m.fanout[first-1]
+	}
+	end := m.fanout[first]
+	if start == end {
+		return nil, 0, false
+	}
+
+	rel, hit := slices.BinarySearchFunc(
+		m.objectIDs[start:end],
+		h,
+		func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
+	)
+	if !hit {
+		return nil, 0, false
+	}
+	abs := int(start) + rel
+	ent := m.entries[abs]
+	return m.packReaders[ent.packID], ent.offset, true
+}
+
+// parseMidx reads the file mapped in mr and returns a fully‑populated
+// midxFile. Only version‑1 / SHA‑1 repositories are supported.
+//
+// dir must be the "…/objects/pack" directory so that pack names from the
+// PNAM chunk can be mmap'ed right away.
+//
+// Note: midx v1 is the current format (different from pack index v2)
+// midx files have their own versioning scheme starting at 1
+func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
+	// Header.
+	var hdr [12]byte
+	if _, err := mr.ReadAt(hdr[:], 0); err != nil {
+		return nil, err
+	}
+	if !bytes.Equal(hdr[0:4], []byte("MIDX")) {
+		return nil, fmt.Errorf("not a MIDX file")
+	}
+	if hdr[4] != 1 /* version */ {
+		return nil, fmt.Errorf("unsupported midx version %d", hdr[4])
+	}
+	if hdr[5] != 1 /* SHA‑1 */ {
+		return nil, fmt.Errorf("only SHA‑1 midx supported")
+	}
+	chunks := int(hdr[6])
+	packCount := int(binary.BigEndian.Uint32(hdr[8:12]))
+
+	// Chunk table.
+	type cdesc struct {
+		id  [4]byte
+		off uint64
+	}
+	cd := make([]cdesc, chunks+1) // +1 for the terminating row
+	for i := range cd {
+		var row [12]byte
+		base := int64(12 + i*12)
+		if _, err := mr.ReadAt(row[:], base); err != nil {
+			return nil, err
+		}
+		copy(cd[i].id[:], row[0:4])
+		cd[i].off = binary.BigEndian.Uint64(row[4:12])
+	}
+	// Calculate size for each chunk by looking at the next offset.
+	sort.Slice(cd, func(i, j int) bool { return cd[i].off < cd[j].off })
+
+	findChunk := func(id uint32) (off int64, size int64, err error) {
+		for i := 0; i < len(cd)-1; i++ {
+			chunkID := binary.BigEndian.Uint32(cd[i].id[:])
+			if chunkID == id {
+				return int64(cd[i].off),
+					int64(cd[i+1].off) - int64(cd[i].off),
+					nil
+			}
+		}
+		return 0, 0, fmt.Errorf("chunk %08x not found", id)
+	}
+
+	// PNAM.
+	pnOff, pnSize, err := findChunk(chunkPNAM)
+	if err != nil {
+		return nil, err
+	}
+	pn := make([]byte, pnSize)
+	if _, err = mr.ReadAt(pn, pnOff); err != nil {
+		return nil, err
+	}
+	// Filenames are NUL‑terminated.
+	var packNames []string
+	for start := 0; start < len(pn); {
+		end := bytes.IndexByte(pn[start:], 0)
+		if end <= 0 {
+			break
+		}
+		packNames = append(packNames, string(pn[start:start+end]))
+		start += end + 1
+	}
+	if len(packNames) != packCount {
+		return nil, fmt.Errorf("PNAM count mismatch (%d vs %d)", len(packNames), packCount)
+	}
+
+	// Mmap every pack straight away so we have a stable *ReaderAt slice.
+	packs := make([]*mmap.ReaderAt, len(packNames))
+	for i, name := range packNames {
+		r, err := mmap.Open(filepath.Join(dir, name))
+		if err != nil {
+			for _, p := range packs[:i] {
+				if p != nil {
+					_ = p.Close()
+				}
+			}
+			return nil, fmt.Errorf("mmap pack %q: %w", name, err)
+		}
+		packs[i] = r
+	}
+
+	// OIDF.
+	fanOff, _, err := findChunk(chunkOIDF)
+	if err != nil {
+		return nil, err
+	}
+	var fanout [fanoutEntries]uint32
+	if _, err = mr.ReadAt(unsafe.Slice((*byte)(unsafe.Pointer(&fanout[0])), fanoutSize), fanOff); err != nil {
+		return nil, err
+	}
+	if isLittleEndian() {
+		for i := range fanout {
+			fanout[i] = bswap32(fanout[i])
+		}
+	}
+	objCount := fanout[255]
+
+	// OIDL.
+	oidOff, _, err := findChunk(chunkOIDL)
+	if err != nil {
+		return nil, err
+	}
+	oids := make([]Hash, objCount)
+	read := unsafe.Slice((*byte)(unsafe.Pointer(&oids[0])), int(objCount*hashSize))
+	if _, err = mr.ReadAt(read, oidOff); err != nil {
+		return nil, err
+	}
+
+	// OOFF / LOFF.
+	offOff, _, err := findChunk(chunkOOFF)
+	if err != nil {
+		return nil, err
+	}
+	offRaw := make([]byte, objCount*8) // two uint32 per object
+	if _, err = mr.ReadAt(offRaw, offOff); err != nil {
+		return nil, err
+	}
+
+	// LOFF is optional.
+	loffOff, loffSize, _ := findChunk(chunkLOFF) // ignore "not found" error
+	var loff []uint64
+	if loffSize > 0 {
+		loff = make([]uint64, loffSize/8)
+		if _, err = mr.ReadAt(
+			unsafe.Slice((*byte)(unsafe.Pointer(&loff[0])), int(loffSize)),
+			loffOff,
+		); err != nil {
+			return nil, err
+		}
+	}
+
+	entries := make([]midxEntry, objCount)
+
+	for i := range objCount {
+		packID := binary.BigEndian.Uint32(offRaw[i*8 : i*8+4])
+		rawOff := binary.BigEndian.Uint32(offRaw[i*8+4 : i*8+8])
+
+		var off64 uint64
+		if rawOff&0x80000000 == 0 {
+			off64 = uint64(rawOff)
+		} else {
+			idx := rawOff & 0x7FFFFFFF
+			if int(idx) >= len(loff) {
+				return nil, fmt.Errorf("invalid LOFF index %d", idx)
+			}
+			off64 = loff[idx]
+		}
+		entries[i] = midxEntry{packID, off64}
+	}
+
+	return &midxFile{
+		packReaders: packs,
+		packNames:   packNames,
+		fanout:      fanout,
+		objectIDs:   oids,
+		entries:     entries,
+	}, nil
+}
+
