@@ -625,7 +625,7 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 	}
 
 	// Sort by hash (lexicographic order)
-	for i := 0; i < len(hashOffsets); i++ {
+	for i := range hashOffsets {
 		for j := i + 1; j < len(hashOffsets); j++ {
 			if bytes.Compare(hashOffsets[i].hash[:], hashOffsets[j].hash[:]) > 0 {
 				hashOffsets[i], hashOffsets[j] = hashOffsets[j], hashOffsets[i]
