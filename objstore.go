@@ -712,21 +712,6 @@ type largeOffsetEntry struct {
 	largeIdx uint32
 }
 
-// bswap32 reverses the byte order of v.
-//
-// Git's on-disk formats are big-endian, whereas most modern hardware
-// that runs Go is little-endian.
-// The helper converts a 32-bit value that was read directly from an
-// index or pack file into the host's native order, allowing the rest
-// of the code to use ordinary arithmetic without sprinkling byte-swaps
-// everywhere.
-func bswap32(v uint32) uint32 {
-	return (v&0x000000FF)<<24 |
-		(v&0x0000FF00)<<8 |
-		(v&0x00FF0000)>>8 |
-		(v&0xFF000000)>>24
-}
-
 // parseIdx reads a Git pack index file using unsafe operations for maximum performance.
 //
 // Git pack index (.idx) file format (version 2):
@@ -769,7 +754,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 
 	if littleEndian {
 		for i := range fanout {
-			fanout[i] = bswap32(fanout[i])
+			fanout[i] = binary.BigEndian.Uint32(fanoutData[i*4:])
 		}
 	}
 
@@ -815,7 +800,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 
 		if littleEndian {
 			for i := range objCount {
-				crcPtr[i] = bswap32(srcPtr[i])
+				crcPtr[i] = binary.BigEndian.Uint32(crcData[i*4:])
 			}
 		} else {
 			copy(crcPtr[:objCount], srcPtr[:objCount])
@@ -833,7 +818,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	for i := range objCount {
 		offset := offsetPtr[i]
 		if littleEndian {
-			offset = bswap32(offset)
+			offset = binary.BigEndian.Uint32(offsetData[i*4:])
 		}
 
 		entries[i].crc = crcs[i]
@@ -1564,7 +1549,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 	}
 	if hostLittle {
 		for i := range fanout {
-			fanout[i] = bswap32(fanout[i])
+			fanout[i] = binary.BigEndian.Uint32(unsafe.Slice((*byte)(unsafe.Pointer(&fanout[i])), 4))
 		}
 	}
 	objCount := fanout[255]

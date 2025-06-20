@@ -20,55 +20,6 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
-func TestBswap32(t *testing.T) {
-	tests := []struct {
-		name     string
-		input    uint32
-		expected uint32
-	}{
-		{
-			name:     "zero",
-			input:    0x00000000,
-			expected: 0x00000000,
-		},
-		{
-			name:     "simple pattern",
-			input:    0x12345678,
-			expected: 0x78563412,
-		},
-		{
-			name:     "all ones",
-			input:    0xFFFFFFFF,
-			expected: 0xFFFFFFFF,
-		},
-		{
-			name:     "alternating bytes",
-			input:    0xAA55AA55,
-			expected: 0x55AA55AA,
-		},
-		{
-			name:     "max uint32",
-			input:    0xFFFFFFFF,
-			expected: 0xFFFFFFFF,
-		},
-		{
-			name:     "git magic bytes",
-			input:    0xFF744F63, // Git pack index magic
-			expected: 0x634F74FF,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := bswap32(tt.input)
-			assert.Equal(t, tt.expected, result)
-
-			reversed := bswap32(result)
-			assert.Equal(t, tt.input, reversed, "bswap32 should be its own inverse")
-		})
-	}
-}
-
 func TestIsLittleEndian(t *testing.T) {
 	result1 := hostLittle
 	result2 := hostLittle
