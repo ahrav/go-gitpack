@@ -70,8 +70,8 @@ func TestBswap32(t *testing.T) {
 }
 
 func TestIsLittleEndian(t *testing.T) {
-	result1 := isLittleEndian()
-	result2 := isLittleEndian()
+	result1 := hostLittle
+	result2 := hostLittle
 
 	assert.Equal(t, result1, result2, "isLittleEndian should return consistent results")
 

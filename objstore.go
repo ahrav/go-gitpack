@@ -47,6 +47,11 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
+var hostLittle = func() bool {
+	var i uint16 = 1
+	return *(*byte)(unsafe.Pointer(&i)) == 1
+}()
+
 // Hash represents a raw Git object identifier.
 //
 // It is the 20-byte binary form of a SHA-1 digest as used by Git internally.
@@ -646,7 +651,7 @@ func detectType(data []byte) ObjectType {
 		blobLE = 0x626f6c62 // "blob" in little-endian
 	)
 
-	if isLittleEndian() {
+	if hostLittle {
 		switch first4 {
 		case treeLE:
 			if len(data) > 4 && data[4] == ' ' {
@@ -722,17 +727,6 @@ func bswap32(v uint32) uint32 {
 		(v&0xFF000000)>>24
 }
 
-// isLittleEndian reports whether the current CPU uses little-endian byte order.
-//
-// The check is performed once at startup and the result is cached in
-// the enclosing call sites, so the tiny cost of the unsafe trickery
-// does not affect tight loops.
-func isLittleEndian() bool {
-	var i int32 = 0x01020304
-	p := unsafe.Pointer(&i)
-	return *(*byte)(p) == 0x04
-}
-
 // parseIdx reads a Git pack index file using unsafe operations for maximum performance.
 //
 // Git pack index (.idx) file format (version 2):
@@ -746,7 +740,7 @@ func isLittleEndian() bool {
 // performance is critical and the code has been thoroughly tested.
 func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	// Git stores data in big-endian format, so we need to byte-swap on little-endian systems.
-	littleEndian := isLittleEndian()
+	littleEndian := hostLittle
 
 	header := make([]byte, headerSize)
 	if _, err := ix.ReadAt(header, 0); err != nil {
@@ -758,11 +752,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, fmt.Errorf("unsupported idx version or v1 not handled")
 	}
 
-	version := *(*uint32)(unsafe.Pointer(&header[4]))
-	if littleEndian {
-		version = bswap32(version)
-	}
-	if version != 2 {
+	if version := binary.BigEndian.Uint32(header[4:]); version != 2 {
 		return nil, fmt.Errorf("unsupported idx version %d", version)
 	}
 
@@ -780,6 +770,13 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	if littleEndian {
 		for i := range fanout {
 			fanout[i] = bswap32(fanout[i])
+		}
+	}
+
+	// Guard against truncated or tampered indexes.
+	for i := 1; i < fanoutEntries; i++ {
+		if fanout[i] < fanout[i-1] {
+			return nil, fmt.Errorf("idx corrupt: fan‑out table not monotonic")
 		}
 	}
 
@@ -1565,7 +1562,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 	if _, err = mr.ReadAt(unsafe.Slice((*byte)(unsafe.Pointer(&fanout[0])), fanoutSize), fanOff); err != nil {
 		return nil, err
 	}
-	if isLittleEndian() {
+	if hostLittle {
 		for i := range fanout {
 			fanout[i] = bswap32(fanout[i])
 		}
