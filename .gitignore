@@ -32,3 +32,6 @@ go.work.sum
 # .vscode/
 
 *.pprof
+
+# Example binary (but not the example directory)
+/example/example
