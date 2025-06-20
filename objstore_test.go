@@ -125,7 +125,7 @@ func TestOpen(t *testing.T) {
 
 		assert.NotNil(t, store)
 		assert.Len(t, store.packs, 1)
-		assert.Greater(t, len(store.index), 0)
+		assert.Greater(t, len(store.packs[0].oidTable), 0)
 		assert.Equal(t, 50, store.maxDeltaDepth)
 	})
 
@@ -148,7 +148,11 @@ func TestOpen(t *testing.T) {
 		defer store.Close()
 
 		assert.Len(t, store.packs, 2)
-		assert.Equal(t, 2, len(store.index))
+		totalObjects := 0
+		for _, pack := range store.packs {
+			totalObjects += len(pack.oidTable)
+		}
+		assert.Equal(t, 2, totalObjects)
 	})
 }
 
@@ -215,7 +219,7 @@ func TestParseIdx(t *testing.T) {
 		largeOffset := uint64(0x80000000) // > 2GB, requires large offset table
 		offsets := []uint64{largeOffset}
 
-		data := createValidIdxDataWithLargeOffsets(t, hashes, offsets)
+		data := createValidIdxData(t, hashes, offsets)
 		tempFile := createTempFileWithData(t, data)
 		defer os.Remove(tempFile)
 
@@ -255,8 +259,9 @@ func TestParseIdx(t *testing.T) {
 
 		assert.Len(t, idx.oidTable, 2)
 		assert.Len(t, idx.entries, 2)
-		assert.Equal(t, hash1, idx.oidTable[0])
-		assert.Equal(t, hash2, idx.oidTable[1])
+		// After sorting, hash2 (starting with '12') comes before hash1 (starting with 'ab').
+		assert.Equal(t, hash2, idx.oidTable[0])
+		assert.Equal(t, hash1, idx.oidTable[1])
 	})
 
 	t.Run("truncated file", func(t *testing.T) {
@@ -285,7 +290,8 @@ func createTempFileWithData(t *testing.T, data []byte) string {
 	return tempFile.Name()
 }
 
-// createValidIdxData creates a minimal valid idx file data for testing.
+// createValidIdxData creates a valid idx file data for testing.
+// It automatically handles both regular and large offsets based on the provided offset values.
 func createValidIdxData(t *testing.T, hashes []Hash, offsets []uint64) []byte {
 	var buf bytes.Buffer
 
@@ -293,90 +299,92 @@ func createValidIdxData(t *testing.T, hashes []Hash, offsets []uint64) []byte {
 	buf.Write([]byte{0xff, 0x74, 0x4f, 0x63})       // magic
 	binary.Write(&buf, binary.BigEndian, uint32(2)) // version
 
-	// Fanout table (256 entries)..
-	objCount := uint32(len(hashes))
+	// Sort hashes and corresponding offsets for proper index format.
+	type hashOffset struct {
+		hash   Hash
+		offset uint64
+	}
+
+	hashOffsets := make([]hashOffset, len(hashes))
+	for i, h := range hashes {
+		hashOffsets[i] = hashOffset{h, offsets[i]}
+	}
+
+	// Sort by hash (lexicographic order).
+	for i := range hashOffsets {
+		for j := i + 1; j < len(hashOffsets); j++ {
+			if bytes.Compare(hashOffsets[i].hash[:], hashOffsets[j].hash[:]) > 0 {
+				hashOffsets[i], hashOffsets[j] = hashOffsets[j], hashOffsets[i]
+			}
+		}
+	}
+
+	sortedHashes := make([]Hash, len(hashes))
+	sortedOffsets := make([]uint64, len(offsets))
+	for i, ho := range hashOffsets {
+		sortedHashes[i] = ho.hash
+		sortedOffsets[i] = ho.offset
+	}
+
+	// Check if we need large offset table.
+	needsLargeOffsets := false
+	for _, offset := range sortedOffsets {
+		if offset > 0x7fffffff {
+			needsLargeOffsets = true
+			break
+		}
+	}
+
+	// Fanout table (256 entries).
 	for i := range 256 {
 		count := uint32(0)
-		// For simplicity, just set the last entry to objCount.
-		if i == 255 {
-			count = objCount
-		} else if len(hashes) > 0 && i >= int(hashes[0][0]) {
-			count = objCount
+		// Count objects whose first byte is <= i.
+		for j, hash := range sortedHashes {
+			if int(hash[0]) <= i {
+				count = uint32(j + 1)
+			}
 		}
 		binary.Write(&buf, binary.BigEndian, count)
 	}
 
 	// Object hashes.
-	for _, hash := range hashes {
+	for _, hash := range sortedHashes {
 		buf.Write(hash[:])
 	}
 
 	// CRC32s (dummy values).
-	for range hashes {
+	for range sortedHashes {
 		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
 	}
 
-	// Offsets (all small offsets for this version).
-	for _, offset := range offsets {
-		binary.Write(&buf, binary.BigEndian, uint32(offset))
-	}
-
-	// Pack checksum + index checksum (dummy).
-	buf.Write(make([]byte, 40))
-
-	return buf.Bytes()
-}
-
-// createValidIdxDataWithLargeOffsets creates idx data with large offset table.
-func createValidIdxDataWithLargeOffsets(t *testing.T, hashes []Hash, offsets []uint64) []byte {
-	var buf bytes.Buffer
-
-	// Header: magic + version.
-	buf.Write([]byte{0xff, 0x74, 0x4f, 0x63})       // magic
-	binary.Write(&buf, binary.BigEndian, uint32(2)) // version
-
-	// Fanout table.
-	objCount := uint32(len(hashes))
-	for i := range 256 {
-		count := uint32(0)
-		if i == 255 {
-			count = objCount
-		} else if len(hashes) > 0 && i >= int(hashes[0][0]) {
-			count = objCount
+	// Offsets - handle both regular and large offsets.
+	if needsLargeOffsets {
+		// Write offsets with large offset references.
+		largeOffsetIndex := uint32(0)
+		for _, offset := range sortedOffsets {
+			if offset > 0x7fffffff {
+				// Use large offset table reference.
+				binary.Write(&buf, binary.BigEndian, uint32(0x80000000|largeOffsetIndex))
+				largeOffsetIndex++
+			} else {
+				binary.Write(&buf, binary.BigEndian, uint32(offset))
+			}
 		}
-		binary.Write(&buf, binary.BigEndian, count)
-	}
 
-	// Object hashes.
-	for _, hash := range hashes {
-		buf.Write(hash[:])
-	}
-
-	// CRC32s.
-	for range hashes {
-		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
-	}
-
-	// Offsets with large offset references.
-	largeOffsetIndex := uint32(0)
-	for _, offset := range offsets {
-		if offset > 0x7fffffff {
-			// Use large offset table reference.
-			binary.Write(&buf, binary.BigEndian, uint32(0x80000000|largeOffsetIndex))
-			largeOffsetIndex++
-		} else {
+		// Large offset table.
+		for _, offset := range sortedOffsets {
+			if offset > 0x7fffffff {
+				binary.Write(&buf, binary.BigEndian, offset)
+			}
+		}
+	} else {
+		// All small offsets.
+		for _, offset := range sortedOffsets {
 			binary.Write(&buf, binary.BigEndian, uint32(offset))
 		}
 	}
 
-	// Large offset table.
-	for _, offset := range offsets {
-		if offset > 0x7fffffff {
-			binary.Write(&buf, binary.BigEndian, offset)
-		}
-	}
-
-	// Pack checksum + index checksum.
+	// Pack checksum + index checksum (dummy).
 	buf.Write(make([]byte, 40))
 
 	return buf.Bytes()
@@ -605,9 +613,37 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 	idxFile.Write([]byte{0xff, 0x74, 0x4f, 0x63})      // magic
 	binary.Write(idxFile, binary.BigEndian, uint32(2)) // version
 
+	// Sort hashes and corresponding offsets for proper index format
+	type hashOffset struct {
+		hash   Hash
+		offset uint64
+	}
+
+	hashOffsets := make([]hashOffset, len(hashes))
+	for i, h := range hashes {
+		hashOffsets[i] = hashOffset{h, offsets[i]}
+	}
+
+	// Sort by hash (lexicographic order)
+	for i := 0; i < len(hashOffsets); i++ {
+		for j := i + 1; j < len(hashOffsets); j++ {
+			if bytes.Compare(hashOffsets[i].hash[:], hashOffsets[j].hash[:]) > 0 {
+				hashOffsets[i], hashOffsets[j] = hashOffsets[j], hashOffsets[i]
+			}
+		}
+	}
+
+	// Extract sorted hashes and offsets
+	sortedHashes := make([]Hash, len(hashes))
+	sortedOffsets := make([]uint64, len(offsets))
+	for i, ho := range hashOffsets {
+		sortedHashes[i] = ho.hash
+		sortedOffsets[i] = ho.offset
+	}
+
 	// Create fanout table.
 	fanout := make([]uint32, 256)
-	for i, h := range hashes {
+	for i, h := range sortedHashes {
 		firstByte := h[0]
 		for j := int(firstByte); j < 256; j++ {
 			fanout[j] = uint32(i + 1)
@@ -617,18 +653,18 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		binary.Write(idxFile, binary.BigEndian, fanout[i])
 	}
 
-	// Write SHA hashes (must be sorted).
-	for _, h := range hashes {
+	// Write SHA hashes (now properly sorted).
+	for _, h := range sortedHashes {
 		idxFile.Write(h[:])
 	}
 
 	// Write CRC32s (dummy values).
-	for range hashes {
+	for range sortedHashes {
 		binary.Write(idxFile, binary.BigEndian, uint32(0x12345678))
 	}
 
 	// Write offsets.
-	for _, off := range offsets {
+	for _, off := range sortedOffsets {
 		if off > 0x7fffffff {
 			return fmt.Errorf("offset too large for test")
 		}
@@ -886,4 +922,58 @@ func BenchmarkOpen(b *testing.B) {
 		require.NoError(b, err)
 		s.Close()
 	}
+}
+
+func TestFindObject(t *testing.T) {
+	// Create test hashes that will be in different fanout ranges.
+	hash1, _ := ParseHash("0123456789abcdef0123456789abcdef01234567") // starts with 0x01
+	hash2, _ := ParseHash("1234567890abcdef1234567890abcdef12345678") // starts with 0x12
+	hash3, _ := ParseHash("abcdef1234567890abcdef1234567890abcdef12") // starts with 0xab
+	hashes := []Hash{hash1, hash2, hash3}
+	offsets := []uint64{100, 200, 300}
+
+	// Create index data and parse it.
+	data := createValidIdxData(t, hashes, offsets)
+	tempFile := createTempFileWithData(t, data)
+	defer os.Remove(tempFile)
+
+	ra, err := mmap.Open(tempFile)
+	require.NoError(t, err)
+	defer ra.Close()
+
+	idx, err := parseIdx(ra)
+	require.NoError(t, err)
+
+	t.Run("find existing objects", func(t *testing.T) {
+		// Test finding each hash.
+		for _, hash := range []Hash{hash1, hash2, hash3} {
+			offset, found := idx.findObject(hash)
+			assert.True(t, found, "Should find hash %x", hash)
+
+			// Find expected offset (since hashes are sorted, we need to find the corresponding offset).
+			expectedOffset := uint64(0)
+			for j, sortedHash := range idx.oidTable {
+				if sortedHash == hash {
+					expectedOffset = idx.entries[j].offset
+					break
+				}
+			}
+			assert.Equal(t, expectedOffset, offset, "Should return correct offset for hash %x", hash)
+		}
+	})
+
+	t.Run("find non-existent object", func(t *testing.T) {
+		nonExistentHash, _ := ParseHash("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+		offset, found := idx.findObject(nonExistentHash)
+		assert.False(t, found, "Should not find non-existent hash")
+		assert.Equal(t, uint64(0), offset, "Should return 0 offset for non-existent hash")
+	})
+
+	t.Run("binary search efficiency", func(t *testing.T) {
+		// Verify that all hashes are properly sorted for efficient binary search.
+		for i := 1; i < len(idx.oidTable); i++ {
+			assert.True(t, bytes.Compare(idx.oidTable[i-1][:], idx.oidTable[i][:]) < 0,
+				"Hash table should be sorted for binary search efficiency")
+		}
+	})
 }

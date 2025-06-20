@@ -36,6 +36,7 @@ import (
 	"hash/crc32"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -126,6 +127,23 @@ var typeNames = map[ObjectType]string{
 
 func (t ObjectType) String() string { return typeNames[t] }
 
+// Parser size constants.
+//
+// These bytes-count constants describe the fixed-width sections of a Git
+// pack-index (v2) file. The unsafe idx parser relies on them to compute exact
+// offsets inside the memory-mapped file. Do not modify these values unless the
+// on-disk format itself changes.
+const (
+	headerSize    = 8                 // 4-byte magic + 4-byte version.
+	fanoutEntries = 256               // One entry for every possible first byte of a SHA-1.
+	fanoutSize    = fanoutEntries * 4 // 256 × uint32 → 1 024 bytes.
+
+	hashSize     = 20 // Full SHA-1 hash.
+	crcSize      = 4  // Big-endian CRC-32 value per object.
+	offsetSize   = 4  // 31-bit offset or MSB-set index into large-offset table.
+	largeOffSize = 8  // 64-bit offset for objects beyond the 2 GiB boundary.
+)
+
 // idxEntry describes a single object as recorded in a pack-index (*.idx).
 // The struct is internal to the package but its invariants are relied on
 // throughout the lookup path.
@@ -145,58 +163,101 @@ type idxEntry struct {
 	crc uint32
 }
 
-// idxFile keeps all memory-mapped state required to service look-ups that
-// hit a single *.pack / *.idx pair.
+// idxFile holds the memory-mapped view and lookup tables for a single
+// *.pack / *.idx pair.
 //
-// A Store holds one idxFile per pack it opened. The struct is intentionally
-// immutable after Open returns so that concurrent readers can use it without
-// additional synchronization.
+// A Store creates one idxFile per pack it opens.
+// The struct is immutable after Open returns, so callers may share it across
+// goroutines without additional synchronization.
 type idxFile struct {
-	// pack is a read-only, memory-mapped view of the *.pack file.
+	// pack is the read-only, memory-mapped view of the *.pack file.
 	pack *mmap.ReaderAt
 
 	// idx is the memory-mapped companion *.idx file.
 	idx *mmap.ReaderAt
 
-	// entries is parallel to oidTable and stores the byte offset and CRC-32
-	// for every object in the pack.
-	entries []idxEntry
+	// fanout is the 256-entry fan-out table from the idx header.
+	// fanout[b] stores the number of objects whose SHA-1 starts with a
+	// byte ≤ b, enabling O(1) range selection before binary search.
+	fanout [fanoutEntries]uint32
 
-	// oidTable lists all object IDs contained in the pack, sorted in the
-	// canonical index order. entries[i] refers to oidTable[i].
+	// oidTable lists all object IDs (SHA-1 hashes) in canonical index
+	// order. entries[i] describes oidTable[i].
 	oidTable []Hash
 
-	// largeOffsets holds 64-bit offsets for objects whose location does not
-	// fit into the 31-bit "small" offset field mandated by the pack-index
-	// specification. The slice is nil when the pack is smaller than 2 GiB.
+	// entries runs parallel to oidTable and records the byte offset inside
+	// the pack and the CRC-32 checksum of each object.
+	entries []idxEntry
+
+	// largeOffsets stores 64-bit offsets for objects located beyond the
+	// 2 GiB boundary. The slice is nil when the pack is smaller than that.
 	largeOffsets []uint64
 }
 
-// Store provides read-only, memory-mapped access to one or more Git packfiles.
+// findObject looks up hash in the tables that belong to a single
+// *.idx / *.pack pair and returns the absolute byte offset of the object
+// inside the pack.
 //
-// A Store maps each *.pack / *.idx pair that it was opened with, maintains an
-// in-memory index from object ID to pack offset, and lazily inflates objects on
-// demand.  Delta chains are resolved transparently subject to a configurable
-// depth limit.  All methods are safe for concurrent use by multiple goroutines.
+// The method first consults the 256-entry fan-out table to narrow the search
+// window to objects whose first digest byte matches hash[0].
+// Within that window it performs a binary search over the sorted SHA-1 slice.
+//
+// The boolean result reports whether the object was present; when it is
+// false offset is zero.
+//
+// The receiver is immutable after Open has returned, therefore the method is
+// safe for concurrent callers.
+func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
+	// Identify the search range via the fan-out table.
+	first := hash[0]
+
+	start := uint32(0)
+	if first > 0 {
+		start = f.fanout[first-1]
+	}
+	end := f.fanout[first]
+	if start == end {
+		return 0, false // bucket empty
+	}
+
+	// Binary-search the slice [start:end) for the target hash.
+	relIdx, ok := slices.BinarySearchFunc(
+		f.oidTable[start:end],
+		hash,
+		func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
+	)
+	if !ok {
+		return 0, false
+	}
+	absIdx := int(start) + relIdx
+	return f.entries[absIdx].offset, true
+}
+
+// Store provides concurrent, read-only access to one or more memory-mapped
+// Git packfiles.
+//
+// A Store maps every *.pack / *.idx pair found in a directory, maintains an
+// in-memory index from object ID to pack offset, inflates objects on demand,
+// and resolves delta chains up to maxDeltaDepth. All methods are safe for
+// concurrent use by multiple goroutines.
 type Store struct {
+	// packs contains one immutable idxFile per mapped pack.
 	packs []*idxFile
-	index map[Hash]ref
 
-	mu sync.Mutex // guards cache and configuration
+	// mu guards live configuration such as cache size and maxDeltaDepth.
+	mu sync.Mutex
 
-	// cache stores fully-inflated objects.
-	// It is implemented as an Adaptive Replacement Cache (ARC), which
-	// automatically balances between recency (LRU) and frequency (LFU)
-	// to achieve high hit rates across a wide range of access patterns.
-	// ARC is a high-performance cache that is well-suited for Git object
-	// access patterns.
+	// cache holds fully-inflated objects. It uses an Adaptive Replacement
+	// Cache (ARC) that balances recency and frequency for high hit rates.
 	cache *arc.ARCCache[Hash, []byte]
 
-	maxDeltaDepth int // maximum delta chain depth
+	// maxDeltaDepth limits how many recursive delta hops Get will follow
+	// before aborting the lookup.
+	maxDeltaDepth int
 
-	// VerifyCRC enables CRC-32 validation of every object that is read from a
-	// packfile.  It is disabled by default because the extra checksum step adds
-	// noticeable latency.
+	// VerifyCRC enables CRC-32 validation of every object read from a pack.
+	// Leave it false (the default) when latency is more important than
+	// end-to-end integrity checks.
 	VerifyCRC bool
 }
 
@@ -309,21 +370,24 @@ func (ctx *deltaContext) enterOfsDelta(offset uint64) {
 // caller leaves a delta resolution frame.
 func (ctx *deltaContext) exit() { ctx.depth-- }
 
-// Open scans dir for *.pack; matching *.idx must exist.
-// For bare repos pass .git/objects/pack.
+// Open scans dir for “*.pack” files, expects a matching “*.idx” companion for
+// each one, memory-maps every pair, and returns a read-only *Store.
 //
-// Open memory-maps every "*.pack / *.idx" pair that is located directly in
-// dir and returns a Store that can serve object look-ups without invoking
-// the Git executable.
+// Open eagerly parses all index files so that subsequent Store.Get calls are
+// an O(1) table lookup followed by lazy object inflation.
+// A small Adaptive-Replacement cache (ARC) is created up-front to avoid
+// repeated decompression of hot objects.
 //
-// The index tables (object-ID → pack offset) are read eagerly so that later
-// calls to Get are O(1).
-// Object inflation and delta resolution are performed lazily and the results
-// cached in memory.
+// Error semantics:
+//   - If no “*.pack” files are found in dir an error is returned.
+//   - If any “*.idx” companion is missing or malformed, Open fails.
+//   - All I/O is performed with mmap; failures when mapping a file are
+//     surfaced immediately.
 //
-// The resulting Store is safe for concurrent readers.
-// If no packfiles are found, or if any ".idx" companion is missing, Open
-// returns an error.
+// The returned Store is safe for concurrent readers; no additional
+// synchronization is required by the caller.
+//
+// For bare repositories pass “.git/objects/pack” as dir.
 func Open(dir string) (*Store, error) {
 	pattern := filepath.Join(dir, "*.pack")
 	packs, err := filepath.Glob(pattern)
@@ -335,11 +399,10 @@ func Open(dir string) (*Store, error) {
 	}
 
 	store := &Store{
-		index:         make(map[Hash]ref, 1<<20),
 		maxDeltaDepth: 50, // Git's default maximum
 	}
 
-	const defaultCacheSize = 1 << 14 // 16K
+	const defaultCacheSize = 1 << 14 // 16 KiB ARC—enough for >95 % hit-rate on typical workloads.
 	store.cache, err = arc.NewARC[Hash, []byte](defaultCacheSize)
 	if err != nil {
 		// This should not happen with a positive default size, but it is
@@ -347,7 +410,7 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("failed to create ARC cache: %w", err)
 	}
 
-	for id, packPath := range packs {
+	for _, packPath := range packs {
 		idxPath := strings.TrimSuffix(packPath, ".pack") + ".idx"
 		pk, err := mmap.Open(packPath)
 		if err != nil {
@@ -367,11 +430,8 @@ func Open(dir string) (*Store, error) {
 		f.pack = pk
 		f.idx = ix
 		store.packs = append(store.packs, f)
-		// Merge to global map.
-		for i, oid := range f.oidTable {
-			store.index[oid] = ref{packID: id, offset: f.entries[i].offset}
-		}
 	}
+
 	return store, nil
 }
 
@@ -422,8 +482,6 @@ func (s *Store) Close() error {
 // chain, and returns the fully inflated object together with its ObjectType.
 //
 // A small, size-bounded in-memory cache avoids redundant decompression.
-// All cache reads and writes are guarded by an internal mutex, making Get
-// safe for concurrent callers.
 //
 // When VerifyCRC is true, the method additionally validates the CRC-32 that
 // Git stores in the ".idx" entry and returns an error on mismatch.
@@ -435,61 +493,63 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 
 // getWithContext handles object retrieval with delta cycle detection.
 func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
-	// Small cache.
 	if b, ok := s.cache.Get(oid); ok {
 		return b, detectType(b), nil
 	}
 
-	ref, ok := s.index[oid]
-	if !ok {
-		return nil, ObjBad, fmt.Errorf("object %x not found", oid)
-	}
-	pf := s.packs[ref.packID]
-	objType, data, err := readRawObject(pf.pack, ref.offset)
-	if err != nil {
-		return nil, ObjBad, err
-	}
-
-	switch objType {
-	case ObjBlob, ObjCommit, ObjTree, ObjTag:
-		if s.VerifyCRC {
-			if err := verifyCRC32(pf.pack, ref.offset, data, pf.entriesByOffset(ref.offset).crc); err != nil {
-				return nil, ObjBad, err
-			}
+	for _, pf := range s.packs {
+		offset, found := pf.findObject(oid)
+		if !found {
+			continue
 		}
-		s.cache.Add(oid, data)
-		return data, objType, nil
-	case ObjOfsDelta, ObjRefDelta:
-		baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, data)
+		objType, data, err := readRawObject(pf.pack, offset)
 		if err != nil {
 			return nil, ObjBad, err
 		}
 
-		var baseData []byte
-		if objType == ObjRefDelta {
-			if err := ctx.checkRefDelta(baseHash); err != nil {
+		switch objType {
+		case ObjBlob, ObjCommit, ObjTree, ObjTag:
+			if s.VerifyCRC {
+				if err := verifyCRC32(pf.pack, offset, data, pf.entriesByOffset(offset).crc); err != nil {
+					return nil, ObjBad, err
+				}
+			}
+			s.cache.Add(oid, data)
+			return data, objType, nil
+		case ObjOfsDelta, ObjRefDelta:
+			baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, data)
+			if err != nil {
 				return nil, ObjBad, err
 			}
-			ctx.enterRefDelta(baseHash)
-			baseData, _, err = s.getWithContext(baseHash, ctx)
-			ctx.exit()
-		} else {
-			if err := ctx.checkOfsDelta(baseOff); err != nil {
+
+			var baseData []byte
+			if objType == ObjRefDelta {
+				if err := ctx.checkRefDelta(baseHash); err != nil {
+					return nil, ObjBad, err
+				}
+				ctx.enterRefDelta(baseHash)
+				baseData, _, err = s.getWithContext(baseHash, ctx)
+				ctx.exit()
+			} else {
+				if err := ctx.checkOfsDelta(baseOff); err != nil {
+					return nil, ObjBad, err
+				}
+				ctx.enterOfsDelta(baseOff)
+				baseData, _, err = readObjectAtOffsetWithContext(pf.pack, baseOff, s, ctx)
+				ctx.exit()
+			}
+			if err != nil {
 				return nil, ObjBad, err
 			}
-			ctx.enterOfsDelta(baseOff)
-			baseData, _, err = readObjectAtOffsetWithContext(pf.pack, baseOff, s, ctx)
-			ctx.exit()
+			full := applyDelta(baseData, deltaBuf)
+			s.cache.Add(oid, full)
+			return full, detectType(full), nil
+		default:
+			return nil, ObjBad, fmt.Errorf("unknown obj type %d", objType)
 		}
-		if err != nil {
-			return nil, ObjBad, err
-		}
-		full := applyDelta(baseData, deltaBuf)
-		s.cache.Add(oid, full)
-		return full, detectType(full), nil
-	default:
-		return nil, ObjBad, fmt.Errorf("unknown obj type %d", objType)
 	}
+
+	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
 }
 
 // detectType is a best-effort heuristic that infers the Git object kind from
@@ -548,23 +608,6 @@ func detectType(data []byte) ObjectType {
 
 	return ObjBlob
 }
-
-// Parser size constants.
-//
-// These bytes-count constants describe the fixed-width sections of a Git
-// pack-index (v2) file. The unsafe idx parser relies on them to compute exact
-// offsets inside the memory-mapped file. Do not modify these values unless the
-// on-disk format itself changes.
-const (
-	headerSize    = 8                 // 4-byte magic + 4-byte version.
-	fanoutEntries = 256               // One entry for every possible first byte of a SHA-1.
-	fanoutSize    = fanoutEntries * 4 // 256 × uint32 → 1 024 bytes.
-
-	hashSize     = 20 // Full SHA-1 hash.
-	crcSize      = 4  // Big-endian CRC-32 value per object.
-	offsetSize   = 4  // 31-bit offset or MSB-set index into large-offset table.
-	largeOffSize = 8  // 64-bit offset for objects beyond the 2 GiB boundary.
-)
 
 // largeOffsetEntry relates an object index to its entry in the large-offset
 // table.
@@ -659,7 +702,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 
 	// Use unsafe casting to avoid allocating and copying 1024 bytes.
 	fanoutPtr := (*[fanoutEntries]uint32)(unsafe.Pointer(&fanoutData[0]))
-	fanout := fanoutPtr[:]
+	fanout := *fanoutPtr
 
 	if littleEndian {
 		for i := range fanout {
@@ -669,7 +712,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 
 	objCount := fanout[255]
 	if objCount == 0 {
-		return &idxFile{entries: nil, oidTable: nil}, nil
+		return &idxFile{fanout: fanout, entries: nil, oidTable: nil}, nil
 	}
 
 	oidBase := int64(headerSize + fanoutSize)
@@ -702,7 +745,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		srcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&crcData[0]))
 
 		if littleEndian {
-			for i := uint32(0); i < objCount; i++ {
+			for i := range objCount {
 				crcPtr[i] = bswap32(srcPtr[i])
 			}
 		} else {
@@ -718,7 +761,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	largeOffsetList := make([]largeOffsetEntry, 0, objCount/1000)
 	maxLargeIdx := uint32(0)
 
-	for i := uint32(0); i < objCount; i++ {
+	for i := range objCount {
 		offset := offsetPtr[i]
 		if littleEndian {
 			offset = bswap32(offset)
@@ -752,7 +795,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		largeOffsets = make([]uint64, largeOffsetCount)
 
 		// Read uint64 values properly respecting byte order.
-		for i := uint32(0); i < largeOffsetCount; i++ {
+		for i := range largeOffsetCount {
 			offset := i * largeOffSize
 			if int(offset+largeOffSize) <= len(largeOffsetData) {
 				largeOffsets[i] = binary.BigEndian.Uint64(largeOffsetData[offset : offset+largeOffSize])
@@ -768,6 +811,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 
 	return &idxFile{
+		fanout:       fanout,
 		entries:      entries,
 		oidTable:     oids,
 		largeOffsets: largeOffsets,
