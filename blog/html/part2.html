@@ -119,6 +119,21 @@
       gap: 8px;
     }
 
+    .section p {
+      margin-bottom: 20px;
+      font-size: 1.1em;
+    }
+
+    .section ul {
+      margin: 20px 0;
+      padding-left: 20px;
+    }
+
+    .section li {
+      margin-bottom: 8px;
+      font-size: 1.1em;
+    }
+
     .icon {
       width: 32px;
       height: 32px;
@@ -319,8 +334,9 @@
       overflow-x: auto;
       box-shadow: 0 8px 25px rgba(0, 0, 0, 0.3);
       border: 1px solid #30363d;
-      white-space: pre;
+      white-space: pre-wrap;
       position: relative;
+      tab-size: 4;
     }
 
     .code-block::before {
@@ -407,39 +423,6 @@
       color: #fbb6ce;
     }
 
-    .interactive-demo {
-      background: white;
-      border-radius: 15px;
-      padding: 25px;
-      margin: 25px 0;
-      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
-      border: 3px solid var(--accent-red);
-    }
-
-    .demo-controls {
-      display: flex;
-      gap: 10px;
-      margin-bottom: 20px;
-      flex-wrap: wrap;
-    }
-
-    .demo-btn {
-      background: var(--accent-red);
-      color: white;
-      padding: 12px 24px;
-      border: none;
-      border-radius: 25px;
-      cursor: pointer;
-      transition: all 0.3s ease;
-      font-weight: 500;
-    }
-
-    .demo-btn:hover {
-      background: #c0392b;
-      transform: translateY(-2px);
-      box-shadow: 0 5px 15px rgba(231, 76, 60, 0.3);
-    }
-
     .stats-panel {
       background: linear-gradient(135deg, var(--accent-green), #229954);
       color: white;
@@ -481,6 +464,28 @@
       font-size: 1.2em;
     }
 
+    .highlight-box {
+      background: linear-gradient(135deg, #74b9ff, #0984e3);
+      color: white;
+      padding: 25px;
+      border-radius: 15px;
+      margin: 30px 0;
+      box-shadow: 0 10px 30px rgba(116, 185, 255, 0.3);
+    }
+
+    .highlight-box h3 {
+      color: white;
+      margin-bottom: 15px;
+    }
+
+    .code-inline {
+      background: #f4f4f4;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: 'SF Mono', Monaco, 'Cascadia Code', 'Roboto Mono', Consolas, 'Courier New', monospace;
+      font-size: 0.9em;
+    }
+
     @media (max-width: 768px) {
       .container {
         margin: 10px;
@@ -510,7 +515,7 @@
   <div class="container">
     <div class="header">
       <h1>🔓 Under the Hood: Unpacking Git's Secrets</h1>
-      <div class="subtitle">Part 2: The Pack Index - Git's Brilliant Search
+      <div class="subtitle">Part 2: The Pack Index – Git's Brilliant Search
         Engine</div>
     </div>
 
@@ -597,7 +602,8 @@
                           Physics</div>
                         <div
                           style="padding: 4px 8px; background: #00b894; color: white; border-radius: 4px; font-size: 0.8em;">
-                          <strong>Science</strong></div>
+                          <strong>Science</strong>
+                        </div>
                         <div
                           style="padding: 4px 8px; background: #fab1a0; border-radius: 4px; font-size: 0.8em;">
                           Space</div>
@@ -631,7 +637,8 @@
 
         <div class="fanout-demo">
           <p>Here's where Git gets clever. Instead of one giant sorted list, Git
-            uses a "fanout table." Let me demonstrate with actual data:</p>
+            uses a <strong>fanout table</strong>. Let me demonstrate with actual
+            data:</p>
 
           <h4>Example: 10 Git Objects in Our Pack</h4>
           <div class="object-list" id="objectList">
@@ -687,7 +694,7 @@
             </div>
           </div>
 
-          <h4>The Fanout Table (256 entries, showing key ones):</h4>
+          <h4>The Fanout Table (key entries):</h4>
           <div class="fanout-table" id="fanoutTable">
             <div class="fanout-entry" data-byte="0x11"
               onclick="highlightFanout('0x11')">0x11: 0</div>
@@ -725,39 +732,43 @@
 
           <div class="format-sections">
             <div class="format-section">
-              <h4>Magic + Version (8 bytes)</h4>
-              <p><code>0xff744f63</code> + version number</p>
-              <small>Safety check: "Is this really a Git index file?"</small>
+              <h4>1. Magic + Version (8 bytes)</h4>
+              <p>0xff744f63 + version number</p>
+              <small><em>Safety check: "Is this really a Git index
+                  file?"</em></small>
             </div>
 
             <div class="format-section">
-              <h4>Fanout Table (1024 bytes)</h4>
+              <h4>2. Fanout Table (1024 bytes)</h4>
               <p>256 × 4-byte integers</p>
-              <small>Our search accelerator - tells us where to look!</small>
+              <small><em>Our search accelerator – tells us where to
+                  look!</em></small>
             </div>
 
             <div class="format-section">
-              <h4>SHA-1 Hashes (20 × N bytes)</h4>
+              <h4>3. SHA-1 Hashes (20 × N bytes)</h4>
               <p>All object hashes, sorted lexicographically</p>
-              <small>The actual object identifiers we're searching for</small>
+              <small><em>The actual object identifiers we're searching
+                  for</em></small>
             </div>
 
             <div class="format-section">
-              <h4>CRC-32 Values (4 × N bytes)</h4>
+              <h4>4. CRC-32 Values (4 × N bytes)</h4>
               <p>Checksums for data integrity</p>
-              <small>Verify objects haven't been corrupted</small>
+              <small><em>Verify objects haven't been corrupted</em></small>
             </div>
 
             <div class="format-section">
-              <h4>32-bit Offsets (4 × N bytes)</h4>
+              <h4>5. 32-bit Offsets (4 × N bytes)</h4>
               <p>Where each object lives in the .pack file</p>
-              <small>The treasure map to find actual object data!</small>
+              <small><em>The treasure map to find actual object
+                  data!</em></small>
             </div>
 
             <div class="format-section">
-              <h4>Large Offset Table (Optional)</h4>
-              <p>64-bit offsets for huge packs (>2GB)</p>
-              <small>Because some repositories are REALLY big</small>
+              <h4>6. Large Offset Table (Optional)</h4>
+              <p>64-bit offsets for huge packs (>2 GB)</p>
+              <small><em>Because some repositories are REALLY big</em></small>
             </div>
           </div>
         </div>
@@ -767,25 +778,25 @@
         <h2><span class="icon">🔍</span>The Two-Step Search Process</h2>
 
         <div class="binary-search-demo">
-          <h3>Finding Object <code>45dead...</code> Step by Step</h3>
+          <h3>Finding Object 45dead... Step by Step</h3>
 
           <div class="search-steps">
             <div class="search-step">
-              <strong>Step 1:</strong> Extract first byte: <code>0x45</code>
+              <strong>Step 1:</strong> Extract first byte: 0x45
             </div>
             <div class="search-step">
               <strong>Step 2:</strong> Fanout lookup: "Objects with 0x45 are in
-              positions 2-4"
-              <br><small>🏃‍♂️ Jump directly to the right "rack" - no scanning
+              positions 2–4"
+              <br><small>🏃‍♂️ Jump directly to the right "rack" – no scanning
                 needed!</small>
             </div>
             <div class="search-step">
-              <strong>Step 3:</strong> Binary search within positions [2,3,4]
+              <strong>Step 3:</strong> Binary search within positions [2, 3, 4]
               <br><small>📖 Books are alphabetized within the rack</small>
             </div>
             <div class="search-step">
               <strong>Step 4:</strong> Check middle position (3): Found
-              <code>45dead...</code>!
+              45dead...!
               <br><small>🎯 Just 1 comparison instead of potentially 10!</small>
             </div>
           </div>
@@ -891,7 +902,7 @@
       </div>
 
       <div class="section">
-        <h2><span class="icon">⚙️</span>Parsing the Index - Step by Step</h2>
+        <h2><span class="icon">⚙️</span>Parsing the Index – Step by Step</h2>
 
         <p>Let's parse the index file, explaining each step as we go:</p>
 
@@ -910,7 +921,7 @@
             class="function">ReadAt</span>(<span class="type">header</span>,
           <span class="number">0</span>)
 
-          <span class="comment">// The magic bytes spell "ÿtOc" (0xff744f63) -
+          <span class="comment">// The magic bytes spell "ÿtOc" (0xff744f63) –
             Git's signature</span>
           <span class="keyword">if</span> <span
             class="operator">!</span>bytes.<span
@@ -937,6 +948,8 @@
             class="string">"unsupported version %d"</span>, <span
             class="type">version</span>)
           }
+          …
+          }
         </div>
 
         <div class="callout">
@@ -947,8 +960,8 @@
         </div>
 
         <h3>📊 Step 2: Read the Fanout Table</h3>
-        <div class="code-block"> <span class="comment">// Step 2: Read the
-            fanout table</span>
+        <div class="code-block"><span class="comment">// Step 2: Read the fanout
+            table</span>
           <span class="type">fanout</span> <span class="operator">:=</span>
           <span class="keyword">make</span>([]<span
             class="keyword">uint32</span>, <span class="number">256</span>)
@@ -974,8 +987,8 @@
               <span class="type">fanout</span>[<span class="type">i</span>]
               <span class="operator">=</span> binary.BigEndian.<span
                 class="function">Uint32</span>(<span
-                class="type">fanoutData</span>[<span
-                class="type">offset</span>:<span class="type">offset</span><span
+                class="type">fanoutData</span>[<span class="type">offset</span>
+              : <span class="type">offset</span><span
                 class="operator">+</span><span class="number">4</span>])
               }
 
@@ -992,16 +1005,14 @@
         <div class="callout">
           <span class="callout-icon">🔢</span>
           <strong>Big-endian format:</strong> Git stores numbers in "big-endian"
-          format (most significant byte first). This is like writing "2024"
-          instead of "4202". We need to convert this to our computer's native
+          format (most significant byte first). We need to convert this to our
+          computer's native
           format.
         </div>
 
         <h3>📍 Step 3: Calculate Section Positions</h3>
-        <div class="code-block"> <span class="comment">// Step 3: Calculate
-            where each section starts</span>
-          <span class="comment">// This is just arithmetic, but it's crucial to
-            get right!</span>
+        <div class="code-block"><span class="comment">// Step 3: Calculate where
+            each section starts</span>
           <span class="type">hashTableStart</span> <span
             class="operator">:=</span> <span class="keyword">int64</span>(<span
             class="number">8</span> <span class="operator">+</span> <span
@@ -1010,25 +1021,27 @@
           <span class="type">crcTableStart</span> <span
             class="operator">:=</span> <span class="type">hashTableStart</span>
           <span class="operator">+</span> <span
-            class="keyword">int64</span>(<span class="type">objectCount</span>
-          <span class="operator">*</span> <span class="number">20</span>)
+            class="keyword">int64</span>(<span
+            class="type">objectCount</span><span class="operator">*</span><span
+            class="number">20</span>)
           <span class="type">offsetTableStart</span> <span
             class="operator">:=</span> <span class="type">crcTableStart</span>
           <span class="operator">+</span> <span
-            class="keyword">int64</span>(<span class="type">objectCount</span>
-          <span class="operator">*</span> <span class="number">4</span>)
+            class="keyword">int64</span>(<span
+            class="type">objectCount</span><span class="operator">*</span><span
+            class="number">4</span>)
         </div>
 
         <h3>🔗 Step 4: Read Object Hashes</h3>
-        <div class="code-block"> <span class="comment">// Step 4: Read all the
+        <div class="code-block"><span class="comment">// Step 4: Read all the
             hashes</span>
           <span class="type">hashes</span> <span class="operator">:=</span>
           <span class="keyword">make</span>([]<span class="type">Hash</span>,
           <span class="type">objectCount</span>)
           <span class="type">hashData</span> <span class="operator">:=</span>
           <span class="keyword">make</span>([]<span class="keyword">byte</span>,
-          <span class="type">objectCount</span> <span class="operator">*</span>
-          <span class="number">20</span>)
+          <span class="type">objectCount</span><span
+            class="operator">*</span><span class="number">20</span>)
           <span class="type">ix</span>.<span
             class="function">ReadAt</span>(<span class="type">hashData</span>,
           <span class="type">hashTableStart</span>)
@@ -1058,31 +1071,25 @@
           comparisons instead of potentially checking all million.
         </div>
 
-        <h3>🗂️ Step 5: Handle Large Packfiles (The 2GB Challenge)</h3>
-        <p>Here's an interesting problem: The offset table uses 32-bit integers,
-          which can only represent numbers up to about 4 billion. But packfiles
-          can be larger than 4GB!</p>
-
-        <div class="code-block"> <span class="comment">// Step 5: Read the
-            offset table</span>
+        <h3>🗂️ Step 5: Handle Large Packfiles (The 2 GB Challenge)</h3>
+        <div class="code-block"><span class="comment">// Step 5: Read the offset
+            table</span>
           <span class="type">entries</span> <span class="operator">:=</span>
           <span class="keyword">make</span>([]<span
             class="type">idxEntry</span>, <span class="type">objectCount</span>)
           <span class="type">offsetData</span> <span class="operator">:=</span>
           <span class="keyword">make</span>([]<span class="keyword">byte</span>,
-          <span class="type">objectCount</span> <span class="operator">*</span>
-          <span class="number">4</span>)
+          <span class="type">objectCount</span><span
+            class="operator">*</span><span class="number">4</span>)
           <span class="type">ix</span>.<span
             class="function">ReadAt</span>(<span class="type">offsetData</span>,
           <span class="type">offsetTableStart</span>)
 
           <span class="keyword">var</span> <span
             class="type">largeOffsetRefs</span> []<span
-            class="keyword">struct</span> {
-          <span class="type">objIndex</span> <span class="keyword">uint32</span>
+            class="keyword">struct</span>{ <span class="type">objIndex</span>,
           <span class="type">largeIndex</span> <span
-            class="keyword">uint32</span>
-          }
+            class="keyword">uint32</span> }
 
           <span class="keyword">for</span> <span class="type">i</span> <span
             class="operator">:=</span> <span class="keyword">uint32</span>(<span
@@ -1103,14 +1110,14 @@
                 class="type">offset32</span><span class="operator">&</span><span
                 class="number">0x80000000</span> <span
                 class="operator">==</span> <span class="number">0</span> {
-              <span class="comment">// Normal offset - use it directly</span>
+              <span class="comment">// Normal offset – use it directly</span>
               <span class="type">entries</span>[<span
                 class="type">i</span>].<span class="type">offset</span> <span
                 class="operator">=</span> <span
                 class="keyword">uint64</span>(<span
                 class="type">offset32</span>)
               } <span class="keyword">else</span> {
-              <span class="comment">// MSB is set - this is a large offset
+              <span class="comment">// MSB is set – this is a large offset
                 reference</span>
               <span class="type">largeIndex</span> <span
                 class="operator">:=</span> <span class="type">offset32</span>
@@ -1120,10 +1127,9 @@
                 class="operator">=</span> <span
                 class="keyword">append</span>(<span
                 class="type">largeOffsetRefs</span>, <span
-                class="keyword">struct</span>{
-              <span class="type">objIndex</span> <span
-                class="keyword">uint32</span>
-              <span class="type">largeIndex</span> <span
+                class="keyword">struct</span> {
+              <span class="type">objIndex</span>, <span
+                class="type">largeIndex</span> <span
                 class="keyword">uint32</span>
               }{<span class="type">i</span>, <span
                 class="type">largeIndex</span>})
@@ -1134,7 +1140,7 @@
         <div class="callout">
           <span class="callout-icon">🧠</span>
           <strong>The clever trick:</strong> If the most significant bit is 1,
-          the remaining 31 bits aren't an offset - they're an index into a
+          the remaining 31 bits aren't an offset – they're an index into a
           separate "large offset" table at the end of the file. This elegantly
           handles huge repositories!
         </div>
@@ -1142,9 +1148,6 @@
 
       <div class="section">
         <h2><span class="icon">🔧</span>Putting It All Together</h2>
-
-        <p>Now we can build our complete store that opens multiple packfiles:
-        </p>
 
         <div class="code-block"><span class="keyword">func</span> <span
             class="function">Open</span>(<span class="type">dir</span> <span
@@ -1158,11 +1161,10 @@
             class="string">"*.pack"</span>))
 
           <span class="type">store</span> <span class="operator">:=</span> <span
-            class="operator">&</span><span class="type">Store</span>{
-          <span class="type">index</span>: <span
-            class="keyword">make</span>(<span class="keyword">map</span>[<span
-            class="type">Hash</span>]<span class="type">ref</span>),
-          }
+            class="operator">&</span><span class="type">Store</span>{ <span
+            class="type">index</span>: <span class="keyword">make</span>(<span
+            class="keyword">map</span>[<span class="type">Hash</span>]<span
+            class="type">ref</span>) }
 
           <span class="keyword">for</span> <span class="type">packID</span>,
           <span class="type">packPath</span> <span class="operator">:=</span>
@@ -1210,8 +1212,6 @@
       <div class="section">
         <h2><span class="icon">🧪</span>Testing Our Implementation</h2>
 
-        <p>Let's verify our code works with a real example:</p>
-
         <div class="code-block"><span class="keyword">func</span> <span
             class="function">main</span>() {
           <span class="type">store</span>, <span class="type">_</span> <span
@@ -1223,14 +1223,13 @@
             class="operator">:=</span> <span
             class="function">ParseHash</span>(<span
             class="string">"45dead0000000000000000000000000000000000"</span>)
-
           <span class="keyword">if</span> <span class="type">ref</span>, <span
             class="type">found</span> <span class="operator">:=</span> <span
             class="type">store</span>.<span class="type">index</span>[<span
             class="type">hash</span>]; <span class="type">found</span> {
           fmt.<span class="function">Printf</span>(<span class="string">"Found
-            object in pack %d at offset %d\n"</span>,
-          <span class="type">ref</span>.<span class="type">packID</span>, <span
+            object in pack %d at offset %d\n"</span>, <span
+            class="type">ref</span>.<span class="type">packID</span>, <span
             class="type">ref</span>.<span class="type">offset</span>)
           }
           }
@@ -1240,10 +1239,8 @@
       <div class="section">
         <h2><span class="icon">🧪</span>Try It Yourself!</h2>
 
-        <p>Want to see this in action? Here's a challenge:</p>
-
-        <div class="code-block">
-          <span class="comment"># Create a test repository</span>
+        <div class="bash-block"><span class="comment"># Create a test
+            repository</span>
           git init test-repo
           cd test-repo
           echo <span class="string">"Hello Git!"</span> > file.txt
@@ -1290,10 +1287,7 @@
         </div>
 
         <h3>📈 What We've Learned</h3>
-        <p>We've not only parsed Git's pack index but understood <em>why</em>
-          it's designed this way:</p>
-
-        <ul style="margin: 20px 0; padding-left: 20px;">
+        <ul>
           <li><strong>The fanout table</strong> dramatically reduces search
             space (like library section guides)</li>
           <li><strong>Sorted hashes</strong> enable efficient binary search
@@ -1309,9 +1303,6 @@
 
       <div class="section">
         <h2><span class="icon">💾</span>Core Data Structures</h2>
-
-        <p>Before we dive into parsing, let's understand what we're building:
-        </p>
 
         <div class="code-block"><span class="comment">// idxFile represents a
             parsed Git pack index file</span>
@@ -1329,15 +1320,14 @@
             tells us where X lives</span>
           <span class="type">entries</span> []<span class="type">idxEntry</span>
 
-          <span class="comment">// The fanout table we just discussed - our
+          <span class="comment">// The fanout table we just discussed – our
             search accelerator!</span>
           <span class="type">fanout</span> [<span
             class="number">256</span>]<span class="keyword">uint32</span>
 
-          <span class="comment">// For huge repositories (>2GB packs), some
-            offsets don't fit</span>
-          <span class="comment">// in 32 bits, so we need this overflow
-            table</span>
+          <span class="comment">// For huge repositories (>2 GB packs), some
+            offsets don't fit in 32 bits,</span>
+          <span class="comment">// so we need this overflow table</span>
           <span class="type">largeOffsets</span> []<span
             class="keyword">uint64</span>
           }
@@ -1355,25 +1345,45 @@
       </div>
 
       <div class="section">
-        <h2><span class="icon">🔮</span>Coming Up Next</h2>
+        <h2>Wrapping Up</h2>
 
-        <p>We can now find any object in a packfile, but we haven't actually
-          read the object data yet. In <strong>Part 3</strong>, we'll dive into
-          the packfile format itself, learning how to:</p>
+        <p>In this second part, we've built the foundation of our Git packfile
+          parser by implementing a complete pack index (.idx) reader. We've
+          learned how Git's fanout table dramatically accelerates object lookups
+          by reducing search space, implemented efficient binary search within
+          narrowed ranges, and handled the complexities of large repositories
+          with 64-bit offset tables. Our parser can now locate any object within
+          a single packfile in logarithmic time, setting the stage for the next
+          challenge: handling repositories with multiple packfiles efficiently
+          using Git's multi-pack-index format.</p>
+      </div>
 
-        <ul style="margin: 20px 0; padding-left: 20px;">
-          <li>Parse object headers and extract metadata</li>
-          <li>Decompress data with zlib compression</li>
-          <li>Handle Git's clever delta compression system</li>
-          <li>Resolve complex delta chains efficiently</li>
-        </ul>
+      <div class="section">
+        <div class="highlight-box">
+          <h3 style="margin-bottom: 15px;">🔮 Coming Up Next</h3>
+          <p>We can now find any object within a single packfile using its .idx
+            index. But modern Git repositories often contain multiple packfiles,
+            and checking each index sequentially becomes a performance
+            bottleneck.</p>
 
-        <div class="callout">
-          <span class="callout-icon">🎯</span>
-          <strong>The real magic of Git's storage efficiency is just beginning
-            to reveal itself!</strong> We've built the index to find objects
-          quickly, but the packfile itself contains the compressed,
-          delta-encoded data that makes Git so space-efficient.
+          <p>In <strong>Part 3</strong>, we'll tackle Git's solution to this
+            problem: the <strong>multi-pack-index (.midx) file</strong>. We'll
+            learn how to:</p>
+
+          <ul style="list-style: none; padding: 0; margin: 15px 0;">
+            <li>• Parse the chunk-based MIDX format (PNAM, OIDF, OIDL, OOFF
+              chunks)</li>
+            <li>• Build a unified index that spans multiple packfiles</li>
+            <li>• Handle large offset tables for repositories exceeding 2GB</li>
+            <li>• Achieve O(1) lookups regardless of packfile count</li>
+            <li>• Integrate MIDX support into our existing Store implementation
+            </li>
+          </ul>
+
+          <p style="margin-bottom: 0;">After mastering MIDX files, <strong>Part
+              4</strong> will dive into the packfile format itself, where we'll
+            decompress objects, handle Git's clever delta compression, and
+            finally read the actual content we've been searching for.</p>
         </div>
       </div>
     </div>

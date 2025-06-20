@@ -1,7 +1,7 @@
 # 🔓 Under the Hood: Unpacking Git's Secrets
 **Part 2: The Pack Index – Git's Brilliant Search Engine**
 
-Welcome back to our journey into Git's internals! In [Part 1](#) — we set out to build a blazing-fast Git packfile parser in Go. Today, we're tackling the first piece of this puzzle: the pack index file (`.idx`).
+Welcome back to our journey into Git's internals! In [Part 1](./part1.md) — we set out to build a blazing-fast Git packfile parser in Go. Today, we're tackling the first piece of this puzzle: the pack index file (`.idx`).
 
 But before we dive into code, let me share a story that perfectly illustrates why Git's design is so clever.
 
@@ -398,16 +398,23 @@ crc    uint32 // Checksum to verify the object isn't corrupted
 
 ---
 
+## Wrapping Up
+
+In this second part, we've built the foundation of our Git packfile parser by implementing a complete pack index (`.idx`) reader. We've learned how Git's fanout table dramatically accelerates object lookups by reducing search space, implemented efficient binary search within narrowed ranges, and handled the complexities of large repositories with 64-bit offset tables. Our parser can now locate any object within a single packfile in logarithmic time, setting the stage for the next challenge: handling repositories with multiple packfiles efficiently using Git's multi-pack-index format.
+
 ## 🔮 Coming Up Next
 
-We can now find any object in a packfile, but we haven't actually read the object data yet. In **Part 3**, we'll dive into the packfile format itself, learning how to:
+We can now find any object within a single packfile using its `.idx` index. But modern Git repositories often contain multiple packfiles, and checking each index sequentially becomes a performance bottleneck.
 
-- Parse object headers and extract metadata
-- Decompress data with zlib compression
-- Handle Git's clever delta compression system
-- Resolve complex delta chains efficiently
+In **Part 3**, we'll tackle Git's solution to this problem: the **multi-pack-index (.midx) file**. We'll learn how to:
 
-> **🎯 The real magic of Git's storage efficiency is just beginning to reveal itself!**
-> We've built the index to find objects quickly, but the packfile itself contains the compressed, delta-encoded data that makes Git so space-efficient.
-```
-````
+- Parse the chunk-based MIDX format (PNAM, OIDF, OIDL, OOFF chunks)
+- Build a unified index that spans multiple packfiles
+- Handle large offset tables for repositories exceeding 2GB
+- Achieve O(1) lookups regardless of packfile count
+- Integrate MIDX support into our existing Store implementation
+
+After mastering MIDX files, **Part 4** will dive into the packfile format itself, where we'll decompress objects, handle Git's clever delta compression, and finally read the actual content we've been searching for.
+
+> **🎯 The journey continues!**
+> We've built the foundation for finding objects. Next, we'll scale it up to handle the massive repositories that inspired this entire project.
