@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -768,6 +769,13 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	objCount := fanout[255]
 	if objCount == 0 {
 		return &idxFile{fanout: fanout, entries: nil, oidTable: nil}, nil
+	}
+
+	// Guard against integer overflow when allocating giant slices.
+	// Prevents wrapped len calculations on malicious files.
+	if objCount > math.MaxUint32/hashSize {
+		return nil, fmt.Errorf("idx claims %d objects – impl refuses >%d", objCount,
+			math.MaxUint32/hashSize)
 	}
 
 	oidBase := int64(headerSize + fanoutSize)
