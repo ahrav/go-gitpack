@@ -193,6 +193,10 @@ type idxFile struct {
 	// the pack and the CRC-32 checksum of each object.
 	entries []idxEntry
 
+	// crcByOffset maps pack file offset to CRC-32 checksum for O(1) lookup
+	// during CRC verification.
+	crcByOffset map[uint64]uint32
+
 	// largeOffsets stores 64-bit offsets for objects located beyond the
 	// 2 GiB boundary. The slice is nil when the pack is smaller than that.
 	largeOffsets []uint64
@@ -575,9 +579,8 @@ func (s *Store) inflateFromPack(
 			// CRC data in the midx structure or skip verification for midx objects.
 			for _, pf := range s.packs {
 				if pf.pack == p {
-					entry := pf.entriesByOffset(off)
-					if entry.offset == off {
-						if err := verifyCRC32(p, off, data, entry.crc); err != nil {
+					if want, ok := pf.crcByOffset[off]; ok {
+						if err := verifyCRC32(p, off, data, want); err != nil {
 							return nil, ObjBad, err
 						}
 					}
@@ -804,8 +807,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	// Convert raw bytes to Hash structs using unsafe operations to avoid parsing overhead.
 	oids := make([]Hash, objCount)
 	if len(oids) > 0 {
-		oidBytes := (*[1 << 30]byte)(unsafe.Pointer(&oids[0]))
-		copy(oidBytes[:objCount*hashSize], oidData)
+		copy(unsafe.Slice((*byte)(unsafe.Pointer(&oids[0])), len(oids)*hashSize), oidData)
 	}
 
 	crcs := make([]uint32, objCount)
@@ -873,29 +875,25 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 
 		for _, entry := range largeOffsetList {
-			if entry.largeIdx >= uint32(len(largeOffsets)) {
+			if entry.largeIdx > uint32(len(largeOffsets)) {
 				return nil, fmt.Errorf("invalid large offset index %d", entry.largeIdx)
 			}
 			entries[entry.objIdx].offset = largeOffsets[entry.largeIdx]
 		}
 	}
 
+	crcByOffset := make(map[uint64]uint32, objCount)
+	for i := range objCount {
+		crcByOffset[entries[i].offset] = entries[i].crc
+	}
+
 	return &idxFile{
 		fanout:       fanout,
 		entries:      entries,
 		oidTable:     oids,
+		crcByOffset:  crcByOffset,
 		largeOffsets: largeOffsets,
 	}, nil
-}
-
-// entriesByOffset helps CRC lookup.
-func (f *idxFile) entriesByOffset(off uint64) idxEntry {
-	for _, e := range f.entries {
-		if e.offset == off {
-			return e
-		}
-	}
-	return idxEntry{}
 }
 
 // copyMemory is a fast memory copy using memmove
@@ -1533,8 +1531,8 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 	var packNames []string
 	for start := 0; start < len(pn); {
 		end := bytes.IndexByte(pn[start:], 0)
-		if end <= 0 {
-			break
+		if end < 0 {
+			return nil, fmt.Errorf("unterminated PNAM entry")
 		}
 		packNames = append(packNames, string(pn[start:start+end]))
 		start += end + 1
@@ -1635,4 +1633,3 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 		entries:     entries,
 	}, nil
 }
-
