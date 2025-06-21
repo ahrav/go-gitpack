@@ -1792,3 +1792,198 @@ func TestCRCVerification(t *testing.T) {
 // 	_, _, err = store.Get(target)
 // 	require.NoError(t, err, "midx fan‑out should locate object across packs")
 // }
+
+func TestThinPackCrossPackViaMidx(t *testing.T) {
+	dir := t.TempDir()
+
+	// Build Pack A containing the base blob.
+	blobBase := []byte("cross-pack base")
+	oidBase := calculateHash(ObjBlob, blobBase)
+
+	packA := filepath.Join(dir, "packA.pack")
+	require.NoError(t, createMinimalPack(packA, blobBase))
+	require.NoError(t, createV2IndexFile(
+		strings.TrimSuffix(packA, ".pack")+".idx",
+		[]Hash{oidBase},
+		[]uint64{12},
+	))
+
+	// Build Pack B as a thin pack containing a REF_DELTA that references
+	// the base blob in Pack A.
+	blobDelta := []byte("cross-pack derived")
+	oidDelta := calculateHash(ObjBlob, blobDelta)
+
+	packB := filepath.Join(dir, "packB.pack")
+	var buf bytes.Buffer
+	buf.Write([]byte("PACK"))
+	binary.Write(&buf, binary.BigEndian, uint32(2))
+	binary.Write(&buf, binary.BigEndian, uint32(1))
+
+	deltaPayload := buildSelfContainedDelta(blobBase, blobDelta)
+
+	var deltaObjectData bytes.Buffer
+	deltaObjectData.Write(oidBase[:])
+	deltaObjectData.Write(deltaPayload)
+
+	var compressedDelta bytes.Buffer
+	zw := zlib.NewWriter(&compressedDelta)
+	zw.Write(deltaObjectData.Bytes())
+	zw.Close()
+
+	sizeBits := encodeObjHeader(uint8(ObjRefDelta), uint64(deltaObjectData.Len()))
+	buf.Write(sizeBits)
+	buf.Write(compressedDelta.Bytes())
+
+	require.NoError(t, os.WriteFile(packB, buf.Bytes(), 0o644))
+
+	require.NoError(t, createV2IndexFile(
+		strings.TrimSuffix(packB, ".pack")+".idx",
+		[]Hash{oidDelta},
+		[]uint64{12},
+	))
+
+	// Create a multi-pack index that maps oidBase to packA and oidDelta to packB.
+	createTwoPackMidxFile(
+		t, dir,
+		[]string{filepath.Base(packA), filepath.Base(packB)},
+		[]Hash{oidBase, oidDelta},
+		[]uint32{0, 1},
+		[]uint64{12, 12},
+	)
+
+	// Verify that the store can resolve cross-pack deltas.
+	store, err := Open(dir)
+	require.NoError(t, err)
+	defer store.Close()
+
+	data, typ, err := store.Get(oidDelta)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, blobDelta, data)
+}
+
+// encodeObjHeader returns the variable-length header used by packfiles.
+func encodeObjHeader(typ uint8, size uint64) []byte {
+	var out []byte
+	b := byte((typ&7)<<4) | byte(size&0x0F)
+	size >>= 4
+	for {
+		if size == 0 {
+			out = append(out, b)
+			return out
+		}
+		out = append(out, b|0x80)
+		b = byte(size & 0x7F)
+		size >>= 7
+	}
+}
+
+// buildSelfContainedDelta creates a delta payload that inserts the full blobDelta.
+func buildSelfContainedDelta(blobBase, blobDelta []byte) []byte {
+	var d bytes.Buffer
+	writeVarInt(&d, uint64(len(blobBase)))
+	writeVarInt(&d, uint64(len(blobDelta)))
+	d.WriteByte(byte(len(blobDelta)))
+	d.Write(blobDelta)
+	return d.Bytes()
+}
+
+// createTwoPackMidxFile writes a minimal, spec-compliant multi-pack-index
+// v1 (SHA-1) that covers two or more packs.
+func createTwoPackMidxFile(
+	t *testing.T,
+	dir string,
+	packNames []string,
+	oids []Hash,
+	packIdx []uint32,
+	offsets []uint64,
+) {
+	t.Helper()
+	if len(packNames) == 0 ||
+		len(oids) != len(packIdx) || len(oids) != len(offsets) {
+		t.Fatalf("invalid input lengths")
+	}
+
+	const (
+		hashIDSHA1   = 1
+		chunkHdrSize = 12
+	)
+
+	var buf bytes.Buffer
+	write := func(v any) { _ = binary.Write(&buf, binary.BigEndian, v) }
+
+	buf.WriteString("MIDX")
+	buf.WriteByte(1)
+	buf.WriteByte(hashIDSHA1)
+	buf.WriteByte(4)
+	buf.WriteByte(0)
+	write(uint32(len(packNames)))
+
+	chunkTableOff := buf.Len()
+	buf.Write(make([]byte, (4+1)*chunkHdrSize))
+
+	type patch struct {
+		id    [4]byte
+		start uint64
+	}
+	var patches []patch
+	addChunk := func(id string, body func()) {
+		var idArr [4]byte
+		copy(idArr[:], id)
+		start := uint64(buf.Len())
+		body()
+		patches = append(patches, patch{idArr, start})
+	}
+
+	addChunk("OIDF", func() {
+		var fanout [256]uint32
+		for _, h := range oids {
+			fanout[h[0]]++
+		}
+		var sum uint32
+		for i := 0; i < 256; i++ {
+			sum += fanout[i]
+			write(sum)
+		}
+	})
+
+	addChunk("OIDL", func() {
+		for _, h := range oids {
+			buf.Write(h[:])
+		}
+	})
+
+	addChunk("OOFF", func() {
+		for i := range oids {
+			write(packIdx[i])
+			write(uint32(offsets[i]))
+		}
+	})
+
+	addChunk("PNAM", func() {
+		for _, n := range packNames {
+			buf.WriteString(n)
+			buf.WriteByte(0)
+		}
+	})
+
+	trailerStart := uint64(buf.Len())
+	buf.Write(make([]byte, 40))
+
+	sort.Slice(patches, func(i, j int) bool {
+		return bytes.Compare(patches[i].id[:], patches[j].id[:]) < 0
+	})
+
+	for i, p := range patches {
+		row := chunkTableOff + i*chunkHdrSize
+		copy(buf.Bytes()[row:row+4], p.id[:])
+		binary.BigEndian.PutUint64(buf.Bytes()[row+4:row+12], p.start)
+	}
+	termRow := chunkTableOff + 4*chunkHdrSize
+	binary.BigEndian.PutUint64(buf.Bytes()[termRow+4:termRow+12], trailerStart)
+
+	if err := os.WriteFile(filepath.Join(dir, "multi-pack-index"),
+		buf.Bytes(), 0o644); err != nil {
+		t.Fatalf("write midx: %v", err)
+	}
+}
