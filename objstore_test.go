@@ -337,8 +337,13 @@ func createValidIdxData(t *testing.T, hashes []Hash, offsets []uint64) []byte {
 		}
 	}
 
-	// Pack checksum + index checksum (dummy).
-	buf.Write(make([]byte, 40))
+	// Pack checksum (dummy) + index checksum (computed).
+	buf.Write(make([]byte, 20)) // packfile checksum (dummy)
+
+	// Compute SHA-1 checksum of the file content up to this point.
+	fileContentSoFar := buf.Bytes()
+	idxChecksum := sha1.Sum(fileContentSoFar)
+	buf.Write(idxChecksum[:]) // index checksum (valid)
 
 	return buf.Bytes()
 }
@@ -556,15 +561,11 @@ func writeVarInt(w io.Writer, v uint64) {
 }
 
 func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
-	idxFile, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer idxFile.Close()
+	var buf bytes.Buffer
 
 	// Write header.
-	idxFile.Write([]byte{0xff, 0x74, 0x4f, 0x63})      // magic
-	binary.Write(idxFile, binary.BigEndian, uint32(2)) // version
+	buf.Write([]byte{0xff, 0x74, 0x4f, 0x63})       // magic
+	binary.Write(&buf, binary.BigEndian, uint32(2)) // version
 
 	// Sort hashes and corresponding offsets for proper index format
 	type hashOffset struct {
@@ -603,17 +604,17 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		}
 	}
 	for i := range 256 {
-		binary.Write(idxFile, binary.BigEndian, fanout[i])
+		binary.Write(&buf, binary.BigEndian, fanout[i])
 	}
 
 	// Write SHA hashes (now properly sorted).
 	for _, h := range sortedHashes {
-		idxFile.Write(h[:])
+		buf.Write(h[:])
 	}
 
 	// Write CRC32s (dummy values).
 	for range sortedHashes {
-		binary.Write(idxFile, binary.BigEndian, uint32(0x12345678))
+		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
 	}
 
 	// Write offsets.
@@ -621,14 +622,24 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		if off > 0x7fffffff {
 			return fmt.Errorf("offset too large for test")
 		}
-		binary.Write(idxFile, binary.BigEndian, uint32(off))
+		binary.Write(&buf, binary.BigEndian, uint32(off))
 	}
 
-	// Write trailing checksums (dummy).
-	idxFile.Write(make([]byte, 20)) // packfile checksum
-	idxFile.Write(make([]byte, 20)) // index checksum
+	// Write trailing checksums.
+	buf.Write(make([]byte, 20)) // packfile checksum (dummy)
 
-	return nil
+	fileContentSoFar := buf.Bytes()
+	idxChecksum := sha1.Sum(fileContentSoFar)
+	buf.Write(idxChecksum[:]) // index checksum (valid)
+
+	idxFile, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer idxFile.Close()
+
+	_, err = idxFile.Write(buf.Bytes())
+	return err
 }
 
 func TestStoreBasic(t *testing.T) {

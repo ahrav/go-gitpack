@@ -29,6 +29,7 @@ package objstore
 import (
 	"bytes"
 	"compress/zlib"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
@@ -457,7 +458,11 @@ func Open(dir string) (*Store, error) {
 			return nil, fmt.Errorf("mmap pack: %w", err)
 		}
 		ix, err := mmap.Open(idxPath)
-		if err != nil {
+		if errors.Is(err, os.ErrNotExist) && midx != nil {
+			// Pack is referenced only through the multi‑pack‑index; CRCs will come from MIDX v2 later.
+			store.packs = append(store.packs, &idxFile{pack: pk}) // minimal stub
+			continue
+		} else if err != nil {
 			_ = pk.Close()
 			return nil, fmt.Errorf("mmap idx: %w", err)
 		}
@@ -865,16 +870,35 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 
 		for _, entry := range largeOffsetList {
-			if entry.largeIdx > uint32(len(largeOffsets)) {
-				return nil, fmt.Errorf("invalid large offset index %d", entry.largeIdx)
+			// Bit 31 of the on-disk 32-bit offset is the "large-offset" flag.
+			// Always clear it before using the value as an index so that a
+			// stray, unmasked bit can never take us past the end of the LOFF
+			// slice.
+			idx := entry.largeIdx & 0x7fffffff
+			if idx >= uint32(len(largeOffsets)) {
+				return nil, fmt.Errorf("invalid large offset index %d", idx)
 			}
-			entries[entry.objIdx].offset = largeOffsets[entry.largeIdx]
+			entries[entry.objIdx].offset = largeOffsets[idx]
 		}
 	}
 
 	crcByOffset := make(map[uint64]uint32, objCount)
 	for i := range objCount {
 		crcByOffset[entries[i].offset] = entries[i].crc
+	}
+
+	trailer := make([]byte, 40)
+	if _, err := ix.ReadAt(trailer, int64(ix.Len()-40)); err != nil {
+		return nil, err
+	}
+
+	fullFile := make([]byte, ix.Len())
+	if _, err := ix.ReadAt(fullFile, 0); err != nil {
+		return nil, err
+	}
+	gotIdxSHA := sha1.Sum(fullFile[:ix.Len()-20]) // compute over entire file minus last 20
+	if !bytes.Equal(trailer[20:], gotIdxSHA[:]) {
+		return nil, fmt.Errorf("idx checksum mismatch")
 	}
 
 	return &idxFile{
