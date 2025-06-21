@@ -1499,6 +1499,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 	if hdr[5] != 1 /* SHA‑1 */ {
 		return nil, fmt.Errorf("only SHA‑1 midx supported")
 	}
+
 	chunks := int(hdr[6])
 	packCount := int(binary.BigEndian.Uint32(hdr[8:12]))
 
