@@ -1633,3 +1633,30 @@ func TestLargePack_LoffHandling(t *testing.T) {
 	assert.Equal(t, off64, idx.entries[0].offset)
 	assert.Len(t, idx.largeOffsets, 1)
 }
+
+func TestStore_MidxOnly_NoIdx(t *testing.T) {
+	dir := t.TempDir()
+
+	pack := filepath.Join(dir, "solo.pack")
+	blob := []byte("midx only")
+	oid := calculateHash(ObjBlob, blob)
+
+	require.NoError(t, createMinimalPack(pack, blob))
+	// idx is required **only** to build the midx – create & delete afterwards.
+	idxPath := strings.TrimSuffix(pack, ".pack") + ".idx"
+	require.NoError(t, createV2IndexFile(idxPath, []Hash{oid}, []uint64{12}))
+
+	createValidMidxFile(t, dir, filepath.Base(pack), []Hash{oid}, []uint64{12})
+	require.NoError(t, os.Remove(idxPath)) // simulate “only midx”
+
+	store, err := Open(dir)
+	require.NoError(t, err)
+	defer store.Close()
+
+	assert.Nil(t, store.packs[0].idx, "Store should tolerate missing .idx when midx present")
+
+	data, typ, err := store.Get(oid)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, blob, data)
+}

@@ -525,8 +525,10 @@ func (s *Store) Close() error {
 		if err := p.pack.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		if err := p.idx.Close(); err != nil && firstErr == nil {
-			firstErr = err
+		if p.idx != nil {
+			if err := p.idx.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
 		}
 	}
 	return firstErr
