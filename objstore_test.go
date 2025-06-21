@@ -1711,6 +1711,59 @@ func TestParseIdx_CorruptFanout(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNonMonotonicFanout)
 }
 
+// TestCRCVerification spins up a tiny Git repo, repacks it, then
+// opens the resulting *.pack / *.idx with Store in CRC‑verification
+// mode.  A successful Get must *not* return a CRC mismatch.
+func TestCRCVerification(t *testing.T) {
+	// Skip when Git is not available (e.g. unusual CI images).
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	// Build a one‑commit repository.
+	tmp := t.TempDir()
+
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = tmp
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t",
+			"GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t",
+			"GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+
+	run("init", "--quiet")
+	os.WriteFile(filepath.Join(tmp, "secret.txt"), []byte("shh"), 0o644)
+	run("add", "secret.txt")
+	run("commit", "-m", "initial", "--quiet")
+
+	// Repack so that objects live in a single *.pack.
+	run("repack", "-adq")
+
+	packDir := filepath.Join(tmp, ".git", "objects", "pack")
+
+	// Need the HEAD commit hash for retrieval.
+	headHashBytes, err := exec.Command("git", "-C", tmp, "rev-parse", "HEAD").Output()
+	require.NoError(t, err)
+	headHash, err := ParseHash(string(headHashBytes[:40]))
+	require.NoError(t, err)
+
+	// Open store & fetch object with CRC verification.
+	store, err := Open(packDir)
+	require.NoError(t, err)
+	defer store.Close()
+	store.VerifyCRC = true
+
+	_, _, err = store.Get(headHash)
+	require.NoError(t, err)
+}
+
 // func TestMidxFanoutAcrossPacks(t *testing.T) {
 // 	packDir := setupBenchmarkRepoWithMidx(t)
 

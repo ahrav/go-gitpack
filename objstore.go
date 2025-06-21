@@ -207,6 +207,10 @@ type idxFile struct {
 	// largeOffsets stores 64-bit offsets for objects located beyond the
 	// 2 GiB boundary. The slice is nil when the pack is smaller than that.
 	largeOffsets []uint64
+
+	// fast look‑ups for CRC verification.
+	entriesByOff  map[uint64]idxEntry // exact offset → entry (constant‑time)
+	sortedOffsets []uint64            // monotonically ascending list of offsets
 }
 
 // findObject looks up hash in the tables that belong to a single
@@ -587,15 +591,10 @@ func (s *Store) inflateFromPack(
 	switch objType {
 	case ObjBlob, ObjCommit, ObjTree, ObjTag:
 		if s.VerifyCRC {
-			// For CRC verification with midx, we need to find the right idxFile
-			// This is a simplified approach - in practice we might want to store
-			// CRC data in the midx structure or skip verification for midx objects.
 			for _, pf := range s.packs {
 				if pf.pack == p {
-					if want, ok := pf.crcByOffset[off]; ok {
-						if err := verifyCRC32(p, off, data, want); err != nil {
-							return nil, ObjBad, err
-						}
+					if err := verifyCRC32(pf, off, pf.entriesByOff[off].crc); err != nil {
+						return nil, ObjBad, err
 					}
 					break
 				}
@@ -721,8 +720,9 @@ type largeOffsetEntry struct {
 }
 
 var (
-	ErrNonMonotonicFanout = errors.New("idx corrupt: fan‑out table not monotonic")
-	ErrBadIdxChecksum     = errors.New("idx corrupt: checksum mismatch")
+	ErrNonMonotonicFanout  = errors.New("idx corrupt: fan‑out table not monotonic")
+	ErrBadIdxChecksum      = errors.New("idx corrupt: checksum mismatch")
+	ErrNonMonotonicOffsets = errors.New("idx corrupt: non‑monotonic offsets")
 )
 
 // parseIdx reads a Git pack index file using unsafe operations for maximum performance.
@@ -894,6 +894,14 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		crcByOffset[entries[i].offset] = entries[i].crc
 	}
 
+	byOff := make(map[uint64]idxEntry, objCount)
+	offs := make([]uint64, objCount)
+	for i, e := range entries {
+		byOff[e.offset] = e
+		offs[i] = e.offset
+	}
+	slices.Sort(offs)
+
 	trailer := make([]byte, 40)
 	if _, err := ix.ReadAt(trailer, int64(ix.Len()-40)); err != nil {
 		return nil, err
@@ -909,11 +917,13 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 
 	return &idxFile{
-		fanout:       fanout,
-		entries:      entries,
-		oidTable:     oids,
-		crcByOffset:  crcByOffset,
-		largeOffsets: largeOffsets,
+		fanout:        fanout,
+		entries:       entries,
+		oidTable:      oids,
+		crcByOffset:   crcByOffset,
+		largeOffsets:  largeOffsets,
+		entriesByOff:  byOff,
+		sortedOffsets: offs,
 	}, nil
 }
 
@@ -1135,38 +1145,54 @@ func readObjectAtOffsetWithContext(
 	return data, objType, nil
 }
 
-// verifyCRC32 computes the CRC-32 checksum for data and compares it with the
-// checksum that Git recorded in the corresponding *.idx entry.
+// verifyCRC32 validates the CRC-32 checksum of a packed object.
 //
-// The calculation is skipped unless Store.VerifyCRC is true because the extra
-// pass over the raw, compressed bytes adds measurable latency for large
-// objects.
+// verifyCRC32 streams the *packed* (still-compressed) byte sequence that
+// starts at objOff inside pf.pack into a CRC-32 hash and compares the result
+// with want, the checksum that Git wrote to the companion *.idx file at
+// pack-creation time.
 //
-// A mismatch indicates on-disk corruption or a bug in the reader and is
-// returned as a formatted error.
-func verifyCRC32(r *mmap.ReaderAt, off uint64, data []byte, want uint32) error {
-	// Use the same polynomial as Git.
-	table := crc32.MakeTable(crc32.Castagnoli)
-
-	got := uint32(0)
-
-	chunks := len(data) / 8
-	if chunks > 0 {
-		uint64Slice := unsafe.Slice((*uint64)(unsafe.Pointer(&data[0])), chunks)
-		for _, chunk := range uint64Slice {
-			got = crc32.Update(got, table, (*[8]byte)(unsafe.Pointer(&chunk))[:])
-		}
-
-		remaining := data[chunks*8:]
-		if len(remaining) > 0 {
-			got = crc32.Update(got, table, remaining)
-		}
-	} else {
-		got = crc32.Update(0, table, data)
+// The object's end is inferred from the next object's offset (as recorded in
+// pf.sortedOffsets) or, for the final object, from the beginning of the pack
+// trailer.
+//
+// Error semantics:
+//   - If objOff cannot be found in pf.sortedOffsets, the function returns an
+//     error that mentions the missing offset.
+//   - ErrNonMonotonicOffsets is returned when the calculated end precedes or
+//     equals objOff, indicating a corrupt index.
+//   - I/O failures from the underlying mmap.ReaderAt are propagated
+//     unchanged.
+//   - A checksum mismatch yields a descriptive error that includes both the
+//     expected and the actual CRC-32 in hexadecimal.
+//
+// A nil return value signals that the on-disk CRC matches the expected one.
+func verifyCRC32(pf *idxFile, objOff uint64, want uint32) error {
+	// Locate objOff in the monotonically-sorted offset slice.
+	idx := sort.Search(len(pf.sortedOffsets), func(i int) bool { return pf.sortedOffsets[i] >= objOff })
+	if idx >= len(pf.sortedOffsets) || pf.sortedOffsets[idx] != objOff {
+		return fmt.Errorf("offset %d not found in index", objOff)
 	}
 
-	if got != want {
-		return fmt.Errorf("crc mismatch obj @%d", off)
+	// The object ends where the next one begins, or at the pack trailer.
+	var objEnd uint64
+	if idx+1 < len(pf.sortedOffsets) {
+		objEnd = pf.sortedOffsets[idx+1]
+	} else {
+		objEnd = uint64(pf.pack.Len()) - hashSize // exclude SHA-1 pack checksum trailer
+	}
+	if objEnd <= objOff {
+		return ErrNonMonotonicOffsets
+	}
+
+	// Stream the exact on-disk bytes into a CRC-32 hash.
+	sec := io.NewSectionReader(pf.pack, int64(objOff), int64(objEnd-objOff))
+	h := crc32.New(crc32.MakeTable(crc32.IEEE))
+	if _, err := io.Copy(h, sec); err != nil {
+		return err
+	}
+	if got := h.Sum32(); got != want {
+		return fmt.Errorf("crc mismatch @%d: got %08x want %08x", objOff, got, want)
 	}
 	return nil
 }
