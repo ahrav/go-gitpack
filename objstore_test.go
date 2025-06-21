@@ -1110,7 +1110,8 @@ func TestParseMidx(t *testing.T) {
 	require.NoError(t, err)
 	defer midxRA.Close()
 
-	midx, err := parseMidx(dir, midxRA)
+	packCache := make(map[string]*mmap.ReaderAt)
+	midx, err := parseMidx(dir, midxRA, packCache)
 	require.NoError(t, err)
 
 	assert.Equal(t, uint32(1), midx.fanout[255], "object count in fanout")
@@ -1166,7 +1167,8 @@ func TestParseMidx_InvalidFiles(t *testing.T) {
 	ra, _ := mmap.Open(midx)
 	defer ra.Close()
 
-	_, err := parseMidx(dir, ra)
+	packCache := make(map[string]*mmap.ReaderAt)
+	_, err := parseMidx(dir, ra, packCache)
 	assert.Error(t, err, "should reject file with invalid magic")
 }
 
@@ -1410,7 +1412,8 @@ func BenchmarkParseMidx(b *testing.B) {
 		ra, err := mmap.Open(midxPath)
 		require.NoError(b, err)
 
-		_, err = parseMidx(packDir, ra)
+		packCache := make(map[string]*mmap.ReaderAt)
+		_, err = parseMidx(packDir, ra, packCache)
 		require.NoError(b, err)
 
 		ra.Close()
@@ -1680,7 +1683,7 @@ func TestParseIdx_TruncatedTrailer(t *testing.T) {
 	h, _ := ParseHash("1234567890abcdef1234567890abcdef12345678")
 	data := createValidIdxData(t, []Hash{h}, []uint64{100})
 
-	// Drop the final 40 bytes (pack‑SHA + idx‑SHA).
+	// Drop the final 40 bytes (pack‑SHA + idx‑SHA).
 	trunc := data[:len(data)-40]
 	idxFile := createTempFileWithData(t, trunc)
 	defer os.Remove(idxFile)

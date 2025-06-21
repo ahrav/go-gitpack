@@ -266,6 +266,9 @@ type Store struct {
 	// midx holds the multi-pack index if one was found, nil otherwise.
 	midx *midxFile
 
+	// packMap tracks unique mmap handles to prevent duplicate mappings.
+	packMap map[string]*mmap.ReaderAt
+
 	// mu guards live configuration such as cache size and maxDeltaDepth.
 	mu sync.Mutex
 
@@ -411,9 +414,16 @@ func (ctx *deltaContext) exit() { ctx.depth-- }
 //
 // For bare repositories pass ".git/objects/pack" as dir.
 func Open(dir string) (*Store, error) {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	packCache := make(map[string]*mmap.ReaderAt)
+
 	// Attempt to mmap a multi-pack-index. It is named exactly
 	//    "…/objects/pack/multi-pack-index".
-	midxPath := filepath.Join(dir, "multi-pack-index")
+	midxPath := filepath.Join(absDir, "multi-pack-index")
 	var midx *midxFile
 	if st, err := os.Stat(midxPath); err == nil && !st.IsDir() {
 		mr, err := mmap.Open(midxPath)
@@ -425,7 +435,7 @@ func Open(dir string) (*Store, error) {
 				_ = mr.Close()
 			}
 		}()
-		midx, err = parseMidx(dir, mr)
+		midx, err = parseMidx(absDir, mr, packCache)
 		if err != nil {
 			_ = mr.Close()
 			return nil, fmt.Errorf("parse midx: %w", err)
@@ -433,18 +443,31 @@ func Open(dir string) (*Store, error) {
 	}
 
 	// Normal pack/idx enumeration.
-	pattern := filepath.Join(dir, "*.pack")
+	pattern := filepath.Join(absDir, "*.pack")
 	packs, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, err
 	}
 	if len(packs) == 0 && midx == nil {
-		return nil, fmt.Errorf("no packfiles found in %s", dir)
+		return nil, fmt.Errorf("no packfiles found in %s", absDir)
+	}
+
+	// Glob all *.pack not already mapped by the midx.
+	for _, p := range packs {
+		if _, ok := packCache[p]; ok {
+			continue
+		}
+		h, err := mmap.Open(p)
+		if err != nil {
+			return nil, err
+		}
+		packCache[p] = h
 	}
 
 	store := &Store{
 		maxDeltaDepth: defaultMaxDeltaDepth,
 		midx:          midx,
+		packMap:       packCache,
 	}
 
 	const defaultCacheSize = 1 << 14 // 16 KiB ARC—enough for >95 % hit-rate on typical workloads.
@@ -455,28 +478,23 @@ func Open(dir string) (*Store, error) {
 		return nil, fmt.Errorf("failed to create ARC cache: %w", err)
 	}
 
-	for _, packPath := range packs {
-		idxPath := strings.TrimSuffix(packPath, ".pack") + ".idx"
-		pk, err := mmap.Open(packPath)
-		if err != nil {
-			return nil, fmt.Errorf("mmap pack: %w", err)
-		}
+	// Build idxFiles, re-using map for the pack field.
+	for path, handle := range packCache {
+		idxPath := strings.TrimSuffix(path, ".pack") + ".idx"
 		ix, err := mmap.Open(idxPath)
 		if errors.Is(err, os.ErrNotExist) && midx != nil {
 			// Pack is referenced only through the multi‑pack‑index; CRCs will come from MIDX v2 later.
-			store.packs = append(store.packs, &idxFile{pack: pk}) // minimal stub
+			store.packs = append(store.packs, &idxFile{pack: handle}) // minimal stub
 			continue
 		} else if err != nil {
-			_ = pk.Close()
 			return nil, fmt.Errorf("mmap idx: %w", err)
 		}
 		f, err := parseIdx(ix)
 		if err != nil {
-			_ = pk.Close()
 			_ = ix.Close()
 			return nil, fmt.Errorf("parse idx: %w", err)
 		}
-		f.pack = pk
+		f.pack = handle
 		f.idx = ix
 		store.packs = append(store.packs, f)
 	}
@@ -515,20 +533,14 @@ func (s *Store) Close() error {
 	}
 	var firstErr error
 
-	if s.midx != nil {
-		for _, p := range s.midx.packReaders {
-			if p != nil {
-				if err := p.Close(); err != nil && firstErr == nil {
-					firstErr = err
-				}
-			}
+	for _, h := range s.packMap {
+		if err := h.Close(); err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
 
+	// Close idx files
 	for _, p := range s.packs {
-		if err := p.pack.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
 		if p.idx != nil {
 			if err := p.idx.Close(); err != nil && firstErr == nil {
 				firstErr = err
@@ -1517,7 +1529,7 @@ func (m *midxFile) findObject(h Hash) (p *mmap.ReaderAt, off uint64, ok bool) {
 //
 // Note: midx v1 is the current format (different from pack index v2)
 // midx files have their own versioning scheme starting at 1
-func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
+func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderAt) (*midxFile, error) {
 	// Header.
 	var hdr [12]byte
 	if _, err := mr.ReadAt(hdr[:], 0); err != nil {
@@ -1592,7 +1604,12 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 	// Mmap every pack straight away so we have a stable *ReaderAt slice.
 	packs := make([]*mmap.ReaderAt, len(packNames))
 	for i, name := range packNames {
-		r, err := mmap.Open(filepath.Join(dir, name))
+		p := filepath.Join(dir, name)
+		if h, ok := packCache[p]; ok {
+			packs[i] = h
+			continue
+		}
+		r, err := mmap.Open(p)
 		if err != nil {
 			for _, p := range packs[:i] {
 				if p != nil {
@@ -1602,6 +1619,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 			return nil, fmt.Errorf("mmap pack %q: %w", name, err)
 		}
 		packs[i] = r
+		packCache[p] = r
 	}
 
 	// OIDF.
