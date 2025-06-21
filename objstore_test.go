@@ -1689,7 +1689,26 @@ func TestParseIdx_TruncatedTrailer(t *testing.T) {
 	defer ra.Close()
 
 	_, err := parseIdx(ra)
-	assert.ErrorContains(t, err, "idx checksum mismatch")
+	assert.ErrorIs(t, err, ErrBadIdxChecksum)
+}
+
+func TestParseIdx_CorruptFanout(t *testing.T) {
+	h, _ := ParseHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	data := createValidIdxData(t, []Hash{h}, []uint64{12})
+
+	// Flip count[42] < count[41].
+	fpos := headerSize + 41*4 // fan‑out index 41
+	binary.BigEndian.PutUint32(data[fpos:fpos+4], 2)
+	binary.BigEndian.PutUint32(data[fpos+4:fpos+8], 1)
+
+	idx := createTempFileWithData(t, data)
+	defer os.Remove(idx)
+
+	ra, _ := mmap.Open(idx)
+	defer ra.Close()
+
+	_, err := parseIdx(ra)
+	assert.ErrorIs(t, err, ErrNonMonotonicFanout)
 }
 
 // func TestMidxFanoutAcrossPacks(t *testing.T) {

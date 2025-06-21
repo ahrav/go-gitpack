@@ -720,6 +720,11 @@ type largeOffsetEntry struct {
 	largeIdx uint32
 }
 
+var (
+	ErrNonMonotonicFanout = errors.New("idx corrupt: fan‑out table not monotonic")
+	ErrBadIdxChecksum     = errors.New("idx corrupt: checksum mismatch")
+)
+
 // parseIdx reads a Git pack index file using unsafe operations for maximum performance.
 //
 // Git pack index (.idx) file format (version 2):
@@ -769,7 +774,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	// Guard against truncated or tampered indexes.
 	for i := 1; i < fanoutEntries; i++ {
 		if fanout[i] < fanout[i-1] {
-			return nil, fmt.Errorf("idx corrupt: fan‑out table not monotonic")
+			return nil, ErrNonMonotonicFanout
 		}
 	}
 
@@ -900,7 +905,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 	gotIdxSHA := sha1.Sum(fullFile[:ix.Len()-20]) // compute over entire file minus last 20
 	if !bytes.Equal(trailer[20:], gotIdxSHA[:]) {
-		return nil, fmt.Errorf("idx checksum mismatch")
+		return nil, ErrBadIdxChecksum
 	}
 
 	return &idxFile{
