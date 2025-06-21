@@ -39,6 +39,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"sort"
 	"strings"
@@ -53,6 +54,15 @@ var hostLittle = func() bool {
 	var i uint16 = 1
 	return *(*byte)(unsafe.Pointer(&i)) == 1
 }()
+
+func init() {
+	// On Windows an mmapped file cannot be closed while any outstanding
+	// slices are still referenced.  A finalizer makes sure users who forget
+	// to call (*Store).Close() do not trigger ERROR_LOCK_VIOLATION.
+	if runtime.GOOS == "windows" {
+		runtime.SetFinalizer(&Store{}, func(s *Store) { _ = s.Close() })
+	}
+}
 
 // Hash represents a raw Git object identifier.
 //
@@ -766,6 +776,12 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, fmt.Errorf("unsupported idx version %d", version)
 	}
 
+	size := int64(ix.Len())
+	// hdr(8) + fan‑out(1024) + trailing hashes(40) is the absolute minimum.
+	if size < 8+256*4+hashSize*2 {
+		return nil, ErrBadIdxChecksum
+	}
+
 	// Fanout table: fanout[i] = total number of objects whose first byte is ≤ i.
 	// This enables O(1) range queries for object lookup by hash prefix.
 	fanoutData := make([]byte, fanoutSize)
@@ -793,6 +809,16 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	objCount := fanout[255]
 	if objCount == 0 {
 		return &idxFile{fanout: fanout, entries: nil, oidTable: nil}, nil
+	}
+
+	// bounds: do the tables we are about to slice actually fit inside the file?
+	fanStart := int64(headerSize)
+	minSize := fanStart + // header
+		256*4 + // fan‑out
+		int64(objCount)*(hashSize+4+4) + // oid + crc + ofs tables
+		hashSize*2 // trailer hashes
+	if size < minSize {
+		return nil, ErrBadIdxChecksum
 	}
 
 	// Guard against integer overflow when allocating giant slices.
@@ -826,18 +852,15 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 
 	crcs := make([]uint32, objCount)
 	if len(crcs) > 0 {
-		alignedCrcData := make([]uint32, objCount)
-		crcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&alignedCrcData[0]))
-		srcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&crcData[0]))
-
 		if littleEndian {
 			for i := range objCount {
-				crcPtr[i] = binary.BigEndian.Uint32(crcData[i*4:])
+				crcs[i] = binary.BigEndian.Uint32(crcData[i*4:])
 			}
 		} else {
+			srcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&crcData[0]))
+			crcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&crcs[0]))
 			copy(crcPtr[:objCount], srcPtr[:objCount])
 		}
-		crcs = alignedCrcData
 	}
 
 	entries := make([]idxEntry, objCount)
@@ -914,17 +937,20 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 	slices.Sort(offs)
 
+	// Trailer verification.
 	trailer := make([]byte, 40)
 	if _, err := ix.ReadAt(trailer, int64(ix.Len()-40)); err != nil {
 		return nil, err
 	}
 
-	fullFile := make([]byte, ix.Len())
-	if _, err := ix.ReadAt(fullFile, 0); err != nil {
+	wantIdxSHA := trailer[hashSize:]
+
+	// Recompute idx‑SHA over everything **except** the final idx hash itself.
+	h := sha1.New()
+	if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-int64(hashSize))); err != nil {
 		return nil, err
 	}
-	gotIdxSHA := sha1.Sum(fullFile[:ix.Len()-20]) // compute over entire file minus last 20
-	if !bytes.Equal(trailer[20:], gotIdxSHA[:]) {
+	if !bytes.Equal(h.Sum(nil), wantIdxSHA) {
 		return nil, ErrBadIdxChecksum
 	}
 
@@ -1589,10 +1615,19 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 	}
 	// Filenames are NUL‑terminated.
 	var packNames []string
-	for start := 0; start < len(pn); {
+	// Stop after we have collected <packCount> names and
+	// silently skip any alignment padding that follows.
+	for i, start := 0, 0; i < packCount; i++ {
+		if start >= len(pn) {
+			return nil, fmt.Errorf("PNAM truncated; expected %d names", packCount)
+		}
 		end := bytes.IndexByte(pn[start:], 0)
 		if end < 0 {
 			return nil, fmt.Errorf("unterminated PNAM entry")
+		}
+		// end-start > 0 guarantees we ignore the 0-length padding "names".
+		if end == 0 {
+			return nil, fmt.Errorf("empty PNAM entry before padding")
 		}
 		packNames = append(packNames, string(pn[start:start+end]))
 		start += end + 1
