@@ -1554,3 +1554,27 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 		}
 	})
 }
+
+func TestTinyRepoHappyPath(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create one‑object pack + idx.
+	pack := filepath.Join(dir, "tiny.pack")
+	payload := []byte("hello tiny")
+	oid := calculateHash(ObjBlob, payload)
+	require.NoError(t, createMinimalPack(pack, payload))
+	require.NoError(t, createV2IndexFile(
+		strings.TrimSuffix(pack, ".pack")+".idx",
+		[]Hash{oid},
+		[]uint64{12},
+	))
+
+	store, err := Open(dir)
+	require.NoError(t, err)
+	defer store.Close()
+
+	data, typ, err := store.Get(oid)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, payload, data)
+}
