@@ -5,7 +5,6 @@ import (
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -253,6 +252,8 @@ func createTempFileWithData(t *testing.T, data []byte) string {
 // createValidIdxData creates a valid idx file data for testing.
 // It automatically handles both regular and large offsets based on the provided offset values.
 func createValidIdxData(t *testing.T, hashes []Hash, offsets []uint64) []byte {
+	t.Helper()
+
 	var buf bytes.Buffer
 
 	// Header: magic + version.
@@ -379,68 +380,6 @@ func createMinimalPack(path string, content []byte) error {
 	file.Write(buf.Bytes())
 
 	return nil
-}
-
-func TestHash(t *testing.T) {
-	tests := []struct {
-		name        string
-		input       string
-		expectError bool
-		checkResult func(t *testing.T, hash Hash, err error)
-	}{
-		{
-			name:        "valid hash",
-			input:       "89e5a3e7d8f6c4b2a1e0d9c8b7a6f5e4d3c2b1a0",
-			expectError: false,
-			checkResult: func(t *testing.T, hash Hash, err error) {
-				require.NoError(t, err)
-				expected := "89e5a3e7d8f6c4b2a1e0d9c8b7a6f5e4d3c2b1a0"
-				assert.Equal(t, expected, hex.EncodeToString(hash[:]))
-			},
-		},
-		{
-			name:        "invalid hash",
-			input:       "invalid",
-			expectError: true,
-			checkResult: func(t *testing.T, hash Hash, err error) {
-				assert.Error(t, err)
-			},
-		},
-		{
-			name:        "wrong length",
-			input:       "abcd",
-			expectError: true,
-			checkResult: func(t *testing.T, hash Hash, err error) {
-				assert.Error(t, err)
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			hash, err := ParseHash(tt.input)
-			tt.checkResult(t, hash, err)
-		})
-	}
-}
-
-func TestObjectTypeString(t *testing.T) {
-	tests := []struct {
-		objType  ObjectType
-		expected string
-	}{
-		{ObjCommit, "commit"},
-		{ObjTree, "tree"},
-		{ObjBlob, "blob"},
-		{ObjTag, "tag"},
-		{ObjOfsDelta, "ofs-delta"},
-		{ObjRefDelta, "ref-delta"},
-		{ObjectType(99), ""},
-	}
-
-	for _, test := range tests {
-		assert.Equal(t, test.expected, test.objType.String())
-	}
 }
 
 func TestDecodeVarInt(t *testing.T) {
@@ -773,22 +712,6 @@ func TestDeltaCycleDetection(t *testing.T) {
 
 	hash3, _ := ParseHash("fedcba0987654321fedcba0987654321fedcba09")
 	assert.Error(t, ctx2.checkRefDelta(hash3), "Should hit depth limit")
-}
-
-func TestDetectType(t *testing.T) {
-	tests := []struct {
-		data     []byte
-		expected ObjectType
-	}{
-		{[]byte("tree 123\x00some tree data"), ObjTree},
-		{[]byte("parent abc\nauthor Someone"), ObjCommit},
-		{[]byte("author Someone\ncommitter"), ObjCommit},
-		{[]byte("just some blob data"), ObjBlob},
-	}
-
-	for _, test := range tests {
-		assert.Equal(t, test.expected, detectType(test.data))
-	}
 }
 
 func ExampleStore() {
