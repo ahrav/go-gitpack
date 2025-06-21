@@ -595,6 +595,15 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		sortedOffsets[i] = ho.offset
 	}
 
+	// Check if we need large offset table
+	needsLargeOffsets := false
+	for _, offset := range sortedOffsets {
+		if offset > 0x7fffffff {
+			needsLargeOffsets = true
+			break
+		}
+	}
+
 	// Create fanout table.
 	fanout := make([]uint32, 256)
 	for i, h := range sortedHashes {
@@ -617,12 +626,31 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
 	}
 
-	// Write offsets.
-	for _, off := range sortedOffsets {
-		if off > 0x7fffffff {
-			return fmt.Errorf("offset too large for test")
+	// Write offsets - handle both regular and large offsets.
+	if needsLargeOffsets {
+		// Write offsets with large offset references.
+		largeOffsetIndex := uint32(0)
+		for _, offset := range sortedOffsets {
+			if offset > 0x7fffffff {
+				// Use large offset table reference.
+				binary.Write(&buf, binary.BigEndian, uint32(0x80000000|largeOffsetIndex))
+				largeOffsetIndex++
+			} else {
+				binary.Write(&buf, binary.BigEndian, uint32(offset))
+			}
 		}
-		binary.Write(&buf, binary.BigEndian, uint32(off))
+
+		// Large offset table.
+		for _, offset := range sortedOffsets {
+			if offset > 0x7fffffff {
+				binary.Write(&buf, binary.BigEndian, offset)
+			}
+		}
+	} else {
+		// All small offsets.
+		for _, off := range sortedOffsets {
+			binary.Write(&buf, binary.BigEndian, uint32(off))
+		}
 	}
 
 	// Write trailing checksums.
@@ -1577,4 +1605,31 @@ func TestTinyRepoHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, payload, data)
+}
+
+func TestLargePack_LoffHandling(t *testing.T) {
+	dir := t.TempDir()
+	pack := filepath.Join(dir, "big.pack")
+
+	blob := []byte("dummy")
+	oid := calculateHash(ObjBlob, blob)
+
+	// Tiny pack – real size unimportant.
+	require.NoError(t, createMinimalPack(pack, blob))
+
+	// Logical offset > 2 GiB so MSB is 1 → LOFF chunk.
+	const off64 = uint64(0x8000_0000 + 1234) // 2 GiB + 1,234 bytes
+	require.NoError(t, createV2IndexFile(
+		strings.TrimSuffix(pack, ".pack")+".idx",
+		[]Hash{oid},
+		[]uint64{off64},
+	))
+
+	// parseIdx must promote the offset into idxFile.largeOffsets.
+	ra, err := mmap.Open(strings.TrimSuffix(pack, ".pack") + ".idx")
+	require.NoError(t, err)
+	idx, err := parseIdx(ra)
+	require.NoError(t, err)
+	assert.Equal(t, off64, idx.entries[0].offset)
+	assert.Len(t, idx.largeOffsets, 1)
 }
