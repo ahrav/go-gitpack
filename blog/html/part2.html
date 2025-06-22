@@ -1210,6 +1210,51 @@
       </div>
 
       <div class="section">
+        <h2><span class="icon">🛡️</span>Git's Safety Net: CRC Checksums</h2>
+
+        <p>Remember those CRC-32 values we skipped over? Here's Git's clever
+          integrity check:</p>
+
+        <div class="code-block"><span class="comment">// Each object in the
+            index has a CRC-32 checksum</span>
+          <span class="keyword">type</span> <span class="type">idxEntry</span>
+          <span class="keyword">struct</span> {
+          <span class="type">offset</span> <span class="keyword">uint64</span>
+          <span class="type">crc</span> <span class="keyword">uint32</span>
+          <span class="comment">// Git's safety net!</span>
+          }
+        </div>
+
+        <p>When Git creates a pack, it calculates a CRC-32 checksum of the
+          <strong>compressed</strong> object data. This means Git can verify
+          objects haven't been corrupted without even decompressing them!</p>
+
+        <div class="code-block"><span class="comment">// In parseIdx, we now
+            build a map for O(1) CRC lookups</span>
+          <span class="type">crcByOffset</span> <span class="operator">:=</span>
+          <span class="keyword">make</span>(<span
+            class="keyword">map</span>[<span class="keyword">uint64</span>]<span
+            class="keyword">uint32</span>, <span class="type">objCount</span>)
+          <span class="keyword">for</span> <span class="type">i</span> <span
+            class="operator">:=</span> <span class="keyword">range</span> <span
+            class="type">objCount</span> {
+          <span class="type">crcByOffset</span>[<span
+            class="type">entries</span>[<span class="type">i</span>].<span
+            class="type">offset</span>] <span class="operator">=</span> <span
+            class="type">entries</span>[<span class="type">i</span>].<span
+            class="type">crc</span>
+          }
+        </div>
+
+        <div class="callout">
+          <span class="callout-icon">💡</span>
+          <strong>The "aha" moment:</strong> Git stores checksums of the
+          compressed data, not the original! This allows lightning-fast
+          integrity checks without the CPU cost of decompression.
+        </div>
+      </div>
+
+      <div class="section">
         <h2><span class="icon">🧪</span>Testing Our Implementation</h2>
 
         <div class="code-block"><span class="keyword">func</span> <span
@@ -1298,6 +1343,8 @@
             cache efficiency</li>
           <li><strong>Large offset handling</strong> gracefully supports huge
             repositories</li>
+          <li><strong>CRC checksums</strong> provide integrity without
+            decompression overhead</li>
         </ul>
       </div>
 
