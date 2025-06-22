@@ -23,31 +23,31 @@ Unit 50: [Products X-Z]
 ```
 
 **Finding Product "M":**
-> 🔍 Check Unit 1 index... not there
-> 🔍 Check Unit 2 index... not there
-> 🔍 Check Unit 3 index... not there
+> Check Unit 1 index... not there
+> Check Unit 2 index... not there
+> Check Unit 3 index... not there
 > ... (potentially checking all 50 units!)
 
 **With Multi-Pack Index (✅):**
 Master inventory system + individual unit manifests:
 
 ```
-📋 Master Index:
+Master Index:
 - Product M → Unit 27, Shelf 3
 - Product N → Unit 12, Shelf 8
 - ...
 ```
 
 **Finding Product "M":**
-1️⃣ Check master index → "Unit 27, Shelf 3"
-2️⃣ Go directly to Unit 27
-3️⃣ Retrieved! 🎯
+1. Check master index → "Unit 27, Shelf 3"
+2. Go directly to Unit 27
+3. Retrieved!
 
-> **💡 This is exactly how Git's multi-pack index works!** Instead of searching through every packfile's index, we have one master index that tells us exactly which pack contains each object.
+> **This is exactly how Git's multi-pack index works!** Instead of searching through every packfile's index, we have one master index that tells us exactly which pack contains each object.
 
 ---
 
-## 🧩 Why Multiple Packfiles Exist
+## Why Multiple Packfiles Exist
 
 ### The Natural Evolution of a Repository
 
@@ -71,7 +71,7 @@ $ ls .git/objects/pack/*.pack | wc -l
 
 ## 🏗️ The Multi-Pack Index Format
 
-### 📋 Multi-Pack Index File Layout
+### Multi-Pack Index File Layout
 
 ```
 ┌─────────────────────────┐
@@ -95,9 +95,9 @@ Let's parse this step by step!
 
 ---
 
-## 🔧 Parsing the Multi-Pack Index
+## Parsing the Multi-Pack Index
 
-### 🎯 Step 1: Read and Validate the Header
+### Step 1: Read and Validate the Header
 
 ```go
 // Multi-pack index chunk identifiers.
@@ -140,7 +140,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 }
 ```
 
-> **🔍 Header Breakdown:**
+> **Header Breakdown:**
 > - **Bytes 0-3**: Magic "MIDX" (0x4D494458)
 > - **Byte 4**: Version number
 > - **Byte 5**: Hash algorithm ID
@@ -148,7 +148,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt) (*midxFile, error) {
 > - **Byte 7**: Reserved (must be 0)
 > - **Bytes 8-11**: Number of base packfiles
 
-### 📑 Step 2: Parse the Chunk Table
+### Step 2: Parse the Chunk Table
 
 The chunk table is like a table of contents, telling us where each data section lives:
 
@@ -190,7 +190,7 @@ findChunk := func(id uint32) (off int64, size int64, err error) {
 }
 ```
 
-### 📦 Step 3: Parse PNAM (Pack Names)
+### Step 3: Parse PNAM (Pack Names)
 
 This chunk lists all the packfiles that the midx indexes:
 
@@ -223,10 +223,10 @@ for start := 0; start < len(pnamData); {
 // pack-c9f5d4e3f1a7b2c0d6e8f4a9b5c1d3e9f5a1b2c3.pack
 ```
 
-> **💡 Why track pack names?**
+> **Why track pack names?**
 > When we find an object, we need to know which physical `.pack` file to read from!
 
-### 🔍 Step 4: Parse OIDF (Fanout Table)
+### Step 4: Parse OIDF (Fanout Table)
 
 Our old friend returns! Just like in `.idx` files:
 
@@ -254,7 +254,7 @@ totalObjects := fanout[255]
 fmt.Printf("MIDX indexes %d total objects\n", totalObjects)
 ```
 
-### 🆔 Step 5: Parse OIDL (Object ID List)
+### Step 5: Parse OIDL (Object ID List)
 
 All object hashes, sorted for binary search:
 
@@ -273,7 +273,7 @@ if _, err = mr.ReadAt(oidBytes, oidOff); err != nil {
 }
 ```
 
-### 📍 Step 6: Parse OOFF (Object Offsets)
+### Step 6: Parse OOFF (Object Offsets)
 
 This is where the magic happens - mapping objects to their pack + offset:
 
@@ -318,7 +318,7 @@ for i := uint32(0); i < totalObjects; i++ {
 }
 ```
 
-### 📏 Step 7: Handle Large Offsets (LOFF)
+### Step 7: Handle Large Offsets (LOFF)
 
 For packfiles larger than 2GB, we need the optional LOFF chunk:
 
@@ -348,7 +348,46 @@ if loffSize > 0 {
 
 ---
 
-## 🔍 The Complete Lookup Process
+## Pack Cache Optimization
+
+Here's a useful optimization for our implementation. When parsing a multi-pack index, the same packfile might be referenced by both the midx AND individual idx files. Without caching, we'd mmap the same file twice!
+
+```go
+// In Open(), we maintain a pack cache
+packCache := make(map[string]*mmap.ReaderAt)
+
+// When the midx parser needs a pack...
+func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderAt) (*midxFile, error) {
+    // ... parse pack names ...
+
+    for i, name := range packNames {
+        p := filepath.Join(dir, name)
+        if h, ok := packCache[p]; ok {
+            packs[i] = h  // Reuse existing mmap!
+            continue
+        }
+        // Only mmap if we haven't seen this pack before
+        r, err := mmap.Open(p)
+        packCache[p] = r
+    }
+}
+```
+
+By sharing mmap handles between midx and idx parsing, we avoid duplicate memory mappings. On a repository with 100 packs, this saves 100 system calls and prevents confusing the OS's page cache.
+
+### Real-World Impact
+```bash
+# Without pack cache: Each subsystem mmaps independently
+$ strace -e openat git cat-file -p HEAD~1000:Makefile 2>&1 | grep pack | wc -l
+247  # Opening same packs multiple times!
+
+# With pack cache: Shared mmap handles
+3    # Each pack opened exactly once!
+```
+
+---
+
+## The Complete Lookup Process
 
 Here's how it all comes together:
 
@@ -416,12 +455,12 @@ $ time git cat-file -p HEAD~10000:Makefile
 
 # Without midx: 0.085s (searches ~50 packs on average)
 # With midx: 0.012s (single index lookup)
-# 7× faster! 🚀
+# 7× faster!
 ```
 
 ---
 
-## 🧪 Testing Our Implementation
+## Testing Our Implementation
 
 Let's verify our midx parser works correctly:
 
@@ -453,7 +492,7 @@ func TestMultiPackIndex(t *testing.T) {
 
 ---
 
-## 💡 Key Insights
+## Key Insights
 
 ### The Brilliance of the Design
 
@@ -477,7 +516,7 @@ $ git multi-pack-index verify
 
 ---
 
-## 🎯 Performance Tips
+## Performance Tips
 
 1. **Enable midx for large repositories**:
    ```bash
@@ -508,12 +547,12 @@ We've now built the complete foundation for reading Git's object database:
 
 The multi-pack index was our last piece of "finding" objects efficiently. Next, we'll dive into actually reading and decompressing the object data from packfiles. Get ready to explore zlib compression, delta chains, and Git's clever storage optimizations!
 
-> **🏗️ Building Block Complete!**
+> **Building Block Complete!**
 > With midx support, our object store can now handle repositories of any size efficiently. Whether you have 1 packfile or 1000, object lookups remain lightning fast!
 
 ---
 
-### 📚 References
+### References
 
 - [Git Documentation - Multi-Pack-Index Format](https://git-scm.com/docs/gitformat-pack#_multi_pack_index_midx_files)
 - [Git Source: midx.c](https://github.com/git/git/blob/master/midx.c)

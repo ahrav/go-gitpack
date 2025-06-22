@@ -24,12 +24,12 @@ All books alphabetized, but no section guide:
 
 **Finding "Science":**
 Binary search through *all* books
-> 🔍 Check middle → too far → go left → check middle → repeat…
+> Check middle → too far → go left → check middle → repeat…
 
 **With Git's Fanout Table (✅):**
 Section directory + alphabetized books:
 
-1. **📋 Section Guide:**
+1. **Section Guide:**
    - A–F: Rack 1–3
    - G–M: Rack 4–7
    - N–S: Rack 8–12
@@ -43,16 +43,16 @@ Section directory + alphabetized books:
    - Space
 
 **Finding "Science":**
-1️⃣ Fanout table → "S books are in Rack 8–12"
-2️⃣ Binary search within that rack only! 🎯
+1. Fanout table → "S books are in Rack 8–12"
+2. Binary search within that rack only!
 
-> **💡 This is exactly how Git's pack index works!** The fanout table tells us "objects starting with 0x45 are in positions 2–5," then we binary search within just those positions instead of the entire pack.
+> **This is exactly how Git's pack index works!** The fanout table tells us "objects starting with 0x45 are in positions 2–5," then we binary search within just those positions instead of the entire pack.
 
 ---
 
-## 🧠 Git's Brilliant Solution: The Pack Index
+## Git's Brilliant Solution: The Pack Index
 
-### 🔍 The Magic of the Fanout Table
+### The Magic of the Fanout Table
 
 Here's where Git gets clever. Instead of one giant sorted list, Git uses a **fanout table**. Let me demonstrate with actual data:
 
@@ -80,13 +80,13 @@ Here's where Git gets clever. Instead of one giant sorted list, Git uses a **fan
 - `0xaa: 6`
 - `0xab: 8`
 
-> **🎯 Click on any fanout entry above** to see which objects it covers! Each entry tells us: "How many objects have a first byte ≤ this value?"
+> Each entry tells us: "How many objects have a first byte ≤ this value?"
 
 ---
 
 ## 🏗️ The Pack Index Format
 
-### 📋 Pack Index File Layout
+### Pack Index File Layout
 
 1. **Magic + Version (8 bytes)**
 ```
@@ -116,88 +116,86 @@ _Because some repositories are REALLY big_
 
 ---
 
-## 🔍 The Two-Step Search Process
+## The Two-Step Search Process
 
 ### Finding Object `45dead…` Step by Step
 
 1. **Step 1:** Extract first byte: `0x45`
 2. **Step 2:** Fanout lookup: "Objects with 0x45 are in positions 2–4"
-_🏃‍♂️ Jump directly to the right "rack" – no scanning needed!_
+_Jump directly to the right "rack" – no scanning needed!_
 3. **Step 3:** Binary search within positions [2, 3, 4]
-_📖 Books are alphabetized within the rack_
+_Books are alphabetized within the rack_
 4. **Step 4:** Check middle position (3): Found `45dead…`!
-_🎯 Just 1 comparison instead of potentially 10!_
+_Just 1 comparison instead of potentially 10!_
 
 ```go
 func (f *idxFile) findObject(targetHash Hash) (offset uint64, found bool) {
-// Step 1: Extract the first byte of our target hash
-firstByte := targetHash[0]
+    // Step 1: Extract the first byte of our target hash
+    firstByte := targetHash[0]
 
-// Step 2: Use fanout to narrow our search range
-searchStart := uint32(0)
-if firstByte > 0 {
- searchStart = f.fanout[firstByte-1]
-}
-searchEnd := f.fanout[firstByte]
+    // Step 2: Use fanout to narrow our search range
+    searchStart := uint32(0)
+    if firstByte > 0 {
+        searchStart = f.fanout[firstByte-1]
+    }
+    searchEnd := f.fanout[firstByte]
 
-// Step 3: Binary search within our narrowed range
-left := int(searchStart)        // 2
-right := int(searchEnd) - 1     // 4
+    // Step 3: Binary search within our narrowed range
+    left := int(searchStart)        // 2
+    right := int(searchEnd) - 1     // 4
 
-for left <= right {
- mid := (left + right) / 2
- cmp := bytes.Compare(f.oidTable[mid][:], targetHash[:])
- if cmp == 0 {
-   return f.entries[mid].offset, true // Found it!
- } else if cmp < 0 {
-   left = mid + 1  // Target is in upper half
- } else {
-   right = mid - 1 // Target is in lower half
- }
-}
+    for left <= right {
+        mid := (left + right) / 2
+        cmp := bytes.Compare(f.oidTable[mid][:], targetHash[:])
+        if cmp == 0 {
+            return f.entries[mid].offset, true // Found it!
+        } else if cmp < 0 {
+            left = mid + 1  // Target is in upper half
+        } else {
+            right = mid - 1 // Target is in lower half
+        }
+    }
 
-return 0, false // Not found
+    return 0, false // Not found
 }
 ```
 
-<div>
 **70%** Search Space Reduced
 **1** Comparison Needed
 vs 10 Without Fanout
-</div>
 
 ---
 
-## ⚙️ Parsing the Index – Step by Step
+## Parsing the Index – Step by Step
 
 Let's parse the index file, explaining each step as we go:
 
-### 🔍 Step 1: Verify the File Header
+### Step 1: Verify the File Header
 
 ```go
 func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
-// Step 1: Verify this is actually a Git index file
-header := make([]byte, 8)
-ix.ReadAt(header, 0)
+    // Step 1: Verify this is actually a Git index file
+    header := make([]byte, 8)
+    ix.ReadAt(header, 0)
 
-// The magic bytes spell "ÿtOc" (0xff744f63) – Git's signature
-if !bytes.Equal(header[0:4], []byte{0xff, 0x74, 0x4f, 0x63}) {
- return nil, fmt.Errorf("not a Git pack index file")
-}
+    // The magic bytes spell "ÿtOc" (0xff744f63) – Git's signature
+    if !bytes.Equal(header[0:4], []byte{0xff, 0x74, 0x4f, 0x63}) {
+        return nil, fmt.Errorf("not a Git pack index file")
+    }
 
-// We only understand version 2 (the current standard)
-version := binary.BigEndian.Uint32(header[4:8])
-if version != 2 {
- return nil, fmt.Errorf("unsupported version %d", version)
-}
-…
+    // We only understand version 2 (the current standard)
+    version := binary.BigEndian.Uint32(header[4:8])
+    if version != 2 {
+        return nil, fmt.Errorf("unsupported version %d", version)
+    }
+    …
 }
 ```
 
-> **🛡️ Why these magic bytes?**
+> **Why these magic bytes?**
 > Git uses them as a safety check. If you accidentally try to parse a JPEG as a pack index, this check saves you immediately!
 
-### 📊 Step 2: Read the Fanout Table
+### Step 2: Read the Fanout Table
 
 ```go
 // Step 2: Read the fanout table
@@ -207,8 +205,8 @@ ix.ReadAt(fanoutData, 8)         // Right after the header
 
 // Convert from bytes to integers (Git uses big-endian)
 for i := 0; i < 256; i++ {
-offset := i * 4
-fanout[i] = binary.BigEndian.Uint32(fanoutData[offset : offset+4])
+    offset := i * 4
+    fanout[i] = binary.BigEndian.Uint32(fanoutData[offset : offset+4])
 }
 
 // The last fanout entry tells us the total object count!
@@ -216,11 +214,11 @@ objectCount := fanout[255]
 fmt.Printf("This pack contains %d objects\n", objectCount)
 ```
 
-> **🔢 Big-endian format:**
+> **Big-endian format:**
 > Git stores numbers in "big-endian" format (most significant byte first).
 > We need to convert this to our computer's native format.
 
-### 📍 Step 3: Calculate Section Positions
+### Step 3: Calculate Section Positions
 
 ```go
 // Step 3: Calculate where each section starts
@@ -229,7 +227,7 @@ crcTableStart    := hashTableStart + int64(objectCount*20)
 offsetTableStart := crcTableStart + int64(objectCount*4)
 ```
 
-### 🔗 Step 4: Read Object Hashes
+### Step 4: Read Object Hashes
 
 ```go
 // Step 4: Read all the hashes
@@ -239,14 +237,14 @@ ix.ReadAt(hashData, hashTableStart)
 
 // Split the continuous byte stream into individual hashes
 for i := uint32(0); i < objectCount; i++ {
-copy(hashes[i][:], hashData[i*20:(i+1)*20])
+    copy(hashes[i][:], hashData[i*20:(i+1)*20])
 }
 ```
 
-> **🔤 Why are the hashes stored sorted?**
+> **Why are the hashes stored sorted?**
 > This enables binary search! With a million objects, we can find any object in just 20 comparisons instead of potentially checking all million.
 
-### 🗂️ Step 5: Handle Large Packfiles (The 2 GB Challenge)
+### Step 5: Handle Large Packfiles (The 2 GB Challenge)
 
 ```go
 // Step 5: Read the offset table
@@ -257,76 +255,102 @@ ix.ReadAt(offsetData, offsetTableStart)
 var largeOffsetRefs []struct{ objIndex, largeIndex uint32 }
 
 for i := uint32(0); i < objectCount; i++ {
-offset32 := binary.BigEndian.Uint32(offsetData[i*4:(i+1)*4])
+    offset32 := binary.BigEndian.Uint32(offsetData[i*4:(i+1)*4])
 
-if offset32&0x80000000 == 0 {
- // Normal offset – use it directly
- entries[i].offset = uint64(offset32)
-} else {
- // MSB is set – this is a large offset reference
- largeIndex := offset32 & 0x7FFFFFFF
- largeOffsetRefs = append(largeOffsetRefs, struct {
-   objIndex, largeIndex uint32
- }{i, largeIndex})
-}
+    if offset32&0x80000000 == 0 {
+        // Normal offset – use it directly
+        entries[i].offset = uint64(offset32)
+    } else {
+        // MSB is set – this is a large offset reference
+        largeIndex := offset32 & 0x7FFFFFFF
+        largeOffsetRefs = append(largeOffsetRefs, struct {
+            objIndex, largeIndex uint32
+        }{i, largeIndex})
+    }
 }
 ```
 
-> **🧠 The clever trick:**
+> **The clever trick:**
 > If the most significant bit is 1, the remaining 31 bits aren't an offset – they're an index into a separate "large offset" table at the end of the file. This elegantly handles huge repositories!
 
 ---
 
-## 🔧 Putting It All Together
+## Putting It All Together
 
 ```go
 func Open(dir string) (*Store, error) {
-// Find all packfiles
-packPaths, _ := filepath.Glob(filepath.Join(dir, "*.pack"))
+    // Find all packfiles
+    packPaths, _ := filepath.Glob(filepath.Join(dir, "*.pack"))
 
-store := &Store{ index: make(map[Hash]ref) }
+    store := &Store{ index: make(map[Hash]ref) }
 
-for packID, packPath := range packPaths {
- // Memory-map both files for efficiency
- packFile, _ := mmap.Open(packPath)
- idxPath := strings.TrimSuffix(packPath, ".pack") + ".idx"
- idxFile, _ := mmap.Open(idxPath)
+    for packID, packPath := range packPaths {
+        // Memory-map both files for efficiency
+        packFile, _ := mmap.Open(packPath)
+        idxPath := strings.TrimSuffix(packPath, ".pack") + ".idx"
+        idxFile, _ := mmap.Open(idxPath)
 
- // Parse the index
- idx, _ := parseIdx(idxFile)
+        // Parse the index
+        idx, _ := parseIdx(idxFile)
 
- // Build our global object map
- for i, hash := range idx.oidTable {
-   store.index[hash] = ref{
-     packID: packID,
-     offset: idx.entries[i].offset,
-   }
- }
-}
+        // Build our global object map
+        for i, hash := range idx.oidTable {
+            store.index[hash] = ref{
+                packID: packID,
+                offset: idx.entries[i].offset,
+            }
+        }
+    }
 
-return store, nil
+    return store, nil
 }
 ```
 
 ---
 
-## 🧪 Testing Our Implementation
+## Git's Safety Net: CRC Checksums
+
+Remember those CRC-32 values we skipped over? Here's Git's clever integrity check:
+
+```go
+// Each object in the index has a CRC-32 checksum
+type idxEntry struct {
+    offset uint64
+    crc    uint32  // Git's safety net!
+}
+```
+
+When Git creates a pack, it calculates a CRC-32 checksum of the **compressed** object data. This means Git can verify objects haven't been corrupted without even decompressing them!
+
+```go
+// In parseIdx, we now build a map for O(1) CRC lookups
+crcByOffset := make(map[uint64]uint32, objCount)
+for i := range objCount {
+    crcByOffset[entries[i].offset] = entries[i].crc
+}
+```
+
+> **The "aha" moment:** Git stores checksums of the compressed data, not the original! This allows lightning-fast integrity checks without the CPU cost of decompression.
+
+---
+
+## Testing Our Implementation
 
 ```go
 func main() {
-store, _ := Open(".git/objects/pack")
+    store, _ := Open(".git/objects/pack")
 
-// Try to find a known object
-hash, _ := ParseHash("45dead0000000000000000000000000000000000")
-if ref, found := store.index[hash]; found {
- fmt.Printf("Found object in pack %d at offset %d\n", ref.packID, ref.offset)
-}
+    // Try to find a known object
+    hash, _ := ParseHash("45dead0000000000000000000000000000000000")
+    if ref, found := store.index[hash]; found {
+        fmt.Printf("Found object in pack %d at offset %d\n", ref.packID, ref.offset)
+    }
 }
 ```
 
 ---
 
-## 🧪 Try It Yourself!
+## Try It Yourself!
 
 ```bash
 # Create a test repository
@@ -348,51 +372,50 @@ git verify-pack -v .git/objects/pack/*.idx
 
 ## 🚀 Performance: Why This Design Is Brilliant
 
-<div>
 **10 M** Objects in Large Repo
 **23** Comparisons Without Fanout
 **15** Comparisons With Fanout
 **35 %** Improvement!
-</div>
 
-> **⚡ Memory efficiency:**
+> **Memory efficiency:**
 > Just 44 bytes per object (20 for hash + 4 for CRC + 4 for offset + overhead).
 > That's incredibly compact for such powerful functionality!
 
-### 📈 What We've Learned
+### What We've Learned
 
 - **The fanout table** dramatically reduces search space (like library section guides)
 - **Sorted hashes** enable efficient binary search within sections
 - **Memory mapping** avoids copying gigabytes of data
 - **Parallel arrays** keep related data together for cache efficiency
 - **Large offset handling** gracefully supports huge repositories
+- **CRC checksums** provide integrity without decompression overhead
 
 ---
 
-## 💾 Core Data Structures
+## Core Data Structures
 
 ```go
 // idxFile represents a parsed Git pack index file
 type idxFile struct {
-// The sorted list of all object hashes in this pack
-// Think of this as the library's sorted card catalog
-oidTable    []Hash
+    // The sorted list of all object hashes in this pack
+    // Think of this as the library's sorted card catalog
+    oidTable    []Hash
 
-// Parallel array containing the location of each object
-// If oidTable[5] is hash X, then entries[5] tells us where X lives
-entries     []idxEntry
+    // Parallel array containing the location of each object
+    // If oidTable[5] is hash X, then entries[5] tells us where X lives
+    entries     []idxEntry
 
-// The fanout table we just discussed – our search accelerator!
-fanout      [256]uint32
+    // The fanout table we just discussed – our search accelerator!
+    fanout      [256]uint32
 
-// For huge repositories (>2 GB packs), some offsets don't fit in 32 bits,
-// so we need this overflow table
-largeOffsets []uint64
+    // For huge repositories (>2 GB packs), some offsets don't fit in 32 bits,
+    // so we need this overflow table
+    largeOffsets []uint64
 }
 
 type idxEntry struct {
-offset uint64 // Where in the .pack file this object starts
-crc    uint32 // Checksum to verify the object isn't corrupted
+    offset uint64 // Where in the .pack file this object starts
+    crc    uint32 // Checksum to verify the object isn't corrupted
 }
 ```
 
@@ -416,5 +439,5 @@ In **Part 3**, we'll tackle Git's solution to this problem: the **multi-pack-ind
 
 After mastering MIDX files, **Part 4** will dive into the packfile format itself, where we'll decompress objects, handle Git's clever delta compression, and finally read the actual content we've been searching for.
 
-> **🎯 The journey continues!**
+> **The journey continues!**
 > We've built the foundation for finding objects. Next, we'll scale it up to handle the massive repositories that inspired this entire project.
