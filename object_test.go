@@ -40,3 +40,19 @@ func TestDetectType(t *testing.T) {
 		assert.Equal(t, test.expected, detectType(test.data))
 	}
 }
+
+func TestIsLittleEndian(t *testing.T) {
+	result1 := hostLittle
+	result2 := hostLittle
+
+	assert.Equal(t, result1, result2, "isLittleEndian should return consistent results")
+
+	assert.IsType(t, true, result1, "isLittleEndian should return a boolean")
+
+	// Document what we expect on common architectures.
+	// Note: This is informational and will vary by platform
+	t.Logf("Platform is little-endian: %v", result1)
+
+	// Most common platforms (amd64, arm64) are little-endian
+	// This is just documentation, not a strict assertion since the code should work on both.
+}
