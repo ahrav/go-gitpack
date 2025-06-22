@@ -385,6 +385,52 @@ $ strace -e openat git cat-file -p HEAD~1000:Makefile 2>&1 | grep pack | wc -l
 3    # Each pack opened exactly once!
 ```
 
+#### Breaking Down the Numbers
+
+Let's trace through what happens when Git resolves `HEAD~1000:Makefile` to understand this dramatic improvement:
+
+**Without Pack Cache (247 opens):**
+```bash
+# Git needs to find 3 objects: commit → tree → blob
+# Each subsystem searches independently through all packs
+
+# 1. Midx parser searches for commit object
+#    - Potentially checks pack-001.pack, pack-002.pack, ..., pack-127.pack
+#    - Finds commit in pack-045.pack
+
+# 2. Individual idx parser searches for tree object
+#    - Opens pack-001.pack, pack-002.pack, ..., pack-127.pack AGAIN
+#    - Finds tree in pack-078.pack
+
+# 3. Another subsystem searches for blob object
+#    - Opens pack-001.pack, pack-002.pack, ..., pack-127.pack AGAIN
+#    - Finds blob in pack-012.pack
+
+# Total: ~127 packs × ~2-3 subsystems ≈ 247 open() calls
+```
+
+**With Pack Cache (3 opens):**
+```bash
+# Midx tells us exactly which pack contains each object
+# Pack handles are shared across all subsystems
+
+# 1. First lookup (commit object)
+#    - Cache miss: Opens pack-045.pack
+#    - Finds commit, stores pack-045.pack handle in cache
+
+# 2. Second lookup (tree object)
+#    - Cache miss: Opens pack-078.pack
+#    - Finds tree, stores pack-078.pack handle in cache
+
+# 3. Third lookup (blob object)
+#    - Cache miss: Opens pack-012.pack
+#    - Finds blob, stores pack-012.pack handle in cache
+
+# Total: Only 3 open() calls for the 3 packs that actually contain our objects
+```
+
+The key insight: **the midx eliminates the search**, and **the cache eliminates redundant opens**. Instead of every subsystem independently searching through potentially all 127 packs, we make exactly one targeted open per pack that actually contains our data.
+
 ---
 
 ## The Complete Lookup Process
@@ -513,26 +559,6 @@ $ git maintenance run --task=incremental-repack
 # Verify midx contents
 $ git multi-pack-index verify
 ```
-
----
-
-## Performance Tips
-
-1. **Enable midx for large repositories**:
-   ```bash
-   git config core.multiPackIndex true
-   ```
-
-2. **Regular maintenance**:
-   ```bash
-   git maintenance start  # Enables automatic midx updates
-   ```
-
-3. **Monitor pack accumulation**:
-   ```bash
-   # When you have >50 packs, midx becomes crucial
-   ls .git/objects/pack/*.pack | wc -l
-   ```
 
 ---
 
