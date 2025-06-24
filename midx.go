@@ -23,6 +23,9 @@ type midxEntry struct {
 	// the specified pack file. The field is 64-bit to support packs
 	// that exceed 2 GiB.
 	offset uint64
+
+	// crc is the CRC-32 checksum of the object (0 if not available).
+	crc uint32
 }
 
 // midxFile represents one "multi-pack-index" (midx) file together with the
@@ -31,6 +34,9 @@ type midxEntry struct {
 // The struct is immutable after parseMidx returns and is safe for concurrent
 // readers – exactly like idxFile.
 type midxFile struct {
+	// version is the MIDX version (1 or 2).
+	version byte
+
 	// packReaders are mmap-handles for the N packfiles listed in PNAM order.
 	// len(packReaders) == len(packNames).
 	packReaders []*mmap.ReaderAt
@@ -51,6 +57,8 @@ const (
 	chunkOIDL = 0x4f49444c // 'OIDL' - object ID list
 	chunkOOFF = 0x4f4f4646 // 'OOFF' - object offsets
 	chunkLOFF = 0x4c4f4646 // 'LOFF' - large object offsets
+	chunkCRCS = 0x43524353 // 'CRCS' - CRC-32 checksums (v2)
+	chunkOSIZ = 0x4f53495a // 'OSIZ' - object sizes (v2)
 )
 
 // findObject performs the same two-stage lookup that idxFile.findObject does
@@ -80,7 +88,7 @@ func (m *midxFile) findObject(h Hash) (p *mmap.ReaderAt, off uint64, ok bool) {
 }
 
 // parseMidx reads the file mapped in mr and returns a fully‑populated
-// midxFile. Only version‑1 / SHA‑1 repositories are supported.
+// midxFile. Both version‑1 and version-2 / SHA‑1 repositories are supported.
 //
 // dir must be the "…/objects/pack" directory so that pack names from the
 // PNAM chunk can be mmap'ed right away.
@@ -88,7 +96,7 @@ func (m *midxFile) findObject(h Hash) (p *mmap.ReaderAt, off uint64, ok bool) {
 // Note: midx v1 is the current format (different from pack index v2)
 // midx files have their own versioning scheme starting at 1
 func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderAt) (*midxFile, error) {
-	// Header.
+	// === HEADER SECTION ===
 	var hdr [12]byte
 	if _, err := mr.ReadAt(hdr[:], 0); err != nil {
 		return nil, err
@@ -96,8 +104,10 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 	if !bytes.Equal(hdr[0:4], []byte("MIDX")) {
 		return nil, fmt.Errorf("not a MIDX file")
 	}
-	if hdr[4] != 1 /* version */ {
-		return nil, fmt.Errorf("unsupported midx version %d", hdr[4])
+
+	version := hdr[4]
+	if version != 1 && version != 2 {
+		return nil, fmt.Errorf("unsupported midx version %d", version)
 	}
 	if hdr[5] != 1 /* SHA‑1 */ {
 		return nil, fmt.Errorf("only SHA‑1 midx supported")
@@ -106,7 +116,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 	chunks := int(hdr[6])
 	packCount := int(binary.BigEndian.Uint32(hdr[8:12]))
 
-	// Chunk table.
+	// === CHUNK TABLE SECTION ===
 	type cdesc struct {
 		id  [4]byte
 		off uint64
@@ -136,7 +146,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		return 0, 0, fmt.Errorf("chunk %08x not found", id)
 	}
 
-	// PNAM.
+	// === PNAM SECTION ===
 	pnOff, pnSize, err := findChunk(chunkPNAM)
 	if err != nil {
 		return nil, err
@@ -189,7 +199,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		packCache[p] = r
 	}
 
-	// OIDF.
+	// === OIDF SECTION ===
 	fanOff, _, err := findChunk(chunkOIDF)
 	if err != nil {
 		return nil, err
@@ -205,7 +215,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 	}
 	objCount := fanout[255]
 
-	// OIDL.
+	// === OIDL SECTION ===
 	oidOff, _, err := findChunk(chunkOIDL)
 	if err != nil {
 		return nil, err
@@ -216,7 +226,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		return nil, err
 	}
 
-	// OOFF / LOFF.
+	// === OOFF SECTION ===
 	offOff, _, err := findChunk(chunkOOFF)
 	if err != nil {
 		return nil, err
@@ -226,7 +236,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		return nil, err
 	}
 
-	// LOFF is optional.
+	// === LOFF SECTION (optional) ===
 	loffOff, loffSize, _ := findChunk(chunkLOFF) // ignore "not found" error
 	var loff []uint64
 	if loffSize > 0 {
@@ -239,8 +249,32 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		}
 	}
 
-	entries := make([]midxEntry, objCount)
+	// === V2-SPECIFIC CHUNKS ===
+	var crcs []uint32
+	if version >= 2 {
+		// Try to find and parse CRCS chunk.
+		crcsOff, crcsSize, err := findChunk(chunkCRCS)
+		if err == nil {
+			expectedSize := int64(objCount * 4)
+			if crcsSize != expectedSize {
+				return nil, fmt.Errorf("CRCS chunk size mismatch: got %d, want %d",
+					crcsSize, expectedSize)
+			}
 
+			crcData := make([]byte, crcsSize)
+			if _, err = mr.ReadAt(crcData, crcsOff); err != nil {
+				return nil, fmt.Errorf("failed to read CRCS chunk: %w", err)
+			}
+
+			crcs = make([]uint32, objCount)
+			for i := range objCount {
+				crcs[i] = binary.BigEndian.Uint32(crcData[i*4:])
+			}
+		}
+	}
+
+	// === BUILD ENTRIES WITH CRC SUPPORT ===
+	entries := make([]midxEntry, objCount)
 	for i := range objCount {
 		packID := binary.BigEndian.Uint32(offRaw[i*8 : i*8+4])
 		rawOff := binary.BigEndian.Uint32(offRaw[i*8+4 : i*8+8])
@@ -255,10 +289,22 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 			}
 			off64 = loff[idx]
 		}
-		entries[i] = midxEntry{packID, off64}
+
+		// Include CRC from v2 data if available.
+		crc := uint32(0)
+		if int(i) < len(crcs) {
+			crc = crcs[i]
+		}
+
+		entries[i] = midxEntry{
+			packID: packID,
+			offset: off64,
+			crc:    crc,
+		}
 	}
 
 	return &midxFile{
+		version:     version,
 		packReaders: packs,
 		packNames:   packNames,
 		fanout:      fanout,

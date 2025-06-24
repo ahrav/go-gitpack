@@ -35,6 +35,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -74,12 +75,23 @@ const (
 )
 
 // Store provides concurrent, read-only access to one or more memory-mapped
-// Git packfiles.
+// Git packfiles with support for multi-pack-index (MIDX) files.
 //
 // A Store maps every *.pack / *.idx pair found in a directory, maintains an
 // in-memory index from object ID to pack offset, inflates objects on demand,
 // and resolves delta chains up to maxDeltaDepth. All methods are safe for
 // concurrent use by multiple goroutines.
+//
+// CRC Verification:
+// When VerifyCRC is enabled, the Store validates CRC-32 checksums for each
+// object read. For objects in regular packs with .idx files, CRCs are always
+// available. For objects that only appear in a multi-pack-index:
+//   - MIDX v1: CRC verification is silently skipped (no CRC data available)
+//   - MIDX v2: CRCs are read from the CRCS chunk and verified
+//
+// Note: Pack trailer checksums can be verified by calling verifyPackTrailers()
+// after opening the Store if additional integrity checking is required.
+
 type Store struct {
 	// packs contains one immutable idxFile per mapped pack.
 	packs []*idxFile
@@ -333,13 +345,14 @@ func (s *Store) inflateFromPack(
 	switch objType {
 	case ObjBlob, ObjCommit, ObjTree, ObjTag:
 		if s.VerifyCRC {
-			for _, pf := range s.packs {
-				if pf.pack == p {
-					if err := verifyCRC32(pf, off, pf.entriesByOff[off].crc); err != nil {
-						return nil, ObjBad, err
-					}
-					break
+			crc, found := s.findCRCForObject(p, off, oid)
+			if found {
+				if err := s.verifyCRCForPackObject(p, off, crc); err != nil {
+					return nil, ObjBad, err
 				}
+			} else if s.midx != nil && s.midx.version >= 2 {
+				// For MIDX v2, we should have CRCs available.
+				return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", oid)
 			}
 		}
 		s.cache.Add(oid, data)
@@ -659,4 +672,113 @@ func decodeVarInt(buf []byte) (uint64, int) {
 	}
 
 	return res, i
+}
+
+// VerifyPackTrailers validates the SHA-1 trailer that closes every mapped
+// packfile.
+//
+// A Git pack ends with a 20-byte checksum that covers all preceding bytes.
+// VerifyPackTrailers re-computes that checksum for each unique *.pack mapping
+// and returns an error if any mismatch is found.
+//
+// The method is a no-op unless the caller has enabled Store.VerifyCRC.
+// It is safe for concurrent use; all work is performed on local variables and
+// no shared state in *Store is mutated.
+// Repeated invocations are cheap—the same mmap handle is processed only once
+// during a single call.
+func (s *Store) VerifyPackTrailers() error {
+	if !s.VerifyCRC {
+		return nil
+	}
+
+	verified := make(map[*mmap.ReaderAt]bool)
+
+	for _, pf := range s.packs {
+		if pf.pack == nil || verified[pf.pack] {
+			continue
+		}
+
+		// verifyPackTrailer performs the actual SHA-1 calculation.
+		if err := verifyPackTrailer(pf.pack); err != nil {
+			return fmt.Errorf("pack %p: %w", pf.pack, err)
+		}
+		verified[pf.pack] = true
+	}
+
+	return nil
+}
+
+// (s *Store) findCRCForObject returns the CRC-32 checksum Git recorded for
+// the object identified by oid.
+//
+// It looks for the checksum in the per-pack *.idx files first and, if it
+// fails to locate it there, falls back to the multi-pack-index (MIDX) when
+// one is present and of version ≥ 2 (the first version that stores CRCs).
+//
+// The bool result reports whether a checksum was found.
+// The method is read-only, safe for concurrent use, and does not depend on
+// Store.VerifyCRC—that flag merely controls whether the caller decides to
+// invoke this helper.
+func (s *Store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32, bool) {
+	for _, pf := range s.packs {
+		if pf.pack == p && pf.entriesByOff != nil {
+			if entry, ok := pf.entriesByOff[off]; ok {
+				return entry.crc, true
+			}
+		}
+	}
+
+	if s.midx != nil && s.midx.version >= 2 {
+		first := oid[0]
+		start := uint32(0)
+		if first > 0 {
+			start = s.midx.fanout[first-1]
+		}
+		end := s.midx.fanout[first]
+
+		rel, hit := slices.BinarySearchFunc(
+			s.midx.objectIDs[start:end],
+			oid,
+			func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
+		)
+		if hit {
+			abs := int(start) + rel
+			entry := s.midx.entries[abs]
+			if entry.crc != 0 {
+				return entry.crc, true
+			}
+		}
+	}
+
+	return 0, false
+}
+
+// (s *Store) verifyCRCForPackObject validates the CRC-32 checksum of the
+// object that starts at byte offset off inside the memory-mapped pack p.
+//
+// The helper locates the corresponding idxFile in s.packs and delegates the
+// actual comparison to verifyCRC32.
+//
+// A pack that is referenced exclusively through a MIDX has no on-disk *.idx
+// file; in that case a minimal idxFile stub is built on the fly so that CRC
+// verification still works.
+//
+// An error is returned when either the pack cannot be located or the checksum
+// does not match.
+func (s *Store) verifyCRCForPackObject(p *mmap.ReaderAt, off uint64, crc uint32) error {
+	for _, pf := range s.packs {
+		if pf.pack == p {
+			if pf.sortedOffsets == nil {
+				// This is a stub idxFile from MIDX.
+				// We need to build minimal structures for CRC verification.
+				pf.sortedOffsets = []uint64{off}
+				pf.entriesByOff = map[uint64]idxEntry{
+					off: {offset: off, crc: crc},
+				}
+			}
+			return verifyCRC32(pf, off, crc)
+		}
+	}
+
+	return fmt.Errorf("pack not found for CRC verification")
 }
