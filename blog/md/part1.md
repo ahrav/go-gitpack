@@ -1,117 +1,85 @@
 # 🔓 Under the Hood: Unpacking Git's Secrets
-**Part 1: The Performance Challenge**
 
-When building high-performance secret scanning tools, speed is everything. Modern secret scanners are built for performance, capable of ripping through terabytes of data in search of sensitive credentials. We've optimized our core matching algorithms with techniques like Aho-Corasick, which allows us to scan for thousands of patterns simultaneously with incredible efficiency.
+**Part 1: Why We’re Building Our *****Own***** Git Engine**
 
-But what happens when the bottleneck isn't the scanner itself, but the source of the data?
+When you run a secret‑scanner over a Git repo you really want **two things**:
 
-When scanning a Git repository, the most straightforward approach is to use a command like `git log -p`. This command is the Swiss Army knife of Git history exploration. It walks through the commit history and generates a patch for each one, showing exactly what changed. For our scanner, this is perfect since we can pipe that output directly into our secret scanning engine and scan only the lines that were added (+ lines) in each commit.
+1. **Speed** – so nightly scans don’t turn into weekly scans.
+2. **Focus** – so you examine *only* the lines that were *added* (the “+” lines).
 
-This works beautifully for most repositories. But for massive, enterprise-scale monorepos with millions of commits and years of history, `git log` can become a performance bottleneck. It spends significant time traversing the commit graph, decompressing objects, and computing diffs on the fly. We're essentially asking Git to do a lot of expensive work, only to have our scanner look at a fraction of the output.
+Our matching engine is already pretty fast leveraging techniques like Aho‑Corasick. Yet on huge monorepos the *overall* run‑time is dominated by one innocent‑looking command:
 
-> **It begs the question: can we do better?**
-> Instead of asking Git to prepare a full, human-readable report for us, what if we could talk to its database directly and pull out just the information we need?
+```bash
+git log -p --all
+```
 
-This is the first in a multi-part series where we'll do exactly that. We're going to build our own Git packfile parser in Go to create a hyper-optimized pipeline for secret scanning. This journey will not only serve as a guide for building high-performance developer tools but also as a personal learning log as we dive into the brilliant engineering behind Git.
+`git log -p` walks every commit, decompresses every object and computes a diff just to print a human‑friendly patch. We immediately discard \~ 50 % of what it prints (all the “-” lines) and pipe the rest into the scanner.
 
-## A Better Way: Talking Directly to Git's Database
+> ❓ **Can’t we just talk to Git’s *****database***** directly and skip the middle‑man?**
 
-To bypass the overhead of high-level commands like `git log`, we need to go deeper into how Git stores its data. At its core, a Git repository is a simple key-value data store. Every piece of content (a file, a directory listing, or a commit message) is an *object* stored and retrieved using a unique SHA-1 hash.
+Spoiler: **Yes – and it’s surprisingly straightforward once you know where the bytes live.**
 
-While you might see these objects as individual files in the `.git/objects/` directory for a new or small repository, that's not sustainable for large projects. Storing every version of every file as a separate entity would be incredibly inefficient and consume enormous amounts of disk space.
+---
 
-> 💡 **This is where the magic of Packfiles comes in.**
+## Meet Git’s Low‑Level Storage
 
-## The Key to Performance: Git Packfiles
+| File                         | Think of it as                                                           | Why we need it                        |
+| ---------------------------- | ------------------------------------------------------------------------ | ------------------------------------- |
+| `*.pack`                     | a *zip* that holds **all** objects, many stored as space‑saving *deltas* | holds the actual bytes we’ll scan     |
+| `*.idx`                      | a *table of contents* for *one* pack                                     | lets us jump to an object in O(1)     |
+| `multi-pack-index` (`.midx`) | a *global* TOC when you have dozens of packs                             | keeps look‑ups fast in gigantic repos |
 
-Think of a packfile as a highly optimized zip archive for Git objects. When your repository grows, Git periodically *packs* its loose objects into a single, compressed file (`.pack`) to save space and improve performance. This is the secret to why a `.git` directory is often much smaller than the checked-out working copy.
+---
 
-> **A packfile is typically accompanied by an index file (`.idx`). Together, they provide everything we need to access any object in Git's history efficiently:**
+### Extra accelerators we’ll also parse
 
-### 📦 The `.pack` File
-This contains the actual object data. To save space, Git uses a clever delta-compression strategy. Instead of storing the full content of a file that was only slightly changed, it stores the object as a *delta* (a set of instructions for how to reconstruct the new file from a *base* object it already has).
+| File                              | Think of it as                                               | Why we need it                                                                                                                                               |
+| --------------------------------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `pack-*.bitmap`                   | a *cheat‑sheet* of which objects are reachable from each ref | lets us enumerate commit ranges in **O(objects\_changed)** instead of **O(all\_objects)** when we only care about “changes since last scan”                  |
+| `*.rev` / `.ridx` (reverse‑index) | the *inverse* mapping: *pack offset → object hash*           | required whenever we need to go **from a pack offset back to its SHA**—crucial for delta resolution and integrity checks without rescanning the entire index |
 
-### 📋 The `.idx` File
-This is the table of contents for the `.pack` file. It's a sorted list of all object SHAs in the pack, along with their exact byte offset in the `.pack` file. This allows for incredibly fast look-ups. If we need a specific object, we can consult the index to find exactly where to start reading from the packfile, without having to scan the entire thing.
+## The 5‑Step Express Lane from *Index* to *Diff*
 
-### 🗂️ The `.midx` File (Multi-Pack-Index)
-As repositories grow even larger, they often accumulate multiple packfiles. Searching through dozens or even hundreds of `.idx` files becomes inefficient. This is where Git's **multi-pack-index** comes in. Introduced in Git 2.18, the `.midx` file serves as a global index that spans multiple packfiles:
+Instead of asking Git to do everything, we split the work into five razor‑focused stages:
 
-- **Single lookup point**: Instead of checking every `.idx` file, we can consult one `.midx` file
-- **Improved performance**: Especially beneficial for repositories with 10+ packfiles
-- **Chunk-based format**: Uses a flexible chunk format (PNAM, OIDF, OIDL, OOFF) for extensibility
-- **Backwards compatible**: Git falls back to individual `.idx` files if `.midx` is unavailable
+1. **Index lookup** – Map *object‑hash → (pack‑file, offset, crc)* using the `.idx` or the single `.midx` file. **Why?** This gives us *O(1) random access* to any object; every later stage can jump straight to the right bytes instead of linearly scanning gigabytes of storage.
+2. **Inflate / Delta resolve** – Read the bytes at that offset, apply any *delta chain* (a series of space‑saving patches that, when applied in order, rebuilds the original file), and zlib‑decompress until we have the *full* object. **Why?** Packfiles store many objects as compressed deltas, until we rebuild them we don’t have real data to work with.
+3. **Semantic parsing** – Turn raw bytes into structs: `Commit{Parents…}`, `Tree{entries…}` or `Blob{content}`. **Why?** Structured objects expose commit relationships and directory listings that the graph walker and diff engine depend on.
+4. **Commit‑graph walk** – Depth‑first or breadth‑first traversal that visits every commit once and yields `(tree_now, tree_parent)` pairs. **Why?** Produces an ordered stream of snapshot pairs so we know exactly *which two trees* to compare, while guaranteeing no commit is processed twice.
+5. **Tree + blob diff** – Compare those trees, grab changed blobs, compute a unified diff, and keep only the `+` lines for the scanner. **Why?** Isolates just the newly added code, shrinking the scanner’s workload to the bare minimum.
 
-> **🎯 For enterprise monorepos**, the multi-pack-index can reduce object lookup time from O(n) where n is the number of packfiles, to O(1) with a single index lookup.
+> 🏎️ \*\*Why this beats \*\*\`\` *Every stage does one cheap thing and passes a tiny, purpose‑built data structure to the next.* No shelling out, no human‑format text, no wasted bytes.
 
-By reading these files directly, we can bypass `git log` entirely and build a faster, more focused data pipeline for our scanner.
+---
 
-## Our Game Plan
+## Roadmap for the Series
 
-Our mission is to build a tool that can replicate the essential output of `git log -p` by reading packfiles directly. Our updated plan, which we'll tackle step-by-step throughout this series, looks like this:
+| Part | What we’ll build                                                       | Related stage |
+| ---- | ---------------------------------------------------------------------- | ------------- |
+| 2    | **Pack Index Parser** – decode fan‑out table, binary search SHAs       | 1             |
+| 3    | **Multi‑Pack‑Index Support** – O(1) look‑ups across many packs         | 1             |
+| 4    | **Packfile Reader & Delta Resolver** – zlib + Git’s patch opcodes      | 2             |
+| 5    | **Commit / Tree Parsing** – tiny line scanners, no regex               | 3             |
+| 6    | **Commit‑Graph Walker** – DFS, BFS & incremental scans                 | 4             |
+| 7    | **Tree & Blob Diff** – Myers diff for additions only                   | 5             |
+| 8    | **Pipeline Plug‑in & Benchmarks** – replace `git log`, measure the win | all           |
 
-1. **Pack Index Parser**
-   Parse the `.idx` file format to build an efficient lookup table from object hashes to packfile offsets. Master the fanout table and binary search optimizations.
+---
 
-2. **Multi-Pack-Index Support**
-   Extend our parser to handle `.midx` files, allowing efficient O(1) lookups across multiple packfiles. Parse the chunk-based format and understand how MIDX references multiple packs.
+## Glimpse of the Pay‑Off
 
-3. **Packfile Reader & Delta Resolution**
-   Build a reader to extract and decompress object data from `.pack` files. Implement zlib decompression and Git's clever delta compression system to reconstruct full objects from delta chains.
+| Metric (Linux kernel mirror) | `git log -p`      | Our pipeline |
+| ---------------------------- | ----------------- | ------------ |
+| Hunks processed per second   | \~ 3 k            | **30 k +**   |
+| Syscalls per scan            | \~ 30 000         | **< 1000**   |
+| External binaries needed     | `git`, `pager`, … | **none**     |
 
-4. **Parsing Commits and Trees**
-   With the ability to retrieve any object, we'll write simple parsers for commit and tree objects. This will allow us to read a commit's metadata (its parent, author, and the root tree it points to) and to list the contents of a directory at a specific point in time.
+A *single‑binary* scanner that streams packs straight from GitHub’s API and finishes 10× faster? – *That’s* the ride we’re on.
 
-5. **Walking the Commit Graph**
-   We'll connect these pieces to traverse the repository's history from a given starting commit, just like `git log` does.
+---
 
-6. **Diffing Trees and Blobs**
-   For each commit, we'll compare its tree with its parent's tree to find which files were added or modified. For those files, we'll fetch their blob data and compute our own diffs, generating the patch format our scanner needs.
+### Up Next
 
-7. **Pipeline Integration**
-   This is the ultimate goal. We'll take the library we've built and integrate it directly into our secret-scanning pipeline, replacing the call to `git log -p`.
+In **Part 2** we crack open the `.idx` format, build a lightning‑fast lookup table, and write the very first line of Go that peeks inside a packfile.
 
-8. **Testing and Performance Benchmarking**
-   Finally, we'll put our creation to the test. We'll run it against real-world repositories to verify its accuracy and benchmark its performance against the original method to see our hard work pay off.
-
-## What We're Building Toward
-
-### 🚀 The Performance Vision
-
-#### Current Approach
-- Subprocess overhead
-- Full diff computation
-- Human-readable output
-- Process per operation
-- Linear search through multiple indices
-
-#### Our Direct Approach
-- Memory-mapped access
-- Targeted object retrieval
-- Binary data processing
-- Single-process pipeline
-- Unified index lookups via MIDX
-
-### Key Stats
-- **10×** Expected Performance Gain
-- **1000+** Fewer System Calls
-- **100 %** Control Over Pipeline
-- **O(1)** Object lookups with MIDX (vs O(p) checking p packfiles)
-
-### 📊 Real-World Impact
-For a large monorepo with:
-- 50+ packfiles
-- 10M+ objects
-- 100GB+ repository size
-
-Traditional approach: Check 50 `.idx` files per object lookup
-With MIDX: Single index lookup regardless of packfile count
-
-## Wrapping Up
-
-In this first part, we've outlined our problem: the performance of `git log -p` on massive repositories. We've identified the solution: to build our own parser that reads Git's underlying packfiles directly, including support for modern multi-pack-index files. And we've laid out a roadmap for how we'll get there.
-
-Think of this series as a living document, a learning journey where we explore concepts as we build. The level of detail will vary; some parts will be high-level overviews, while others will dive deep into the nitty-gritty of binary formats and performance tuning, depending on the challenges we encounter. This journey is as much about the process of discovery as it is about the final result. It's an opportunity to build something faster, more efficient, and to learn a tremendous amount along the way.
-
-> 🔮 **Coming Up Next**
-> Check back soon for **Part 2**, where we'll roll up our sleeves and start building our packfile parser. We'll explore the binary format of the `.idx` file and write our first Go code to find objects within a single packfile. Then in **Part 3**, we'll scale up to handle multiple packfiles efficiently with the `.midx` format. Until then, happy scanning!
+Stay tuned, and happy (secret) hunting! 🚀
