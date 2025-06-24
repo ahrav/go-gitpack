@@ -392,6 +392,16 @@ func (s *Store) inflateFromPack(
 	}
 }
 
+// inflateSection returns a stream of the uncompressed object bytes that start
+// at off, have compressed length n, and live inside the mmap-ed pack r.
+func inflateSection(r *mmap.ReaderAt, off, n int64) (io.ReadCloser, error) {
+	if n <= 0 {
+		return nil, errors.New("invalid compressed length")
+	}
+	src := io.NewSectionReader(r, off, n)
+	return zlib.NewReader(src) // caller must Close
+}
+
 // readRawObject inflates the object that starts at off in the given
 // memory-mapped packfile.
 //
@@ -475,9 +485,12 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 		return objType, buf.Bytes(), nil
 	}
 
-	// TODO: For large objects, use streaming.
-	src := io.NewSectionReader(r, int64(off)+int64(headerLen), int64(size)+1024)
-	zr, err := zlib.NewReader(src)
+	// For large objects, use streaming.
+	zr, err := inflateSection(
+		r,
+		int64(off)+int64(headerLen),
+		int64(size)+1024,
+	)
 	if err != nil {
 		return ObjBad, nil, err
 	}
