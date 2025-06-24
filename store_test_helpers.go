@@ -6,9 +6,11 @@ import (
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -90,7 +92,7 @@ func createValidIdxData(t *testing.T, hashes []Hash, offsets []uint64) []byte {
 		buf.Write(hash[:])
 	}
 
-	// CRC32s (dummy values).
+	// CRC32s (dummy values for createValidIdxData - pack file may not exist).
 	for range sortedHashes {
 		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
 	}
@@ -323,9 +325,36 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		buf.Write(h[:])
 	}
 
-	// Write CRC32s (dummy values).
-	for range sortedHashes {
-		binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
+	// Write CRC32s (compute actual values from pack data).
+	packPath := strings.TrimSuffix(path, ".idx") + ".pack"
+	packData, err := os.ReadFile(packPath)
+	if err != nil {
+		// Fallback to dummy values if pack file can't be read.
+		for range sortedHashes {
+			binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
+		}
+	} else {
+		for _, offset := range sortedOffsets {
+			// Find the object end to determine compressed data length.
+			var objEnd uint64
+			objEnd = uint64(len(packData) - 20) // default to pack trailer start.
+			for _, nextOffset := range sortedOffsets {
+				if nextOffset > offset && nextOffset < objEnd {
+					objEnd = nextOffset
+				}
+			}
+
+			// Calculate CRC of the entire object data (INCLUDING header).
+			// This matches what verifyCRC32 does: from objOff to objEnd.
+			if offset < objEnd && objEnd <= uint64(len(packData)) {
+				objectData := packData[offset:objEnd]
+				crc := crc32.ChecksumIEEE(objectData)
+				binary.Write(&buf, binary.BigEndian, crc)
+			} else {
+				// Fallback to dummy value if we can't calculate.
+				binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
+			}
+		}
 	}
 
 	// Write offsets - handle both regular and large offsets.
