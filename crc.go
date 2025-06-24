@@ -1,18 +1,25 @@
 package objstore
 
 import (
+	"bytes"
+	"crypto/sha1"
 	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
 	"sort"
+
+	"golang.org/x/exp/mmap"
 )
 
 var (
-	ErrNonMonotonicOffsets = errors.New("idx corrupt: non‑monotonic offsets")
+	ErrNonMonotonicOffsets     = errors.New("idx corrupt: non‑monotonic offsets")
+	ErrObjectExceedsPackBounds = errors.New("object extends past pack trailer")
+	ErrPackTrailerCorrupt      = errors.New("pack trailer checksum mismatch")
 )
 
-// verifyCRC32 validates the CRC-32 checksum of a packed object.
+// verifyCRC32 validates the CRC-32 checksum of a packed object with additional
+// integrity checks for pack boundaries.
 //
 // verifyCRC32 streams the *packed* (still-compressed) byte sequence that
 // starts at objOff inside pf.pack into a CRC-32 hash and compares the result
@@ -28,6 +35,8 @@ var (
 //     error that mentions the missing offset.
 //   - ErrNonMonotonicOffsets is returned when the calculated end precedes or
 //     equals objOff, indicating a corrupt index.
+//   - ErrObjectExceedsPackBounds is returned when an object extends into or
+//     past the pack trailer.
 //   - I/O failures from the underlying mmap.ReaderAt are propagated
 //     unchanged.
 //   - A checksum mismatch yields a descriptive error that includes both the
@@ -42,12 +51,21 @@ func verifyCRC32(pf *idxFile, objOff uint64, want uint32) error {
 	}
 
 	// The object ends where the next one begins, or at the pack trailer.
+	packSize := uint64(pf.pack.Len())
+	trailerStart := packSize - hashSize
+
 	var objEnd uint64
 	if idx+1 < len(pf.sortedOffsets) {
 		objEnd = pf.sortedOffsets[idx+1]
 	} else {
-		objEnd = uint64(pf.pack.Len()) - hashSize // exclude SHA-1 pack checksum trailer
+		objEnd = trailerStart
 	}
+
+	// Edge case: ensure object doesn't extend into or past trailer.
+	if objEnd > trailerStart {
+		return ErrObjectExceedsPackBounds
+	}
+
 	if objEnd <= objOff {
 		return ErrNonMonotonicOffsets
 	}
@@ -61,5 +79,34 @@ func verifyCRC32(pf *idxFile, objOff uint64, want uint32) error {
 	if got := h.Sum32(); got != want {
 		return fmt.Errorf("crc mismatch @%d: got %08x want %08x", objOff, got, want)
 	}
+	return nil
+}
+
+// verifyPackTrailer validates the SHA-1 checksum at the end of a pack file.
+// This should be called once per pack to ensure the trailer hasn't been corrupted.
+func verifyPackTrailer(pack *mmap.ReaderAt) error {
+	size := pack.Len()
+	if size < hashSize {
+		return fmt.Errorf("pack too small for trailer")
+	}
+
+	// Read the trailer checksum.
+	trailer := make([]byte, hashSize)
+	if _, err := pack.ReadAt(trailer, int64(size-hashSize)); err != nil {
+		return fmt.Errorf("failed to read pack trailer: %w", err)
+	}
+
+	// Compute checksum over entire pack except the trailer itself.
+	h := sha1.New()
+	sec := io.NewSectionReader(pack, 0, int64(size-hashSize))
+	if _, err := io.Copy(h, sec); err != nil {
+		return fmt.Errorf("failed to checksum pack: %w", err)
+	}
+
+	computed := h.Sum(nil)
+	if !bytes.Equal(computed, trailer) {
+		return ErrPackTrailerCorrupt
+	}
+
 	return nil
 }
