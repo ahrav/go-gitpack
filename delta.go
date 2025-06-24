@@ -5,12 +5,6 @@ import (
 	"unsafe"
 )
 
-// copyMemory is a fast memory copy using memmove
-//
-//go:linkname copyMemory runtime.memmove
-//go:noescape
-func copyMemory(to, from unsafe.Pointer, n int)
-
 // deltaContext carries per-lookup state while resolving delta chains.
 //
 // A single deltaContext is threaded through the recursive resolution
