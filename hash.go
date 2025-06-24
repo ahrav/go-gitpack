@@ -3,7 +3,6 @@ package objstore
 import (
 	"encoding/hex"
 	"fmt"
-	"unsafe"
 )
 
 // Hash represents a raw Git object identifier.
@@ -33,16 +32,3 @@ func ParseHash(s string) (Hash, error) {
 	copy(h[:], b)
 	return h, nil
 }
-
-// Uint64 returns the first eight bytes of h as an implementation-native
-// uint64.
-//
-// The value is taken verbatim from the underlying byte slice; no byte-order
-// conversion is performed.
-// The conversion is implemented via an unsafe cast which is safe because
-// Hash' backing array is 20 bytes and therefore long-word aligned on every
-// platform that Go supports.
-// The numeric representation is only meant for in-memory shortcuts such as
-// hash-table look-ups and must not be persisted or used as a portable
-// identifier.
-func (h Hash) Uint64() uint64 { return *(*uint64)(unsafe.Pointer(&h[0])) }
