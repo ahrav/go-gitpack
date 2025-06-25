@@ -91,7 +91,6 @@ const (
 //
 // Note: Pack trailer checksums can be verified by calling verifyPackTrailers()
 // after opening the Store if additional integrity checking is required.
-
 type Store struct {
 	// packs contains one immutable idxFile per mapped pack.
 	packs []*idxFile
@@ -108,6 +107,9 @@ type Store struct {
 	// cache holds fully-inflated objects. It uses an Adaptive Replacement
 	// Cache (ARC) that balances recency and frequency for high hit rates.
 	cache *arc.ARCCache[Hash, []byte]
+
+	// dw is a short-lived object window (32 MiB) for delta chain optimization.
+	dw *deltaWindow
 
 	// maxDeltaDepth limits how many recursive delta hops Get will follow
 	// before aborting the lookup.
@@ -206,13 +208,19 @@ func Open(dir string) (*Store, error) {
 		packCache[p] = h
 	}
 
+	dw, err := newDeltaWindow()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create delta window: %w", err)
+	}
+
 	store := &Store{
 		maxDeltaDepth: defaultMaxDeltaDepth,
 		midx:          midx,
 		packMap:       packCache,
+		dw:            dw,
 	}
 
-	const defaultCacheSize = 1 << 14 // 16 KiB ARC—enough for >95 % hit-rate on typical workloads.
+	const defaultCacheSize = 1 << 14 // 16K entries ~ 96MiB
 	store.cache, err = arc.NewARC[Hash, []byte](defaultCacheSize)
 	if err != nil {
 		// This should not happen with a positive default size, but it is
@@ -239,6 +247,14 @@ func Open(dir string) (*Store, error) {
 		f.pack = handle
 		f.idx = ix
 		store.packs = append(store.packs, f)
+
+		if f.sortedOffsets != nil {
+			f.ridx, err = loadReverseIndex(path, f)
+			if err != nil {
+				_ = ix.Close()
+				return nil, fmt.Errorf("load ridx: %w", err)
+			}
+		}
 	}
 
 	return store, nil
@@ -292,23 +308,71 @@ func (s *Store) Close() error {
 	return firstErr
 }
 
-// Get returns decompressed, fully resolved bytes and object type.
+// Get returns the fully materialized Git object identified by oid together
+// with its on-disk ObjectType.
 //
-// Get looks up the object identified by oid, resolves and applies any delta
-// chain, and returns the fully inflated object together with its ObjectType.
+// The method first consults two in-memory caches:
+//  1. a very small, hot-object “delta window”, and
+//  2. an Adaptive-Replacement Cache (ARC) that balances recency and
+//     frequency.
 //
-// A small, size-bounded in-memory cache avoids redundant decompression.
+// A hit in either cache avoids the cost of decompression.
 //
-// When VerifyCRC is true, the method additionally validates the CRC-32 that
-// Git stores in the ".idx" entry and returns an error on mismatch.
+// On a miss, Get inflates the object from the underlying packfile.
+// If the object is stored as a delta, the method follows the delta chain—
+// capped by Store.maxDeltaDepth—until it reaches the base object, then
+// applies each delta in order to reconstruct the full byte stream.
 //
-// The returned byte slice is a copy; callers may modify it freely.
+// When Store.VerifyCRC is true, Get validates the CRC-32 checksum recorded
+// in the corresponding *.idx file (or multi-pack-index v2) and returns an
+// error on mismatch.
+//
+// The returned slice is always a fresh allocation; callers may mutate it at
+// will.
+// Get is safe for concurrent use by multiple goroutines.
 func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
+	// Fast path: check the tiny “delta window” that holds the most recently
+	// materialized objects, which are likely to be referenced by upcoming
+	// deltas.
+	if b, ok := s.dw.lookup(oid); ok {
+		return b, detectType(b), nil
+	}
+
+	// Second-level lookup in the larger ARC cache.
+	if b, ok := s.cache.Get(oid); ok {
+		return b, detectType(b), nil
+	}
+
+	// Cache miss – inflate from pack while tracking delta depth to prevent
+	// cycles and excessive recursion.
 	return s.getWithContext(oid, newDeltaContext(s.maxDeltaDepth))
+}
+
+// peekObjectType reads at most 32 bytes to discover the on‑disk type without
+// inflating the body. It also returns the header length (needed by callers
+// that want to inflate manually afterwards).
+func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
+	var buf [32]byte
+	n, err := r.ReadAt(buf[:], int64(off))
+	if err != nil && err != io.EOF {
+		return ObjBad, 0, err
+	}
+	if n == 0 {
+		return ObjBad, 0, errors.New("empty object header")
+	}
+	ot, _, hdrLen := parseObjectHeaderUnsafe(buf[:n])
+	if hdrLen <= 0 {
+		return ObjBad, 0, errors.New("cannot parse object header")
+	}
+	return ot, hdrLen, nil
 }
 
 // getWithContext handles object retrieval with delta cycle detection.
 func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
+	if b, ok := s.dw.lookup(oid); ok {
+		return b, detectType(b), nil
+	}
+
 	if b, ok := s.cache.Get(oid); ok {
 		return b, detectType(b), nil
 	}
@@ -337,13 +401,25 @@ func (s *Store) inflateFromPack(
 	oid Hash,
 	ctx *deltaContext,
 ) ([]byte, ObjectType, error) {
-	objType, data, err := readRawObject(p, off)
+	// Quick header peek – avoids decompression for commit objects.
+	objType, _, err := peekObjectType(p, off)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+
+	if objType == ObjCommit {
+		// Commit‑graph supplies metadata → skip inflation entirely.
+		return nil, ObjCommit, nil
+	}
+
+	// For non-commits, we need the full object data for processing.
+	_, data, err := readRawObject(p, off)
 	if err != nil {
 		return nil, ObjBad, err
 	}
 
 	switch objType {
-	case ObjBlob, ObjCommit, ObjTree, ObjTag:
+	case ObjBlob, ObjTree, ObjTag:
 		if s.VerifyCRC {
 			crc, found := s.findCRCForObject(p, off, oid)
 			if found {
@@ -355,6 +431,7 @@ func (s *Store) inflateFromPack(
 				return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", oid)
 			}
 		}
+		s.dw.add(oid, data)
 		s.cache.Add(oid, data)
 		return data, objType, nil
 
@@ -384,6 +461,7 @@ func (s *Store) inflateFromPack(
 			return nil, ObjBad, err
 		}
 		full := applyDelta(base, deltaBuf)
+		s.dw.add(oid, full)
 		s.cache.Add(oid, full)
 		return full, detectType(full), nil
 
