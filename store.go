@@ -60,7 +60,7 @@ var hostLittle = func() bool {
 
 func init() {
 	// On Windows an mmapped file cannot be closed while any outstanding
-	// slices are still referenced.  A finalizer makes sure users who forget
+	// slices are still referenced. A finalizer makes sure users who forget
 	// to call (*Store).Close() do not trigger ERROR_LOCK_VIOLATION.
 	if runtime.GOOS == "windows" {
 		runtime.SetFinalizer(&Store{}, func(s *Store) { _ = s.Close() })
@@ -118,7 +118,7 @@ type Store struct {
 	cache *arc.ARCCache[Hash, []byte]
 
 	// dw is a short-lived object window (32 MiB) for delta chain optimization.
-	dw *deltaWindow
+	dw *refCountedDeltaWindow
 
 	// maxDeltaDepth limits how many recursive delta hops Get will follow
 	// before aborting the lookup.
@@ -217,16 +217,11 @@ func Open(dir string) (*Store, error) {
 		packCache[p] = h
 	}
 
-	dw, err := newDeltaWindow()
-	if err != nil {
-		return nil, fmt.Errorf("failed to create delta window: %w", err)
-	}
-
 	store := &Store{
 		maxDeltaDepth: defaultMaxDeltaDepth,
 		midx:          midx,
 		packMap:       packCache,
-		dw:            dw,
+		dw:            newRefCountedDeltaWindow(),
 	}
 
 	const defaultCacheSize = 1 << 14 // 16K entries ~ 96MiB
@@ -343,8 +338,8 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 	// Fast path: check the tiny "delta window" that holds the most recently
 	// materialized objects, which are likely to be referenced by upcoming
 	// deltas.
-	if b, ok := s.dw.lookup(oid); ok {
-		return b, detectType(b), nil
+	if b, ok := s.dw.acquire(oid); ok {
+		return b.Data(), detectType(b.Data()), nil
 	}
 
 	// Second-level lookup in the larger ARC cache.
@@ -378,8 +373,8 @@ func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
 
 // getWithContext handles object retrieval with delta cycle detection.
 func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
-	if b, ok := s.dw.lookup(oid); ok {
-		return b, detectType(b), nil
+	if b, ok := s.dw.acquire(oid); ok {
+		return b.Data(), detectType(b.Data()), nil
 	}
 
 	if b, ok := s.cache.Get(oid); ok {
