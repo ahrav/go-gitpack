@@ -1,3 +1,16 @@
+// delta.go
+//
+// Delta compression resolution for Git packfile objects.
+// The module handles *delta headers* → *base object references* + *delta operations*
+// and applies copy/insert instruction streams to reconstruct full objects from
+// compressed deltas. This enables space‑efficient storage by storing objects as
+// differences from base objects rather than complete content.
+//
+// The implementation supports both ref‑delta (references by object hash) and
+// ofs‑delta (references by pack offset) formats with cycle detection and depth
+// limiting. Delta operations are applied using optimized memory operations with
+// pre‑allocated output buffers sized according to the encoded target length.
+
 package objstore
 
 import (

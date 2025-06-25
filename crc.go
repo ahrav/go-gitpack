@@ -1,3 +1,16 @@
+// crc.go
+//
+// CRC‑32 integrity verification for Git packfile objects and trailers.
+// The module validates *pack object offsets* → *computed checksums* against
+// the CRC‑32 values recorded in pack‑index files to detect corruption during
+// transport or storage. This provides end‑to‑end data integrity checking for
+// critical repository operations without requiring full object decompression.
+//
+// The implementation streams compressed object data directly from memory‑mapped
+// pack files and computes IEEE CRC‑32 checksums with pack boundary validation.
+// Pack trailer SHA‑1 checksums are verified separately to ensure overall pack
+// integrity beyond individual object corruption detection.
+
 package objstore
 
 import (

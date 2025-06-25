@@ -5,14 +5,21 @@
 // The store is intended for read-only scenarios—such as code search,
 // indexing, and content serving—where low-latency look-ups are required but a
 // full on-disk checkout is unnecessary.
-// It memory-maps one or more *.pack / *.idx pairs, builds an in-memory map
-// from SHA-1 object IDs to their pack offsets, and inflates objects on demand.
-// Delta chains are resolved transparently with bounded depth and cycle
-// detection.
-// A small, size-bounded cache avoids redundant decompression, and optional
-// CRC-32 verification can be enabled for additional integrity checks.
 //
-// Typical usage:
+// IMPLEMENTATION:
+// The store memory-maps one or more *.pack / *.idx pairs, builds an in-memory map
+// from SHA-1 object IDs to their pack offsets, and inflates objects on demand.
+// It coordinates between pack-index (IDX), multi-pack-index (MIDX), and
+// reverse-index (RIDX) files, providing unified access across multiple packfiles
+// with transparent delta chain resolution and caching.
+//
+// All packfiles are memory-mapped for zero-copy access, with an adaptive
+// replacement cache (ARC) and delta window for hot objects. Delta chains are
+// resolved transparently with bounded depth and cycle detection. A small,
+// size-bounded cache avoids redundant decompression, and optional CRC-32
+// verification can be enabled for additional integrity checks.
+//
+// USAGE:
 //
 //	s, err := objstore.Open(".git/objects/pack")
 //	if err != nil {
@@ -23,7 +30,9 @@
 //	data, typ, err := s.Get(oid)
 //	// handle data…
 //
-// Store is safe for concurrent readers.
+// Store is safe for concurrent readers and eliminates the need to shell out
+// to Git while providing high-performance object retrieval for read-only
+// workloads like indexing and content serving.
 package objstore
 
 import (
@@ -312,7 +321,7 @@ func (s *Store) Close() error {
 // with its on-disk ObjectType.
 //
 // The method first consults two in-memory caches:
-//  1. a very small, hot-object “delta window”, and
+//  1. a very small, hot-object "delta window", and
 //  2. an Adaptive-Replacement Cache (ARC) that balances recency and
 //     frequency.
 //
@@ -331,7 +340,7 @@ func (s *Store) Close() error {
 // will.
 // Get is safe for concurrent use by multiple goroutines.
 func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
-	// Fast path: check the tiny “delta window” that holds the most recently
+	// Fast path: check the tiny "delta window" that holds the most recently
 	// materialized objects, which are likely to be referenced by upcoming
 	// deltas.
 	if b, ok := s.dw.lookup(oid); ok {
@@ -542,7 +551,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	// For small objects, read everything at once.
 	if size < 65536 { // 64KB threshold
 		compressedBuf := make([]byte, size+1024) // Extra space for zlib overhead
-		n, err := r.ReadAt(compressedBuf, int64(off)+int64(headerLen))
+		n, err := r.ReadAt(compressedBuf[:n], int64(off)+int64(headerLen))
 		if err != nil && err != io.EOF {
 			return ObjBad, nil, err
 		}

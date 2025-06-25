@@ -1,3 +1,16 @@
+// deltawindow.go
+//
+// Delta resolution cache for Git packfile object inflation.
+// The cache maps *recently inflated object hashes* → *decompressed object data*
+// to optimize delta chain resolution by avoiding redundant decompression during
+// sequential pack traversal. This provides significant performance improvements
+// when multiple delta objects reference the same base within a short timeframe.
+//
+// The implementation uses a bounded LRU cache with a 32 MiB memory budget,
+// automatically evicting least‑recently‑used entries when the limit is exceeded.
+// Large objects that exceed the budget are deliberately skipped to prevent
+// cache thrashing and maintain working set locality.
+
 package objstore
 
 import (
