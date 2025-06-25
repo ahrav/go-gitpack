@@ -383,3 +383,12 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		sortedOffsets: offs,
 	}, nil
 }
+
+// resolveIdxPos converts a bit‑index from a bitmap (offset order) to its
+// position in the *.idx oid table.  A panic indicates application misuse.
+func (pf *idxFile) resolveIdxPos(bit int) uint32 {
+	if pf.ridx == nil || bit < 0 || bit >= len(pf.ridx) {
+		panic("idxFile.resolveIdxPos: out‑of‑range")
+	}
+	return pf.ridx[bit]
+}

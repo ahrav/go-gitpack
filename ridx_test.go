@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -158,10 +159,10 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
 
+	require.NoError(t, os.WriteFile(packPath, []byte("minimal pack"), 0644))
+
 	blob := []byte("test")
 	hash := calculateHash(ObjBlob, blob)
-
-	require.NoError(t, createMinimalPack(packPath, blob))
 	idxPath := filepath.Join(dir, "test.idx")
 	require.NoError(t, createV2IndexFile(idxPath, []Hash{hash}, []uint64{12}))
 
@@ -174,16 +175,19 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 
 	t.Run("bad_magic", func(t *testing.T) {
 		ridxPath := filepath.Join(dir, "test.ridx")
-		// Write bad magic plus version to avoid EOF during header parsing.
 		var buf bytes.Buffer
-		buf.WriteString("BADM")
+		buf.WriteString("NOPE")
 		binary.Write(&buf, binary.BigEndian, uint32(1))
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
 		defer os.Remove(ridxPath)
 
-		_, err := loadReverseIndex(packPath, pf)
+		_, err := tryLoadRidxFile(ridxPath, pf)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "bad magic")
+
+		ridx, err := loadReverseIndex(packPath, pf)
+		assert.NoError(t, err)
+		assert.NotNil(t, ridx)
 	})
 
 	t.Run("bad_version", func(t *testing.T) {
@@ -194,9 +198,13 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
 		defer os.Remove(ridxPath)
 
-		_, err := loadReverseIndex(packPath, pf)
+		_, err := tryLoadRidxFile(ridxPath, pf)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "unsupported version")
+
+		ridx, err := loadReverseIndex(packPath, pf)
+		assert.NoError(t, err)
+		assert.NotNil(t, ridx)
 	})
 
 	t.Run("object_count_mismatch", func(t *testing.T) {
@@ -204,9 +212,13 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		require.NoError(t, createValidRidxFile(t, ridxPath, 5, nil, nil))
 		defer os.Remove(ridxPath)
 
-		_, err := loadReverseIndex(packPath, pf)
+		_, err := tryLoadRidxFile(ridxPath, pf)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "object count mismatch")
+
+		ridx, err := loadReverseIndex(packPath, pf)
+		assert.NoError(t, err)
+		assert.NotNil(t, ridx)
 	})
 
 	t.Run("truncated_fanout", func(t *testing.T) {
@@ -221,8 +233,12 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
 		defer os.Remove(ridxPath)
 
-		_, err := loadReverseIndex(packPath, pf)
+		_, err := tryLoadRidxFile(ridxPath, pf)
 		assert.Error(t, err)
+
+		ridx, err := loadReverseIndex(packPath, pf)
+		assert.NoError(t, err)
+		assert.NotNil(t, ridx)
 	})
 
 	t.Run("truncated_entries", func(t *testing.T) {
@@ -240,8 +256,12 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
 		defer os.Remove(ridxPath)
 
-		_, err := loadReverseIndex(packPath, pf)
+		_, err := tryLoadRidxFile(ridxPath, pf)
 		assert.Error(t, err)
+
+		ridx, err := loadReverseIndex(packPath, pf)
+		assert.NoError(t, err)
+		assert.NotNil(t, ridx)
 	})
 
 	t.Run("missing_trailer", func(t *testing.T) {
@@ -311,17 +331,23 @@ func TestLoadReverseIndex_TrailerVerification(t *testing.T) {
 	wrongChecksum := sha1.Sum([]byte("wrong"))
 	require.NoError(t, createValidRidxFile(t, ridxPath, 1, wrongChecksum[:], idxChecksum))
 
-	_, err = loadReverseIndex(packPath, pf)
+	_, err = tryLoadRidxFile(ridxPath, pf)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "pack checksum mismatch")
+
+	_, err = loadReverseIndex(packPath, pf)
+	assert.NoError(t, err)
 
 	// Test with wrong idx checksum.
 	os.Remove(ridxPath)
 	require.NoError(t, createValidRidxFile(t, ridxPath, 1, packChecksum[:], wrongChecksum[:]))
 
-	_, err = loadReverseIndex(packPath, pf)
+	_, err = tryLoadRidxFile(ridxPath, pf)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "idx checksum mismatch")
+
+	_, err = loadReverseIndex(packPath, pf)
+	assert.NoError(t, err)
 }
 
 func TestBuildReverseFromOffsets(t *testing.T) {
@@ -376,45 +402,45 @@ func TestReverseIndexMapping(t *testing.T) {
 	assert.Equal(t, uint32(0), ridx[3], "Smallest offset (10) should map to idx pos 0")
 }
 
-// func TestResolveIdxPos(t *testing.T) {
-// 	pf := &idxFile{
-// 		ridx: []uint32{5, 4, 3, 2, 1, 0},
-// 	}
+func TestResolveIdxPos(t *testing.T) {
+	pf := &idxFile{
+		ridx: []uint32{5, 4, 3, 2, 1, 0},
+	}
 
-// 	tests := []struct {
-// 		name      string
-// 		bit       int
-// 		expected  uint32
-// 		shouldPanic bool
-// 	}{
-// 		{"first bit", 0, 5, false},
-// 		{"middle bit", 3, 2, false},
-// 		{"last bit", 5, 0, false},
-// 		{"negative bit", -1, 0, true},
-// 		{"out of range", 6, 0, true},
-// 	}
+	tests := []struct {
+		name        string
+		bit         int
+		expected    uint32
+		shouldPanic bool
+	}{
+		{"first bit", 0, 5, false},
+		{"middle bit", 3, 2, false},
+		{"last bit", 5, 0, false},
+		{"negative bit", -1, 0, true},
+		{"out of range", 6, 0, true},
+	}
 
-// 	for _, tt := range tests {
-// 		t.Run(tt.name, func(t *testing.T) {
-// 			if tt.shouldPanic {
-// 				assert.Panics(t, func() {
-// 					pf.resolveIdxPos(tt.bit)
-// 				})
-// 			} else {
-// 				result := pf.resolveIdxPos(tt.bit)
-// 				assert.Equal(t, tt.expected, result)
-// 			}
-// 		})
-// 	}
-// }
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.shouldPanic {
+				assert.Panics(t, func() {
+					pf.resolveIdxPos(tt.bit)
+				})
+			} else {
+				result := pf.resolveIdxPos(tt.bit)
+				assert.Equal(t, tt.expected, result)
+			}
+		})
+	}
+}
 
-// func TestResolveIdxPos_NilRidx(t *testing.T) {
-// 	pf := &idxFile{ridx: nil}
+func TestResolveIdxPos_NilRidx(t *testing.T) {
+	pf := &idxFile{ridx: nil}
 
-// 	assert.Panics(t, func() {
-// 		pf.resolveIdxPos(0)
-// 	})
-// }
+	assert.Panics(t, func() {
+		pf.resolveIdxPos(0)
+	})
+}
 
 func TestLoadReverseIndex_NilPf(t *testing.T) {
 	assert.Panics(t, func() {
@@ -529,76 +555,70 @@ func BenchmarkLoadReverseIndex_FromFile(b *testing.B) {
 	}
 }
 
-// func BenchmarkResolveIdxPos(b *testing.B) {
-// 	numObjects := 10000
-// 	ridx := make([]uint32, numObjects)
-// 	for i := 0; i < numObjects; i++ {
-// 		ridx[i] = uint32(numObjects - 1 - i)
-// 	}
+func BenchmarkResolveIdxPos(b *testing.B) {
+	numObjects := 10000
+	ridx := make([]uint32, numObjects)
+	for i := 0; i < numObjects; i++ {
+		ridx[i] = uint32(numObjects - 1 - i)
+	}
 
-// 	pf := &idxFile{ridx: ridx}
+	pf := &idxFile{ridx: ridx}
 
-// 	b.ResetTimer()
-// 	for b.Loop() {
-// 		// Access various positions
-// 		_ = pf.resolveIdxPos(0)
-// 		_ = pf.resolveIdxPos(numObjects / 2)
-// 		_ = pf.resolveIdxPos(numObjects - 1)
-// 	}
-// }
+	b.ResetTimer()
+	for b.Loop() {
+		_ = pf.resolveIdxPos(0)
+		_ = pf.resolveIdxPos(numObjects / 2)
+		_ = pf.resolveIdxPos(numObjects - 1)
+	}
+}
 
-// func TestLoadReverseIndex_Integration(t *testing.T) {
-// 	dir := t.TempDir()
-// 	packPath := filepath.Join(dir, "test.pack")
-// 	ridxPath := filepath.Join(dir, "test.ridx")
+func TestLoadReverseIndex_Integration(t *testing.T) {
+	dir := t.TempDir()
+	packPath := filepath.Join(dir, "test.pack")
+	ridxPath := filepath.Join(dir, "test.ridx")
 
-// 	// Create pack with multiple objects at known offsets
-// 	var packBuf bytes.Buffer
-// 	packBuf.Write([]byte("PACK"))
-// 	binary.Write(&packBuf, binary.BigEndian, uint32(2))
-// 	binary.Write(&packBuf, binary.BigEndian, uint32(3))
+	// Create pack with multiple objects at known offsets.
+	var packBuf bytes.Buffer
+	packBuf.Write([]byte("PACK"))
+	binary.Write(&packBuf, binary.BigEndian, uint32(2))
+	binary.Write(&packBuf, binary.BigEndian, uint32(3))
 
-// 	// Track offsets where objects will be placed
-// 	offsets := []uint64{12, 50, 100}
-// 	hashes := make([]Hash, 3)
+	// Track offsets where objects will be placed.
+	offsets := []uint64{12, 50, 100}
+	hashes := make([]Hash, 3)
 
-// 	// Write pack content (simplified - just placeholders)
-// 	packContent := make([]byte, 150)
-// 	copy(packContent, packBuf.Bytes())
-// 	require.NoError(t, os.WriteFile(packPath, packContent, 0644))
+	packContent := make([]byte, 150)
+	copy(packContent, packBuf.Bytes())
+	require.NoError(t, os.WriteFile(packPath, packContent, 0644))
 
-// 	// Create idx file
-// 	for i := range hashes {
-// 		hashes[i] = calculateHash(ObjBlob, []byte(fmt.Sprintf("object %d", i)))
-// 	}
-// 	idxPath := filepath.Join(dir, "test.idx")
-// 	require.NoError(t, createV2IndexFile(idxPath, hashes, offsets))
+	for i := range hashes {
+		hashes[i] = calculateHash(ObjBlob, []byte(fmt.Sprintf("object %d", i)))
+	}
+	idxPath := filepath.Join(dir, "test.idx")
+	require.NoError(t, createV2IndexFile(idxPath, hashes, offsets))
 
-// 	// Parse idx
-// 	idxRA, err := mmap.Open(idxPath)
-// 	require.NoError(t, err)
-// 	defer idxRA.Close()
+	idxRA, err := mmap.Open(idxPath)
+	require.NoError(t, err)
+	defer idxRA.Close()
 
-// 	pf, err := parseIdx(idxRA)
-// 	require.NoError(t, err)
+	pf, err := parseIdx(idxRA)
+	require.NoError(t, err)
 
-// 	// Create ridx with proper mapping
-// 	// offsets [12, 50, 100] -> descending [100, 50, 12] -> idx positions [2, 1, 0]
-// 	require.NoError(t, createValidRidxFile(t, ridxPath, 3, nil, nil))
+	// Create ridx with proper mapping.
+	// offsets [12, 50, 100] -> descending [100, 50, 12] -> idx positions [2, 1, 0]
+	require.NoError(t, createValidRidxFile(t, ridxPath, 3, nil, nil))
 
-// 	// Load and verify
-// 	ridx, err := loadReverseIndex(packPath, pf)
-// 	require.NoError(t, err)
-// 	require.NotNil(t, ridx)
+	ridx, err := loadReverseIndex(packPath, pf)
+	require.NoError(t, err)
+	require.NotNil(t, ridx)
 
-// 	// Set the ridx on the idxFile
-// 	pf.ridx = ridx
+	pf.ridx = ridx
 
-// 	// Verify the mapping:
-// 	// Bit 0 (largest offset 100) -> idx position 2
-// 	// Bit 1 (middle offset 50) -> idx position 1
-// 	// Bit 2 (smallest offset 12) -> idx position 0
-// 	assert.Equal(t, uint32(2), pf.resolveIdxPos(0))
-// 	assert.Equal(t, uint32(1), pf.resolveIdxPos(1))
-// 	assert.Equal(t, uint32(0), pf.resolveIdxPos(2))
-// }
+	// Verify the mapping:
+	// Bit 0 (largest offset 100) -> idx position 2
+	// Bit 1 (middle offset 50) -> idx position 1
+	// Bit 2 (smallest offset 12) -> idx position 0
+	assert.Equal(t, uint32(2), pf.resolveIdxPos(0))
+	assert.Equal(t, uint32(1), pf.resolveIdxPos(1))
+	assert.Equal(t, uint32(0), pf.resolveIdxPos(2))
+}

@@ -51,9 +51,18 @@ func loadReverseIndex(packPath string, pf *idxFile) ([]uint32, error) {
 		return buildReverseFromOffsets(pf.sortedOffsets), nil
 	}
 
+	ridx, err := tryLoadRidxFile(ridxPath, pf)
+	if err != nil {
+		// Any error during ridx parsing -> fall back to building from offsets.
+		return buildReverseFromOffsets(pf.sortedOffsets), nil
+	}
+	return ridx, nil
+}
+
+func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	mr, err := mmap.Open(ridxPath)
 	if err != nil {
-		return nil, fmt.Errorf("mmap ridx: %w", err)
+		return nil, err
 	}
 	defer mr.Close()
 
