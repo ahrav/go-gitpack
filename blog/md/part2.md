@@ -76,8 +76,6 @@ func (f *idxFile) findObject(hash Hash) (uint64, bool) {
 }
 ```
 
-*Comment boxes in the margin explain:*
-
 - **Why first‑byte bucket?** 256 counters fit in CPU cache.
 - **Why binary search next?** Hashes are sorted -> O(log k) where *k* is bucket size.
 

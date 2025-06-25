@@ -1,3 +1,14 @@
+// midx.go
+//
+// Multi‑pack‑index ("MIDX") parser for Git repositories.
+// The file maps *object SHA‑1 hashes* → *pack ID* + *pack byte offsets* across
+// multiple packfiles, eliminating the need to search each pack individually.
+// This provides unified object lookup across an entire repository's pack collection.
+//
+// The implementation supports both MIDX v1 and v2 formats, with v2 adding
+// CRC‑32 checksum support. All referenced packfiles are memory‑mapped immediately
+// for stable reader handles, while the MIDX lookup tables stay memory‑resident.
+
 package objstore
 
 import (

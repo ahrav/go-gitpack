@@ -1,3 +1,14 @@
+// idx.go
+//
+// Pack‑index ("IDX") parser for Git packfiles.
+// The file maps *object SHA‑1 hashes* → *pack byte offsets* + *CRC‑32 checksums*
+// enabling fast object lookup within a single packfile using a fanout table
+// for O(1) range selection followed by binary search.
+//
+// The implementation supports both regular (≤2GB) and large (>2GB) packfiles
+// via a two‑tier offset system. All lookup tables remain memory‑resident for
+// constant‑time access, while the pack data itself stays memory‑mapped.
+
 package objstore
 
 import (
@@ -76,6 +87,14 @@ type idxFile struct {
 	// fast look‑ups for CRC verification.
 	entriesByOff  map[uint64]idxEntry // exact offset → entry (constant‑time)
 	sortedOffsets []uint64            // monotonically ascending list of offsets
+
+	// ridx is the reverse‑index table that maps pack file byte offsets back
+	// to zero‑based object indices within the sorted oidTable. When present,
+	// ridx[i] contains the object index whose pack data starts at
+	// sortedOffsets[i], enabling efficient reverse lookups during pack
+	// traversal and delta resolution. The slice is nil when no reverse
+	// index is available and has length equal to the object count when loaded.
+	ridx []uint32
 }
 
 // findObject looks up hash in the tables that belong to a single
