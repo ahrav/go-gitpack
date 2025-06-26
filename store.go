@@ -546,7 +546,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	// For small objects, read everything at once.
 	if size < 65536 { // 64KB threshold
 		compressedBuf := make([]byte, size+1024) // Extra space for zlib overhead
-		n, err := r.ReadAt(compressedBuf[:n], int64(off)+int64(headerLen))
+		n, err := r.ReadAt(compressedBuf, int64(off)+int64(headerLen))
 		if err != nil && err != io.EOF {
 			return ObjBad, nil, err
 		}
