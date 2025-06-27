@@ -283,3 +283,73 @@ func applyDelta(base, delta []byte) []byte {
 
 	return out
 }
+
+// decodeVarInt decodes the base-128 varint format that Git uses in several
+// places (object sizes, delta offsets, …).
+//
+// It returns the decoded value together with the number of bytes that were
+// consumed.
+// A negative byte count indicates malformed input (overflow or premature EOF).
+func decodeVarInt(buf []byte) (uint64, int) {
+	if len(buf) == 0 {
+		return 0, 0
+	}
+
+	var res uint64
+	var i int
+
+	// Unrolled loop for common cases (1-4 bytes) using unsafe.Add with bounds checking.
+	b0 := *(*byte)(unsafe.Pointer(&buf[0]))
+	if b0&0x80 == 0 {
+		return uint64(b0), 1
+	}
+	res = uint64(b0 & 0x7f)
+
+	if len(buf) > 1 {
+		b1 := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), 1))
+		if b1&0x80 == 0 {
+			return res | (uint64(b1) << 7), 2
+		}
+		res |= uint64(b1&0x7f) << 7
+	} else {
+		return 0, -1 // Invalid encoding
+	}
+
+	if len(buf) > 2 {
+		b2 := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), 2))
+		if b2&0x80 == 0 {
+			return res | (uint64(b2) << 14), 3
+		}
+		res |= uint64(b2&0x7f) << 14
+	} else {
+		return 0, -1 // Invalid encoding
+	}
+
+	if len(buf) > 3 {
+		b3 := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), 3))
+		if b3&0x80 == 0 {
+			return res | (uint64(b3) << 21), 4
+		}
+		res |= uint64(b3&0x7f) << 21
+	} else {
+		return 0, -1 // Invalid encoding
+	}
+
+	// Fallback for longer varints.
+	shift := uint(28)
+	i = 4
+	for i < len(buf) {
+		b := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), i))
+		res |= uint64(b&0x7f) << shift
+		i++
+		if b&0x80 == 0 {
+			break
+		}
+		shift += 7
+		if shift > 63 {
+			return 0, -1 // Overflow
+		}
+	}
+
+	return res, i
+}

@@ -352,52 +352,6 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 	return s.getWithContext(oid, newDeltaContext(s.maxDeltaDepth))
 }
 
-// peekObjectType reads at most 32 bytes to discover the on‑disk type without
-// inflating the body. It also returns the header length (needed by callers
-// that want to inflate manually afterwards).
-func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
-	var buf [32]byte
-	n, err := r.ReadAt(buf[:], int64(off))
-	if err != nil && err != io.EOF {
-		return ObjBad, 0, err
-	}
-	if n == 0 {
-		return ObjBad, 0, errors.New("empty object header")
-	}
-	ot, _, hdrLen := parseObjectHeaderUnsafe(buf[:n])
-	if hdrLen <= 0 {
-		return ObjBad, 0, errors.New("cannot parse object header")
-	}
-	return ot, hdrLen, nil
-}
-
-// getWithContext handles object retrieval with delta cycle detection.
-func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
-	if b, ok := s.dw.acquire(oid); ok {
-		return b.Data(), detectType(b.Data()), nil
-	}
-
-	if b, ok := s.cache.Get(oid); ok {
-		return b, detectType(b), nil
-	}
-
-	if s.midx != nil {
-		if p, off, ok := s.midx.findObject(oid); ok {
-			return s.inflateFromPack(p, off, oid, ctx)
-		}
-	}
-
-	for _, pf := range s.packs {
-		offset, found := pf.findObject(oid)
-		if !found {
-			continue
-		}
-		return s.inflateFromPack(pf.pack, offset, oid, ctx)
-	}
-
-	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
-}
-
 // inflateFromPack handles object inflation from a specific pack, with delta resolution.
 func (s *Store) inflateFromPack(
 	p *mmap.ReaderAt,
@@ -474,14 +428,50 @@ func (s *Store) inflateFromPack(
 	}
 }
 
-// inflateSection returns a stream of the uncompressed object bytes that start
-// at off, have compressed length n, and live inside the mmap-ed pack r.
-func inflateSection(r *mmap.ReaderAt, off, n int64) (io.ReadCloser, error) {
-	if n <= 0 {
-		return nil, errors.New("invalid compressed length")
+// peekObjectType reads at most 32 bytes to discover the on‑disk type without
+// inflating the body. It also returns the header length (needed by callers
+// that want to inflate manually afterwards).
+func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
+	var buf [32]byte
+	n, err := r.ReadAt(buf[:], int64(off))
+	if err != nil && err != io.EOF {
+		return ObjBad, 0, err
 	}
-	src := io.NewSectionReader(r, off, n)
-	return zlib.NewReader(src) // caller must Close
+	if n == 0 {
+		return ObjBad, 0, errors.New("empty object header")
+	}
+	ot, _, hdrLen := parseObjectHeaderUnsafe(buf[:n])
+	if hdrLen <= 0 {
+		return ObjBad, 0, errors.New("cannot parse object header")
+	}
+	return ot, hdrLen, nil
+}
+
+// getWithContext handles object retrieval with delta cycle detection.
+func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
+	if b, ok := s.dw.acquire(oid); ok {
+		return b.Data(), detectType(b.Data()), nil
+	}
+
+	if b, ok := s.cache.Get(oid); ok {
+		return b, detectType(b), nil
+	}
+
+	if s.midx != nil {
+		if p, off, ok := s.midx.findObject(oid); ok {
+			return s.inflateFromPack(p, off, oid, ctx)
+		}
+	}
+
+	for _, pf := range s.packs {
+		offset, found := pf.findObject(oid)
+		if !found {
+			continue
+		}
+		return s.inflateFromPack(pf.pack, offset, oid, ctx)
+	}
+
+	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
 }
 
 // readRawObject inflates the object that starts at off in the given
@@ -544,8 +534,13 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	}
 
 	// For small objects, read everything at once.
-	if size < 65536 { // 64KB threshold
-		compressedBuf := make([]byte, size+1024) // Extra space for zlib overhead
+	const (
+		smallObjectThreshold = 65536 // 64KB threshold
+		zlibOverheadSize     = 1024  // Extra space for zlib compression overhead
+	)
+
+	if size < smallObjectThreshold {
+		compressedBuf := make([]byte, size+zlibOverheadSize) // Extra space for zlib overhead
 		n, err := r.ReadAt(compressedBuf, int64(off)+int64(headerLen))
 		if err != nil && err != io.EOF {
 			return ObjBad, nil, err
@@ -568,11 +563,13 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	}
 
 	// For large objects, use streaming.
-	zr, err := inflateSection(
-		r,
-		int64(off)+int64(headerLen),
-		int64(size)+1024,
-	)
+	// TODO: Should we return an io.Reader instead?
+	compressedLen := int64(size) + zlibOverheadSize
+	if compressedLen <= 0 {
+		return ObjBad, nil, errors.New("invalid compressed length")
+	}
+	src := io.NewSectionReader(r, int64(off)+int64(headerLen), compressedLen)
+	zr, err := zlib.NewReader(src)
 	if err != nil {
 		return ObjBad, nil, err
 	}
@@ -596,9 +593,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 //
 // For performance reasons the implementation
 // – performs all work on the supplied byte slice without additional
-//
-//	allocations,
-//
+// allocations,
 // – relies on unsafe.Pointer arithmetic to avoid bounds checks, and
 // – returns the number of header bytes that were consumed so the caller can
 //
@@ -697,76 +692,6 @@ func readObjectAtOffsetWithContext(
 		return full, detectType(full), nil
 	}
 	return data, objType, nil
-}
-
-// decodeVarInt decodes the base-128 varint format that Git uses in several
-// places (object sizes, delta offsets, …).
-//
-// It returns the decoded value together with the number of bytes that were
-// consumed.
-// A negative byte count indicates malformed input (overflow or premature EOF).
-func decodeVarInt(buf []byte) (uint64, int) {
-	if len(buf) == 0 {
-		return 0, 0
-	}
-
-	var res uint64
-	var i int
-
-	// Unrolled loop for common cases (1-4 bytes) using unsafe.Add with bounds checking.
-	b0 := *(*byte)(unsafe.Pointer(&buf[0]))
-	if b0&0x80 == 0 {
-		return uint64(b0), 1
-	}
-	res = uint64(b0 & 0x7f)
-
-	if len(buf) > 1 {
-		b1 := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), 1))
-		if b1&0x80 == 0 {
-			return res | (uint64(b1) << 7), 2
-		}
-		res |= uint64(b1&0x7f) << 7
-	} else {
-		return 0, -1 // Invalid encoding
-	}
-
-	if len(buf) > 2 {
-		b2 := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), 2))
-		if b2&0x80 == 0 {
-			return res | (uint64(b2) << 14), 3
-		}
-		res |= uint64(b2&0x7f) << 14
-	} else {
-		return 0, -1 // Invalid encoding
-	}
-
-	if len(buf) > 3 {
-		b3 := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), 3))
-		if b3&0x80 == 0 {
-			return res | (uint64(b3) << 21), 4
-		}
-		res |= uint64(b3&0x7f) << 21
-	} else {
-		return 0, -1 // Invalid encoding
-	}
-
-	// Fallback for longer varints.
-	shift := uint(28)
-	i = 4
-	for i < len(buf) {
-		b := *(*byte)(unsafe.Add(unsafe.Pointer(&buf[0]), i))
-		res |= uint64(b&0x7f) << shift
-		i++
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-		if shift > 63 {
-			return 0, -1 // Overflow
-		}
-	}
-
-	return res, i
 }
 
 // VerifyPackTrailers validates the SHA-1 trailer that closes every mapped
