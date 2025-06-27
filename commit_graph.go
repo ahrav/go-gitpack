@@ -229,13 +229,50 @@ type parsedGraph struct {
 // resolveParentsInto converts parent indices from this graph file into actual OIDs,
 // storing the result in dst. It handles split commit-graph chains by applying the
 // given offset and respects layer precedence (newer layers override older ones).
+// This optimized version pre-scans commits to estimate parent counts and pre-allocates
+// slices accordingly to reduce memory allocations and improve performance.
 func (g parsedGraph) resolveParentsInto(dst Parents, all []Hash, offset int) error {
+	// Pre-scan to estimate parent counts for each commit.
+	// Benchmarks show this additional step is worth it.
+	parentCounts := make([]int, len(g.oids))
+	for i := range g.oids {
+		count := 0
+
+		if g.p1[i] != graphParentNone {
+			count++
+		}
+
+		// Count second parent or octopus parents.
+		if v := g.p2raw[i]; v != graphParentNone {
+			if v&graphLastEdge == 0 {
+				// Direct second parent.
+				count++
+			} else {
+				// Edge pointer for octopus merges - count actual parents.
+				idx := int(v & ^uint32(graphLastEdge))
+				if idx < len(g.edge) {
+					for idx < len(g.edge) {
+						w := g.edge[idx]
+						count++
+						idx++
+						if w&graphLastEdge != 0 {
+							break
+						}
+					}
+				}
+			}
+		}
+		parentCounts[i] = count
+	}
+
 	for i, oid := range g.oids {
 		// Newer layers take precedence.
 		if _, seen := dst[oid]; seen {
 			continue
 		}
-		var ps []Hash
+
+		// Pre-allocate with exact capacity to avoid reallocations.
+		ps := make([]Hash, 0, parentCounts[i])
 
 		// First parent.
 		if p := g.p1[i]; p != graphParentNone {
