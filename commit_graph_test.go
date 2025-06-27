@@ -69,7 +69,7 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 	}
 	// Make fanout values cumulative.
 	var total uint32
-	for i := 0; i < fanoutEntries; i++ {
+	for i := range fanoutEntries {
 		total += fan[i]
 		fan[i] = total
 	}
