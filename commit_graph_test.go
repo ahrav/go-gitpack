@@ -10,6 +10,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 /* ------------------------------------------------------------------------- */
@@ -244,20 +247,14 @@ func TestCommitGraphChainParentAcrossLayers(t *testing.T) {
 
 	// parse ----------------------------------------------------------------
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load chain: %v", err)
-	}
-	if graphData == nil {
-		t.Fatalf("expected commit graph data, got nil")
-	}
-	if len(graphData.OrderedOIDs) != 3 {
-		t.Fatalf("want 3 commits, got %d", len(graphData.OrderedOIDs))
-	}
+	require.NoError(t, err, "load chain: %v", err)
+	require.NotNil(t, graphData, "expected commit graph data, got nil")
+	require.Len(t, graphData.OrderedOIDs, 3, "want 3 commits, got %d", len(graphData.OrderedOIDs))
 
 	// C should have B as single parent.
 	parents := graphData.Parents[C]
-	if len(parents) != 1 || parents[0] != B {
-		t.Errorf("cross‑layer parent not resolved: got %v, want [%x]", parents, B)
+	if assert.Len(t, parents, 1) {
+		assert.Equal(t, B, parents[0], "cross‑layer parent not resolved: got %v, want [%x]", parents, B)
 	}
 }
 
@@ -293,30 +290,22 @@ func TestCommitGraphEdgePointerMisaligned(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("parse: %v", err)
-	}
+	require.NoError(t, err, "parse: %v", err)
 
 	// Get parents for merge commit M
 	parents := graphData.Parents[M]
 
 	// expected parents = [A, B]
 	want := []Hash{A, B}
-	if len(parents) != 2 || parents[0] != want[0] || parents[1] != want[1] {
-		t.Errorf("octopus parents wrong: got %v, want %v", parents, want)
-	}
+	assert.Equal(t, want, parents, "octopus parents wrong: got %v, want %v", parents, want)
 }
 
 /* ------------------------------------------------------------------------- */
 
 func mustWrite(t *testing.T, path string, data []byte) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(path, data, 0o644); err != nil {
-		t.Fatalf("write %s: %v", path, err)
-	}
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755), "mkdir: %v")
+	require.NoError(t, os.WriteFile(path, data, 0o644), "write %s: %v", path)
 }
 
 /* ------------------------------------------------------------------------- */
@@ -342,15 +331,9 @@ func TestCommitGraphEmptyChainFallback(t *testing.T) {
 
 	// Load and verify
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
-	if graphData == nil {
-		t.Fatal("expected graph data")
-	}
-	if len(graphData.OrderedOIDs) != 1 {
-		t.Errorf("expected 1 commit, got %d", len(graphData.OrderedOIDs))
-	}
+	require.NoError(t, err, "load failed: %v", err)
+	require.NotNil(t, graphData, "expected graph data")
+	assert.Len(t, graphData.OrderedOIDs, 1, "expected 1 commit, got %d", len(graphData.OrderedOIDs))
 }
 
 // Test 4: Chain file with missing graph files
@@ -365,9 +348,7 @@ func TestCommitGraphChainMissingFiles(t *testing.T) {
 
 	// Should fail to load
 	_, err := LoadCommitGraph(tmp)
-	if err == nil {
-		t.Fatal("expected error for missing graph files")
-	}
+	require.Error(t, err, "expected error for missing graph files")
 }
 
 // Test 5: Both chain and single file exist - chain takes precedence
@@ -398,11 +379,9 @@ func TestCommitGraphChainPrecedence(t *testing.T) {
 
 	// Load - should get B from chain, not A from single
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
-	if len(graphData.OrderedOIDs) != 1 || graphData.OrderedOIDs[0] != B {
-		t.Errorf("chain should take precedence")
+	require.NoError(t, err, "load failed: %v", err)
+	if assert.Len(t, graphData.OrderedOIDs, 1) {
+		assert.Equal(t, B, graphData.OrderedOIDs[0], "chain should take precedence")
 	}
 }
 
@@ -441,9 +420,7 @@ func TestCommitGraphMissingChunks(t *testing.T) {
 		mustWrite(t, path, buf.Bytes())
 
 		_, err := LoadCommitGraph(tmp)
-		if err == nil {
-			t.Error("expected error for missing OIDF")
-		}
+		assert.Error(t, err, "expected error for missing OIDF")
 	})
 }
 
@@ -515,11 +492,8 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 		mustWrite(t, path, data)
 
 		_, err := LoadCommitGraph(tmp)
-		if err == nil {
-			t.Error("expected error for OIDL size mismatch")
-		}
-		if err != nil && !strings.Contains(err.Error(), "OIDL") && !strings.Contains(err.Error(), "size") {
-			t.Errorf("expected error about OIDL size, got: %v", err)
+		if assert.Error(t, err, "expected error for OIDL size mismatch") {
+			assert.True(t, strings.Contains(err.Error(), "OIDL") && strings.Contains(err.Error(), "size"), "expected error about OIDL size, got: %v", err)
 		}
 	})
 
@@ -540,9 +514,7 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 		mustWrite(t, path, data)
 
 		_, err := LoadCommitGraph(tmp)
-		if err == nil {
-			t.Error("expected error for CDAT size mismatch")
-		}
+		assert.Error(t, err, "expected error for CDAT size mismatch")
 	})
 
 	t.Run("FANOUTWrongSize", func(t *testing.T) {
@@ -590,11 +562,8 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 		mustWrite(t, path, data)
 
 		_, err := LoadCommitGraph(tmp)
-		if err == nil {
-			t.Error("expected error for wrong OIDF size")
-		}
-		if err != nil && !strings.Contains(err.Error(), "OIDF") {
-			t.Errorf("expected error about OIDF, got: %v", err)
+		if assert.Error(t, err, "expected error for wrong OIDF size") {
+			assert.Contains(t, err.Error(), "OIDF", "expected error about OIDF, got: %v", err)
 		}
 	})
 }
@@ -628,9 +597,7 @@ func TestCommitGraphOverlappingChunks(t *testing.T) {
 	mustWrite(t, path, buf.Bytes())
 
 	_, err := LoadCommitGraph(tmp)
-	if err == nil {
-		t.Error("expected error for overlapping chunks")
-	}
+	assert.Error(t, err, "expected error for overlapping chunks")
 }
 
 /* ------------------------------------------------------------------------- */
@@ -678,16 +645,12 @@ func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 
 	// Should handle gracefully, not infinite loop
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("failed to parse: %v", err)
-	}
+	require.NoError(t, err, "failed to parse: %v", err)
 
 	// Should have collected all parents until hitting terminator
 	parents := graphData.Parents[M]
 	// We expect 9 parents total: first parent (0) + 8 from edge list
-	if len(parents) != 9 {
-		t.Errorf("expected 9 parents, got %d: %v", len(parents), parents)
-	}
+	require.Len(t, parents, 9, "expected 9 parents, got %d: %v", len(parents), parents)
 
 	// Verify we got the expected parents (including duplicates)
 	expected := []Hash{
@@ -703,9 +666,7 @@ func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	}
 
 	for i, p := range parents {
-		if p != expected[i] {
-			t.Errorf("parent[%d]: got %x, want %x", i, p, expected[i])
-		}
+		assert.Equal(t, expected[i], p, "parent[%d]: got %x, want %x", i, p, expected[i])
 	}
 }
 
@@ -746,14 +707,10 @@ func TestCommitGraphManyParents(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
+	require.NoError(t, err, "parse failed: %v", err)
 
 	parents := graphData.Parents[M]
-	if len(parents) != 100 {
-		t.Errorf("expected 100 parents, got %d", len(parents))
-	}
+	assert.Len(t, parents, 100, "expected 100 parents, got %d", len(parents))
 }
 
 // Test 11: Edge list without terminator
@@ -788,16 +745,12 @@ func TestCommitGraphEdgeNoTerminator(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("parse failed: %v", err)
-	}
+	require.NoError(t, err, "parse failed: %v", err)
 
 	// Should read all edges until end of chunk
 	parents := graphData.Parents[M]
 	// We expect 4 parents: first parent (0) + 3 from edge chunk
-	if len(parents) != 4 {
-		t.Errorf("expected 4 parents, got %d", len(parents))
-	}
+	assert.Len(t, parents, 4, "expected 4 parents, got %d", len(parents))
 }
 
 // Test 12: Parent index exactly at boundary
@@ -825,15 +778,13 @@ func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 		mustWrite(t, path, data)
 
 		graphData, err := LoadCommitGraph(tmp)
-		if err != nil {
-			t.Fatalf("unexpected error for valid boundary: %v", err)
-		}
+		require.NoError(t, err, "unexpected error for valid boundary: %v", err)
 
 		// Verify the parent relationship
 		child := makeCGHash("aa")
 		parents := graphData.Parents[child]
-		if len(parents) != 1 || parents[0] != makeCGHash("09") {
-			t.Errorf("wrong parent: got %v", parents)
+		if assert.Len(t, parents, 1) {
+			assert.Equal(t, makeCGHash("09"), parents[0], "wrong parent: got %v", parents)
 		}
 	})
 
@@ -858,11 +809,8 @@ func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 		mustWrite(t, path, data)
 
 		_, err := LoadCommitGraph(tmp)
-		if err == nil {
-			t.Error("expected error for out-of-bounds parent")
-		}
-		if err != nil && !strings.Contains(err.Error(), "parent index") && !strings.Contains(err.Error(), "out of bounds") {
-			t.Errorf("expected error about parent index out of bounds, got: %v", err)
+		if assert.Error(t, err, "expected error for out-of-bounds parent") {
+			assert.True(t, strings.Contains(err.Error(), "parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about parent index out of bounds, got: %v", err)
 		}
 	})
 
@@ -896,11 +844,8 @@ func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 		mustWrite(t, path, data)
 
 		_, err := LoadCommitGraph(tmp)
-		if err == nil {
-			t.Error("expected error for out-of-bounds edge parent")
-		}
-		if err != nil && !strings.Contains(err.Error(), "edge parent index") && !strings.Contains(err.Error(), "out of bounds") {
-			t.Errorf("expected error about edge parent index out of bounds, got: %v", err)
+		if assert.Error(t, err, "expected error for out-of-bounds edge parent") {
+			assert.True(t, strings.Contains(err.Error(), "edge parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about edge parent index out of bounds, got: %v", err)
 		}
 	})
 }
@@ -966,9 +911,7 @@ func TestCommitGraphBadFanout(t *testing.T) {
 	mustWrite(t, path, data)
 
 	_, err := LoadCommitGraph(tmp)
-	if err == nil {
-		t.Error("expected error for non-monotonic fanout")
-	}
+	assert.Error(t, err, "expected error for non-monotonic fanout")
 }
 
 // Test 14: Zero commits
@@ -983,12 +926,8 @@ func TestCommitGraphEmpty(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("failed to load empty graph: %v", err)
-	}
-	if len(graphData.OrderedOIDs) != 0 {
-		t.Error("expected 0 commits")
-	}
+	require.NoError(t, err, "failed to load empty graph: %v", err)
+	assert.Empty(t, graphData.OrderedOIDs, "expected 0 commits")
 }
 
 // Test 15: Fanout doesn't match actual OID count
@@ -1015,9 +954,7 @@ func TestCommitGraphFanoutMismatch(t *testing.T) {
 	mustWrite(t, path, data)
 
 	_, err := LoadCommitGraph(tmp)
-	if err == nil {
-		t.Error("expected error for fanout mismatch")
-	}
+	assert.Error(t, err, "expected error for fanout mismatch")
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1066,22 +1003,20 @@ func TestCommitGraphDeepChainParent(t *testing.T) {
 
 	// Load
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify the parent relationships
 	// File 1 internal references should work
-	if parents := graphData.Parents[makeCGHash("01")]; len(parents) != 1 || parents[0] != makeCGHash("00") {
-		t.Errorf("commit 01: wrong parents %v", parents)
+	if parents := graphData.Parents[makeCGHash("01")]; assert.Len(t, parents, 1) {
+		assert.Equal(t, makeCGHash("00"), parents[0], "commit 01: wrong parents %v", parents)
 	}
-	if parents := graphData.Parents[makeCGHash("02")]; len(parents) != 1 || parents[0] != makeCGHash("01") {
-		t.Errorf("commit 02: wrong parents %v", parents)
+	if parents := graphData.Parents[makeCGHash("02")]; assert.Len(t, parents, 1) {
+		assert.Equal(t, makeCGHash("01"), parents[0], "commit 02: wrong parents %v", parents)
 	}
 
 	// File 2 internal references should work (with offset adjustment)
-	if parents := graphData.Parents[makeCGHash("11")]; len(parents) != 1 || parents[0] != makeCGHash("10") {
-		t.Errorf("commit 11: wrong parents %v", parents)
+	if parents := graphData.Parents[makeCGHash("11")]; assert.Len(t, parents, 1) {
+		assert.Equal(t, makeCGHash("10"), parents[0], "commit 11: wrong parents %v", parents)
 	}
 
 	// This test shows that split commit-graphs have limitations on cross-file references
@@ -1120,14 +1055,12 @@ func TestCommitGraphChainDuplicates(t *testing.T) {
 
 	// Load
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Tip version should take precedence
 	parents := graphData.Parents[A]
-	if len(parents) != 1 || parents[0] != B {
-		t.Error("tip layer should override base for duplicate OID")
+	if assert.Len(t, parents, 1) {
+		assert.Equal(t, B, parents[0], "tip layer should override base for duplicate OID")
 	}
 }
 
@@ -1164,15 +1097,9 @@ func TestCommitGraphLongChain(t *testing.T) {
 	graphData, err := LoadCommitGraph(tmp)
 	elapsed := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
-	if len(graphData.OrderedOIDs) != 50 {
-		t.Errorf("expected 50 commits, got %d", len(graphData.OrderedOIDs))
-	}
-	if elapsed > 100*time.Millisecond {
-		t.Errorf("loading 50-chain took too long: %v", elapsed)
-	}
+	require.NoError(t, err, "load failed: %v", err)
+	assert.Len(t, graphData.OrderedOIDs, 50, "expected 50 commits, got %d", len(graphData.OrderedOIDs))
+	assert.Less(t, elapsed, 100*time.Millisecond, "loading 50-chain took too long: %v", elapsed)
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1198,23 +1125,13 @@ func TestCommitGraphTreeOIDs(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify TreeOIDs populated correctly
-	if len(graphData.TreeOIDs) != 3 {
-		t.Fatalf("expected 3 trees, got %d", len(graphData.TreeOIDs))
-	}
-	if graphData.TreeOIDs[0] != treeA {
-		t.Errorf("tree 0: got %v, want %v", graphData.TreeOIDs[0], treeA)
-	}
-	if graphData.TreeOIDs[1] != treeB {
-		t.Errorf("tree 1: got %v, want %v", graphData.TreeOIDs[1], treeB)
-	}
-	if graphData.TreeOIDs[2] != treeC {
-		t.Errorf("tree 2: got %v, want %v", graphData.TreeOIDs[2], treeC)
-	}
+	require.Len(t, graphData.TreeOIDs, 3, "expected 3 trees, got %d", len(graphData.TreeOIDs))
+	assert.Equal(t, treeA, graphData.TreeOIDs[0], "tree 0: got %v, want %v", graphData.TreeOIDs[0], treeA)
+	assert.Equal(t, treeB, graphData.TreeOIDs[1], "tree 1: got %v, want %v", graphData.TreeOIDs[1], treeB)
+	assert.Equal(t, treeC, graphData.TreeOIDs[2], "tree 2: got %v, want %v", graphData.TreeOIDs[2], treeC)
 }
 
 // Test 20: Timestamp extraction
@@ -1300,19 +1217,13 @@ func TestCommitGraphTimestamps(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify timestamps
-	if len(graphData.Timestamps) != 3 {
-		t.Fatalf("expected 3 timestamps, got %d", len(graphData.Timestamps))
-	}
+	require.Len(t, graphData.Timestamps, 3, "expected 3 timestamps, got %d", len(graphData.Timestamps))
 
 	for i, expected := range timestamps {
-		if graphData.Timestamps[i] != expected {
-			t.Errorf("timestamp[%d]: got %d, want %d", i, graphData.Timestamps[i], expected)
-		}
+		assert.Equal(t, expected, graphData.Timestamps[i], "timestamp[%d]: got %d, want %d", i, graphData.Timestamps[i], expected)
 	}
 }
 
@@ -1342,22 +1253,19 @@ func TestCommitGraphOIDIndexMap(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify mapping
 	for i, oid := range oids {
-		if idx, ok := graphData.OIDToIndex[oid]; !ok || idx != i {
-			t.Errorf("OID %v: got index %d, want %d", oid, idx, i)
-		}
+		idx, ok := graphData.OIDToIndex[oid]
+		assert.True(t, ok)
+		assert.Equal(t, i, idx, "OID %v: got index %d, want %d", oid, idx, i)
 	}
 
 	// Test non-existent OID
 	fake := makeCGHash("ff")
-	if _, ok := graphData.OIDToIndex[fake]; ok {
-		t.Error("found index for non-existent OID")
-	}
+	_, ok := graphData.OIDToIndex[fake]
+	assert.False(t, ok, "found index for non-existent OID")
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1389,14 +1297,10 @@ func TestCommitGraphCleanupOnError(t *testing.T) {
 
 	// Should fail but clean up properly
 	_, err := LoadCommitGraph(tmp)
-	if err == nil {
-		t.Fatal("expected error for truncated file")
-	}
+	require.Error(t, err, "expected error for truncated file")
 
 	// Verify error mentions the issue
-	if !strings.Contains(err.Error(), "read") && !strings.Contains(err.Error(), "parse") && !strings.Contains(err.Error(), "EOF") {
-		t.Errorf("error should indicate parse failure: %v", err)
-	}
+	assert.True(t, strings.Contains(err.Error(), "read") || strings.Contains(err.Error(), "parse") || strings.Contains(err.Error(), "EOF"), "error should indicate parse failure: %v", err)
 }
 
 // Test 23: Corrupted file headers
@@ -1441,11 +1345,8 @@ func TestCommitGraphCorruptHeaders(t *testing.T) {
 			mustWrite(t, path, buf.Bytes())
 
 			_, err := LoadCommitGraph(testTmp)
-			if err == nil {
-				t.Fatal("expected error")
-			}
-			if !strings.Contains(err.Error(), tc.errMsg) {
-				t.Errorf("expected error about %s, got: %v", tc.errMsg, err)
+			if assert.Error(t, err) {
+				assert.Contains(t, err.Error(), tc.errMsg, "expected error about %s, got: %v", tc.errMsg, err)
 			}
 		})
 	}
@@ -1488,20 +1389,14 @@ func TestCommitGraphLargeFile(t *testing.T) {
 	graphData, err := LoadCommitGraph(tmp)
 	loadTime := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
-	if len(graphData.OrderedOIDs) != 10000 {
-		t.Errorf("expected 10k commits, got %d", len(graphData.OrderedOIDs))
-	}
+	require.NoError(t, err, "load failed: %v", err)
+	assert.Len(t, graphData.OrderedOIDs, 10000, "expected 10k commits, got %d", len(graphData.OrderedOIDs))
 
 	t.Logf("Build time: %v, Load time: %v, File size: %d bytes",
 		buildTime, loadTime, len(data))
 
 	// Verify memory usage is reasonable (rough check)
-	if loadTime > 500*time.Millisecond {
-		t.Errorf("loading 10k commits took too long: %v", loadTime)
-	}
+	assert.Less(t, loadTime, 500*time.Millisecond, "loading 10k commits took too long: %v", loadTime)
 }
 
 // Test 25: Maximum edge complexity
@@ -1566,36 +1461,26 @@ func TestCommitGraphComplexMerges(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify merge parents
 	m1 := makeCGHash("20")
 	parents1 := graphData.Parents[m1]
-	if len(parents1) != 3 {
-		t.Errorf("merge 1: expected 3 parents, got %d (parents: %v)", len(parents1), parents1)
-	}
+	assert.Len(t, parents1, 3, "merge 1: expected 3 parents, got %d (parents: %v)", len(parents1), parents1)
 
 	m2 := makeCGHash("21")
 	parents2 := graphData.Parents[m2]
-	if len(parents2) != 5 {
-		t.Errorf("merge 2: expected 5 parents, got %d (parents: %v)", len(parents2), parents2)
-	}
+	assert.Len(t, parents2, 5, "merge 2: expected 5 parents, got %d (parents: %v)", len(parents2), parents2)
 
 	m3 := makeCGHash("22")
 	parents3 := graphData.Parents[m3]
-	if len(parents3) != 11 { // Fixed: should be 11, not 10!
-		t.Errorf("octopus: expected 11 parents, got %d (parents: %v)", len(parents3), parents3)
-	}
+	assert.Len(t, parents3, 11, "octopus: expected 11 parents, got %d (parents: %v)", len(parents3), parents3)
 
 	// Optionally verify the actual parent OIDs are correct
 	if len(parents1) == 3 {
 		expected := []Hash{makeCGHash("00"), makeCGHash("01"), makeCGHash("02")}
 		for i, p := range parents1 {
-			if p != expected[i] {
-				t.Errorf("merge 1 parent %d: got %x, want %x", i, p, expected[i])
-			}
+			assert.Equal(t, expected[i], p, "merge 1 parent %d: got %x, want %x", i, p, expected[i])
 		}
 	}
 }
@@ -1623,15 +1508,11 @@ func TestCommitGraphAllRoots(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify all have no parents
 	for _, oid := range graphData.OrderedOIDs {
-		if len(graphData.Parents[oid]) != 0 {
-			t.Errorf("root commit %v has parents", oid)
-		}
+		assert.Empty(t, graphData.Parents[oid], "root commit %v has parents", oid)
 	}
 }
 
@@ -1664,21 +1545,15 @@ func TestCommitGraphLinearHistory(t *testing.T) {
 	graphData, err := LoadCommitGraph(tmp)
 	loadTime := time.Since(start)
 
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify linear chain
 	for i := 1; i < 1000; i++ {
 		oid := makeCGHash(fmt.Sprintf("%04x", i))
 		parents := graphData.Parents[oid]
-		if len(parents) != 1 {
-			t.Fatalf("commit %d: expected 1 parent, got %d", i, len(parents))
-		}
+		require.Len(t, parents, 1, "commit %d: expected 1 parent, got %d", i, len(parents))
 		expectedParent := makeCGHash(fmt.Sprintf("%04x", i-1))
-		if parents[0] != expectedParent {
-			t.Errorf("commit %d: wrong parent", i)
-		}
+		assert.Equal(t, expectedParent, parents[0], "commit %d: wrong parent", i)
 	}
 
 	t.Logf("Linear history (1000): build=%v, load=%v", buildTime, loadTime)
@@ -1747,47 +1622,34 @@ func TestCommitGraphBinaryTree(t *testing.T) {
 	mustWrite(t, path, data)
 
 	graphData, err := LoadCommitGraph(tmp)
-	if err != nil {
-		t.Fatalf("load failed: %v", err)
-	}
+	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify structure
-	if len(graphData.OrderedOIDs) != 31 { // 1+2+4+8+16
-		t.Errorf("expected 31 commits, got %d", len(graphData.OrderedOIDs))
-	}
+	require.Len(t, graphData.OrderedOIDs, 31, "expected 31 commits, got %d", len(graphData.OrderedOIDs)) // 1+2+4+8+16
 
 	// Verify the tree structure
 	// Root should have no parents
 	rootParents := graphData.Parents[makeCGHash("00")]
-	if len(rootParents) != 0 {
-		t.Errorf("root should have 0 parents, got %d", len(rootParents))
-	}
+	assert.Empty(t, rootParents, "root should have 0 parents, got %d", len(rootParents))
 
 	// Level 1 commits should have 1 parent (the root)
 	for i := 0; i < 2; i++ {
 		oid := makeCGHash(fmt.Sprintf("01%02x", i))
 		parents := graphData.Parents[oid]
-		if len(parents) != 1 {
-			t.Errorf("level 1 commit %x should have 1 parent, got %d", oid, len(parents))
-		}
-		if len(parents) > 0 && parents[0] != makeCGHash("00") {
-			t.Errorf("level 1 commit %x should have root as parent", oid)
+		if assert.Len(t, parents, 1, "level 1 commit %x should have 1 parent, got %d", oid, len(parents)) {
+			assert.Equal(t, makeCGHash("00"), parents[0], "level 1 commit %x should have root as parent", oid)
 		}
 	}
 
 	// Check all commits have 0-2 parents
 	for i := 0; i < len(commits); i++ {
 		parents := graphData.Parents[commits[i].oid]
-		if len(parents) > 2 {
-			t.Errorf("commit %v: unexpected parent count %d (max 2)", commits[i].oid, len(parents))
-		}
+		assert.LessOrEqual(t, len(parents), 2, "commit %v: unexpected parent count %d (max 2)", commits[i].oid, len(parents))
 	}
 
 	// Verify some specific relationships
 	// Level 2, commit 0 should have level 1 commits 0 and 1 as parents
 	level2_0 := makeCGHash("0200")
 	parents2_0 := graphData.Parents[level2_0]
-	if len(parents2_0) != 2 {
-		t.Errorf("level 2 commit 0 should have 2 parents, got %d", len(parents2_0))
-	}
+	assert.Len(t, parents2_0, 2, "level 2 commit 0 should have 2 parents, got %d", len(parents2_0))
 }
