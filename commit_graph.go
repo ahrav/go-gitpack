@@ -113,10 +113,10 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 		return nil, err
 	}
 	if len(chain) == 0 {
-		return nil, nil // No commit-graph on disk.
+		return nil, nil
 	}
 
-	// Parse every graph file in the chain and concatenate their per-chunk data.
+	// Parse every graph file in the chain and concatenate their data.
 	var allOids []Hash
 	var allTrees []Hash
 	var allTimes []int64
@@ -125,7 +125,7 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 	for i, path := range chain {
 		pg, err := parseGraphFile(path)
 		if err != nil {
-			// Opened mmaps must be closed before we leave.
+			// Close opened mmaps before returning.
 			for j := 0; j < i; j++ {
 				fileInfo[j].mr.Close()
 			}
@@ -137,7 +137,6 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 		allTimes = append(allTimes, pg.times...)
 	}
 
-	// Sanity check: all parallel slices must have identical length.
 	if len(allOids) != len(allTrees) || len(allOids) != len(allTimes) {
 		for _, g := range fileInfo {
 			g.mr.Close()
@@ -157,7 +156,7 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 			}
 			return nil, err
 		}
-		offset += len(g.oids) // Next file's parent indices start after this.
+		offset += len(g.oids)
 	}
 
 	for i, oid := range allOids {
@@ -227,19 +226,19 @@ type parsedGraph struct {
 	edge []uint32
 }
 
+// resolveParentsInto converts parent indices from this graph file into actual OIDs,
+// storing the result in dst. It handles split commit-graph chains by applying the
+// given offset and respects layer precedence (newer layers override older ones).
 func (g parsedGraph) resolveParentsInto(dst Parents, all []Hash, offset int) error {
 	for i, oid := range g.oids {
-		// If this OID was already encountered in a *newer* layer,
-		// keep the existing information – later (older) layers must
-		// not clobber it.
+		// Newer layers take precedence.
 		if _, seen := dst[oid]; seen {
 			continue
 		}
 		var ps []Hash
 
-		// First parent
+		// First parent.
 		if p := g.p1[i]; p != graphParentNone {
-			// Adjust index by offset for chained files
 			adjustedP := int(p) + offset
 			if adjustedP >= len(all) {
 				return fmt.Errorf("parent index %d out of bounds", adjustedP)
@@ -247,26 +246,26 @@ func (g parsedGraph) resolveParentsInto(dst Parents, all []Hash, offset int) err
 			ps = append(ps, all[adjustedP])
 		}
 
-		// Second parent or edge pointer
+		// Second parent or edge pointer.
 		v := g.p2raw[i]
 		switch {
 		case v == graphParentNone:
-			// no second parent
+			// No second parent.
 		case v&graphLastEdge == 0:
-			// Direct second parent index
+			// Direct second parent index.
 			adjustedV := int(v) + offset
 			if adjustedV >= len(all) {
 				return fmt.Errorf("parent index %d out of bounds", adjustedV)
 			}
 			ps = append(ps, all[adjustedV])
 		default:
-			// Edge pointer - points to EDGE chunk
+			// Edge pointer for octopus merges.
 			idx := int(v & ^uint32(graphLastEdge))
 			if idx >= len(g.edge) {
 				return fmt.Errorf("edge index %d out of bounds (edge len=%d)", idx, len(g.edge))
 			}
 
-			// Read parents from edge list until terminator
+			// Read parents from edge list until terminator.
 			for idx < len(g.edge) {
 				w := g.edge[idx]
 				parentIdx := int(w & ^uint32(graphLastEdge)) + offset
@@ -285,10 +284,13 @@ func (g parsedGraph) resolveParentsInto(dst Parents, all []Hash, offset int) err
 	return nil
 }
 
+// discoverGraphFiles finds commit-graph files for the given Git repository.
+// It follows Git's search order: split chains first, then single files.
+// Returns nil if no commit-graph is found.
 func discoverGraphFiles(objectsDir string) ([]string, error) {
 	infoDir := filepath.Join(objectsDir, "info")
 
-	// Try split chain first
+	// Try split chain first.
 	chainFile := filepath.Join(infoDir, "commit-graphs", "commit-graph-chain")
 	if f, err := os.Open(chainFile); err == nil {
 		defer f.Close()
@@ -311,22 +313,24 @@ func discoverGraphFiles(objectsDir string) ([]string, error) {
 		}
 	}
 
-	// Try single file
+	// Try single file.
 	single := filepath.Join(infoDir, "commit-graph")
 	if _, err := os.Stat(single); err == nil {
 		return []string{single}, nil
 	}
 
-	return nil, nil // No commit-graph
+	return nil, nil
 }
 
+// parseGraphFile reads and validates a commit-graph file, returning the parsed data.
+// The returned parsedGraph keeps the memory mapping open for the caller to close.
 func parseGraphFile(path string) (parsedGraph, error) {
 	mr, err := mmap.Open(path)
 	if err != nil {
 		return parsedGraph{}, err
 	}
 
-	// Ensure cleanup on all error paths
+	// Ensure cleanup on all error paths.
 	var result parsedGraph
 	defer func() {
 		if result.mr == nil && mr != nil {
@@ -334,7 +338,7 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		}
 	}()
 
-	// Parse header
+	// Parse header.
 	var hdr [8]byte
 	if _, err = mr.ReadAt(hdr[:], 0); err != nil {
 		return parsedGraph{}, err
@@ -351,13 +355,13 @@ func parseGraphFile(path string) (parsedGraph, error) {
 
 	chunks := int(hdr[6])
 
-	// Parse chunk table
+	// Parse chunk table.
 	type chunkDesc struct {
 		id  uint32
 		off uint64
 	}
 	desc := make([]chunkDesc, chunks+1)
-	for i := 0; i < len(desc); i++ {
+	for i := range desc {
 		var row [12]byte
 		if _, err := mr.ReadAt(row[:], int64(8+i*12)); err != nil {
 			return parsedGraph{}, err
@@ -376,7 +380,7 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		return 0
 	})
 
-	// Validate no overlapping chunks
+	// Validate no overlapping chunks.
 	for i := 0; i < len(desc)-1; i++ {
 		if desc[i].off > desc[i+1].off && desc[i].id != 0 {
 			return parsedGraph{}, fmt.Errorf("overlapping chunks: chunk %x at offset %d overlaps with next chunk", desc[i].id, desc[i].off)
@@ -389,7 +393,7 @@ func parseGraphFile(path string) (parsedGraph, error) {
 				off := int64(desc[i].off)
 				size := int64(desc[i+1].off) - off
 				if size < 0 {
-					return 0, 0, false // Invalid chunk size
+					return 0, 0, false
 				}
 				return off, size, true
 			}
@@ -397,7 +401,6 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		return 0, 0, false
 	}
 
-	// Parse chunks
 	off, size, ok := find(chunkOIDF)
 	if !ok || size != fanoutSize {
 		return parsedGraph{}, errors.New("OIDF missing/wrong size")
@@ -408,7 +411,7 @@ func parseGraphFile(path string) (parsedGraph, error) {
 	}
 	total := binary.BigEndian.Uint32(fanout[fanoutSize-4:])
 
-	// Validate fanout monotonicity
+	// Validate fanout monotonicity.
 	var prev uint32
 	for i := 0; i < fanoutEntries; i++ {
 		val := binary.BigEndian.Uint32(fanout[i*4:])
@@ -418,7 +421,6 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		prev = val
 	}
 
-	// OIDL
 	off, size, ok = find(chunkOIDL)
 	if !ok {
 		return parsedGraph{}, errors.New("OIDL chunk missing")
@@ -437,7 +439,6 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		}
 	}
 
-	// CDAT - extract trees and timestamps too
 	off, size, ok = find(chunkCDAT)
 	if !ok {
 		return parsedGraph{}, errors.New("CDAT chunk missing")
@@ -455,28 +456,24 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		}
 	}
 
-	// Parse CDAT for parents, trees, and times
+	// Parse commit data records.
 	n := int(total)
 	p1 := make([]uint32, n)
 	p2 := make([]uint32, n)
 	trees := make([]Hash, n)
 	times := make([]int64, n)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		base := i * cdatRecordSize
-		// Tree OID
 		copy(trees[i][:], cdat[base:base+hashSize])
-		// Parent indices
 		p1[i] = binary.BigEndian.Uint32(cdat[base+hashSize:])
 		p2[i] = binary.BigEndian.Uint32(cdat[base+hashSize+4:])
 
-		// Generation (upper 30 bits) and timestamp (lower 34 bits)
 		genTime := binary.BigEndian.Uint64(cdat[base+hashSize+8:])
 		times[i] = int64(genTime & 0x3FFFFFFFF)
-		// Note: generation number is in upper bits if needed later
 	}
 
-	// EDGE
+	// Parse optional edge chunk for octopus merges.
 	var edge []uint32
 	if off, size, ok = find(chunkEDGE); ok {
 		if size%4 != 0 {
