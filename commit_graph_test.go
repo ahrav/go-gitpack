@@ -1647,17 +1647,15 @@ func mustWriteTB(t testing.TB, path string, data []byte) {
 }
 
 // generateTestGraphFile creates a commit graph file with the specified number of commits.
-// This is adapted from the provided benchmarks and reuses existing buildCGFile logic where possible.
+// This reuses existing buildCGFile logic and creates deterministic but varied commit structures.
 func generateTestGraphFile(t testing.TB, path string, numCommits int, hasEdges bool) {
 	t.Helper()
 
-	// Generate commits with deterministic but varied structure
 	var commits []cgCommit
 	var edge []uint32
 	edgeIndex := 0
 
-	for i := 0; i < numCommits; i++ {
-		// Create deterministic OIDs
+	for i := range numCommits {
 		oid := makeCGHash(fmt.Sprintf("%08x", i))
 		tree := makeCGHash(fmt.Sprintf("1%07x", i))
 
@@ -1666,22 +1664,21 @@ func generateTestGraphFile(t testing.TB, path string, numCommits int, hasEdges b
 		var useEdge bool
 
 		if i == 0 {
-			// Root commit - no parents
+			// Root commit has no parents.
 		} else if hasEdges && i%10 == 0 && i > 2 {
-			// Octopus merge - first parent in CDAT, rest in EDGE
+			// Create octopus merge every 10th commit with first parent in CDAT, rest in EDGE.
 			parents = []uint32{uint32(i - 1)}
 			edgePointer = uint32(edgeIndex)
 			useEdge = true
 
-			// Add 2 additional parents to edge list
 			edge = append(edge, uint32(i-2))
 			edge = append(edge, uint32(i-3)|lastEdgeMask)
 			edgeIndex += 2
 		} else if i > 1 && i%5 == 0 {
-			// Regular merge - 2 parents
+			// Create regular merge every 5th commit.
 			parents = []uint32{uint32(i - 1), uint32(i - 2)}
 		} else {
-			// Linear history
+			// Linear history.
 			parents = []uint32{uint32(i - 1)}
 		}
 
@@ -1694,7 +1691,6 @@ func generateTestGraphFile(t testing.TB, path string, numCommits int, hasEdges b
 		})
 	}
 
-	// Use existing buildCGFile helper
 	var edgeData []uint32
 	if hasEdges {
 		edgeData = edge
@@ -1704,7 +1700,7 @@ func generateTestGraphFile(t testing.TB, path string, numCommits int, hasEdges b
 	mustWriteTB(t, path, data)
 }
 
-// generateTestGraphChain creates a chain of commit graph files.
+// generateTestGraphChain creates a chain of commit graph files for testing chain scenarios.
 func generateTestGraphChain(t testing.TB, dir string, layers []int) []string {
 	t.Helper()
 
@@ -1723,21 +1719,24 @@ func generateTestGraphChain(t testing.TB, dir string, layers []int) []string {
 		graphPath := filepath.Join(chainDir, fmt.Sprintf("graph-%s.graph", hash))
 		paths = append(paths, graphPath)
 
-		hasEdges := i == 0 // Only first layer has edges for variety
+		hasEdges := i == 0 // Only first layer has edges for variety.
 		generateTestGraphFile(t, graphPath, numCommits, hasEdges)
 	}
 
-	// Write chain file
 	chainPath := filepath.Join(chainDir, "commit-graph-chain")
 	f, err := os.Create(chainPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer f.Close()
 
-	for _, h := range hashes {
-		fmt.Fprintln(f, h)
-	}
+	func() {
+		defer f.Close()
+		for _, h := range hashes {
+			if _, err := fmt.Fprintln(f, h); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}()
 
 	return paths
 }
@@ -1763,7 +1762,7 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				data, err := LoadCommitGraph(dir)
 				if err != nil {
 					b.Fatal(err)
@@ -1785,7 +1784,7 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				data, err := LoadCommitGraph(dir)
 				if err != nil {
 					b.Fatal(err)
@@ -1803,34 +1802,40 @@ func BenchmarkParseGraphFile(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
-			path := filepath.Join(b.TempDir(), "test.graph")
+			dir := b.TempDir()
+			path := filepath.Join(dir, "test.graph")
 			generateTestGraphFile(b, path, size, true)
 
 			b.ResetTimer()
 			b.ReportAllocs()
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				pg, err := parseGraphFile(path)
 				if err != nil {
 					b.Fatal(err)
 				}
-				pg.mr.Close()
+				if pg.mr != nil {
+					pg.mr.Close()
+				}
 			}
 		})
 
 		b.Run(fmt.Sprintf("size_%d_noedge", size), func(b *testing.B) {
-			path := filepath.Join(b.TempDir(), "test.graph")
+			dir := b.TempDir()
+			path := filepath.Join(dir, "test.graph")
 			generateTestGraphFile(b, path, size, false)
 
 			b.ResetTimer()
 			b.ReportAllocs()
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				pg, err := parseGraphFile(path)
 				if err != nil {
 					b.Fatal(err)
 				}
-				pg.mr.Close()
+				if pg.mr != nil {
+					pg.mr.Close()
+				}
 			}
 		})
 	}
@@ -1841,14 +1846,19 @@ func BenchmarkResolveParents(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
-			path := filepath.Join(b.TempDir(), "test.graph")
+			dir := b.TempDir()
+			path := filepath.Join(dir, "test.graph")
 			generateTestGraphFile(b, path, size, true)
 
 			pg, err := parseGraphFile(path)
 			if err != nil {
 				b.Fatal(err)
 			}
-			defer pg.mr.Close()
+			defer func() {
+				if pg.mr != nil {
+					pg.mr.Close()
+				}
+			}()
 
 			// Prepare full OID list
 			allOids := make([]Hash, size)
@@ -1857,7 +1867,7 @@ func BenchmarkResolveParents(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				parents := make(Parents, size)
 				if err := pg.resolveParentsInto(parents, allOids, 0); err != nil {
 					b.Fatal(err)
@@ -1872,15 +1882,13 @@ func BenchmarkOIDToIndexLookup(b *testing.B) {
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
-			// Create test data
 			oidToIndex := make(map[Hash]int, size)
-			lookupOids := make([]Hash, 1000) // Sample OIDs to lookup
+			lookupOids := make([]Hash, 1000) // Sample OIDs to lookup.
 
-			for i := 0; i < size; i++ {
+			for i := range size {
 				oid := makeCGHash(fmt.Sprintf("%08x", i))
 				oidToIndex[oid] = i
 
-				// Sample some OIDs for lookup
 				if i < 1000 {
 					lookupOids[i] = oid
 				}
@@ -1889,7 +1897,7 @@ func BenchmarkOIDToIndexLookup(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				for j := 0; j < 1000; j++ {
 					oid := lookupOids[j%len(lookupOids)]
 					if idx, ok := oidToIndex[oid]; !ok || idx != j%len(lookupOids) {
@@ -1915,7 +1923,7 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			files, err := discoverGraphFiles(dir)
 			if err != nil {
 				b.Fatal(err)
@@ -1933,7 +1941,7 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			files, err := discoverGraphFiles(dir)
 			if err != nil {
 				b.Fatal(err)
@@ -1950,7 +1958,7 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 		b.ResetTimer()
 		b.ReportAllocs()
 
-		for i := 0; i < b.N; i++ {
+		for b.Loop() {
 			files, err := discoverGraphFiles(dir)
 			if err != nil {
 				b.Fatal(err)
@@ -1966,27 +1974,26 @@ func BenchmarkChunkParsing(b *testing.B) {
 	sizes := []int{10000, 100000}
 
 	for _, size := range sizes {
-		path := filepath.Join(b.TempDir(), "test.graph")
-		generateTestGraphFile(b, path, size, true)
-
 		b.Run(fmt.Sprintf("CDAT_%d", size), func(b *testing.B) {
+			dir := b.TempDir()
+			path := filepath.Join(dir, "test.graph")
+			generateTestGraphFile(b, path, size, true)
+
 			mr, err := mmap.Open(path)
 			if err != nil {
 				b.Fatal(err)
 			}
 			defer mr.Close()
 
-			// Find CDAT chunk offset
-			// Read header to get chunk count
+			// Find CDAT chunk offset by reading header and scanning chunk table.
 			var hdr [8]byte
 			if _, err := mr.ReadAt(hdr[:], 0); err != nil {
 				b.Fatal(err)
 			}
 			chunks := int(hdr[6])
 
-			// Find CDAT in chunk table
 			var cdatOffset, cdatSize int64
-			for i := 0; i < chunks; i++ {
+			for i := range chunks {
 				var row [12]byte
 				if _, err := mr.ReadAt(row[:], int64(8+i*12)); err != nil {
 					b.Fatal(err)
@@ -1994,7 +2001,6 @@ func BenchmarkChunkParsing(b *testing.B) {
 				id := binary.BigEndian.Uint32(row[0:4])
 				if id == chunkCDAT {
 					cdatOffset = int64(binary.BigEndian.Uint64(row[4:12]))
-					// Get size from next entry
 					if _, err := mr.ReadAt(row[:], int64(8+(i+1)*12)); err != nil {
 						b.Fatal(err)
 					}
@@ -2013,65 +2019,22 @@ func BenchmarkChunkParsing(b *testing.B) {
 			b.ResetTimer()
 			b.ReportAllocs()
 
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				cdat := make([]byte, cdatSize)
 				if _, err := mr.ReadAt(cdat, cdatOffset); err != nil {
 					b.Fatal(err)
 				}
 
-				// Parse CDAT
 				n := int(cdatSize / cdatRecordSize)
 				trees := make([]Hash, n)
 				times := make([]int64, n)
 
-				for j := 0; j < n; j++ {
+				for j := range n {
 					base := j * cdatRecordSize
 					copy(trees[j][:], cdat[base:base+hashLen])
 					genTime := binary.BigEndian.Uint64(cdat[base+hashLen+8:])
 					times[j] = int64(genTime & 0x3FFFFFFFF)
 				}
-			}
-		})
-	}
-}
-
-// Memory allocation benchmarks
-func BenchmarkMemoryAllocation(b *testing.B) {
-	sizes := []int{10000, 100000, 1000000}
-
-	for _, size := range sizes {
-		b.Run(fmt.Sprintf("maps_%d", size), func(b *testing.B) {
-			b.ReportAllocs()
-
-			for i := 0; i < b.N; i++ {
-				parents := make(Parents, size)
-				oidToIndex := make(map[Hash]int, size)
-
-				// Simulate population
-				for j := 0; j < size/100; j++ {
-					oid := makeCGHash(fmt.Sprintf("%08x", j))
-					parents[oid] = []Hash{oid}
-					oidToIndex[oid] = j
-				}
-			}
-		})
-
-		b.Run(fmt.Sprintf("slices_%d", size), func(b *testing.B) {
-			b.ReportAllocs()
-
-			for i := 0; i < b.N; i++ {
-				oids := make([]Hash, size)
-				trees := make([]Hash, size)
-				times := make([]int64, size)
-				p1 := make([]uint32, size)
-				p2 := make([]uint32, size)
-
-				// Prevent compiler optimization
-				_ = oids
-				_ = trees
-				_ = times
-				_ = p1
-				_ = p2
 			}
 		})
 	}
