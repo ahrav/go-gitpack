@@ -46,22 +46,11 @@ var ErrWindowFull = errors.New("delta window full: all entries in use")
 // - Cold fields follow, also ordered by size
 // - This minimizes struct padding while keeping hot fields in the first cache line
 //
-// Memory layout (64-bit system):
-//
-//	Offset 0-31:  oid (Hash, 32 bytes)           - hot, largest
-//	Offset 32-55: data ([]byte, 24 bytes)       - hot, slice header
-//	Offset 56-63: refCnt (atomic.Int32, 8 bytes) - hot, atomic wrapper
-//	Offset 64-71: size (int, 8 bytes)           - cold
-//
-// Total: 72 bytes, hot fields fit in first cache line (64 bytes + 8 bytes)
-//
 // The entry exists within a refCountedDeltaWindow and tracks how many
 // active Handle instances currently reference its data. The reference
 // count is managed atomically to avoid data races during concurrent
 // acquire/release operations.
 type refCountedEntry struct {
-	// === HOT FIELDS (frequently accessed, ordered by size) ===
-
 	// oid uniquely identifies the object this entry represents, stored
 	// in canonical object-ID hash form for fast map lookups.
 	// HIGH FREQUENCY: every lookup/acquire for identification
@@ -81,8 +70,6 @@ type refCountedEntry struct {
 	// VERY HIGH FREQUENCY: every acquire/release operation
 	// 8 bytes (atomic.Int32 wrapper), 8-byte aligned
 	refCnt atomic.Int32
-
-	// === COLD FIELDS (accessed less frequently) ===
 
 	// size records len(data) in bytes at the time of last update.
 	// This cached value enables memory accounting without repeated
@@ -131,6 +118,11 @@ type refCountedDeltaWindow struct {
 	// for LRU eviction. This optimization avoids scanning the entire
 	// LRU list when all entries are actively referenced.
 	evictable int
+
+	// handlePool reuses Handle instances to reduce allocation overhead
+	// and GC pressure. Handles are frequently created and destroyed
+	// during delta resolution, making pooling beneficial.
+	handlePool sync.Pool
 }
 
 // newRefCountedDeltaWindow allocates and returns a refCountedDeltaWindow
@@ -139,11 +131,17 @@ type refCountedDeltaWindow struct {
 // The returned cache is ready for immediate use and safe for concurrent
 // access by multiple goroutines.
 func newRefCountedDeltaWindow() *refCountedDeltaWindow {
-	return &refCountedDeltaWindow{
+	w := &refCountedDeltaWindow{
 		budget: windowBudget,
 		lru:    list.New(),
 		index:  make(map[Hash]*list.Element, 256), // Pre-size for typical workloads
 	}
+
+	w.handlePool = sync.Pool{
+		New: func() any { return new(Handle) },
+	}
+
+	return w
 }
 
 // Handle represents an active reference to cached object data and ensures
@@ -186,16 +184,24 @@ func (h *Handle) Release() {
 		return
 	}
 
-	h.w.mu.Lock()
-	defer h.w.mu.Unlock()
+	w := h.w
+
+	w.mu.Lock()
+	defer w.mu.Unlock()
 
 	newCount := h.entry.refCnt.Add(-1)
 
 	if newCount == 0 {
-		h.w.evictable++
+		w.evictable++
 	}
 
+	// Clear only the internal reference fields before returning to pool.
+	// Keep h.data intact so Data() remains valid after Release() as documented.
 	h.entry = nil
+	h.w = nil
+
+	// Return the handle to the pool for reuse
+	w.handlePool.Put(h)
 }
 
 // Data returns the cached object data associated with this handle.
@@ -236,7 +242,13 @@ func (w *refCountedDeltaWindow) acquire(oid Hash) (*Handle, bool) {
 
 	w.lru.MoveToFront(elem)
 
-	return &Handle{data: entry.data, entry: entry, w: w}, true
+	// Get a handle from the pool and initialize it
+	handle := w.handlePool.Get().(*Handle)
+	handle.data = entry.data
+	handle.entry = entry
+	handle.w = w
+
+	return handle, true
 }
 
 // add inserts or updates the cached entry for the given object hash.
