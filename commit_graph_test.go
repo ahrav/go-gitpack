@@ -83,11 +83,11 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 	)
 
 	// Write file header.
-	buf.WriteString("CGPH")                    // Magic signature.
-	buf.WriteByte(1)                           // Version.
-	buf.WriteByte(1)                           // Hash version (SHA-1).
-	buf.WriteByte(byte(3 + btoi(edge != nil))) // Chunk count.
-	buf.WriteByte(0)                           // Reserved byte.
+	buf.WriteString("CGPH")
+	buf.WriteByte(1)
+	buf.WriteByte(1)
+	buf.WriteByte(byte(3 + btoi(edge != nil)))
+	buf.WriteByte(0)
 
 	// Prepare chunk table rows (offsets will be filled later).
 	ids := []uint32{chunkOIDF, chunkOIDL, chunkCDAT}
@@ -103,7 +103,7 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 	chunkOffTbl = append(chunkOffTbl, struct {
 		id  uint32
 		off uint64
-	}{id: 0, off: 0}) // Terminator entry.
+	}{id: 0, off: 0})
 
 	// Reserve space for chunk table.
 	buf.Write(make([]byte, len(chunkOffTbl)*12))
@@ -142,18 +142,15 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 			p1 = c.parents[0]
 		}
 
-		// Check if we should use edge pointer.
+		// Use edge pointer for octopus merges.
 		if c.useEdge {
-			// This is an octopus merge - p2 contains edge pointer.
 			p2 = c.edgePointer | lastEdgeMask
 		} else if len(c.parents) > 1 {
-			// Regular 2-parent merge.
 			p2 = c.parents[1]
 		}
 
 		binary.BigEndian.PutUint32(cdat[off+hashLen:], p1)
 		binary.BigEndian.PutUint32(cdat[off+hashLen+4:], p2)
-		// Leave generation and time fields as zero.
 	}
 	appendChunk(chunkCDAT, cdat)
 
@@ -360,7 +357,7 @@ func TestCommitGraphChainPrecedence(t *testing.T) {
 	singlePath := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, singlePath, singleData)
 
-	// Create chain with commit B
+	// Create chain with commit B.
 	B := makeCGHash("bb")
 	chainCommits := []cgCommit{
 		{oid: B, tree: makeCGHash("22"), parents: nil},
@@ -373,7 +370,7 @@ func TestCommitGraphChainPrecedence(t *testing.T) {
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(chainHash+"\n"))
 
-	// Load - should get B from chain, not A from single
+	// Load and verify chain takes precedence.
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 	if assert.Len(t, graphData.OrderedOIDs, 1) {
@@ -607,34 +604,33 @@ func TestCommitGraphOverlappingChunks(t *testing.T) {
 func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Create some commits that can be referenced
+	// Create commits that can be referenced.
 	commits := []cgCommit{
-		{oid: makeCGHash("00"), tree: makeCGHash("10")}, // index 0
-		{oid: makeCGHash("01"), tree: makeCGHash("11")}, // index 1
-		{oid: makeCGHash("02"), tree: makeCGHash("12")}, // index 2
-		{oid: makeCGHash("03"), tree: makeCGHash("13")}, // index 3
+		{oid: makeCGHash("00"), tree: makeCGHash("10")},
+		{oid: makeCGHash("01"), tree: makeCGHash("11")},
+		{oid: makeCGHash("02"), tree: makeCGHash("12")},
+		{oid: makeCGHash("03"), tree: makeCGHash("13")},
 	}
 
-	// Create a circular edge list - commit 4 has parents that form a cycle
-	// The edge list references commits 0->1->2->3->0 (circular)
+	// Create a circular edge list that references commits 0->1->2->3->0.
 	edge := []uint32{
-		1,                // parent is commit 1
-		2,                // parent is commit 2
-		3,                // parent is commit 3
-		0,                // parent is commit 0 (back to start - circular!)
-		1,                // parent is commit 1 again
-		2,                // parent is commit 2 again
-		3,                // parent is commit 3 again
-		0 | lastEdgeMask, // terminate with commit 0
+		1,
+		2,
+		3,
+		0,
+		1,
+		2,
+		3,
+		0 | lastEdgeMask,
 	}
 
-	// Add the merge commit that uses this edge list
+	// Add the merge commit that uses this edge list.
 	M := makeCGHash("aa")
 	commits = append(commits, cgCommit{
 		oid:         M,
 		tree:        makeCGHash("1a"),
-		parents:     []uint32{0}, // first parent
-		edgePointer: 0,           // starts at edge[0]
+		parents:     []uint32{0},
+		edgePointer: 0,
 		useEdge:     true,
 	})
 
@@ -642,26 +638,25 @@ func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	// Should handle gracefully, not infinite loop
+	// Should handle gracefully without infinite loop.
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "failed to parse: %v", err)
 
-	// Should have collected all parents until hitting terminator
+	// Should have collected all parents until hitting terminator.
 	parents := graphData.Parents[M]
-	// We expect 9 parents total: first parent (0) + 8 from edge list
 	require.Len(t, parents, 9, "expected 9 parents, got %d: %v", len(parents), parents)
 
-	// Verify we got the expected parents (including duplicates)
+	// Verify expected parent order including duplicates.
 	expected := []Hash{
-		makeCGHash("00"), // first parent
-		makeCGHash("01"), // from edge[0]
-		makeCGHash("02"), // from edge[1]
-		makeCGHash("03"), // from edge[2]
-		makeCGHash("00"), // from edge[3] - circular!
-		makeCGHash("01"), // from edge[4]
-		makeCGHash("02"), // from edge[5]
-		makeCGHash("03"), // from edge[6]
-		makeCGHash("00"), // from edge[7] with terminator
+		makeCGHash("00"),
+		makeCGHash("01"),
+		makeCGHash("02"),
+		makeCGHash("03"),
+		makeCGHash("00"),
+		makeCGHash("01"),
+		makeCGHash("02"),
+		makeCGHash("03"),
+		makeCGHash("00"),
 	}
 
 	for i, p := range parents {
@@ -674,16 +669,16 @@ func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 func TestCommitGraphManyParents(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Create 100 parent commits
+	// Create 100 parent commits.
 	var commits []cgCommit
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		commits = append(commits, cgCommit{
 			oid:  makeCGHash(fmt.Sprintf("%02x", i)),
 			tree: makeCGHash(fmt.Sprintf("1%02x", i)),
 		})
 	}
 
-	// Create octopus merge with all as parents
+	// Create octopus merge with all as parents.
 	var edge []uint32
 	for i := uint32(1); i < 100; i++ {
 		if i == 99 {
@@ -697,8 +692,8 @@ func TestCommitGraphManyParents(t *testing.T) {
 	commits = append(commits, cgCommit{
 		oid:         M,
 		tree:        makeCGHash("ff"),
-		parents:     []uint32{0}, // first parent in p1
-		edgePointer: 0,           // rest in EDGE
+		parents:     []uint32{0},
+		edgePointer: 0,
 		useEdge:     true,
 	})
 
@@ -722,11 +717,11 @@ func TestCommitGraphEdgeNoTerminator(t *testing.T) {
 	B := makeCGHash("bb")
 	M := makeCGHash("cc")
 
-	// Edge list without lastEdgeMask terminator
+	// Edge list without lastEdgeMask terminator.
 	edge := []uint32{
-		1, // parent B, but no terminator!
-		0, // parent A
-		1, // parent B again
+		1,
+		0,
+		1,
 	}
 
 	commits := []cgCommit{
@@ -748,108 +743,9 @@ func TestCommitGraphEdgeNoTerminator(t *testing.T) {
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "parse failed: %v", err)
 
-	// Should read all edges until end of chunk
+	// Should read all edges until end of chunk.
 	parents := graphData.Parents[M]
-	// We expect 4 parents: first parent (0) + 3 from edge chunk
 	assert.Len(t, parents, 4, "expected 4 parents, got %d", len(parents))
-}
-
-// TestCommitGraphParentBoundaryIndex tests error handling when parent index
-// is out of bounds.
-func TestCommitGraphParentBoundaryIndex(t *testing.T) {
-	tmp := t.TempDir()
-
-	t.Run("ValidBoundary", func(t *testing.T) {
-		// Create 10 commits
-		var commits []cgCommit
-		for i := 0; i < 10; i++ {
-			commits = append(commits, cgCommit{
-				oid:  makeCGHash(fmt.Sprintf("%02x", i)),
-				tree: makeCGHash(fmt.Sprintf("1%02x", i)),
-			})
-		}
-		// Parent at index 9 (last valid index)
-		commits = append(commits, cgCommit{
-			oid:     makeCGHash("aa"),
-			tree:    makeCGHash("aa"),
-			parents: []uint32{9}, // valid boundary
-		})
-
-		data := buildCGFile(commits, nil)
-		path := filepath.Join(tmp, "info", "commit-graph")
-		mustWrite(t, path, data)
-
-		graphData, err := LoadCommitGraph(tmp)
-		require.NoError(t, err, "unexpected error for valid boundary: %v", err)
-
-		// Verify the parent relationship
-		child := makeCGHash("aa")
-		parents := graphData.Parents[child]
-		if assert.Len(t, parents, 1) {
-			assert.Equal(t, makeCGHash("09"), parents[0], "wrong parent: got %v", parents)
-		}
-	})
-
-	t.Run("InvalidBoundary", func(t *testing.T) {
-		// Create 10 commits
-		var commits []cgCommit
-		for i := 0; i < 10; i++ {
-			commits = append(commits, cgCommit{
-				oid:  makeCGHash(fmt.Sprintf("%02x", i)),
-				tree: makeCGHash(fmt.Sprintf("1%02x", i)),
-			})
-		}
-		// Add 11th commit with parent at index 11 (out of bounds - only 0-10 will exist)
-		commits = append(commits, cgCommit{
-			oid:     makeCGHash("aa"),
-			tree:    makeCGHash("aa"),
-			parents: []uint32{11}, // invalid! We'll have 11 commits (0-10), so 11 is out of bounds
-		})
-
-		data := buildCGFile(commits, nil)
-		path := filepath.Join(tmp, "info", "commit-graph")
-		mustWrite(t, path, data)
-
-		_, err := LoadCommitGraph(tmp)
-		if assert.Error(t, err, "expected error for out-of-bounds parent") {
-			assert.True(t, strings.Contains(err.Error(), "parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about parent index out of bounds, got: %v", err)
-		}
-	})
-
-	t.Run("InvalidBoundaryInEDGE", func(t *testing.T) {
-		// Test out-of-bounds parent in EDGE chunk
-		var commits []cgCommit
-		for i := 0; i < 5; i++ {
-			commits = append(commits, cgCommit{
-				oid:  makeCGHash(fmt.Sprintf("%02x", i)),
-				tree: makeCGHash(fmt.Sprintf("1%02x", i)),
-			})
-		}
-
-		// Add octopus merge with out-of-bounds parent in edge
-		edge := []uint32{
-			1,                 // valid
-			2,                 // valid
-			10 | lastEdgeMask, // invalid! Only 0-5 will exist
-		}
-
-		commits = append(commits, cgCommit{
-			oid:         makeCGHash("aa"),
-			tree:        makeCGHash("aa"),
-			parents:     []uint32{0}, // first parent valid
-			edgePointer: 0,
-			useEdge:     true,
-		})
-
-		data := buildCGFile(commits, edge)
-		path := filepath.Join(tmp, "info", "commit-graph")
-		mustWrite(t, path, data)
-
-		_, err := LoadCommitGraph(tmp)
-		if assert.Error(t, err, "expected error for out-of-bounds edge parent") {
-			assert.True(t, strings.Contains(err.Error(), "edge parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about edge parent index out of bounds, got: %v", err)
-		}
-	})
 }
 
 /* ------------------------------------------------------------------------- */
@@ -882,7 +778,7 @@ func TestCommitGraphBadFanout(t *testing.T) {
 	// Write OIDF with non-monotonic values.
 	oidfOffset := buf.Len()
 	fanout := make([]uint32, 256)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		if i < 128 {
 			fanout[i] = uint32(i + 1)
 		} else {
@@ -916,11 +812,10 @@ func TestCommitGraphBadFanout(t *testing.T) {
 	assert.Error(t, err, "expected error for non-monotonic fanout")
 }
 
-// TestCommitGraphEmpty tests error handling when a commit graph file has no commits.
+// TestCommitGraphEmpty tests loading an empty commit graph file.
 func TestCommitGraphEmpty(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Valid file with 0 commits
 	commits := []cgCommit{}
 	data := buildCGFile(commits, nil)
 
@@ -937,19 +832,13 @@ func TestCommitGraphEmpty(t *testing.T) {
 func TestCommitGraphFanoutMismatch(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Build file normally
 	commits := []cgCommit{
 		{oid: makeCGHash("aa"), tree: makeCGHash("11")},
 	}
 	data := buildCGFile(commits, nil)
 
-	// Find OIDF chunk and corrupt fanout[255]
-	// The buildCGFile creates correct fanout, so we need to modify it
-	// Fanout starts after 8-byte header + chunk table
-	// For 3 chunks + terminator = 4 entries * 12 bytes = 48 bytes
-	// So OIDF starts at offset 8 + 48 = 56
-
-	// Set fanout[255] to claim 100 commits instead of 1
+	// Corrupt fanout[255] to claim 100 commits instead of 1.
+	// Fanout starts at offset 8 (header) + 48 (chunk table) = 56.
 	fanoutLastOffset := 56 + 255*4
 	binary.BigEndian.PutUint32(data[fanoutLastOffset:], 100)
 
@@ -964,33 +853,23 @@ func TestCommitGraphFanoutMismatch(t *testing.T) {
 /*                          Chain-specific Tests                             */
 /* ------------------------------------------------------------------------- */
 
-// TestCommitGraphDeepChainParent tests error handling when parent indices
-// in split chains are not resolved correctly.
+// TestCommitGraphDeepChainParent tests parent index resolution in chained commit graphs.
 func TestCommitGraphDeepChainParent(t *testing.T) {
 	tmp := t.TempDir()
 
-	// The test demonstrates that parent indices in split chains are local to each file
-	// and get adjusted by the cumulative offset of previous files
-
-	// Build a simple 2-file chain to clearly show the offset adjustment
-
-	// File 1: 3 commits
+	// File 1: 3 commits with internal parent references.
 	file1Commits := []cgCommit{
-		{oid: makeCGHash("00"), tree: makeCGHash("10")},                       // global 0
-		{oid: makeCGHash("01"), tree: makeCGHash("11"), parents: []uint32{0}}, // global 1, parent global 0
-		{oid: makeCGHash("02"), tree: makeCGHash("12"), parents: []uint32{1}}, // global 2, parent global 1
+		{oid: makeCGHash("00"), tree: makeCGHash("10")},
+		{oid: makeCGHash("01"), tree: makeCGHash("11"), parents: []uint32{0}},
+		{oid: makeCGHash("02"), tree: makeCGHash("12"), parents: []uint32{1}},
 	}
 
-	// File 2: 2 commits that reference file 1
-	// Since file 1 has 3 commits, file 2's offset is -3
-	// To reference global index 0, we'd need local index -3 (impossible)
-	// So file 2 can only create new roots or reference within itself
+	// File 2: 2 commits with internal references only.
 	file2Commits := []cgCommit{
-		{oid: makeCGHash("10"), tree: makeCGHash("20")},                       // global 3, new root
-		{oid: makeCGHash("11"), tree: makeCGHash("21"), parents: []uint32{0}}, // global 4, parent global 3
+		{oid: makeCGHash("10"), tree: makeCGHash("20")},
+		{oid: makeCGHash("11"), tree: makeCGHash("21"), parents: []uint32{0}},
 	}
 
-	// Build the files
 	data1 := buildCGFile(file1Commits, nil)
 	hash1 := "1111111111111111111111111111111111111111"
 	path1 := filepath.Join(tmp, "info", "commit-graphs", "graph-"+hash1+".graph")
@@ -1001,40 +880,31 @@ func TestCommitGraphDeepChainParent(t *testing.T) {
 	path2 := filepath.Join(tmp, "info", "commit-graphs", "graph-"+hash2+".graph")
 	mustWrite(t, path2, data2)
 
-	// Chain file (newest first)
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(hash2+"\n"+hash1+"\n"))
 
-	// Load
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
-	// Verify the parent relationships
-	// File 1 internal references should work
+	// Verify parent relationships work within each file.
 	if parents := graphData.Parents[makeCGHash("01")]; assert.Len(t, parents, 1) {
 		assert.Equal(t, makeCGHash("00"), parents[0], "commit 01: wrong parents %v", parents)
 	}
 	if parents := graphData.Parents[makeCGHash("02")]; assert.Len(t, parents, 1) {
 		assert.Equal(t, makeCGHash("01"), parents[0], "commit 02: wrong parents %v", parents)
 	}
-
-	// File 2 internal references should work (with offset adjustment)
 	if parents := graphData.Parents[makeCGHash("11")]; assert.Len(t, parents, 1) {
 		assert.Equal(t, makeCGHash("10"), parents[0], "commit 11: wrong parents %v", parents)
 	}
-
-	// This test shows that split commit-graphs have limitations on cross-file references
-	// due to the local indexing + offset adjustment mechanism
 }
 
-// TestCommitGraphChainDuplicates tests error handling when duplicate commits
-// exist across chain files.
+// TestCommitGraphChainDuplicates tests handling of duplicate commits across chain files.
 func TestCommitGraphChainDuplicates(t *testing.T) {
 	tmp := t.TempDir()
 
 	A := makeCGHash("aa")
 
-	// Base layer: A with no parents
+	// Base layer with commit A having no parents.
 	baseCommits := []cgCommit{
 		{oid: A, tree: makeCGHash("11"), parents: nil},
 	}
@@ -1043,10 +913,10 @@ func TestCommitGraphChainDuplicates(t *testing.T) {
 	basePath := filepath.Join(tmp, "info", "commit-graphs", "graph-"+baseHash+".graph")
 	mustWrite(t, basePath, baseData)
 
-	// Tip layer: A again but with parent
+	// Tip layer with same commit A but now having a parent.
 	B := makeCGHash("bb")
 	tipCommits := []cgCommit{
-		{oid: A, tree: makeCGHash("11"), parents: []uint32{1}}, // now has parent
+		{oid: A, tree: makeCGHash("11"), parents: []uint32{1}},
 		{oid: B, tree: makeCGHash("22"), parents: nil},
 	}
 	tipData := buildCGFile(tipCommits, nil)
@@ -1054,15 +924,13 @@ func TestCommitGraphChainDuplicates(t *testing.T) {
 	tipPath := filepath.Join(tmp, "info", "commit-graphs", "graph-"+tipHash+".graph")
 	mustWrite(t, tipPath, tipData)
 
-	// Chain file
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(tipHash+"\n"+baseHash+"\n"))
 
-	// Load
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
-	// Tip version should take precedence
+	// Tip version should take precedence over base version.
 	parents := graphData.Parents[A]
 	if assert.Len(t, parents, 1) {
 		assert.Equal(t, B, parents[0], "tip layer should override base for duplicate OID")
@@ -1079,7 +947,7 @@ func TestCommitGraphLongChain(t *testing.T) {
 
 	// Create 50-file chain
 	var chainContent []string
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		commits := []cgCommit{
 			{
 				oid:  makeCGHash(fmt.Sprintf("%02x", i)),
@@ -1373,7 +1241,7 @@ func TestCommitGraphLargeFile(t *testing.T) {
 
 	// Generate 10k commits (not 1M for practicality)
 	var commits []cgCommit
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		parent := []uint32{}
 		if i > 0 {
 			parent = []uint32{uint32(i - 1)}
@@ -1415,7 +1283,7 @@ func TestCommitGraphComplexMerges(t *testing.T) {
 	var edge []uint32
 	edgeOffset := uint32(0)
 	// 20 regular commits
-	for i := 0; i < 20; i++ {
+	for i := range 20 {
 		commits = append(commits, cgCommit{
 			oid:  makeCGHash(fmt.Sprintf("%02x", i)),
 			tree: makeCGHash(fmt.Sprintf("1%02x", i)),
@@ -1503,7 +1371,7 @@ func TestCommitGraphAllRoots(t *testing.T) {
 
 	// Create 100 root commits
 	var commits []cgCommit
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		commits = append(commits, cgCommit{
 			oid:     makeCGHash(fmt.Sprintf("%02x", i)),
 			tree:    makeCGHash(fmt.Sprintf("1%02x", i)),
@@ -1531,7 +1399,7 @@ func TestCommitGraphLinearHistory(t *testing.T) {
 
 	// Create 1000 commits in a line
 	var commits []cgCommit
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		var parents []uint32
 		if i > 0 {
 			parents = []uint32{uint32(i - 1)}
@@ -1594,11 +1462,11 @@ func TestCommitGraphBinaryTree(t *testing.T) {
 		prevLevelSize := 1 << (level - 1) // Size of previous level
 
 		// Calculate where previous level starts
-		for l := 0; l < level-1; l++ {
+		for l := range level - 1 {
 			prevLevelStart += 1 << l
 		}
 
-		for i := 0; i < levelSize; i++ {
+		for i := range levelSize {
 			// For level 1, all commits have root as single parent
 			// For other levels, commits can have 1 or 2 parents
 			var parents []uint32
@@ -1643,7 +1511,7 @@ func TestCommitGraphBinaryTree(t *testing.T) {
 	assert.Empty(t, rootParents, "root should have 0 parents, got %d", len(rootParents))
 
 	// Level 1 commits should have 1 parent (the root)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		oid := makeCGHash(fmt.Sprintf("01%02x", i))
 		parents := graphData.Parents[oid]
 		if assert.Len(t, parents, 1, "level 1 commit %x should have 1 parent, got %d", oid, len(parents)) {
@@ -1652,7 +1520,7 @@ func TestCommitGraphBinaryTree(t *testing.T) {
 	}
 
 	// Check all commits have 0-2 parents
-	for i := 0; i < len(commits); i++ {
+	for i := range commits {
 		parents := graphData.Parents[commits[i].oid]
 		assert.LessOrEqual(t, len(parents), 2, "commit %v: unexpected parent count %d (max 2)", commits[i].oid, len(parents))
 	}
@@ -1662,4 +1530,101 @@ func TestCommitGraphBinaryTree(t *testing.T) {
 	level2_0 := makeCGHash("0200")
 	parents2_0 := graphData.Parents[level2_0]
 	assert.Len(t, parents2_0, 2, "level 2 commit 0 should have 2 parents, got %d", len(parents2_0))
+}
+
+// TestCommitGraphParentBoundaryIndex tests parent index boundary conditions.
+func TestCommitGraphParentBoundaryIndex(t *testing.T) {
+	tmp := t.TempDir()
+
+	t.Run("ValidBoundary", func(t *testing.T) {
+		// Create 10 commits.
+		var commits []cgCommit
+		for i := range 10 {
+			commits = append(commits, cgCommit{
+				oid:  makeCGHash(fmt.Sprintf("%02x", i)),
+				tree: makeCGHash(fmt.Sprintf("1%02x", i)),
+			})
+		}
+		// Add commit with parent at last valid index.
+		commits = append(commits, cgCommit{
+			oid:     makeCGHash("aa"),
+			tree:    makeCGHash("aa"),
+			parents: []uint32{9},
+		})
+
+		data := buildCGFile(commits, nil)
+		path := filepath.Join(tmp, "info", "commit-graph")
+		mustWrite(t, path, data)
+
+		graphData, err := LoadCommitGraph(tmp)
+		require.NoError(t, err, "unexpected error for valid boundary: %v", err)
+
+		// Verify the parent relationship.
+		child := makeCGHash("aa")
+		parents := graphData.Parents[child]
+		if assert.Len(t, parents, 1) {
+			assert.Equal(t, makeCGHash("09"), parents[0], "wrong parent: got %v", parents)
+		}
+	})
+
+	t.Run("InvalidBoundary", func(t *testing.T) {
+		// Create 10 commits.
+		var commits []cgCommit
+		for i := range 10 {
+			commits = append(commits, cgCommit{
+				oid:  makeCGHash(fmt.Sprintf("%02x", i)),
+				tree: makeCGHash(fmt.Sprintf("1%02x", i)),
+			})
+		}
+		// Add commit with out-of-bounds parent index.
+		commits = append(commits, cgCommit{
+			oid:     makeCGHash("aa"),
+			tree:    makeCGHash("aa"),
+			parents: []uint32{11},
+		})
+
+		data := buildCGFile(commits, nil)
+		path := filepath.Join(tmp, "info", "commit-graph")
+		mustWrite(t, path, data)
+
+		_, err := LoadCommitGraph(tmp)
+		if assert.Error(t, err, "expected error for out-of-bounds parent") {
+			assert.True(t, strings.Contains(err.Error(), "parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about parent index out of bounds, got: %v", err)
+		}
+	})
+
+	t.Run("InvalidBoundaryInEDGE", func(t *testing.T) {
+		// Create 5 commits.
+		var commits []cgCommit
+		for i := range 5 {
+			commits = append(commits, cgCommit{
+				oid:  makeCGHash(fmt.Sprintf("%02x", i)),
+				tree: makeCGHash(fmt.Sprintf("1%02x", i)),
+			})
+		}
+
+		// Add octopus merge with out-of-bounds parent in edge.
+		edge := []uint32{
+			1,
+			2,
+			10 | lastEdgeMask,
+		}
+
+		commits = append(commits, cgCommit{
+			oid:         makeCGHash("aa"),
+			tree:        makeCGHash("aa"),
+			parents:     []uint32{0},
+			edgePointer: 0,
+			useEdge:     true,
+		})
+
+		data := buildCGFile(commits, edge)
+		path := filepath.Join(tmp, "info", "commit-graph")
+		mustWrite(t, path, data)
+
+		_, err := LoadCommitGraph(tmp)
+		if assert.Error(t, err, "expected error for out-of-bounds edge parent") {
+			assert.True(t, strings.Contains(err.Error(), "edge parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about edge parent index out of bounds, got: %v", err)
+		}
+	})
 }
