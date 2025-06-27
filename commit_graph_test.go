@@ -16,7 +16,7 @@ import (
 )
 
 /* ------------------------------------------------------------------------- */
-/*                               helpers                                     */
+/*                               Helpers                                     */
 /* ------------------------------------------------------------------------- */
 
 const (
@@ -26,15 +26,15 @@ const (
 )
 
 type cgCommit struct {
-	oid         Hash     // commit id
-	tree        Hash     // root tree (arbitrary)
-	parents     []uint32 // positional parent indexes (first two go in CDAT)
-	edgeParents []uint32 // extra parent indexes stored in EDGE
-	edgePointer uint32   // index in EDGE slice (only for octopus)
-	useEdge     bool     // explicitly indicates this commit should use edge encoding
+	oid         Hash     // Commit ID.
+	tree        Hash     // Root tree (arbitrary).
+	parents     []uint32 // Positional parent indexes (first two go in CDAT).
+	edgeParents []uint32 // Extra parent indexes stored in EDGE.
+	edgePointer uint32   // Index in EDGE slice (only for octopus).
+	useEdge     bool     // Explicitly indicates this commit should use edge encoding.
 }
 
-// makeCGHash creates a Hash from a hex string, padding to 20 bytes
+// makeCGHash creates a Hash from a hex string, padding to 20 bytes.
 func makeCGHash(hex string) Hash {
 	var h Hash
 	for i := 0; i < len(hex) && i < 40; i += 2 {
@@ -60,14 +60,14 @@ func makeCGHash(hex string) Hash {
 	return h
 }
 
-// buildCGFile builds an in‑memory commit‑graph version‑1 file.
-// When edge==nil the EDGE chunk is omitted.
+// buildCGFile builds an in-memory commit-graph version-1 file.
+// When edge is nil, the EDGE chunk is omitted.
 func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 	var fan [fanoutEntries]uint32
 	for _, c := range commits {
 		fan[c.oid[0]]++
 	}
-	// cumulative
+	// Make fanout values cumulative.
 	var total uint32
 	for i := 0; i < fanoutEntries; i++ {
 		total += fan[i]
@@ -82,14 +82,14 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 		}
 	)
 
-	// header ----------------------------------------------------------------
-	buf.WriteString("CGPH")                    // magic
-	buf.WriteByte(1)                           // version
-	buf.WriteByte(1)                           // hash version (SHA‑1)
-	buf.WriteByte(byte(3 + btoi(edge != nil))) // chunk count
-	buf.WriteByte(0)                           // reserved
+	// Write file header.
+	buf.WriteString("CGPH")                    // Magic signature.
+	buf.WriteByte(1)                           // Version.
+	buf.WriteByte(1)                           // Hash version (SHA-1).
+	buf.WriteByte(byte(3 + btoi(edge != nil))) // Chunk count.
+	buf.WriteByte(0)                           // Reserved byte.
 
-	// chunk table rows – we'll fill offsets later.
+	// Prepare chunk table rows (offsets will be filled later).
 	ids := []uint32{chunkOIDF, chunkOIDL, chunkCDAT}
 	if edge != nil {
 		ids = append(ids, chunkEDGE)
@@ -103,63 +103,61 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 	chunkOffTbl = append(chunkOffTbl, struct {
 		id  uint32
 		off uint64
-	}{id: 0, off: 0}) // terminator
+	}{id: 0, off: 0}) // Terminator entry.
 
-	// space for table
+	// Reserve space for chunk table.
 	buf.Write(make([]byte, len(chunkOffTbl)*12))
 
-	// helper to append a chunk and record its offset
+	// Helper function to append a chunk and record its offset.
 	appendChunk := func(id uint32, data []byte) {
 		chunkOffTbl = setChunkOffset(chunkOffTbl, id, uint64(buf.Len()))
 		buf.Write(data)
 	}
 
-	/* --- chunks ---------------------------------------------------------- */
-
-	// OIDF
+	// Build and append OIDF chunk (fanout table).
 	fanBytes := make([]byte, fanoutEntries*4)
 	for i, v := range fan {
 		binary.BigEndian.PutUint32(fanBytes[i*4:], v)
 	}
 	appendChunk(chunkOIDF, fanBytes)
 
-	// OIDL
+	// Build and append OIDL chunk (object IDs).
 	oidBytes := make([]byte, len(commits)*hashLen)
 	for i, c := range commits {
 		copy(oidBytes[i*hashLen:], c.oid[:])
 	}
 	appendChunk(chunkOIDL, oidBytes)
 
-	// CDAT
+	// Build and append CDAT chunk (commit data).
 	const recSize = hashLen + 16
 	cdat := make([]byte, len(commits)*recSize)
 	for i, c := range commits {
 		off := i * recSize
 		copy(cdat[off:], c.tree[:])
 
-		// Handle parent indices properly
+		// Handle parent indices properly.
 		var p1, p2 uint32 = noParent, noParent
 
 		if len(c.parents) > 0 {
 			p1 = c.parents[0]
 		}
 
-		// Check if we should use edge pointer
+		// Check if we should use edge pointer.
 		if c.useEdge {
-			// This is an octopus merge - p2 contains edge pointer
+			// This is an octopus merge - p2 contains edge pointer.
 			p2 = c.edgePointer | lastEdgeMask
 		} else if len(c.parents) > 1 {
-			// Regular 2-parent merge
+			// Regular 2-parent merge.
 			p2 = c.parents[1]
 		}
 
 		binary.BigEndian.PutUint32(cdat[off+hashLen:], p1)
 		binary.BigEndian.PutUint32(cdat[off+hashLen+4:], p2)
-		// leave gen/time = 0
+		// Leave generation and time fields as zero.
 	}
 	appendChunk(chunkCDAT, cdat)
 
-	// EDGE
+	// Build and append EDGE chunk if provided.
 	if edge != nil {
 		edgeBytes := make([]byte, len(edge)*4)
 		for i, v := range edge {
@@ -168,7 +166,7 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 		appendChunk(chunkEDGE, edgeBytes)
 	}
 
-	/* --- write back chunk table ----------------------------------------- */
+	// Write back chunk table with calculated offsets.
 	startTable := 8
 	for i, row := range chunkOffTbl {
 		if i == len(chunkOffTbl)-1 {
@@ -181,18 +179,12 @@ func buildCGFile(commits []cgCommit, edge []uint32) []byte {
 	return buf.Bytes()
 }
 
-// helpers
+// btoi converts a boolean to an integer (0 or 1).
 func btoi(b bool) int {
 	if b {
 		return 1
 	}
 	return 0
-}
-func intOrSentinel(v uint32) int {
-	if v == ^uint32(0) {
-		return noParent
-	}
-	return int(v)
 }
 
 func setChunkOffset(tbl []struct {
@@ -212,14 +204,15 @@ func setChunkOffset(tbl []struct {
 }
 
 /* ------------------------------------------------------------------------- */
-/*                               TESTS                                       */
+/*                                Tests                                      */
 /* ------------------------------------------------------------------------- */
 
-// Test 1: parent index in tip layer points to base layer.
+// TestCommitGraphChainParentAcrossLayers tests that parent indices in the tip layer
+// can correctly reference commits in the base layer of a chained commit graph.
 func TestCommitGraphChainParentAcrossLayers(t *testing.T) {
 	tmp := t.TempDir()
 
-	// --- base layer: A, B -----------------------------------------------
+	// Create base layer with commits A and B.
 	A := makeCGHash("01")
 	B := makeCGHash("02")
 	baseCommits := []cgCommit{
@@ -231,7 +224,7 @@ func TestCommitGraphChainParentAcrossLayers(t *testing.T) {
 	basePath := filepath.Join(tmp, "info", "commit-graphs", "graph-"+baseHash+".graph")
 	mustWrite(t, basePath, baseData)
 
-	// --- tip layer: C with parent -> index 2 (which lives in base) -------
+	// Create tip layer with commit C that has a parent at index 2 (which lives in base).
 	C := makeCGHash("03")
 	tipCommits := []cgCommit{
 		{oid: C, tree: makeCGHash("33"), parents: []uint32{2}},
@@ -241,36 +234,37 @@ func TestCommitGraphChainParentAcrossLayers(t *testing.T) {
 	tipPath := filepath.Join(tmp, "info", "commit-graphs", "graph-"+tipHash+".graph")
 	mustWrite(t, tipPath, tipData)
 
-	// chain file (tip first)
+	// Create chain file (tip first).
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(tipHash+"\n"+baseHash+"\n"))
 
-	// parse ----------------------------------------------------------------
+	// Parse the commit graph chain.
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "load chain: %v", err)
 	require.NotNil(t, graphData, "expected commit graph data, got nil")
 	require.Len(t, graphData.OrderedOIDs, 3, "want 3 commits, got %d", len(graphData.OrderedOIDs))
 
-	// C should have B as single parent.
+	// Verify that C has B as its single parent.
 	parents := graphData.Parents[C]
 	if assert.Len(t, parents, 1) {
-		assert.Equal(t, B, parents[0], "cross‑layer parent not resolved: got %v, want [%x]", parents, B)
+		assert.Equal(t, B, parents[0], "cross-layer parent not resolved: got %v, want [%x]", parents, B)
 	}
 }
 
-// Test 2: EDGE pointer not at index 0 – current code ignores pointer.
+// TestCommitGraphEdgePointerMisaligned tests that EDGE pointers work correctly
+// even when not starting at index 0, ensuring the current code handles non-zero offsets.
 func TestCommitGraphEdgePointerMisaligned(t *testing.T) {
 	tmp := t.TempDir()
 
-	// commits: A, B, M (octopus)
+	// Create commits A, B, and octopus merge M.
 	A := makeCGHash("11")
 	B := makeCGHash("22")
 	M := makeCGHash("33")
 
 	edge := []uint32{
-		lastEdgeMask,     // dummy list 0 (one bogus word)
-		lastEdgeMask,     // dummy list 1
-		1 | lastEdgeMask, // real list starts here: parent index 1 (B)
+		lastEdgeMask,     // Dummy list 0 (one bogus word).
+		lastEdgeMask,     // Dummy list 1.
+		1 | lastEdgeMask, // Real list starts here: parent index 1 (B).
 	}
 
 	commits := []cgCommit{
@@ -280,7 +274,7 @@ func TestCommitGraphEdgePointerMisaligned(t *testing.T) {
 			oid:         M,
 			tree:        makeCGHash("43"),
 			parents:     []uint32{0},
-			edgePointer: 2, // point to third word in EDGE
+			edgePointer: 2, // Point to third word in EDGE.
 			useEdge:     true,
 		},
 	}
@@ -292,16 +286,15 @@ func TestCommitGraphEdgePointerMisaligned(t *testing.T) {
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "parse: %v", err)
 
-	// Get parents for merge commit M
+	// Get parents for merge commit M.
 	parents := graphData.Parents[M]
 
-	// expected parents = [A, B]
+	// Expected parents = [A, B].
 	want := []Hash{A, B}
 	assert.Equal(t, want, parents, "octopus parents wrong: got %v, want %v", parents, want)
 }
 
-/* ------------------------------------------------------------------------- */
-
+// mustWrite is a test helper that writes data to a file, creating parent directories as needed.
 func mustWrite(t *testing.T, path string, data []byte) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755), "mkdir: %v")
@@ -312,15 +305,16 @@ func mustWrite(t *testing.T, path string, data []byte) {
 /*                        File Discovery & Chain Tests                       */
 /* ------------------------------------------------------------------------- */
 
-// Test 3: Empty chain file should fall back to single file
+// TestCommitGraphEmptyChainFallback tests that when a chain file is empty,
+// the loader falls back to using a single commit-graph file.
 func TestCommitGraphEmptyChainFallback(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Create empty chain file
+	// Create empty chain file.
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(""))
 
-	// Create valid single commit-graph file
+	// Create valid single commit-graph file.
 	A := makeCGHash("aa")
 	commits := []cgCommit{
 		{oid: A, tree: makeCGHash("11"), parents: nil},
@@ -329,33 +323,35 @@ func TestCommitGraphEmptyChainFallback(t *testing.T) {
 	singlePath := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, singlePath, data)
 
-	// Load and verify
+	// Load and verify fallback behavior.
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 	require.NotNil(t, graphData, "expected graph data")
 	assert.Len(t, graphData.OrderedOIDs, 1, "expected 1 commit, got %d", len(graphData.OrderedOIDs))
 }
 
-// Test 4: Chain file with missing graph files
+// TestCommitGraphChainMissingFiles tests error handling when chain file
+// references non-existent graph files.
 func TestCommitGraphChainMissingFiles(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Create chain file referencing non-existent graphs
+	// Create chain file referencing non-existent graphs.
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(
 		"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\n"+
 			"cafebabecafebabecafebabecafebabecafebabe\n"))
 
-	// Should fail to load
+	// Should fail to load.
 	_, err := LoadCommitGraph(tmp)
 	require.Error(t, err, "expected error for missing graph files")
 }
 
-// Test 5: Both chain and single file exist - chain takes precedence
+// TestCommitGraphChainPrecedence tests that when both chain and single files exist,
+// the chain takes precedence over the single file.
 func TestCommitGraphChainPrecedence(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Create single file with commit A
+	// Create single file with commit A.
 	A := makeCGHash("aa")
 	singleCommits := []cgCommit{
 		{oid: A, tree: makeCGHash("11"), parents: nil},
@@ -389,32 +385,32 @@ func TestCommitGraphChainPrecedence(t *testing.T) {
 /*                          Chunk Validation Tests                           */
 /* ------------------------------------------------------------------------- */
 
-// Test 6: Missing required chunks
+// TestCommitGraphMissingChunks tests error handling when required chunks
+// are missing from the commit graph file.
 func TestCommitGraphMissingChunks(t *testing.T) {
 	tmp := t.TempDir()
 
-	// Test missing OIDF
 	t.Run("MissingOIDF", func(t *testing.T) {
 		buf := bytes.Buffer{}
-		// Header
+		// Write header.
 		buf.WriteString("CGPH")
-		buf.WriteByte(1) // version
-		buf.WriteByte(1) // hash version
-		buf.WriteByte(2) // chunk count (only OIDL, CDAT)
-		buf.WriteByte(0) // reserved
+		buf.WriteByte(1) // Version.
+		buf.WriteByte(1) // Hash version.
+		buf.WriteByte(2) // Chunk count (only OIDL, CDAT).
+		buf.WriteByte(0) // Reserved.
 
-		// Chunk table (no OIDF)
+		// Write chunk table (no OIDF).
 		binary.Write(&buf, binary.BigEndian, uint32(chunkOIDL))
-		binary.Write(&buf, binary.BigEndian, uint64(44)) // offset after table
+		binary.Write(&buf, binary.BigEndian, uint64(44)) // Offset after table.
 		binary.Write(&buf, binary.BigEndian, uint32(chunkCDAT))
-		binary.Write(&buf, binary.BigEndian, uint64(64))  // offset
-		binary.Write(&buf, binary.BigEndian, uint32(0))   // terminator
-		binary.Write(&buf, binary.BigEndian, uint64(100)) // final offset
+		binary.Write(&buf, binary.BigEndian, uint64(64))  // Offset.
+		binary.Write(&buf, binary.BigEndian, uint32(0))   // Terminator.
+		binary.Write(&buf, binary.BigEndian, uint64(100)) // Final offset.
 
-		// OIDL chunk
-		buf.Write(make([]byte, 20)) // one hash
-		// CDAT chunk
-		buf.Write(make([]byte, 36)) // one record
+		// Write OIDL chunk.
+		buf.Write(make([]byte, 20)) // One hash.
+		// Write CDAT chunk.
+		buf.Write(make([]byte, 36)) // One record.
 
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, buf.Bytes())
@@ -424,64 +420,65 @@ func TestCommitGraphMissingChunks(t *testing.T) {
 	})
 }
 
-// Test 7: Chunks with size mismatches
+// TestCommitGraphChunkSizeMismatch tests error handling when chunk sizes
+// don't match the expected values based on other chunks.
 func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 	tmp := t.TempDir()
 
 	t.Run("OIDLSizeMismatch", func(t *testing.T) {
-		// Manually build a file with OIDL size that doesn't match fanout
+		// Manually build a file with OIDL size that doesn't match fanout.
 		buf := bytes.Buffer{}
-		// Header
+		// Write header.
 		buf.WriteString("CGPH")
-		buf.WriteByte(1) // version
-		buf.WriteByte(1) // hash version
-		buf.WriteByte(3) // chunk count
-		buf.WriteByte(0) // reserved
+		buf.WriteByte(1) // Version.
+		buf.WriteByte(1) // Hash version.
+		buf.WriteByte(3) // Chunk count.
+		buf.WriteByte(0) // Reserved.
 
-		// Chunk table
+		// Write chunk table.
 		tableStart := buf.Len()
 		binary.Write(&buf, binary.BigEndian, uint32(chunkOIDF))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 		binary.Write(&buf, binary.BigEndian, uint32(chunkOIDL))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 		binary.Write(&buf, binary.BigEndian, uint32(chunkCDAT))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
-		binary.Write(&buf, binary.BigEndian, uint32(0)) // terminator
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
+		binary.Write(&buf, binary.BigEndian, uint32(0)) // Terminator.
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 
-		// OIDF - indicates 2 commits
+		// Write OIDF indicating 2 commits.
 		oidfOffset := buf.Len()
 		fanout := make([]byte, fanoutSize)
-		// Set fanout to indicate 2 commits
+		// Set fanout to indicate 2 commits.
 		for i := 0xaa; i < 256; i++ {
 			binary.BigEndian.PutUint32(fanout[i*4:], 2)
 		}
 		buf.Write(fanout)
 
-		// OIDL - but only include 1 OID (mismatch!)
+		// Write OIDL with only 1 OID (mismatch!).
 		oidlOffset := buf.Len()
 		h := makeCGHash("aa")
-		buf.Write(h[:]) // Only 1 OID instead of 2
+		buf.Write(h[:]) // Only 1 OID instead of 2.
 
-		// CDAT - 2 records to match fanout
+		// Write CDAT with 2 records to match fanout.
 		cdatOffset := buf.Len()
-		// First commit
+		// First commit.
 		h = makeCGHash("11")
-		buf.Write(h[:]) // tree
+		buf.Write(h[:]) // Tree.
 		binary.Write(&buf, binary.BigEndian, uint32(graphParentNone))
 		binary.Write(&buf, binary.BigEndian, uint32(graphParentNone))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // gen/time
-		// Second commit
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Generation/time.
+		// Second commit.
 		h = makeCGHash("22")
-		buf.Write(h[:]) // tree
+		buf.Write(h[:]) // Tree.
 		binary.Write(&buf, binary.BigEndian, uint32(graphParentNone))
 		binary.Write(&buf, binary.BigEndian, uint32(graphParentNone))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // gen/time
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Generation/time.
 
-		// Final offset
+		// Final offset.
 		finalOffset := buf.Len()
 
-		// Fix up chunk table
+		// Fix up chunk table.
 		data := buf.Bytes()
 		binary.BigEndian.PutUint64(data[tableStart+4:], uint64(oidfOffset))
 		binary.BigEndian.PutUint64(data[tableStart+16:], uint64(oidlOffset))
@@ -498,7 +495,7 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 	})
 
 	t.Run("CDATSizeMismatch", func(t *testing.T) {
-		// Build normal file
+		// Build normal file.
 		A := makeCGHash("aa")
 		B := makeCGHash("bb")
 		commits := []cgCommit{
@@ -507,7 +504,7 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 		}
 		data := buildCGFile(commits, nil)
 
-		// Truncate CDAT chunk
+		// Truncate CDAT chunk.
 		data = data[:len(data)-20]
 
 		path := filepath.Join(tmp, "info", "commit-graph")
@@ -518,40 +515,40 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 	})
 
 	t.Run("FANOUTWrongSize", func(t *testing.T) {
-		// Manually build a file with wrong OIDF size
+		// Manually build a file with wrong OIDF size.
 		buf := bytes.Buffer{}
-		// Header
+		// Write header.
 		buf.WriteString("CGPH")
-		buf.WriteByte(1) // version
-		buf.WriteByte(1) // hash version
-		buf.WriteByte(3) // chunk count
-		buf.WriteByte(0) // reserved
+		buf.WriteByte(1) // Version.
+		buf.WriteByte(1) // Hash version.
+		buf.WriteByte(3) // Chunk count.
+		buf.WriteByte(0) // Reserved.
 
-		// Chunk table
+		// Write chunk table.
 		tableStart := buf.Len()
 		binary.Write(&buf, binary.BigEndian, uint32(chunkOIDF))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 		binary.Write(&buf, binary.BigEndian, uint32(chunkOIDL))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 		binary.Write(&buf, binary.BigEndian, uint32(chunkCDAT))
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
-		binary.Write(&buf, binary.BigEndian, uint32(0)) // terminator
-		binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
+		binary.Write(&buf, binary.BigEndian, uint32(0)) // Terminator.
+		binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 
-		// OIDF with wrong size (only 100 bytes instead of 1024)
+		// Write OIDF with wrong size (only 100 bytes instead of 1024).
 		oidfOffset := buf.Len()
 		buf.Write(make([]byte, 100))
 
-		// OIDL (empty)
+		// Write OIDL (empty).
 		oidlOffset := buf.Len()
 
-		// CDAT (empty)
+		// Write CDAT (empty).
 		cdatOffset := buf.Len()
 
-		// Final offset
+		// Final offset.
 		finalOffset := buf.Len()
 
-		// Fix up chunk table
+		// Fix up chunk table.
 		data := buf.Bytes()
 		binary.BigEndian.PutUint64(data[tableStart+4:], uint64(oidfOffset))
 		binary.BigEndian.PutUint64(data[tableStart+16:], uint64(oidlOffset))
@@ -568,29 +565,30 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 	})
 }
 
-// Test 8: Overlapping chunks
+// TestCommitGraphOverlappingChunks tests error handling when chunk offsets
+// indicate overlapping data regions.
 func TestCommitGraphOverlappingChunks(t *testing.T) {
 	tmp := t.TempDir()
 
 	buf := bytes.Buffer{}
-	// Header
+	// Write header.
 	buf.WriteString("CGPH")
-	buf.WriteByte(1) // version
-	buf.WriteByte(1) // hash version
-	buf.WriteByte(3) // chunk count
-	buf.WriteByte(0) // reserved
+	buf.WriteByte(1) // Version.
+	buf.WriteByte(1) // Hash version.
+	buf.WriteByte(3) // Chunk count.
+	buf.WriteByte(0) // Reserved.
 
-	// Chunk table with overlapping offsets
+	// Write chunk table with overlapping offsets.
 	binary.Write(&buf, binary.BigEndian, uint32(chunkOIDF))
-	binary.Write(&buf, binary.BigEndian, uint64(56)) // starts at 56
+	binary.Write(&buf, binary.BigEndian, uint64(56)) // Starts at 56.
 	binary.Write(&buf, binary.BigEndian, uint32(chunkOIDL))
-	binary.Write(&buf, binary.BigEndian, uint64(100)) // overlaps with OIDF!
+	binary.Write(&buf, binary.BigEndian, uint64(100)) // Overlaps with OIDF!
 	binary.Write(&buf, binary.BigEndian, uint32(chunkCDAT))
 	binary.Write(&buf, binary.BigEndian, uint64(200))
-	binary.Write(&buf, binary.BigEndian, uint32(0)) // terminator
+	binary.Write(&buf, binary.BigEndian, uint32(0)) // Terminator.
 	binary.Write(&buf, binary.BigEndian, uint64(300))
 
-	// Add some data
+	// Add some data.
 	buf.Write(make([]byte, 300))
 
 	path := filepath.Join(tmp, "info", "commit-graph")
@@ -604,7 +602,8 @@ func TestCommitGraphOverlappingChunks(t *testing.T) {
 /*                    Edge Cases for Parent Resolution                       */
 /* ------------------------------------------------------------------------- */
 
-// Test 9: Circular edge references
+// TestCommitGraphCircularEdgeRefs tests error handling when edge references
+// form a circular pattern.
 func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -670,7 +669,8 @@ func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	}
 }
 
-// Test 10: Very long parent lists (stress test)
+// TestCommitGraphManyParents tests error handling when a commit has a very long
+// parent list.
 func TestCommitGraphManyParents(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -713,7 +713,8 @@ func TestCommitGraphManyParents(t *testing.T) {
 	assert.Len(t, parents, 100, "expected 100 parents, got %d", len(parents))
 }
 
-// Test 11: Edge list without terminator
+// TestCommitGraphEdgeNoTerminator tests error handling when edge list
+// does not end with a terminator.
 func TestCommitGraphEdgeNoTerminator(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -753,7 +754,8 @@ func TestCommitGraphEdgeNoTerminator(t *testing.T) {
 	assert.Len(t, parents, 4, "expected 4 parents, got %d", len(parents))
 }
 
-// Test 12: Parent index exactly at boundary
+// TestCommitGraphParentBoundaryIndex tests error handling when parent index
+// is out of bounds.
 func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -854,53 +856,53 @@ func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 /*                              Fanout Tests                                 */
 /* ------------------------------------------------------------------------- */
 
-// Test 13: Non-monotonic fanout values
+// TestCommitGraphBadFanout tests error handling when fanout values are not monotonic.
 func TestCommitGraphBadFanout(t *testing.T) {
 	tmp := t.TempDir()
 
 	buf := bytes.Buffer{}
-	// Header
+	// Write header.
 	buf.WriteString("CGPH")
-	buf.WriteByte(1) // version
-	buf.WriteByte(1) // hash version
-	buf.WriteByte(3) // chunk count
-	buf.WriteByte(0) // reserved
+	buf.WriteByte(1) // Version.
+	buf.WriteByte(1) // Hash version.
+	buf.WriteByte(3) // Chunk count.
+	buf.WriteByte(0) // Reserved.
 
-	// Chunk table
+	// Write chunk table.
 	tableStart := buf.Len()
 	binary.Write(&buf, binary.BigEndian, uint32(chunkOIDF))
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 	binary.Write(&buf, binary.BigEndian, uint32(chunkOIDL))
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 	binary.Write(&buf, binary.BigEndian, uint32(chunkCDAT))
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
-	binary.Write(&buf, binary.BigEndian, uint32(0)) // terminator
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
+	binary.Write(&buf, binary.BigEndian, uint32(0)) // Terminator.
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 
-	// OIDF with non-monotonic values
+	// Write OIDF with non-monotonic values.
 	oidfOffset := buf.Len()
 	fanout := make([]uint32, 256)
 	for i := 0; i < 256; i++ {
 		if i < 128 {
 			fanout[i] = uint32(i + 1)
 		} else {
-			fanout[i] = uint32(256 - i) // goes down!
+			fanout[i] = uint32(256 - i) // Goes down!
 		}
 	}
 	for _, v := range fanout {
 		binary.Write(&buf, binary.BigEndian, v)
 	}
 
-	// OIDL (empty for now)
+	// Write OIDL (empty for now).
 	oidlOffset := buf.Len()
 
-	// CDAT (empty for now)
+	// Write CDAT (empty for now).
 	cdatOffset := buf.Len()
 
-	// Final offset
+	// Final offset.
 	finalOffset := buf.Len()
 
-	// Fix up chunk table
+	// Fix up chunk table.
 	data := buf.Bytes()
 	binary.BigEndian.PutUint64(data[tableStart+4:], uint64(oidfOffset))
 	binary.BigEndian.PutUint64(data[tableStart+16:], uint64(oidlOffset))
@@ -914,7 +916,7 @@ func TestCommitGraphBadFanout(t *testing.T) {
 	assert.Error(t, err, "expected error for non-monotonic fanout")
 }
 
-// Test 14: Zero commits
+// TestCommitGraphEmpty tests error handling when a commit graph file has no commits.
 func TestCommitGraphEmpty(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -930,7 +932,8 @@ func TestCommitGraphEmpty(t *testing.T) {
 	assert.Empty(t, graphData.OrderedOIDs, "expected 0 commits")
 }
 
-// Test 15: Fanout doesn't match actual OID count
+// TestCommitGraphFanoutMismatch tests error handling when fanout values
+// don't match the actual number of commits.
 func TestCommitGraphFanoutMismatch(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -961,7 +964,8 @@ func TestCommitGraphFanoutMismatch(t *testing.T) {
 /*                          Chain-specific Tests                             */
 /* ------------------------------------------------------------------------- */
 
-// Test 16: Parent in much earlier layer
+// TestCommitGraphDeepChainParent tests error handling when parent indices
+// in split chains are not resolved correctly.
 func TestCommitGraphDeepChainParent(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1023,7 +1027,8 @@ func TestCommitGraphDeepChainParent(t *testing.T) {
 	// due to the local indexing + offset adjustment mechanism
 }
 
-// Test 17: Duplicate commits across chain files
+// TestCommitGraphChainDuplicates tests error handling when duplicate commits
+// exist across chain files.
 func TestCommitGraphChainDuplicates(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1064,7 +1069,7 @@ func TestCommitGraphChainDuplicates(t *testing.T) {
 	}
 }
 
-// Test 18: Very long chain (performance)
+// TestCommitGraphLongChain tests error handling when a commit graph file is very long.
 func TestCommitGraphLongChain(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping long chain test")
@@ -1106,7 +1111,7 @@ func TestCommitGraphLongChain(t *testing.T) {
 /*                         Data Extraction Tests                             */
 /* ------------------------------------------------------------------------- */
 
-// Test 19: Tree OID extraction
+// TestCommitGraphTreeOIDs tests error handling when tree OIDs are not populated correctly.
 func TestCommitGraphTreeOIDs(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1134,19 +1139,19 @@ func TestCommitGraphTreeOIDs(t *testing.T) {
 	assert.Equal(t, treeC, graphData.TreeOIDs[2], "tree 2: got %v, want %v", graphData.TreeOIDs[2], treeC)
 }
 
-// Test 20: Timestamp extraction
+// TestCommitGraphTimestamps tests error handling when timestamps are not populated correctly.
 func TestCommitGraphTimestamps(t *testing.T) {
 	tmp := t.TempDir()
 
 	// We'll create a custom builder for this test
 	var buf bytes.Buffer
 
-	// Header
+	// Write header.
 	buf.WriteString("CGPH")
-	buf.WriteByte(1) // version
-	buf.WriteByte(1) // hash version
-	buf.WriteByte(3) // chunk count
-	buf.WriteByte(0) // reserved
+	buf.WriteByte(1) // Version.
+	buf.WriteByte(1) // Hash version.
+	buf.WriteByte(3) // Chunk count.
+	buf.WriteByte(0) // Reserved.
 
 	// We'll have 3 commits with different timestamps
 	timestamps := []int64{
@@ -1155,18 +1160,18 @@ func TestCommitGraphTimestamps(t *testing.T) {
 		int64(1<<34 - 1), // max 34-bit value
 	}
 
-	// Chunk table
+	// Write chunk table.
 	tableStart := buf.Len()
 	binary.Write(&buf, binary.BigEndian, uint32(chunkOIDF))
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 	binary.Write(&buf, binary.BigEndian, uint32(chunkOIDL))
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 	binary.Write(&buf, binary.BigEndian, uint32(chunkCDAT))
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
-	binary.Write(&buf, binary.BigEndian, uint32(0)) // terminator
-	binary.Write(&buf, binary.BigEndian, uint64(0)) // will fill
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
+	binary.Write(&buf, binary.BigEndian, uint32(0)) // Terminator.
+	binary.Write(&buf, binary.BigEndian, uint64(0)) // Will fill.
 
-	// OIDF
+	// Write OIDF.
 	oidfOffset := buf.Len()
 	fanout := make([]byte, fanoutSize)
 	// All commits start with different bytes for even distribution
@@ -1178,7 +1183,7 @@ func TestCommitGraphTimestamps(t *testing.T) {
 	}
 	buf.Write(fanout)
 
-	// OIDL
+	// Write OIDL.
 	oidlOffset := buf.Len()
 	oids := []Hash{
 		makeCGHash("01"),
@@ -1189,24 +1194,24 @@ func TestCommitGraphTimestamps(t *testing.T) {
 		buf.Write(oid[:])
 	}
 
-	// CDAT with custom timestamps
+	// Write CDAT with custom timestamps.
 	cdatOffset := buf.Len()
 	for i, ts := range timestamps {
-		// Tree
+		// Tree.
 		treeHash := makeCGHash(fmt.Sprintf("1%02x", i))
 		buf.Write(treeHash[:])
-		// Parents
+		// Parents.
 		binary.Write(&buf, binary.BigEndian, uint32(graphParentNone))
 		binary.Write(&buf, binary.BigEndian, uint32(graphParentNone))
-		// Generation (0) and timestamp
+		// Generation (0) and timestamp.
 		genTime := uint64(ts) & 0x3FFFFFFFF // 34-bit timestamp
 		binary.Write(&buf, binary.BigEndian, genTime)
 	}
 
-	// Final offset
+	// Final offset.
 	finalOffset := buf.Len()
 
-	// Fix up chunk table
+	// Fix up chunk table.
 	data := buf.Bytes()
 	binary.BigEndian.PutUint64(data[tableStart+4:], uint64(oidfOffset))
 	binary.BigEndian.PutUint64(data[tableStart+16:], uint64(oidlOffset))
@@ -1219,7 +1224,7 @@ func TestCommitGraphTimestamps(t *testing.T) {
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
-	// Verify timestamps
+	// Verify timestamps.
 	require.Len(t, graphData.Timestamps, 3, "expected 3 timestamps, got %d", len(graphData.Timestamps))
 
 	for i, expected := range timestamps {
@@ -1227,7 +1232,8 @@ func TestCommitGraphTimestamps(t *testing.T) {
 	}
 }
 
-// Test 21: OIDToIndex mapping
+// TestCommitGraphOIDIndexMap tests error handling when OID to index mapping
+// is not populated correctly.
 func TestCommitGraphOIDIndexMap(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1255,7 +1261,7 @@ func TestCommitGraphOIDIndexMap(t *testing.T) {
 	graphData, err := LoadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
-	// Verify mapping
+	// Verify mapping.
 	for i, oid := range oids {
 		idx, ok := graphData.OIDToIndex[oid]
 		assert.True(t, ok)
@@ -1272,7 +1278,8 @@ func TestCommitGraphOIDIndexMap(t *testing.T) {
 /*                         Error Recovery Tests                              */
 /* ------------------------------------------------------------------------- */
 
-// Test 22: Cleanup on parse errors
+// TestCommitGraphCleanupOnError tests error handling when a commit graph file
+// is corrupted and cannot be parsed.
 func TestCommitGraphCleanupOnError(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1303,7 +1310,7 @@ func TestCommitGraphCleanupOnError(t *testing.T) {
 	assert.True(t, strings.Contains(err.Error(), "read") || strings.Contains(err.Error(), "parse") || strings.Contains(err.Error(), "EOF"), "error should indicate parse failure: %v", err)
 }
 
-// Test 23: Corrupted file headers
+// TestCommitGraphCorruptHeaders tests error handling when file headers are corrupted.
 func TestCommitGraphCorruptHeaders(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1356,7 +1363,7 @@ func TestCommitGraphCorruptHeaders(t *testing.T) {
 /*                              Stress Tests                                 */
 /* ------------------------------------------------------------------------- */
 
-// Test 24: Large graph file
+// TestCommitGraphLargeFile tests error handling when a commit graph file is very large.
 func TestCommitGraphLargeFile(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping large file test")
@@ -1399,7 +1406,8 @@ func TestCommitGraphLargeFile(t *testing.T) {
 	assert.Less(t, loadTime, 500*time.Millisecond, "loading 10k commits took too long: %v", loadTime)
 }
 
-// Test 25: Maximum edge complexity
+// TestCommitGraphComplexMerges tests error handling when complex merge commits
+// are not handled correctly.
 func TestCommitGraphComplexMerges(t *testing.T) {
 	tmp := t.TempDir()
 	// Create base commits
@@ -1489,7 +1497,7 @@ func TestCommitGraphComplexMerges(t *testing.T) {
 /*                            Special Patterns                               */
 /* ------------------------------------------------------------------------- */
 
-// Test 26: All commits are roots
+// TestCommitGraphAllRoots tests error handling when all commits are roots.
 func TestCommitGraphAllRoots(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1516,7 +1524,8 @@ func TestCommitGraphAllRoots(t *testing.T) {
 	}
 }
 
-// Test 27: Linear history
+// TestCommitGraphLinearHistory tests error handling when a commit graph
+// represents a linear history.
 func TestCommitGraphLinearHistory(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1559,7 +1568,8 @@ func TestCommitGraphLinearHistory(t *testing.T) {
 	t.Logf("Linear history (1000): build=%v, load=%v", buildTime, loadTime)
 }
 
-// Test 28: Binary tree pattern
+// TestCommitGraphBinaryTree tests error handling when a commit graph
+// represents a binary tree pattern.
 func TestCommitGraphBinaryTree(t *testing.T) {
 	tmp := t.TempDir()
 	// Create commits in binary tree pattern
