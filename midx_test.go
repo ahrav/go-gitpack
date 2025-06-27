@@ -407,9 +407,8 @@ func createManualMidx(tb testing.TB, packDir string) {
 
 	// Verify that the multi-pack index file was successfully created.
 	midxPath := filepath.Join(packDir, "multi-pack-index")
-	if _, err := os.Stat(midxPath); err != nil {
-		tb.Fatalf("Failed to create multi-pack-index: %v", err)
-	}
+	_, err = os.Stat(midxPath)
+	require.NoError(tb, err, "Failed to create multi-pack-index")
 }
 
 // createManualMidxFileMultiPack constructs a complete multi-pack index file
@@ -420,11 +419,7 @@ func createManualMidxFileMultiPack(
 	packDir string,
 	packs []packObjectsInfo,
 ) {
-	tb.Helper()
-
-	if len(packs) == 0 {
-		tb.Fatal("No packs provided to createManualMidxFileMultiPack")
-	}
+	require.NotEmpty(tb, packs, "No packs provided to createManualMidxFileMultiPack")
 
 	// Build combined object list with pack IDs
 	type objWithPack struct {
@@ -555,9 +550,8 @@ func createManualMidxFileMultiPack(
 	}
 
 	midxPath := filepath.Join(packDir, "multi-pack-index")
-	if err := os.WriteFile(midxPath, file.Bytes(), 0644); err != nil {
-		tb.Fatalf("Failed to write multi-pack-index: %v", err)
-	}
+	err := os.WriteFile(midxPath, file.Bytes(), 0644)
+	require.NoError(tb, err, "Failed to write multi-pack-index")
 
 	tb.Logf("Created multi-pack-index with %d objects from %d packs", len(allObjs), len(packs))
 }
@@ -603,9 +597,7 @@ func BenchmarkOpenWithMidx(b *testing.B) {
 		require.NoError(b, err)
 
 		// Verify that the midx was successfully loaded and utilized.
-		if store.midx == nil {
-			b.Fatal("Store should have loaded midx")
-		}
+		require.NotNil(b, store.midx, "Store should have loaded midx")
 
 		store.Close()
 	}
@@ -698,9 +690,7 @@ func BenchmarkFindObject_MidxVsIdx(b *testing.B) {
 	b.Run("midx", func(b *testing.B) {
 		for b.Loop() {
 			_, _, found := store.midx.findObject(testHash)
-			if !found {
-				b.Fatal("Object should be found in midx")
-			}
+			require.True(b, found, "Object should be found in midx")
 		}
 	})
 
@@ -714,9 +704,7 @@ func BenchmarkFindObject_MidxVsIdx(b *testing.B) {
 					break
 				}
 			}
-			if !found {
-				b.Fatal("Object should be found in regular idx")
-			}
+			require.True(b, found, "Object should be found in regular idx")
 		}
 	})
 }
@@ -745,9 +733,8 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 
 	// Remove midx file to force fallback to individual index files.
 	midxPath := filepath.Join(packDir, "multi-pack-index")
-	if err := os.Remove(midxPath); err != nil && !os.IsNotExist(err) {
-		b.Fatalf("Failed to remove midx: %v", err)
-	}
+	err := os.Remove(midxPath)
+	require.True(b, err == nil || os.IsNotExist(err), "Failed to remove midx: %v", err)
 
 	b.Run("without_midx", func(b *testing.B) {
 		b.ReportAllocs()
@@ -1037,8 +1024,7 @@ func createTwoPackMidxFile(
 	termRow := chunkTableOff + 4*chunkHdrSize
 	binary.BigEndian.PutUint64(buf.Bytes()[termRow+4:termRow+12], trailerStart)
 
-	if err := os.WriteFile(filepath.Join(dir, "multi-pack-index"),
-		buf.Bytes(), 0o644); err != nil {
-		t.Fatalf("write midx: %v", err)
-	}
+	midxPath := filepath.Join(dir, "multi-pack-index")
+	err := os.WriteFile(midxPath, buf.Bytes(), 0o644)
+	require.NoError(t, err, "Failed to write multi-pack-index")
 }

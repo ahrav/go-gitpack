@@ -1752,9 +1752,7 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 		b.Run(fmt.Sprintf("single_%d", size), func(b *testing.B) {
 			dir := b.TempDir()
 			infoDir := filepath.Join(dir, "info")
-			if err := os.MkdirAll(infoDir, 0755); err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, os.MkdirAll(infoDir, 0755))
 
 			graphPath := filepath.Join(infoDir, "commit-graph")
 			generateTestGraphFile(b, graphPath, size, true)
@@ -1764,12 +1762,8 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 
 			for b.Loop() {
 				data, err := LoadCommitGraph(dir)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if len(data.OrderedOIDs) != size {
-					b.Fatalf("expected %d commits, got %d", size, len(data.OrderedOIDs))
-				}
+				require.NoError(b, err)
+				require.Len(b, data.OrderedOIDs, size)
 			}
 		})
 
@@ -1786,12 +1780,8 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 
 			for b.Loop() {
 				data, err := LoadCommitGraph(dir)
-				if err != nil {
-					b.Fatal(err)
-				}
-				if len(data.OrderedOIDs) != size {
-					b.Fatalf("expected %d commits, got %d", size, len(data.OrderedOIDs))
-				}
+				require.NoError(b, err)
+				require.Len(b, data.OrderedOIDs, size)
 			}
 		})
 	}
@@ -1811,9 +1801,7 @@ func BenchmarkParseGraphFile(b *testing.B) {
 
 			for b.Loop() {
 				pg, err := parseGraphFile(path)
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 				if pg.mr != nil {
 					pg.mr.Close()
 				}
@@ -1830,9 +1818,7 @@ func BenchmarkParseGraphFile(b *testing.B) {
 
 			for b.Loop() {
 				pg, err := parseGraphFile(path)
-				if err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, err)
 				if pg.mr != nil {
 					pg.mr.Close()
 				}
@@ -1851,9 +1837,7 @@ func BenchmarkResolveParents(b *testing.B) {
 			generateTestGraphFile(b, path, size, true)
 
 			pg, err := parseGraphFile(path)
-			if err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, err)
 			defer func() {
 				if pg.mr != nil {
 					pg.mr.Close()
@@ -1869,9 +1853,7 @@ func BenchmarkResolveParents(b *testing.B) {
 
 			for b.Loop() {
 				parents := make(Parents, size)
-				if err := pg.resolveParentsInto(parents, allOids, 0); err != nil {
-					b.Fatal(err)
-				}
+				require.NoError(b, pg.resolveParentsInto(parents, allOids, 0))
 			}
 		})
 	}
@@ -1900,9 +1882,9 @@ func BenchmarkOIDToIndexLookup(b *testing.B) {
 			for b.Loop() {
 				for j := 0; j < 1000; j++ {
 					oid := lookupOids[j%len(lookupOids)]
-					if idx, ok := oidToIndex[oid]; !ok || idx != j%len(lookupOids) {
-						b.Fatal("lookup failed")
-					}
+					idx, ok := oidToIndex[oid]
+					require.True(b, ok, "lookup should succeed")
+					require.Equal(b, j%len(lookupOids), idx, "lookup should return correct index")
 				}
 			}
 		})
@@ -1913,9 +1895,7 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 	b.Run("single", func(b *testing.B) {
 		dir := b.TempDir()
 		infoDir := filepath.Join(dir, "info")
-		if err := os.MkdirAll(infoDir, 0755); err != nil {
-			b.Fatal(err)
-		}
+		require.NoError(b, os.MkdirAll(infoDir, 0755))
 
 		graphPath := filepath.Join(infoDir, "commit-graph")
 		generateTestGraphFile(b, graphPath, 1000, false)
@@ -1925,12 +1905,8 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 
 		for b.Loop() {
 			files, err := discoverGraphFiles(dir)
-			if err != nil {
-				b.Fatal(err)
-			}
-			if len(files) != 1 {
-				b.Fatal("expected 1 file")
-			}
+			require.NoError(b, err)
+			require.Len(b, files, 1)
 		}
 	})
 
@@ -1943,12 +1919,8 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 
 		for b.Loop() {
 			files, err := discoverGraphFiles(dir)
-			if err != nil {
-				b.Fatal(err)
-			}
-			if len(files) != 3 {
-				b.Fatal("expected 3 files")
-			}
+			require.NoError(b, err)
+			require.Len(b, files, 3)
 		}
 	})
 
@@ -1960,12 +1932,8 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 
 		for b.Loop() {
 			files, err := discoverGraphFiles(dir)
-			if err != nil {
-				b.Fatal(err)
-			}
-			if len(files) != 0 {
-				b.Fatal("expected no files")
-			}
+			require.NoError(b, err)
+			require.Empty(b, files)
 		}
 	})
 }
@@ -1980,39 +1948,32 @@ func BenchmarkChunkParsing(b *testing.B) {
 			generateTestGraphFile(b, path, size, true)
 
 			mr, err := mmap.Open(path)
-			if err != nil {
-				b.Fatal(err)
-			}
+			require.NoError(b, err)
 			defer mr.Close()
 
 			// Find CDAT chunk offset by reading header and scanning chunk table.
 			var hdr [8]byte
-			if _, err := mr.ReadAt(hdr[:], 0); err != nil {
-				b.Fatal(err)
-			}
+			_, err = mr.ReadAt(hdr[:], 0)
+			require.NoError(b, err)
 			chunks := int(hdr[6])
 
 			var cdatOffset, cdatSize int64
 			for i := range chunks {
 				var row [12]byte
-				if _, err := mr.ReadAt(row[:], int64(8+i*12)); err != nil {
-					b.Fatal(err)
-				}
+				_, err = mr.ReadAt(row[:], int64(8+i*12))
+				require.NoError(b, err)
 				id := binary.BigEndian.Uint32(row[0:4])
 				if id == chunkCDAT {
 					cdatOffset = int64(binary.BigEndian.Uint64(row[4:12]))
-					if _, err := mr.ReadAt(row[:], int64(8+(i+1)*12)); err != nil {
-						b.Fatal(err)
-					}
+					_, err = mr.ReadAt(row[:], int64(8+(i+1)*12))
+					require.NoError(b, err)
 					nextOffset := int64(binary.BigEndian.Uint64(row[4:12]))
 					cdatSize = nextOffset - cdatOffset
 					break
 				}
 			}
 
-			if cdatOffset == 0 {
-				b.Fatal("CDAT chunk not found")
-			}
+			require.NotZero(b, cdatOffset, "CDAT chunk should be found")
 
 			const cdatRecordSize = hashLen + 16
 
@@ -2021,9 +1982,8 @@ func BenchmarkChunkParsing(b *testing.B) {
 
 			for b.Loop() {
 				cdat := make([]byte, cdatSize)
-				if _, err := mr.ReadAt(cdat, cdatOffset); err != nil {
-					b.Fatal(err)
-				}
+				_, err := mr.ReadAt(cdat, cdatOffset)
+				require.NoError(b, err)
 
 				n := int(cdatSize / cdatRecordSize)
 				trees := make([]Hash, n)

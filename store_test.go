@@ -403,12 +403,8 @@ func benchmarkGet(b *testing.B, cacheWarm bool) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	if len(store.packs) == 0 {
-		b.Fatalf("No packs found after setup - pack creation failed")
-	}
-	if len(store.packs[0].oidTable) == 0 {
-		b.Fatalf("No objects found in pack - object creation failed")
-	}
+	require.NotEmpty(b, store.packs, "No packs found after setup - pack creation failed")
+	require.NotEmpty(b, store.packs[0].oidTable, "No objects found in pack - object creation failed")
 
 	someHash := store.packs[0].oidTable[0]
 
