@@ -282,6 +282,17 @@ func (g parsedGraph) resolveParentsInto(dst Parents, all []Hash, offset int) err
 			ps = append(ps, all[adjustedP])
 		}
 
+		// Fast path for the common case: exactly 2 parents (90%+ of commits).
+		if g.p2raw[i] != graphParentNone && g.p2raw[i]&graphLastEdge == 0 {
+			adj := int(g.p2raw[i]) + offset
+			if adj >= len(all) {
+				return fmt.Errorf("parent index %d out of bounds", adj)
+			}
+			ps = append(ps, all[adj])
+			dst[oid] = ps
+			continue
+		}
+
 		// Second parent or edge pointer.
 		v := g.p2raw[i]
 		switch {
@@ -391,19 +402,24 @@ func parseGraphFile(path string) (parsedGraph, error) {
 
 	chunks := int(hdr[6])
 
-	// Parse chunk table.
+	// Parse chunk table with single ReadAt.
 	type chunkDesc struct {
 		id  uint32
 		off uint64
 	}
 	desc := make([]chunkDesc, chunks+1)
+
+	chunkTableSize := (chunks + 1) * 12
+	buf := make([]byte, chunkTableSize)
+	if _, err := mr.ReadAt(buf, 8); err != nil {
+		return parsedGraph{}, err
+	}
+
+	// Parse chunk descriptors from buffer.
 	for i := range desc {
-		var row [12]byte
-		if _, err := mr.ReadAt(row[:], int64(8+i*12)); err != nil {
-			return parsedGraph{}, err
-		}
-		desc[i].id = binary.BigEndian.Uint32(row[0:4])
-		desc[i].off = binary.BigEndian.Uint64(row[4:12])
+		base := i * 12
+		desc[i].id = binary.BigEndian.Uint32(buf[base : base+4])
+		desc[i].off = binary.BigEndian.Uint64(buf[base+4 : base+12])
 	}
 
 	// Validate no overlapping chunks.
@@ -439,7 +455,7 @@ func parseGraphFile(path string) (parsedGraph, error) {
 
 	// Validate fanout monotonicity.
 	var prev uint32
-	for i := 0; i < fanoutEntries; i++ {
+	for i := range fanoutEntries {
 		val := binary.BigEndian.Uint32(fanout[i*4:])
 		if val < prev {
 			return parsedGraph{}, fmt.Errorf("fanout not monotonic at index %d: %d < %d", i, val, prev)
@@ -458,11 +474,11 @@ func parseGraphFile(path string) (parsedGraph, error) {
 
 	var oids []Hash
 	if total > 0 {
-		oidsBuf := make([]byte, size)
+		oids = make([]Hash, total)
+		oidsBuf := unsafe.Slice((*byte)(unsafe.Pointer(&oids[0])), int(size))
 		if _, err := mr.ReadAt(oidsBuf, off); err != nil {
 			return parsedGraph{}, fmt.Errorf("reading OIDL chunk: %w", err)
 		}
-		oids = unsafe.Slice((*Hash)(unsafe.Pointer(&oidsBuf[0])), total)
 	}
 
 	off, size, ok = find(chunkCDAT)
@@ -483,7 +499,7 @@ func parseGraphFile(path string) (parsedGraph, error) {
 
 	if total > 0 {
 		buf := make([]byte, cdatRecordSize) // recycled buffer
-		for i := 0; i < n; i++ {
+		for i := range n {
 			if _, err := mr.ReadAt(buf, off+int64(i*cdatRecordSize)); err != nil {
 				return parsedGraph{}, fmt.Errorf("reading CDAT record %d: %w", i, err)
 			}
