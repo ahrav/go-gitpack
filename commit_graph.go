@@ -31,7 +31,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/exp/mmap"
-	"golang.org/x/exp/slices"
 )
 
 const (
@@ -407,16 +406,6 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		desc[i].off = binary.BigEndian.Uint64(row[4:12])
 	}
 
-	slices.SortFunc(desc, func(a, b chunkDesc) int {
-		if a.off < b.off {
-			return -1
-		}
-		if a.off > b.off {
-			return 1
-		}
-		return 0
-	})
-
 	// Validate no overlapping chunks.
 	for i := 0; i < len(desc)-1; i++ {
 		if desc[i].off > desc[i+1].off && desc[i].id != 0 {
@@ -469,11 +458,11 @@ func parseGraphFile(path string) (parsedGraph, error) {
 
 	var oids []Hash
 	if total > 0 {
-		oids = make([]Hash, total)
-		buf := unsafe.Slice((*byte)(unsafe.Pointer(&oids[0])), int(size))
-		if _, err := mr.ReadAt(buf, off); err != nil {
+		oidsBuf := make([]byte, size)
+		if _, err := mr.ReadAt(oidsBuf, off); err != nil {
 			return parsedGraph{}, fmt.Errorf("reading OIDL chunk: %w", err)
 		}
+		oids = unsafe.Slice((*Hash)(unsafe.Pointer(&oidsBuf[0])), total)
 	}
 
 	off, size, ok = find(chunkCDAT)
@@ -485,29 +474,25 @@ func parseGraphFile(path string) (parsedGraph, error) {
 		return parsedGraph{}, fmt.Errorf("CDAT size mismatch: got %d, expected %d", size, expectedCdatSize)
 	}
 
-	var cdat []byte
-	if total > 0 {
-		cdat = make([]byte, size)
-		if _, err := mr.ReadAt(cdat, off); err != nil {
-			return parsedGraph{}, fmt.Errorf("reading CDAT chunk: %w", err)
-		}
-	}
-
-	// Parse commit data records.
+	// Parse commit data records directly from mmap using recycled buffer.
 	n := int(total)
 	p1 := make([]uint32, n)
 	p2 := make([]uint32, n)
 	trees := make([]Hash, n)
 	times := make([]int64, n)
 
-	for i := range n {
-		base := i * cdatRecordSize
-		copy(trees[i][:], cdat[base:base+hashSize])
-		p1[i] = binary.BigEndian.Uint32(cdat[base+hashSize:])
-		p2[i] = binary.BigEndian.Uint32(cdat[base+hashSize+4:])
-
-		genTime := binary.BigEndian.Uint64(cdat[base+hashSize+8:])
-		times[i] = int64(genTime & 0x3FFFFFFFF)
+	if total > 0 {
+		buf := make([]byte, cdatRecordSize) // recycled buffer
+		for i := 0; i < n; i++ {
+			if _, err := mr.ReadAt(buf, off+int64(i*cdatRecordSize)); err != nil {
+				return parsedGraph{}, fmt.Errorf("reading CDAT record %d: %w", i, err)
+			}
+			copy(trees[i][:], buf[:hashSize])
+			p1[i] = binary.BigEndian.Uint32(buf[hashSize:])
+			p2[i] = binary.BigEndian.Uint32(buf[hashSize+4:])
+			genTime := binary.BigEndian.Uint64(buf[hashSize+8:])
+			times[i] = int64(genTime & 0x3FFFFFFFF)
+		}
 	}
 
 	// Parse optional edge chunk for octopus merges.
