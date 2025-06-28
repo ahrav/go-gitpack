@@ -13,7 +13,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/exp/mmap"
 )
 
 /* ------------------------------------------------------------------------- */
@@ -1746,7 +1745,7 @@ func generateTestGraphChain(t testing.TB, dir string, layers []int) []string {
 /* ------------------------------------------------------------------------- */
 
 func BenchmarkLoadCommitGraph(b *testing.B) {
-	sizes := []int{1000, 10000, 100000}
+	sizes := []int{1_000, 10_000, 100_000, 1_000_000}
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("single_%d", size), func(b *testing.B) {
@@ -1788,7 +1787,7 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 }
 
 func BenchmarkParseGraphFile(b *testing.B) {
-	sizes := []int{1000, 10000, 100000}
+	sizes := []int{1_000, 10_000, 100_000, 1_000_000}
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
@@ -1828,7 +1827,7 @@ func BenchmarkParseGraphFile(b *testing.B) {
 }
 
 func BenchmarkResolveParents(b *testing.B) {
-	sizes := []int{1000, 10000, 50000}
+	sizes := []int{1_000, 10_000, 50_000, 100_000, 500_000}
 
 	for _, size := range sizes {
 		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
@@ -1859,38 +1858,6 @@ func BenchmarkResolveParents(b *testing.B) {
 	}
 }
 
-func BenchmarkOIDToIndexLookup(b *testing.B) {
-	sizes := []int{10000, 100000}
-
-	for _, size := range sizes {
-		b.Run(fmt.Sprintf("size_%d", size), func(b *testing.B) {
-			oidToIndex := make(map[Hash]int, size)
-			lookupOids := make([]Hash, 1000) // Sample OIDs to lookup.
-
-			for i := range size {
-				oid := makeCGHash(fmt.Sprintf("%08x", i))
-				oidToIndex[oid] = i
-
-				if i < 1000 {
-					lookupOids[i] = oid
-				}
-			}
-
-			b.ResetTimer()
-			b.ReportAllocs()
-
-			for b.Loop() {
-				for j := 0; j < 1000; j++ {
-					oid := lookupOids[j%len(lookupOids)]
-					idx, ok := oidToIndex[oid]
-					require.True(b, ok, "lookup should succeed")
-					require.Equal(b, j%len(lookupOids), idx, "lookup should return correct index")
-				}
-			}
-		})
-	}
-}
-
 func BenchmarkDiscoverGraphFiles(b *testing.B) {
 	b.Run("single", func(b *testing.B) {
 		dir := b.TempDir()
@@ -1912,7 +1879,7 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 
 	b.Run("chain", func(b *testing.B) {
 		dir := b.TempDir()
-		generateTestGraphChain(b, dir, []int{1000, 1000, 1000})
+		generateTestGraphChain(b, dir, []int{1_000, 10_000, 100_000, 1_000_000})
 
 		b.ResetTimer()
 		b.ReportAllocs()
@@ -1920,7 +1887,7 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 		for b.Loop() {
 			files, err := discoverGraphFiles(dir)
 			require.NoError(b, err)
-			require.Len(b, files, 3)
+			require.Len(b, files, 4)
 		}
 	})
 
@@ -1936,66 +1903,4 @@ func BenchmarkDiscoverGraphFiles(b *testing.B) {
 			require.Empty(b, files)
 		}
 	})
-}
-
-func BenchmarkChunkParsing(b *testing.B) {
-	sizes := []int{10000, 100000}
-
-	for _, size := range sizes {
-		b.Run(fmt.Sprintf("CDAT_%d", size), func(b *testing.B) {
-			dir := b.TempDir()
-			path := filepath.Join(dir, "test.graph")
-			generateTestGraphFile(b, path, size, true)
-
-			mr, err := mmap.Open(path)
-			require.NoError(b, err)
-			defer mr.Close()
-
-			// Find CDAT chunk offset by reading header and scanning chunk table.
-			var hdr [8]byte
-			_, err = mr.ReadAt(hdr[:], 0)
-			require.NoError(b, err)
-			chunks := int(hdr[6])
-
-			var cdatOffset, cdatSize int64
-			for i := range chunks {
-				var row [12]byte
-				_, err = mr.ReadAt(row[:], int64(8+i*12))
-				require.NoError(b, err)
-				id := binary.BigEndian.Uint32(row[0:4])
-				if id == chunkCDAT {
-					cdatOffset = int64(binary.BigEndian.Uint64(row[4:12]))
-					_, err = mr.ReadAt(row[:], int64(8+(i+1)*12))
-					require.NoError(b, err)
-					nextOffset := int64(binary.BigEndian.Uint64(row[4:12]))
-					cdatSize = nextOffset - cdatOffset
-					break
-				}
-			}
-
-			require.NotZero(b, cdatOffset, "CDAT chunk should be found")
-
-			const cdatRecordSize = hashLen + 16
-
-			b.ResetTimer()
-			b.ReportAllocs()
-
-			for b.Loop() {
-				cdat := make([]byte, cdatSize)
-				_, err := mr.ReadAt(cdat, cdatOffset)
-				require.NoError(b, err)
-
-				n := int(cdatSize / cdatRecordSize)
-				trees := make([]Hash, n)
-				times := make([]int64, n)
-
-				for j := range n {
-					base := j * cdatRecordSize
-					copy(trees[j][:], cdat[base:base+hashLen])
-					genTime := binary.BigEndian.Uint64(cdat[base+hashLen+8:])
-					times[j] = int64(genTime & 0x3FFFFFFFF)
-				}
-			}
-		})
-	}
 }
