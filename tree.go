@@ -4,7 +4,6 @@ package objstore
 import (
 	"bytes"
 	"errors"
-	"strconv"
 )
 
 var (
@@ -80,10 +79,17 @@ func parseTree(raw []byte) (*Tree, error) {
 		if sp < 0 {
 			return nil, ErrCorruptTree
 		}
-		mode, err := strconv.ParseUint(string(raw[:sp]), 8, 32)
-		if err != nil {
-			return nil, err
+
+		// Parse octal chmod value (3-6 digits) directly from raw[:sp].
+		// Each byte must be '0'-'7', multiply by 8 and add digit value.
+		var mode uint32
+		for _, b := range raw[:sp] {
+			if b < '0' || b > '7' {
+				return nil, ErrCorruptTree
+			}
+			mode = mode<<3 | uint32(b-'0') // multiply by 8 and add digit
 		}
+
 		raw = raw[sp+1:]
 
 		// Extract the entry name up to the NUL terminator.
@@ -107,7 +113,7 @@ func parseTree(raw []byte) (*Tree, error) {
 		copy(h[:], raw[:20])
 		raw = raw[20:]
 
-		out = append(out, treeEntry{h, name, uint32(mode)})
+		out = append(out, treeEntry{h, name, mode})
 	}
 
 	t := &Tree{sortedEntries: out}
