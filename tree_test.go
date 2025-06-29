@@ -43,7 +43,7 @@ func buildRaw(entries []treeEntry) []byte {
 	return raw
 }
 
-// deterministic hash samples
+// Deterministic hash samples.
 var (
 	hash0 = mustHash("000102030405060708090a0b0c0d0e0f10111213")
 	hash1 = mustHash("1111111111111111111111111111111111111111")
@@ -169,11 +169,11 @@ func TestTreeGet_ConcurrentReads(t *testing.T) {
 	require.NoError(t, err, "parse should succeed")
 
 	wg := sync.WaitGroup{}
-	for g := 0; g < 8; g++ {
+	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for i := 0; i < n; i++ {
+			for range n {
 				name := fmt.Sprintf("k%04d", rand.Intn(n))
 				_, ok := tree.get(name)
 				assert.True(t, ok, "should find %s", name)
