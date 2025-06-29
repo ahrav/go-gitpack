@@ -23,11 +23,16 @@ type packObjectsInfo struct {
 }
 
 func TestOpen(t *testing.T) {
-	t.Run("no packfiles found", func(t *testing.T) {
+	t.Run("empty directory returns empty store", func(t *testing.T) {
 		emptyDir := t.TempDir()
-		_, err := Open(emptyDir)
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "no packfiles found")
+		store, err := Open(emptyDir)
+		require.NoError(t, err)
+		require.NotNil(t, store)
+		defer store.Close()
+
+		assert.Len(t, store.packs, 0)
+		assert.NotNil(t, store.packMap)
+		assert.Equal(t, defaultMaxDeltaDepth, store.maxDeltaDepth)
 	})
 
 	t.Run("missing idx file", func(t *testing.T) {

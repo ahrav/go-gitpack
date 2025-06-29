@@ -36,3 +36,15 @@ memory-bank/**
 
 # Example binary (but not the example directory)
 /example/example
+
+# Test data
+testdata/repos/
+*.work/
+*.tmp/
+
+# Generated test artifacts
+*.pack
+*.idx
+multi-pack-index
+commit-graph
+commit-graphs/

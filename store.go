@@ -202,7 +202,22 @@ func Open(dir string) (*Store, error) {
 		return nil, err
 	}
 	if len(packs) == 0 && midx == nil {
-		return nil, fmt.Errorf("no packfiles found in %s", absDir)
+		// Empty repository - return a valid but empty store.
+		store := &Store{
+			maxDeltaDepth: defaultMaxDeltaDepth,
+			packs:         []*idxFile{}, // Empty slice instead of nil
+			packMap:       make(map[string]*mmap.ReaderAt),
+			dw:            newRefCountedDeltaWindow(),
+		}
+
+		const defaultCacheSize = 1 << 14 // 16K entries ~ 96MiB
+		var err error
+		store.cache, err = arc.NewARC[Hash, []byte](defaultCacheSize)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create ARC cache: %w", err)
+		}
+
+		return store, nil
 	}
 
 	// Glob all *.pack not already mapped by the midx.
