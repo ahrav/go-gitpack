@@ -53,9 +53,10 @@ type Tree struct {
 	// ordering invariant expected by lookup algorithms.
 	sortedEntries []treeEntry
 
-	// index accelerates name-to-entry look-ups for large trees. It is nil
-	// when the tree holds fewer than indexThreshold entries.
-	index map[string]treeEntry
+	// index accelerates name-to-entry look-ups for large trees by mapping
+	// entry names to their indices in sortedEntries. It is nil when the tree
+	// holds fewer than indexThreshold entries.
+	index map[string]uint32
 }
 
 // parseTree decodes a raw Git tree object and returns an immutable *Tree.
@@ -121,9 +122,9 @@ func parseTree(raw []byte) (*Tree, error) {
 	// Build the auxiliary index only for large trees to trade memory
 	// for faster look-ups.
 	if len(out) > indexThreshold {
-		m := make(map[string]treeEntry, len(out))
-		for _, e := range out {
-			m[e.Name] = e
+		m := make(map[string]uint32, len(out))
+		for i, e := range out {
+			m[e.Name] = uint32(i)
 		}
 		t.index = m
 	}
@@ -139,8 +140,11 @@ func parseTree(raw []byte) (*Tree, error) {
 // in tight loops.
 func (t *Tree) get(name string) (treeEntry, bool) {
 	if t.index != nil {
-		e, ok := t.index[name]
-		return e, ok
+		i, ok := t.index[name]
+		if ok {
+			return t.sortedEntries[i], true
+		}
+		return treeEntry{}, false
 	}
 	for _, e := range t.sortedEntries {
 		if e.Name == name {
