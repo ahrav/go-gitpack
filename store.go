@@ -374,7 +374,7 @@ func (s *Store) inflateFromPack(
 	oid Hash,
 	ctx *deltaContext,
 ) ([]byte, ObjectType, error) {
-	// Quick header peek – avoids decompression for commit objects.
+	// Quick header peek to determine object type
 	objType, _, err := peekObjectType(p, off)
 	if err != nil {
 		return nil, ObjBad, err
@@ -385,35 +385,21 @@ func (s *Store) inflateFromPack(
 		return nil, ObjCommit, nil
 	}
 
-	// For non-commits, we need the full object data for processing.
-	_, data, err := readRawObject(p, off)
-	if err != nil {
-		return nil, ObjBad, err
-	}
-
-	switch objType {
-	case ObjBlob, ObjTree, ObjTag:
-		if s.VerifyCRC {
-			crc, found := s.findCRCForObject(p, off, oid)
-			if found {
-				if err := s.verifyCRCForPackObject(p, off, crc); err != nil {
-					return nil, ObjBad, err
-				}
-			} else if s.midx != nil && s.midx.version >= 2 {
-				// For MIDX v2, we should have CRCs available.
-				return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", oid)
-			}
-		}
-		s.dw.add(oid, data)
-		s.cache.Add(oid, data)
-		return data, objType, nil
-
-	case ObjOfsDelta, ObjRefDelta:
-		baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, data)
+	// Handle delta objects - they need decompression too!
+	if objType == ObjOfsDelta || objType == ObjRefDelta {
+		// Use readRawObject to get properly decompressed delta data
+		_, deltaData, err := readRawObject(p, off)
 		if err != nil {
 			return nil, ObjBad, err
 		}
 
+		// Parse the delta header to get base reference and delta instructions
+		baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, deltaData)
+		if err != nil {
+			return nil, ObjBad, err
+		}
+
+		// Resolve the base object
 		var base []byte
 		if objType == ObjRefDelta {
 			if err := ctx.checkRefDelta(baseHash); err != nil {
@@ -422,25 +408,53 @@ func (s *Store) inflateFromPack(
 			ctx.enterRefDelta(baseHash)
 			base, _, err = s.getWithContext(baseHash, ctx)
 			ctx.exit()
-		} else {
-			if err := ctx.checkOfsDelta(baseOff); err != nil {
+		} else { // ObjOfsDelta
+			// For ofs-delta, calculate the actual offset
+			actualOffset := off - baseOff
+			if err := ctx.checkOfsDelta(actualOffset); err != nil {
 				return nil, ObjBad, err
 			}
-			ctx.enterOfsDelta(baseOff)
-			base, _, err = readObjectAtOffsetWithContext(p, baseOff, s, ctx)
+			ctx.enterOfsDelta(actualOffset)
+			base, _, err = readObjectAtOffsetWithContext(p, actualOffset, s, ctx)
 			ctx.exit()
 		}
 		if err != nil {
 			return nil, ObjBad, err
 		}
+
+		// Apply the delta to reconstruct the full object
 		full := applyDelta(base, deltaBuf)
+		if full == nil {
+			return nil, ObjBad, fmt.Errorf("delta application failed for object %x", oid)
+		}
+
+		finalType := detectType(full)
 		s.dw.add(oid, full)
 		s.cache.Add(oid, full)
-		return full, detectType(full), nil
-
-	default:
-		return nil, ObjBad, fmt.Errorf("unknown obj type %d", objType)
+		return full, finalType, nil
 	}
+
+	// For regular objects (blob, tree, tag), use normal decompression
+	_, data, err := readRawObject(p, off)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+
+	if s.VerifyCRC {
+		crc, found := s.findCRCForObject(p, off, oid)
+		if found {
+			if err := s.verifyCRCForPackObject(p, off, crc); err != nil {
+				return nil, ObjBad, err
+			}
+		} else if s.midx != nil && s.midx.version >= 2 {
+			// For MIDX v2, we should have CRCs available.
+			return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", oid)
+		}
+	}
+
+	s.dw.add(oid, data)
+	s.cache.Add(oid, data)
+	return data, objType, nil
 }
 
 // peekObjectType reads at most 32 bytes to discover the on‑disk type without
@@ -679,11 +693,14 @@ func readObjectAtOffsetWithContext(
 	if err != nil {
 		return nil, ObjBad, err
 	}
+
 	if objType == ObjOfsDelta || objType == ObjRefDelta {
+		// data is already decompressed by readRawObject
 		bhash, boff, deltaBuf, err := parseDeltaHeader(objType, data)
 		if err != nil {
 			return nil, ObjBad, err
 		}
+
 		var base []byte
 		if objType == ObjRefDelta {
 			if err := ctx.checkRefDelta(bhash); err != nil {
@@ -693,19 +710,27 @@ func readObjectAtOffsetWithContext(
 			base, _, err = s.getWithContext(bhash, ctx)
 			ctx.exit()
 		} else {
-			if err := ctx.checkOfsDelta(boff); err != nil {
+			// For ofs-delta, calculate the actual offset
+			actualOffset := off - boff
+			if err := ctx.checkOfsDelta(actualOffset); err != nil {
 				return nil, ObjBad, err
 			}
-			ctx.enterOfsDelta(boff)
-			base, _, err = readObjectAtOffsetWithContext(r, boff, s, ctx)
+			ctx.enterOfsDelta(actualOffset)
+			base, _, err = readObjectAtOffsetWithContext(r, actualOffset, s, ctx)
 			ctx.exit()
 		}
 		if err != nil {
 			return nil, ObjBad, err
 		}
+
 		full := applyDelta(base, deltaBuf)
+		if full == nil {
+			return nil, ObjBad, fmt.Errorf("delta application failed")
+		}
+
 		return full, detectType(full), nil
 	}
+
 	return data, objType, nil
 }
 

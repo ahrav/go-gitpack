@@ -609,3 +609,66 @@ func TestParseIdx_CorruptFanout(t *testing.T) {
 	_, err := parseIdx(ra)
 	assert.ErrorIs(t, err, ErrNonMonotonicFanout)
 }
+
+func TestStore_DeltaObjectRetrieval(t *testing.T) {
+	t.Run("delta objects should not cause zlib errors", func(t *testing.T) {
+		packPath, _, cleanup := createTestPackWithDelta(t)
+		defer cleanup()
+
+		store, err := Open(filepath.Dir(packPath))
+		require.NoError(t, err)
+		defer store.Close()
+
+		require.NotEmpty(t, store.packs, "Pack should be loaded")
+		require.NotEmpty(t, store.packs[0].oidTable, "Pack should contain objects")
+
+		// Test each object in the pack - this will include both base and delta objects.
+		for i, oid := range store.packs[0].oidTable {
+			t.Run(fmt.Sprintf("object_%d_%x", i, oid[:4]), func(t *testing.T) {
+				data, objType, err := store.Get(oid)
+
+				if err != nil {
+					assert.NotContains(t, err.Error(), "zlib: invalid header",
+						"Delta objects should not cause zlib decompression errors")
+					assert.NotContains(t, err.Error(), "zlib",
+						"Should not have any zlib-related errors for object %x", oid)
+				}
+
+				if err == nil {
+					assert.NotEmpty(t, data, "Retrieved object data should not be empty")
+					assert.NotEqual(t, ObjBad, objType, "Object type should be valid")
+				}
+			})
+		}
+	})
+
+	t.Run("specific delta types", func(t *testing.T) {
+		packPath, _, cleanup := createTestPackWithDelta(t)
+		defer cleanup()
+
+		store, err := Open(filepath.Dir(packPath))
+		require.NoError(t, err)
+		defer store.Close()
+
+		// Look for delta objects specifically by examining the pack directly.
+		pack := store.packs[0]
+		for i, oid := range pack.oidTable {
+			offset := pack.entries[i].offset
+
+			objType, _, err := peekObjectType(pack.pack, offset)
+			require.NoError(t, err)
+
+			if objType == ObjRefDelta || objType == ObjOfsDelta {
+				t.Logf("Testing %s object %x at offset %d", objType, oid[:4], offset)
+
+				data, retrievedType, err := store.Get(oid)
+				require.NoError(t, err,
+					"Getting %s object should not fail with zlib error", objType)
+
+				assert.NotEqual(t, ObjRefDelta, retrievedType, "Delta should be resolved")
+				assert.NotEqual(t, ObjOfsDelta, retrievedType, "Delta should be resolved")
+				assert.NotEmpty(t, data, "Resolved delta should have data")
+			}
+		}
+	})
+}
