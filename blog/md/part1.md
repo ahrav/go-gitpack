@@ -188,10 +188,11 @@ We use:    Pre-computed metadata (fast)
 Result:    Parent SHAs + root tree SHA
 ```
 
-**4. Semantic Parsing**
+**4. Tree Traversal**
 ```
-Raw bytes: "tree abc123\nparent def456\nauthor..."
-Parsed:    {tree: "abc123", parents: ["def456"], author: ...}
+Input:  Parent commit SHA + current commit SHA
+Output: Parent tree SHA + current tree SHA
+Method: Direct lookup via commit-graph (no parsing needed)
 ```
 
 **5. Tree & Blob Diff**
@@ -212,10 +213,8 @@ Result: Only the + lines that contain potential secrets
 | **3** | Multi-Pack-Index Support | Scaling across multiple pack files |
 | **4** | Packfile Reader & Delta Resolver | Reconstructing objects from compressed deltas |
 | **5** | The Commit-Graph Advantage | Leveraging pre-computed commit metadata |
-| **6** | Commit/Tree Parsing | Efficiently parsing Git's object formats |
-| **7** | Commit-Graph Walker | Traversing repository history optimally |
-| **8** | Tree & Blob Diff | Computing precise change detection |
-| **9** | Pipeline Integration | Bringing it all together with benchmarks |
+| **6** | Tree & Blob Diff Engine | Computing precise change detection between commits |
+| **7** | Pipeline Integration | Bringing it all together with benchmarks |
 
 ### Expected Performance Gains
 
