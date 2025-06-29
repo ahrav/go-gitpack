@@ -4,7 +4,7 @@ import "sync"
 
 // treeCache caches parsed Tree objects keyed by their object ID (Hash).
 // The cache is shared by a Store instance and guarantees that each tree
-// object is parsed at most once during the Store’s lifetime.  Callers
+// object is parsed at most once during the Store's lifetime.  Callers
 // should use (*treeCache).get to obtain a *Tree; the method is safe for
 // concurrent use and returns the same *Tree instance for identical hashes.
 type treeCache struct {
@@ -45,6 +45,10 @@ func (c *treeCache) get(oid Hash) (*Tree, error) {
 	// Double-check: another goroutine might have loaded it.
 	if t, ok := c.mem[oid]; ok {
 		return t, nil
+	}
+
+	if c.store == nil {
+		return nil, ErrTreeNotFound
 	}
 
 	// Now we're the only one who will load this object.
