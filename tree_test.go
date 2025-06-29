@@ -168,7 +168,7 @@ func TestTreeGet_ConcurrentReads(t *testing.T) {
 	tree, err := parseTree(buildRaw(entries))
 	require.NoError(t, err, "parse should succeed")
 
-	wg := sync.WaitGroup{}
+	var wg sync.WaitGroup
 	for range 8 {
 		wg.Add(1)
 		go func() {
@@ -216,6 +216,7 @@ func BenchmarkParseTree(b *testing.B) {
 	}
 	raw := buildRaw(ent)
 
+	b.ReportAllocs()
 	for b.Loop() {
 		_, err := parseTree(raw)
 		require.NoError(b, err)

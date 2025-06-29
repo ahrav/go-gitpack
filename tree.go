@@ -10,6 +10,7 @@ import (
 var (
 	ErrCorruptTree  = errors.New("corrupt tree object")
 	ErrTypeMismatch = errors.New("unexpected object type")
+	ErrTreeNotFound = errors.New("tree object not found")
 )
 
 // treeEntry represents a single "<mode> <name>\0<sha1>" record inside a Git
