@@ -8,7 +8,14 @@ package objstore
 
 import (
 	"bytes"
+	"errors"
 	"io"
+)
+
+var (
+	ErrCorruptTree  = errors.New("corrupt tree object")
+	ErrTypeMismatch = errors.New("unexpected object type")
+	ErrTreeNotFound = errors.New("tree object not found")
 )
 
 // TreeIter provides a zero-allocation, forward-only iterator over the entries
