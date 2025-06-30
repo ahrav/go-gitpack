@@ -177,7 +177,7 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 				}
 			}
 
-			if err := walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, new Hash, mode uint32) error {
+			err := walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, new Hash, mode uint32) error {
 				if mode&040000 != 0 {
 					return nil
 				}
@@ -186,15 +186,14 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 				oldBytes, _, _ := hs.store.Get(old)
 				newBytes, _, _ := hs.store.Get(new)
 
-				for _, ln := range addedLines(oldBytes, newBytes) {
-					out <- Addition{
-						Commit: c.OID,
-						Path:   filepath.ToSlash(path),
-						Lines:  [][]byte{ln},
-					}
+				out <- Addition{
+					Commit: c.OID,
+					Path:   filepath.ToSlash(path),
+					Lines:  addedLines(oldBytes, newBytes),
 				}
 				return nil
-			}); err != nil {
+			})
+			if err != nil {
 				errC <- err
 				return
 			}
