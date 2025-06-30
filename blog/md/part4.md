@@ -392,15 +392,15 @@ Instead of a simple LRU cache, we use reference counting to track which objects 
 
 ```go
 // With reference counting:
-base := cache.acquire("large-base")       // Inflates once: 5ms
-// base now has refCnt=1, cannot be evicted!
+handle := cache.acquire("large-base")     // Inflates once: 5ms
+// handle now has refCnt=1, cannot be evicted!
 
-delta1 := applyDelta(base.Data(), getDelta1()) // 20ms
-delta2 := applyDelta(base.Data(), getDelta2()) // 20ms
+delta1 := applyDelta(handle.Data(), getDelta1()) // 20ms
+delta2 := applyDelta(handle.Data(), getDelta2()) // 20ms
 // ... more work, base stays in cache
 
-finalResult := applyDelta(base.Data(), getFinalDelta()) // Uses cached copy!
-base.Release() // Now eligible for eviction
+finalResult := applyDelta(handle.Data(), getFinalDelta()) // Uses cached copy!
+handle.Release() // Now eligible for eviction
 ```
 
 The key insight: objects with active references cannot be evicted, preventing expensive re-inflation during multi-step operations. This cache design is specifically tailored to Git's delta resolution patterns where objects need to be held across multiple operations.
@@ -469,12 +469,14 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
     // materialized objects, which are likely to be referenced by upcoming
     // deltas.
     if b, ok := s.dw.acquire(oid); ok {
-        return b.Data(), detectType(b.Data()), nil
+        d, t := b.Data(), b.Type()
+        b.Release()
+        return d, t, nil
     }
 
     // Second-level lookup in the larger ARC cache.
     if b, ok := s.cache.Get(oid); ok {
-        return b, detectType(b), nil
+        return b.data, b.typ, nil
     }
 
     // Cache miss – inflate from pack while tracking delta depth to prevent
@@ -546,9 +548,8 @@ func (s *Store) inflateFromPack(
             return nil, ObjBad, fmt.Errorf("delta application failed for object %x", oid)
         }
 
-        // finalType := detectType(full)
-        s.dw.add(oid, full)
-        s.cache.Add(oid, full)
+        s.dw.add(oid, full, baseType)
+        s.cache.Add(oid, cachedObj{data: full, typ: baseType})
         return full, baseType, nil
     }
 
@@ -571,8 +572,8 @@ func (s *Store) inflateFromPack(
         }
     }
 
-    s.dw.add(oid, data)
-    s.cache.Add(oid, data)
+    s.dw.add(oid, data, objType)
+    s.cache.Add(oid, cachedObj{data: data, typ: objType})
     return data, objType, nil
 }
 ```

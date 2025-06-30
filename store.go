@@ -83,6 +83,24 @@ const (
 	defaultMaxDeltaDepth = 50
 )
 
+// cachedObj pairs a fully-materialized Git object with its on-disk
+// ObjectType.
+//
+// The ARC cache inside Store uses cachedObj as its value type so that a
+// cache hit returns both the raw bytes and the already-known object type.
+// This avoids having to call detectType on every lookup.
+//
+// A cachedObj is immutable after it has been placed in the cache.
+type cachedObj struct {
+	// data holds the complete, inflated object contents.
+	// The slice must not be mutated once the value is cached.
+	data []byte
+
+	// typ records the object's kind (blob, tree, commit, tag, …) so callers
+	// can skip type detection on a cache hit.
+	typ ObjectType
+}
+
 // Store provides concurrent, read-only access to one or more memory-mapped
 // Git packfiles with support for multi-pack-index (MIDX) files.
 //
@@ -115,7 +133,7 @@ type Store struct {
 
 	// cache holds fully-inflated objects. It uses an Adaptive Replacement
 	// Cache (ARC) that balances recency and frequency for high hit rates.
-	cache *arc.ARCCache[Hash, []byte]
+	cache *arc.ARCCache[Hash, cachedObj]
 
 	// dw is a short-lived object window (32 MiB) for delta chain optimization.
 	dw *refCountedDeltaWindow
@@ -212,7 +230,7 @@ func Open(dir string) (*Store, error) {
 
 		const defaultCacheSize = 1 << 14 // 16K entries ~ 96MiB
 		var err error
-		store.cache, err = arc.NewARC[Hash, []byte](defaultCacheSize)
+		store.cache, err = arc.NewARC[Hash, cachedObj](defaultCacheSize)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create ARC cache: %w", err)
 		}
@@ -240,7 +258,7 @@ func Open(dir string) (*Store, error) {
 	}
 
 	const defaultCacheSize = 1 << 14 // 16K entries ~ 96MiB
-	store.cache, err = arc.NewARC[Hash, []byte](defaultCacheSize)
+	store.cache, err = arc.NewARC[Hash, cachedObj](defaultCacheSize)
 	if err != nil {
 		// This should not happen with a positive default size, but it is
 		// best practice to handle the error from any constructor.
@@ -354,12 +372,14 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 	// materialized objects, which are likely to be referenced by upcoming
 	// deltas.
 	if b, ok := s.dw.acquire(oid); ok {
-		return b.Data(), detectType(b.Data()), nil
+		d, t := b.Data(), b.Type()
+		b.Release()
+		return d, t, nil
 	}
 
 	// Second-level lookup in the larger ARC cache.
 	if b, ok := s.cache.Get(oid); ok {
-		return b, detectType(b), nil
+		return b.data, b.typ, nil
 	}
 
 	// Cache miss – inflate from pack while tracking delta depth to prevent
@@ -455,8 +475,8 @@ func (s *Store) inflateFromPack(
 		}
 
 		// finalType := detectType(full)
-		s.dw.add(oid, full)
-		s.cache.Add(oid, full)
+		s.dw.add(oid, full, baseType)
+		s.cache.Add(oid, cachedObj{data: full, typ: baseType})
 		return full, baseType, nil
 	}
 
@@ -479,8 +499,8 @@ func (s *Store) inflateFromPack(
 		}
 	}
 
-	s.dw.add(oid, data)
-	s.cache.Add(oid, data)
+	s.dw.add(oid, data, objType)
+	s.cache.Add(oid, cachedObj{data: data, typ: objType})
 	return data, objType, nil
 }
 
@@ -506,11 +526,13 @@ func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
 // getWithContext handles object retrieval with delta cycle detection.
 func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	if b, ok := s.dw.acquire(oid); ok {
-		return b.Data(), detectType(b.Data()), nil
+		d, t := b.Data(), b.Type()
+		b.Release()
+		return d, t, nil
 	}
 
 	if b, ok := s.cache.Get(oid); ok {
-		return b, detectType(b), nil
+		return b.data, b.typ, nil
 	}
 
 	if s.midx != nil {

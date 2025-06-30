@@ -36,7 +36,7 @@ func testCoreFunctionality(t *testing.T) {
 		oid := makeHash("happy-path")
 		data := []byte("hello world")
 
-		err := w.add(oid, data)
+		err := w.add(oid, data, ObjBlob)
 		require.NoError(t, err, "add should not fail")
 
 		h, ok := w.acquire(oid)
@@ -62,7 +62,7 @@ func testCoreFunctionality(t *testing.T) {
 		oid := makeHash("mutable")
 		originalData := []byte("original")
 
-		err := w.add(oid, originalData)
+		err := w.add(oid, originalData, ObjBlob)
 		require.NoError(t, err, "add should not fail")
 
 		originalData[0] = 'X'
@@ -79,7 +79,7 @@ func testReferenceCounting(t *testing.T) {
 	t.Run("Ref-Count and Evictable Accounting", func(t *testing.T) {
 		w := newRefCountedDeltaWindow()
 		oid := makeHash("ref-counting")
-		w.add(oid, []byte("data"))
+		w.add(oid, []byte("data"), ObjBlob)
 
 		assert.Equal(t, 1, w.evictable, "evictable should be 1 after add")
 
@@ -99,7 +99,7 @@ func testReferenceCounting(t *testing.T) {
 	t.Run("Double Release is Idempotent", func(t *testing.T) {
 		w := newRefCountedDeltaWindow()
 		oid := makeHash("double-release")
-		w.add(oid, []byte("data"))
+		w.add(oid, []byte("data"), ObjBlob)
 		h, _ := w.acquire(oid)
 
 		h.Release()
@@ -116,9 +116,9 @@ func testEvictionPolicy(t *testing.T) {
 		w.budget = 100
 		oids := []Hash{makeHash("A"), makeHash("B"), makeHash("C")}
 
-		w.add(oids[0], make([]byte, 40))
-		w.add(oids[1], make([]byte, 40))
-		w.add(oids[2], make([]byte, 40))
+		w.add(oids[0], make([]byte, 40), ObjBlob)
+		w.add(oids[1], make([]byte, 40), ObjBlob)
+		w.add(oids[2], make([]byte, 40), ObjBlob)
 
 		_, ok := w.acquire(oids[0])
 		assert.False(t, ok, "LRU object A should be evicted")
@@ -132,13 +132,13 @@ func testEvictionPolicy(t *testing.T) {
 		w.budget = 100
 		oids := []Hash{makeHash("A"), makeHash("B"), makeHash("C"), makeHash("D")}
 
-		w.add(oids[0], make([]byte, 50))
-		w.add(oids[1], make([]byte, 50))
+		w.add(oids[0], make([]byte, 50), ObjBlob)
+		w.add(oids[1], make([]byte, 50), ObjBlob)
 
 		h, _ := w.acquire(oids[0])
 		h.Release()
 
-		w.add(oids[2], make([]byte, 50))
+		w.add(oids[2], make([]byte, 50), ObjBlob)
 
 		_, ok := w.acquire(oids[0])
 		assert.True(t, ok, "recently used object A should be present")
@@ -152,7 +152,7 @@ func testEvictionPolicy(t *testing.T) {
 		w.budget = 100
 		oidA, oidB, oidC := makeHash("A"), makeHash("B"), makeHash("C")
 
-		w.add(oidA, make([]byte, 60))
+		w.add(oidA, make([]byte, 60), ObjBlob)
 
 		h, ok := w.acquire(oidA)
 		require.True(t, ok, "should be able to acquire object A")
@@ -162,9 +162,9 @@ func testEvictionPolicy(t *testing.T) {
 			}
 		}()
 
-		w.add(oidB, make([]byte, 60))
+		w.add(oidB, make([]byte, 60), ObjBlob)
 
-		err := w.add(oidC, make([]byte, 30))
+		err := w.add(oidC, make([]byte, 30), ObjBlob)
 		require.NoError(t, err, "add should not fail")
 
 		_, ok = w.acquire(oidA)
@@ -182,10 +182,10 @@ func testUpdates(t *testing.T) {
 		data1 := []byte("initial data")
 		data2 := []byte("updated data")
 
-		w.add(oid, data1)
+		w.add(oid, data1, ObjBlob)
 		h1, _ := w.acquire(oid)
 
-		w.add(oid, data2)
+		w.add(oid, data2, ObjBlob)
 		h2, _ := w.acquire(oid)
 
 		assert.Equal(t, data2, h2.Data(), "new handle should see the updated data")
@@ -200,11 +200,11 @@ func testUpdates(t *testing.T) {
 		largeData := make([]byte, 1000)
 		smallData := make([]byte, 100)
 
-		w.add(oid, largeData)
+		w.add(oid, largeData, ObjBlob)
 		h1, _ := w.acquire(oid)
 		h1.Release()
 
-		w.add(oid, smallData)
+		w.add(oid, smallData, ObjBlob)
 		h2, _ := w.acquire(oid)
 
 		assert.Equal(t, len(smallData), len(h2.Data()), "data length should match the new data")
@@ -220,7 +220,7 @@ func testErrorsAndEdgeCases(t *testing.T) {
 		w.budget = 100
 		oversized := makeBlob(101)
 
-		err := w.add(makeHash("oversized"), oversized)
+		err := w.add(makeHash("oversized"), oversized, ObjBlob)
 		assert.Error(t, err, "should get error when adding object larger than budget")
 	})
 
@@ -228,7 +228,7 @@ func testErrorsAndEdgeCases(t *testing.T) {
 		w := newRefCountedDeltaWindow()
 		w.budget = 100
 
-		err := w.add(makeHash("A"), make([]byte, 80))
+		err := w.add(makeHash("A"), make([]byte, 80), ObjBlob)
 		require.NoError(t, err, "should be able to add A")
 		t.Logf("After adding A: used=%d, evictable=%d", w.used, w.evictable)
 
@@ -237,7 +237,7 @@ func testErrorsAndEdgeCases(t *testing.T) {
 		defer h.Release()
 
 		// This should exceed budget and fail.
-		err = w.add(makeHash("B"), make([]byte, 80))
+		err = w.add(makeHash("B"), make([]byte, 80), ObjBlob)
 		t.Logf("After attempting to add B: used=%d, evictable=%d, err=%v", w.used, w.evictable, err)
 		assert.ErrorIs(t, err, ErrWindowFull, "should get ErrWindowFull")
 	})
@@ -246,13 +246,13 @@ func testErrorsAndEdgeCases(t *testing.T) {
 		w := newRefCountedDeltaWindow()
 		w.budget = 100
 
-		w.add(makeHash("A"), make([]byte, 80)) // Use 80 bytes instead of 60
-		h, _ := w.acquire(makeHash("A"))       // Pin the entry.
+		w.add(makeHash("A"), make([]byte, 80), ObjBlob) // Use 80 bytes instead of 60
+		h, _ := w.acquire(makeHash("A"))                // Pin the entry.
 		defer h.Release()
 
 		// This add should fail because it exceeds the budget (80+80=160 > 100),
 		// and the existing item cannot be evicted.
-		err := w.add(makeHash("B"), make([]byte, 80))
+		err := w.add(makeHash("B"), make([]byte, 80), ObjBlob)
 		assert.ErrorIs(t, err, ErrWindowFull, "should get ErrWindowFull when all entries are pinned")
 	})
 
@@ -261,10 +261,10 @@ func testErrorsAndEdgeCases(t *testing.T) {
 		oidZero := makeHash("zero")
 		oidNil := makeHash("nil")
 
-		err := w.add(oidZero, []byte{})
+		err := w.add(oidZero, []byte{}, ObjBlob)
 		require.NoError(t, err, "add with empty slice should not fail")
 
-		err = w.add(oidNil, nil)
+		err = w.add(oidNil, nil, ObjBlob)
 		require.NoError(t, err, "add with nil slice should not fail")
 
 		h, ok := w.acquire(oidZero)
@@ -290,7 +290,7 @@ func testConcurrency(t *testing.T) {
 		chunk := makeBlob(windowBudget / objects / 4) // Use small chunks
 
 		for i := range objects {
-			_ = w.add(makeHash(fmt.Sprintf("obj-%d", i)), chunk)
+			_ = w.add(makeHash(fmt.Sprintf("obj-%d", i)), chunk, ObjBlob)
 		}
 
 		var wg sync.WaitGroup
@@ -317,7 +317,7 @@ func testConcurrency(t *testing.T) {
 							}
 						} else {
 							// Errors are expected and ignored (e.g., ErrWindowFull)
-							_ = w.add(oid, chunk)
+							_ = w.add(oid, chunk, ObjBlob)
 						}
 						rng = rng*1664525 + 1013904223
 					}
@@ -484,7 +484,7 @@ func generatePackTraversalPattern(numSteps int) []packStep {
 
 // Cache interface for benchmarking different implementations.
 type benchCache interface {
-	add(Hash, []byte) error
+	add(Hash, []byte, ObjectType) error
 	acquire(Hash) (*Handle, bool)
 }
 
@@ -507,7 +507,7 @@ func newLRUCache(budget, avgObjSize int) benchCache {
 	return &lruWrap{c}
 }
 
-func (l *lruWrap) add(h Hash, b []byte) error {
+func (l *lruWrap) add(h Hash, b []byte, _ ObjectType) error {
 	l.Add(string(h[:]), b)
 	return nil
 }
@@ -618,7 +618,7 @@ func benchmarkHotBases(b *testing.B, newCache func() benchCache) {
 		// Simulate decompression.
 		m.inflates.Add(1)
 		time.Sleep(obj.cost)
-		cache.add(obj.oid, obj.data)
+		cache.add(obj.oid, obj.data, ObjBlob)
 		inflating.Delete(string(obj.oid[:]))
 
 		h, _ := cache.acquire(obj.oid)
@@ -705,7 +705,7 @@ func benchmarkTreeWalk(b *testing.B, newCache func() benchCache) {
 
 		m.inflates.Add(1)
 		time.Sleep(obj.cost)
-		cache.add(obj.oid, obj.data)
+		cache.add(obj.oid, obj.data, ObjBlob)
 		inflating.Delete(string(obj.oid[:]))
 
 		h, _ := cache.acquire(obj.oid)
@@ -796,7 +796,7 @@ func benchmarkConcurrentChains(b *testing.B, newCache func() benchCache) {
 
 		m.inflates.Add(1)
 		time.Sleep(obj.cost)
-		cache.add(obj.oid, obj.data)
+		cache.add(obj.oid, obj.data, ObjBlob)
 		inflating.Delete(string(obj.oid[:]))
 
 		h, _ := cache.acquire(obj.oid)
@@ -907,7 +907,7 @@ func benchmarkPackTraversal(b *testing.B, newCache func() benchCache) {
 
 		m.inflates.Add(1)
 		time.Sleep(obj.cost)
-		cache.add(obj.oid, obj.data)
+		cache.add(obj.oid, obj.data, ObjBlob)
 		inflating.Delete(string(obj.oid[:]))
 
 		h, _ := cache.acquire(obj.oid)
@@ -1050,7 +1050,7 @@ func benchmarkDeltaChainResolution(b *testing.B, newCache func() benchCache) {
 		time.Sleep(obj.cost)
 
 		// Add to cache
-		if err := cache.add(obj.oid, obj.data); err != nil {
+		if err := cache.add(obj.oid, obj.data, ObjBlob); err != nil {
 			inflating.Delete(string(obj.oid[:]))
 			return nil
 		}

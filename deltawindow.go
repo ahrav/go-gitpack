@@ -77,6 +77,12 @@ type refCountedEntry struct {
 	// LOW FREQUENCY: mainly used during add/eviction operations
 	// 8 bytes, 8-byte aligned
 	size int
+
+	// typ stores the Git object type (blob, tree, commit, tag).
+	// This avoids repeatedly calling detectType() on cached data.
+	// MEDIUM FREQUENCY: returned with every acquire operation
+	// 1 byte, 1-byte aligned
+	typ ObjectType
 }
 
 // refCountedDeltaWindow implements a bounded LRU cache with reference counting
@@ -168,6 +174,16 @@ type Handle struct {
 	// w points back to the originating refCountedDeltaWindow to enable
 	// proper cleanup during Release().
 	w *refCountedDeltaWindow
+}
+
+// Type returns the Git ObjectType associated with the cached data.
+// It is safe to call after Release(); if the underlying entry has
+// already been cleared the method returns ObjBad.
+func (h *Handle) Type() ObjectType {
+	if h.entry != nil {
+		return h.entry.typ
+	}
+	return ObjBad // handle was released
 }
 
 // Release decrements the reference count for this handle's entry and
@@ -268,7 +284,7 @@ func (w *refCountedDeltaWindow) acquire(oid Hash) (*Handle, bool) {
 // evictable entries exist, ErrWindowFull is returned.
 //
 // This method is safe for concurrent use by multiple goroutines.
-func (w *refCountedDeltaWindow) add(oid Hash, buf []byte) error {
+func (w *refCountedDeltaWindow) add(oid Hash, buf []byte, objType ObjectType) error {
 	if len(buf) > w.budget {
 		return errors.New("object too large for window")
 	}
@@ -284,6 +300,7 @@ func (w *refCountedDeltaWindow) add(oid Hash, buf []byte) error {
 		// IMPORTANT: Callers must not modify buf after calling add().
 		entry.data = buf
 		entry.size = len(buf)
+		entry.typ = objType
 
 		w.used += entry.size - oldSize
 
@@ -299,6 +316,7 @@ func (w *refCountedDeltaWindow) add(oid Hash, buf []byte) error {
 			oid:  oid,
 			data: buf,
 			size: len(buf),
+			typ:  objType,
 		}
 
 		elem := w.lru.PushFront(entry)
