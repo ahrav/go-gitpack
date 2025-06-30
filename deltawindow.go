@@ -41,11 +41,6 @@ var ErrWindowFull = errors.New("delta window full: all entries in use")
 // refCountedEntry holds the fully-inflated form of a single Git object
 // along with atomic reference counting to enable safe concurrent access.
 //
-// Fields are ordered by access frequency WITHIN alignment constraints:
-// - Hot fields are grouped first and ordered by size (largest to smallest)
-// - Cold fields follow, also ordered by size
-// - This minimizes struct padding while keeping hot fields in the first cache line
-//
 // The entry exists within a refCountedDeltaWindow and tracks how many
 // active Handle instances currently reference its data. The reference
 // count is managed atomically to avoid data races during concurrent
@@ -53,36 +48,26 @@ var ErrWindowFull = errors.New("delta window full: all entries in use")
 type refCountedEntry struct {
 	// oid uniquely identifies the object this entry represents, stored
 	// in canonical object-ID hash form for fast map lookups.
-	// HIGH FREQUENCY: every lookup/acquire for identification
-	// 32 bytes, 1-byte aligned
 	oid Hash
 
 	// data contains the object's entire decompressed byte contents.
 	// The slice backing array may be reused when updating existing
 	// entries if the new data fits within the existing capacity.
-	// HIGH FREQUENCY: every acquire/lookup copies from this slice
-	// 24 bytes (slice header: ptr+len+cap), 8-byte aligned
 	data []byte
+
+	// typ stores the Git object type (blob, tree, commit, tag).
+	// This avoids repeatedly calling detectType() on cached data.
+	typ ObjectType
 
 	// refCnt tracks the number of active Handle instances that reference
 	// this entry's data. Must be accessed atomically. When refCnt reaches
 	// zero, the entry becomes eligible for LRU eviction.
-	// VERY HIGH FREQUENCY: every acquire/release operation
-	// 8 bytes (atomic.Int32 wrapper), 8-byte aligned
 	refCnt atomic.Int32
 
 	// size records len(data) in bytes at the time of last update.
 	// This cached value enables memory accounting without repeated
 	// slice length calculations during eviction decisions.
-	// LOW FREQUENCY: mainly used during add/eviction operations
-	// 8 bytes, 8-byte aligned
 	size int
-
-	// typ stores the Git object type (blob, tree, commit, tag).
-	// This avoids repeatedly calling detectType() on cached data.
-	// MEDIUM FREQUENCY: returned with every acquire operation
-	// 1 byte, 1-byte aligned
-	typ ObjectType
 }
 
 // refCountedDeltaWindow implements a bounded LRU cache with reference counting
