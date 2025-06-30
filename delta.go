@@ -15,6 +15,8 @@ package objstore
 
 import (
 	"fmt"
+	"slices"
+	"sync"
 	"unsafe"
 )
 
@@ -105,10 +107,6 @@ func (ctx *deltaContext) enterOfsDelta(offset uint64) {
 	ctx.depth++
 }
 
-// (ctx *deltaContext) exit decrements the recursion depth counter when the
-// caller leaves a delta resolution frame.
-func (ctx *deltaContext) exit() { ctx.depth-- }
-
 // parseDeltaHeader splits the base reference from the delta buffer and
 // returns • the base object hash (for ref-delta), • the base offset
 // (for ofs-delta), and • the start of the delta instruction stream.
@@ -158,18 +156,74 @@ func parseDeltaHeader(t ObjectType, data []byte) (Hash, uint64, []byte, error) {
 	return h, off, data[i:], nil
 }
 
-// applyDelta materializes a delta by interpreting Git's copy/insert opcode
-// stream.
+var (
+	// Pool size classes based on typical Git object distributions.
+
+	// Small: Most source code files (< 16KB).
+	smallPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 0, 16*1024) // 16KB
+			return &buf
+		},
+	}
+
+	// Medium: Larger source files, docs, small assets (< 256KB).
+	mediumPool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 0, 256*1024) // 256KB
+			return &buf
+		},
+	}
+
+	// Large: Images, binaries, build artifacts (< 2MB).
+	largePool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 0, 2*1024*1024) // 2MB
+			return &buf
+		},
+	}
+
+	// XLarge: Very large files (videos, archives).
+	xlargePool = sync.Pool{
+		New: func() any {
+			buf := make([]byte, 0, 16*1024*1024) // 16MB
+			return &buf
+		},
+	}
+)
+
+// Size thresholds for pool selection.
+const (
+	smallThreshold  = 8 * 1024        // 8 KiB – direct alloc below this
+	mediumThreshold = 128 * 1024      // 128 KiB
+	largeThreshold  = 1024 * 1024     // 1 MiB
+	xlargeThreshold = 8 * 1024 * 1024 // 8 MiB
+)
+
+// applyDelta interprets a Git delta stream and returns the fully
+// reconstructed object.
 //
-// The function pre-allocates the exact output size that is encoded at the
-// beginning of the delta buffer and uses the hand-rolled memmove wrapper to
-// copy larger chunks efficiently.
-// A zero return value signals a malformed delta.
+// The function first reads the source and target sizes (two Git varints)
+// and then executes the delta instruction stream consisting of copy and
+// insert op-codes.
+//
+// Fast-path buffer management:
+//
+//   - For very small targets (< 8 KiB) it allocates directly on the heap to
+//     avoid the overhead of a sync.Pool.
+//
+//   - For larger targets it chooses one of several size-class pools to
+//     amortize allocations across multiple delta applications.
+//
+// The returned slice is a fresh clone; callers may mutate it freely.
+// A nil slice signals malformed input (e.g., invalid op-codes, bounds
+// violations, overflow in varint parsing).
 func applyDelta(base, delta []byte) []byte {
 	if len(delta) == 0 {
 		return nil
 	}
 
+	// The first two varints encode source & target lengths.
 	_, n1 := decodeVarInt(delta)
 	if n1 <= 0 || n1 >= len(delta) {
 		return nil
@@ -179,109 +233,124 @@ func applyDelta(base, delta []byte) []byte {
 		return nil
 	}
 
-	out := make([]byte, targetSize)
+	var buf *[]byte
+	var pool *sync.Pool
+
+	// Select the appropriate pool (or direct allocation) based on targetSize.
+	switch {
+	case targetSize <= smallThreshold:
+		// Tiny objects: a direct allocation is cheaper than sync.Pool traffic.
+		b := make([]byte, targetSize)
+		buf = &b
+		pool = nil
+
+	case targetSize <= mediumThreshold:
+		pool = &smallPool
+		buf = pool.Get().(*[]byte)
+
+	case targetSize <= largeThreshold:
+		pool = &mediumPool
+		buf = pool.Get().(*[]byte)
+
+	case targetSize <= xlargeThreshold:
+		pool = &largePool
+		buf = pool.Get().(*[]byte)
+
+	default:
+		// Very large blobs (≥ 8 MiB) still benefit from pooling to curb GC churn.
+		pool = &xlargePool
+		buf = pool.Get().(*[]byte)
+	}
+
+	// Ensure the buffer is large enough; if not, grow it
+	// but keep the (now larger) slice in the pool for future reuse.
+	if pool != nil && cap(*buf) < int(targetSize) {
+		*buf = make([]byte, targetSize)
+	}
+
+	out := (*buf)[:targetSize]
 
 	deltaLen := len(delta)
 	baseLen := len(base)
-
-	opIdx := n1 + n2
+	opIdx := n1 + n2 // Start of the op-code stream.
 	outIdx := 0
 
 	for opIdx < deltaLen {
 		op := *(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))
 		opIdx++
 
-		if op&0x80 != 0 { // Copy operation
+		if op&0x80 != 0 { // -------- Copy operation --------
 			var cpOff, cpLen uint32
 
+			// Offsets and lengths are stored bit-sliced in the op byte.
 			if op&0x01 != 0 {
-				if opIdx >= deltaLen {
-					return nil
-				}
-				cpOff = uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx)))
+				cpOff = uint32(delta[opIdx])
 				opIdx++
 			}
 			if op&0x02 != 0 {
-				if opIdx >= deltaLen {
-					return nil
-				}
-				cpOff |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 8
+				cpOff |= uint32(delta[opIdx]) << 8
 				opIdx++
 			}
 			if op&0x04 != 0 {
-				if opIdx >= deltaLen {
-					return nil
-				}
-				cpOff |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 16
+				cpOff |= uint32(delta[opIdx]) << 16
 				opIdx++
 			}
 			if op&0x08 != 0 {
-				if opIdx >= deltaLen {
-					return nil
-				}
-				cpOff |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 24
+				cpOff |= uint32(delta[opIdx]) << 24
 				opIdx++
 			}
 
-			// Unrolled length parsing.
 			if op&0x10 != 0 {
-				if opIdx >= deltaLen {
-					return nil
-				}
-				cpLen = uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx)))
+				cpLen = uint32(delta[opIdx])
 				opIdx++
 			}
 			if op&0x20 != 0 {
-				if opIdx >= deltaLen {
-					return nil
-				}
-				cpLen |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 8
+				cpLen |= uint32(delta[opIdx]) << 8
 				opIdx++
 			}
 			if op&0x40 != 0 {
-				if opIdx >= deltaLen {
-					return nil
-				}
-				cpLen |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 16
+				cpLen |= uint32(delta[opIdx]) << 16
 				opIdx++
 			}
-
 			if cpLen == 0 {
 				cpLen = 65536
 			}
 
 			if int(cpOff)+int(cpLen) > baseLen || outIdx+int(cpLen) > int(targetSize) {
+				if pool != nil {
+					pool.Put(buf)
+				}
 				return nil
 			}
-
-			// Use memmove for potentially overlapping memory.
-			copyMemory(
-				unsafe.Add(unsafe.Pointer(&out[0]), outIdx),
-				unsafe.Add(unsafe.Pointer(&base[0]), cpOff),
-				int(cpLen),
-			)
+			copy(out[outIdx:], base[cpOff:cpOff+cpLen])
 			outIdx += int(cpLen)
 
-		} else if op != 0 { // Insert operation
+		} else if op != 0 { // ------- Insert operation -------
 			insertLen := int(op)
 			if opIdx+insertLen > deltaLen || outIdx+insertLen > int(targetSize) {
+				if pool != nil {
+					pool.Put(buf)
+				}
 				return nil
 			}
-
-			// Direct memory copy
-			copyMemory(
-				unsafe.Add(unsafe.Pointer(&out[0]), outIdx),
-				unsafe.Add(unsafe.Pointer(&delta[0]), opIdx),
-				insertLen,
-			)
+			copy(out[outIdx:], delta[opIdx:opIdx+insertLen])
 			opIdx += insertLen
 			outIdx += insertLen
-		} else {
-			return nil // Invalid op
+
+		} else { // op == 0
+			if pool != nil {
+				pool.Put(buf)
+			}
+			return nil // invalid op-code
 		}
 	}
 
-	return out
+	// Hand a fresh slice to the caller.
+	result := slices.Clone(out)
+	if pool != nil {
+		pool.Put(buf)
+	}
+	return result
 }
 
 // decodeVarInt decodes the base-128 varint format that Git uses in several
