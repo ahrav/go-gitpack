@@ -4,7 +4,6 @@ package objstore
 import (
 	"bytes"
 	"strings"
-	"unsafe"
 
 	"github.com/hexops/gotextdiff"
 	"github.com/hexops/gotextdiff/myers"
@@ -21,13 +20,6 @@ func addedLines(old, new []byte) [][]byte {
 		return nil
 	}
 
-	// zero‑copy []byte → string (safe as long as old/new aren’t mutated afterwards).
-	btostr := func(b []byte) string {
-		if len(b) == 0 {
-			return ""
-		}
-		return unsafe.String(&b[0], len(b))
-	}
 	a := btostr(old)
 	b := btostr(new)
 
@@ -47,13 +39,13 @@ func addedLines(old, new []byte) [][]byte {
 			lines = lines[:len(lines)-1]
 		}
 
-		for _, ln := range lines {
+		for _, line := range lines {
 			// Filter unified‑diff headers and “+” false‑positives.
-			if strings.HasPrefix(ln, "+++ ") || (len(ln) > 0 && ln[0] == '+') {
+			if strings.HasPrefix(line, "+++ ") || (len(line) > 0 && line[0] == '+') {
 				continue
 			}
 			// Preserve exact bytes (including CR for CRLF).
-			out = append(out, []byte(ln))
+			out = append(out, []byte(line))
 		}
 	}
 	return out

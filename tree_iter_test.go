@@ -438,14 +438,118 @@ func TestTreeIter_DocumentedBehavior(t *testing.T) {
 	})
 }
 
-// octStr converts a uint32 to an octal string. This helper exists to avoid
-// dependencies on the fmt package.
+// BenchmarkTreeIter_Typical benchmarks iteration over a realistic Git tree.
+// This covers the common case most applications will encounter.
+func BenchmarkTreeIter_Typical(b *testing.B) {
+	// Realistic project structure with ~20 entries
+	entries := []struct {
+		mode uint32
+		name string
+	}{
+		{040000, ".github"},
+		{100644, ".gitignore"},
+		{100644, "LICENSE"},
+		{100644, "README.md"},
+		{100644, "go.mod"},
+		{100644, "go.sum"},
+		{100755, "build.sh"},
+		{040000, "cmd"},
+		{040000, "internal"},
+		{040000, "pkg"},
+		{040000, "test"},
+		{100644, "main.go"},
+		{100644, "config.yaml"},
+		{120000, "latest"}, // symlink
+		{040000, "docs"},
+		{100644, "Dockerfile"},
+		{100644, "Makefile"},
+		{040000, "scripts"},
+		{160000, "vendor"}, // submodule
+		{100644, "version.txt"},
+	}
+
+	var raw []byte
+	for i, e := range entries {
+		raw = append(raw, []byte(octStr(e.mode))...)
+		raw = append(raw, ' ')
+		raw = append(raw, []byte(e.name)...)
+		raw = append(raw, 0)
+		sha := bytes.Repeat([]byte{byte(i + 1)}, 20)
+		raw = append(raw, sha...)
+	}
+
+	b.ReportAllocs()
+
+	for b.Loop() {
+		iter := newTreeIter(raw)
+		for {
+			name, oid, mode, ok, err := iter.Next()
+			if !ok {
+				break
+			}
+			// Use all returned values to prevent compiler optimization
+			_ = name
+			_ = oid
+			_ = mode
+			_ = err
+		}
+	}
+}
+
+// BenchmarkTreeIter_Large benchmarks iteration over a large tree.
+// This covers the edge case of repositories with many files in a directory.
+func BenchmarkTreeIter_Large(b *testing.B) {
+	const numEntries = 2000 // Large but realistic (e.g., node_modules, vendor dirs)
+
+	var raw []byte
+	for i := 0; i < numEntries; i++ {
+		// Mix of file types to be realistic
+		mode := "100644"
+		if i%15 == 0 {
+			mode = "040000" // Directory (~7%)
+		} else if i%25 == 0 {
+			mode = "100755" // Executable (~4%)
+		}
+
+		name := "file" + octStr(uint32(i)) + ".ext"
+		sha := bytes.Repeat([]byte{byte(i%256 + 1)}, 20)
+
+		raw = append(raw, []byte(mode)...)
+		raw = append(raw, ' ')
+		raw = append(raw, []byte(name)...)
+		raw = append(raw, 0)
+		raw = append(raw, sha...)
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for b.Loop() {
+		iter := newTreeIter(raw)
+		count := 0
+		for {
+			name, oid, mode, ok, err := iter.Next()
+			if !ok {
+				break
+			}
+			count++
+			// Use all returned values to prevent compiler optimization
+			_ = name
+			_ = oid
+			_ = mode
+			_ = err
+		}
+		if count != numEntries {
+			b.Fatalf("expected %d entries, got %d", numEntries, count)
+		}
+	}
+}
+
+// octStr converts a uint32 to an octal string.
 func octStr(n uint32) string {
 	if n == 0 {
 		return "0"
 	}
-	// A uint32 can be represented by a maximum of 11 octal digits, plus one
-	// for buffer.
 	var buf [12]byte
 	i := len(buf)
 	for n > 0 {

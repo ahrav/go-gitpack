@@ -77,7 +77,7 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 		return "", Hash{}, 0, false, ErrCorruptTree
 	}
 	// Convert the slice header to string without copying bytes.
-	name = string(it.rest[:nul])
+	name = btostr(it.rest[:nul])
 	it.rest = it.rest[nul+1:]
 
 	/* ---- <sha1> (20 bytes) ----------------------------------------- */

@@ -71,7 +71,7 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	if _, err := mr.ReadAt(header[:], 0); err != nil {
 		return nil, err
 	}
-	if string(header[0:4]) != ridxMagic {
+	if btostr(header[0:4]) != ridxMagic {
 		return nil, errors.New("ridx: bad magic")
 	}
 	if ver := binary.BigEndian.Uint32(header[4:8]); ver != 1 {

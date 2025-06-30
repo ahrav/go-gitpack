@@ -182,7 +182,7 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		if end == 0 {
 			return nil, fmt.Errorf("empty PNAM entry before padding")
 		}
-		packNames = append(packNames, string(pn[start:start+end]))
+		packNames = append(packNames, btostr(pn[start:start+end]))
 		start += end + 1
 	}
 	if len(packNames) != packCount {
