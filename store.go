@@ -640,12 +640,13 @@ func readObjectAtOffsetWithContext(
 		}
 
 		var base []byte
+		var baseType ObjectType
 		if objType == ObjRefDelta {
 			if err := ctx.checkRefDelta(bhash); err != nil {
 				return nil, ObjBad, err
 			}
 			ctx.enterRefDelta(bhash)
-			base, _, err = s.getWithContext(bhash, ctx)
+			base, baseType, err = s.getWithContext(bhash, ctx)
 			ctx.exit()
 		} else {
 			// Calculate offset for ofs-delta base object.
@@ -654,7 +655,7 @@ func readObjectAtOffsetWithContext(
 				return nil, ObjBad, err
 			}
 			ctx.enterOfsDelta(actualOffset)
-			base, _, err = readObjectAtOffsetWithContext(r, actualOffset, s, ctx)
+			base, baseType, err = readObjectAtOffsetWithContext(r, actualOffset, s, ctx)
 			ctx.exit()
 		}
 		if err != nil {
@@ -666,7 +667,7 @@ func readObjectAtOffsetWithContext(
 			return nil, ObjBad, fmt.Errorf("delta application failed")
 		}
 
-		return full, detectType(full), nil
+		return full, baseType, nil
 	}
 
 	return data, objType, nil
