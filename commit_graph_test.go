@@ -236,7 +236,7 @@ func TestCommitGraphChainParentAcrossLayers(t *testing.T) {
 	mustWrite(t, chainFile, []byte(tipHash+"\n"+baseHash+"\n"))
 
 	// Parse the commit graph chain.
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load chain: %v", err)
 	require.NotNil(t, graphData, "expected commit graph data, got nil")
 	require.Len(t, graphData.OrderedOIDs, 3, "want 3 commits, got %d", len(graphData.OrderedOIDs))
@@ -280,7 +280,7 @@ func TestCommitGraphEdgePointerMisaligned(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "parse: %v", err)
 
 	// Get parents for merge commit M.
@@ -321,7 +321,7 @@ func TestCommitGraphEmptyChainFallback(t *testing.T) {
 	mustWrite(t, singlePath, data)
 
 	// Load and verify fallback behavior.
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 	require.NotNil(t, graphData, "expected graph data")
 	assert.Len(t, graphData.OrderedOIDs, 1, "expected 1 commit, got %d", len(graphData.OrderedOIDs))
@@ -339,7 +339,7 @@ func TestCommitGraphChainMissingFiles(t *testing.T) {
 			"cafebabecafebabecafebabecafebabecafebabe\n"))
 
 	// Should fail to load.
-	_, err := LoadCommitGraph(tmp)
+	_, err := loadCommitGraph(tmp)
 	require.Error(t, err, "expected error for missing graph files")
 }
 
@@ -371,7 +371,7 @@ func TestCommitGraphChainPrecedence(t *testing.T) {
 	mustWrite(t, chainFile, []byte(chainHash+"\n"))
 
 	// Load and verify chain takes precedence.
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 	if assert.Len(t, graphData.OrderedOIDs, 1) {
 		assert.Equal(t, B, graphData.OrderedOIDs[0], "chain should take precedence")
@@ -412,7 +412,7 @@ func TestCommitGraphMissingChunks(t *testing.T) {
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, buf.Bytes())
 
-		_, err := LoadCommitGraph(tmp)
+		_, err := loadCommitGraph(tmp)
 		assert.Error(t, err, "expected error for missing OIDF")
 	})
 }
@@ -485,7 +485,7 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, data)
 
-		_, err := LoadCommitGraph(tmp)
+		_, err := loadCommitGraph(tmp)
 		if assert.Error(t, err, "expected error for OIDL size mismatch") {
 			assert.True(t, strings.Contains(err.Error(), "OIDL") && strings.Contains(err.Error(), "size"), "expected error about OIDL size, got: %v", err)
 		}
@@ -507,7 +507,7 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, data)
 
-		_, err := LoadCommitGraph(tmp)
+		_, err := loadCommitGraph(tmp)
 		assert.Error(t, err, "expected error for CDAT size mismatch")
 	})
 
@@ -555,7 +555,7 @@ func TestCommitGraphChunkSizeMismatch(t *testing.T) {
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, data)
 
-		_, err := LoadCommitGraph(tmp)
+		_, err := loadCommitGraph(tmp)
 		if assert.Error(t, err, "expected error for wrong OIDF size") {
 			assert.Contains(t, err.Error(), "OIDF", "expected error about OIDF, got: %v", err)
 		}
@@ -591,7 +591,7 @@ func TestCommitGraphOverlappingChunks(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, buf.Bytes())
 
-	_, err := LoadCommitGraph(tmp)
+	_, err := loadCommitGraph(tmp)
 	assert.Error(t, err, "expected error for overlapping chunks")
 }
 
@@ -639,7 +639,7 @@ func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	mustWrite(t, path, data)
 
 	// Should handle gracefully without infinite loop.
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "failed to parse: %v", err)
 
 	// Should have collected all parents until hitting terminator.
@@ -701,7 +701,7 @@ func TestCommitGraphManyParents(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "parse failed: %v", err)
 
 	parents := graphData.Parents[M]
@@ -740,7 +740,7 @@ func TestCommitGraphEdgeNoTerminator(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "parse failed: %v", err)
 
 	// Should read all edges until end of chunk.
@@ -808,7 +808,7 @@ func TestCommitGraphBadFanout(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	_, err := LoadCommitGraph(tmp)
+	_, err := loadCommitGraph(tmp)
 	assert.Error(t, err, "expected error for non-monotonic fanout")
 }
 
@@ -822,7 +822,7 @@ func TestCommitGraphEmpty(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "failed to load empty graph: %v", err)
 	assert.Empty(t, graphData.OrderedOIDs, "expected 0 commits")
 }
@@ -845,7 +845,7 @@ func TestCommitGraphFanoutMismatch(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	_, err := LoadCommitGraph(tmp)
+	_, err := loadCommitGraph(tmp)
 	assert.Error(t, err, "expected error for fanout mismatch")
 }
 
@@ -883,7 +883,7 @@ func TestCommitGraphDeepChainParent(t *testing.T) {
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(hash2+"\n"+hash1+"\n"))
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify parent relationships work within each file.
@@ -927,7 +927,7 @@ func TestCommitGraphChainDuplicates(t *testing.T) {
 	chainFile := filepath.Join(tmp, "info", "commit-graphs", "commit-graph-chain")
 	mustWrite(t, chainFile, []byte(tipHash+"\n"+baseHash+"\n"))
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
 	// Tip version should take precedence over base version.
@@ -967,7 +967,7 @@ func TestCommitGraphLongChain(t *testing.T) {
 
 	// Time the load
 	start := time.Now()
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	elapsed := time.Since(start)
 
 	require.NoError(t, err, "load failed: %v", err)
@@ -997,7 +997,7 @@ func TestCommitGraphTreeOIDs(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify TreeOIDs populated correctly
@@ -1126,7 +1126,7 @@ func TestCommitGraphOIDIndexMap(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify mapping.
@@ -1171,7 +1171,7 @@ func TestCommitGraphCleanupOnError(t *testing.T) {
 	mustWrite(t, chainFile, []byte(hash1+"\n"+hash2+"\n"))
 
 	// Should fail but clean up properly
-	_, err := LoadCommitGraph(tmp)
+	_, err := loadCommitGraph(tmp)
 	require.Error(t, err, "expected error for truncated file")
 
 	// Verify error mentions the issue
@@ -1219,7 +1219,7 @@ func TestCommitGraphCorruptHeaders(t *testing.T) {
 			path := filepath.Join(testTmp, "info", "commit-graph")
 			mustWrite(t, path, buf.Bytes())
 
-			_, err := LoadCommitGraph(testTmp)
+			_, err := loadCommitGraph(testTmp)
 			if assert.Error(t, err) {
 				assert.Contains(t, err.Error(), tc.errMsg, "expected error about %s, got: %v", tc.errMsg, err)
 			}
@@ -1261,7 +1261,7 @@ func TestCommitGraphLargeFile(t *testing.T) {
 	mustWrite(t, path, data)
 
 	start = time.Now()
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	loadTime := time.Since(start)
 
 	require.NoError(t, err, "load failed: %v", err)
@@ -1336,7 +1336,7 @@ func TestCommitGraphComplexMerges(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify merge parents
@@ -1383,7 +1383,7 @@ func TestCommitGraphAllRoots(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify all have no parents
@@ -1419,7 +1419,7 @@ func TestCommitGraphLinearHistory(t *testing.T) {
 	mustWrite(t, path, data)
 
 	start = time.Now()
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	loadTime := time.Since(start)
 
 	require.NoError(t, err, "load failed: %v", err)
@@ -1499,7 +1499,7 @@ func TestCommitGraphBinaryTree(t *testing.T) {
 	path := filepath.Join(tmp, "info", "commit-graph")
 	mustWrite(t, path, data)
 
-	graphData, err := LoadCommitGraph(tmp)
+	graphData, err := loadCommitGraph(tmp)
 	require.NoError(t, err, "load failed: %v", err)
 
 	// Verify structure
@@ -1556,7 +1556,7 @@ func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, data)
 
-		graphData, err := LoadCommitGraph(tmp)
+		graphData, err := loadCommitGraph(tmp)
 		require.NoError(t, err, "unexpected error for valid boundary: %v", err)
 
 		// Verify the parent relationship.
@@ -1587,7 +1587,7 @@ func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, data)
 
-		_, err := LoadCommitGraph(tmp)
+		_, err := loadCommitGraph(tmp)
 		if assert.Error(t, err, "expected error for out-of-bounds parent") {
 			assert.True(t, strings.Contains(err.Error(), "parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about parent index out of bounds, got: %v", err)
 		}
@@ -1622,7 +1622,7 @@ func TestCommitGraphParentBoundaryIndex(t *testing.T) {
 		path := filepath.Join(tmp, "info", "commit-graph")
 		mustWrite(t, path, data)
 
-		_, err := LoadCommitGraph(tmp)
+		_, err := loadCommitGraph(tmp)
 		if assert.Error(t, err, "expected error for out-of-bounds edge parent") {
 			assert.True(t, strings.Contains(err.Error(), "edge parent index") && strings.Contains(err.Error(), "out of bounds"), "expected error about edge parent index out of bounds, got: %v", err)
 		}
@@ -1760,7 +1760,7 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 			b.ReportAllocs()
 
 			for b.Loop() {
-				data, err := LoadCommitGraph(dir)
+				data, err := loadCommitGraph(dir)
 				require.NoError(b, err)
 				require.Len(b, data.OrderedOIDs, size)
 			}
@@ -1778,7 +1778,7 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 			b.ReportAllocs()
 
 			for b.Loop() {
-				data, err := LoadCommitGraph(dir)
+				data, err := loadCommitGraph(dir)
 				require.NoError(b, err)
 				require.Len(b, data.OrderedOIDs, size)
 			}

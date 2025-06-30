@@ -53,7 +53,7 @@ const cdatRecordSize = hashSize + 16
 // LoadCommitGraph.
 type Parents = map[Hash][]Hash
 
-// CommitGraphData provides a read-only, in-memory view of one or more
+// commitGraphData provides a read-only, in-memory view of one or more
 // on-disk Git commit-graph files.
 //
 // The value is returned by LoadCommitGraph and is intended for callers that
@@ -62,7 +62,7 @@ type Parents = map[Hash][]Hash
 // OrderedOIDs[i] has metadata at TreeOIDs[i] and Timestamps[i], and can be
 // found in O(1) via OIDToIndex.  Once constructed the instance is immutable
 // and safe for concurrent reads.
-type CommitGraphData struct {
+type commitGraphData struct {
 	// Parents maps a commit OID to the OIDs of its immediate parents.
 	// The map contains an entry for every commit included in the commit-graph.
 	Parents Parents
@@ -83,14 +83,14 @@ type CommitGraphData struct {
 	OIDToIndex map[Hash]int
 }
 
-// LoadCommitGraph parses the commit-graph files that belong to the Git
+// loadCommitGraph parses the commit-graph files that belong to the Git
 // repository located at objectsDir and returns an in-memory
 // CommitGraphData.
 //
 // A commit-graph can be materialised as either a single file
 // $objects/info/commit-graph or as a "split chain" referenced from
 // $objects/info/commit-graphs/commit-graph-chain.
-// LoadCommitGraph transparently handles both layouts.
+// loadCommitGraph transparently handles both layouts.
 //
 // If no commit-graph is present, the function returns (nil, nil).
 // On success the returned CommitGraphData is completely detached from the
@@ -106,7 +106,7 @@ type CommitGraphData struct {
 //
 // The caller should cache the returned structure if multiple look-ups are
 // expected; constructing it is O(number of commits).
-func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
+func loadCommitGraph(objectsDir string) (*commitGraphData, error) {
 	chain, err := discoverGraphFiles(objectsDir)
 	if err != nil {
 		return nil, err
@@ -172,7 +172,7 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 		g.mr.Close()
 	}
 
-	return &CommitGraphData{
+	return &commitGraphData{
 		Parents:     parents,
 		OrderedOIDs: allOids,
 		TreeOIDs:    allTrees,

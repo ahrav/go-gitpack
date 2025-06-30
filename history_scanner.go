@@ -115,7 +115,7 @@ type HistoryScanner struct {
 	// graphData is the parsed commit-graph for the repository.
 	// It is nil when the repository lacks a commit-graph file, in which
 	// case the scanner falls back to packfile enumeration.
-	graphData *CommitGraphData
+	graphData *commitGraphData
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -152,7 +152,7 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 
 	// Require commit‑graph (TODO: add fallback to packfile parsing for repositories without commit-graph)
 	graphDir := filepath.Join(gitDir, "objects")
-	graph, err := LoadCommitGraph(graphDir)
+	graph, err := loadCommitGraph(graphDir)
 	if err != nil || graph == nil {
 		store.Close() // Clean up store if we can't load commit graph
 		if err != nil {
