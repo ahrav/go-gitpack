@@ -3,38 +3,57 @@ package objstore
 
 import (
 	"bytes"
-	"fmt"
 	"strings"
+	"unsafe"
 
 	"github.com/hexops/gotextdiff"
 	"github.com/hexops/gotextdiff/myers"
 	"github.com/hexops/gotextdiff/span"
 )
 
-// addedLines returns every line that was *inserted* in new with respect to old.
-// The leading ‘+’ from each inserted line in the unified diff is stripped
-// before the line is returned.
+// addedLines returns every line that is *present in new but absent in old*.
+// The slice elements are the raw line bytes with the trailing '\n' removed.
+// The implementation relies on gotextdiff's Myers algorithm and requires Go ≥1.20
+// for zero‑copy slice→string conversion via unsafe.String.
 func addedLines(old, new []byte) [][]byte {
-	if len(old) == len(new) && bytes.Equal(old, new) {
+	// Short‑circuit: identical blobs
+	if bytes.Equal(old, new) {
 		return nil
 	}
 
-	// gotextdiff works on strings, so convert once up front.
-	a := string(old)
-	b := string(new)
+	// zero‑copy []byte → string (safe as long as old/new aren’t mutated afterwards).
+	btostr := func(b []byte) string {
+		if len(b) == 0 {
+			return ""
+		}
+		return unsafe.String(&b[0], len(b))
+	}
+	a := btostr(old)
+	b := btostr(new)
 
+	// Compute full‑line edits.
 	edits := myers.ComputeEdits(span.URIFromPath(""), a, b)
-	unified := gotextdiff.ToUnified("", "", a, edits)
-
-	// fmt.Sprint invokes Unified.Format, yielding the unified-diff text.
-	diffText := fmt.Sprint(unified)
+	edits = gotextdiff.LineEdits(a, edits)
 
 	var out [][]byte
-	for l := range strings.SplitSeq(diffText, "\n") {
-		// A line that starts with “+” and is not the “+++ …” header
-		// represents an insertion we care about.
-		if len(l) > 0 && l[0] == '+' && !(len(l) > 1 && l[1] == '+') {
-			out = append(out, []byte(l[1:]))
+	for _, e := range edits {
+		if e.NewText == "" {
+			continue // pure deletions
+		}
+		lines := strings.Split(e.NewText, "\n")
+
+		// Drop final empty element that follows the trailing '\n'.
+		if len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+
+		for _, ln := range lines {
+			// Filter unified‑diff headers and “+” false‑positives.
+			if strings.HasPrefix(ln, "+++ ") || (len(ln) > 0 && ln[0] == '+') {
+				continue
+			}
+			// Preserve exact bytes (including CR for CRLF).
+			out = append(out, []byte(ln))
 		}
 	}
 	return out

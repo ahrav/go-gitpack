@@ -33,26 +33,22 @@ ensure_pack_files() {
   local loose_count=$(find "$repo_path/objects" -type f -path "*/[0-9a-f][0-9a-f]/[0-9a-f]*" 2>/dev/null | wc -l)
   local pack_count=$(find "$repo_path/objects/pack" -name "*.pack" 2>/dev/null | wc -l)
 
-  if [ "$loose_count" -eq 0 ] && [ "$pack_count" -eq 0 ]; then
-    echo -e "    ${RED}✗ No objects found to pack${NC}"
-    return 1
-  fi
-
-  # If we already have pack files, we're done
-  if [ "$pack_count" -gt 0 ]; then
+  # If we already have pack files but also have loose objects, force repack
+  if [ "$pack_count" -gt 0 ] && [ "$loose_count" -gt 0 ]; then
+    echo -e "    ${BLUE}Found $pack_count existing pack(s) and $loose_count loose objects, repacking...${NC}"
+    git -C "$repo_path" repack -ad >/dev/null 2>&1 || git -C "$repo_path" repack -a >/dev/null 2>&1
+  elif [ "$pack_count" -gt 0 ]; then
     echo -e "    ${GREEN}✓ Already has $pack_count pack file(s)${NC}"
     return 0
+  elif [ "$loose_count" -eq 0 ]; then
+    echo -e "    ${RED}✗ No objects found to pack${NC}"
+    return 1
+  else
+    echo -e "    ${BLUE}Found $loose_count loose objects, creating pack files...${NC}"
+    git -C "$repo_path" repack -ad >/dev/null 2>&1 ||
+      git -C "$repo_path" repack -a >/dev/null 2>&1 ||
+      git -C "$repo_path" gc --aggressive >/dev/null 2>&1
   fi
-
-  echo -e "    ${BLUE}Found $loose_count loose objects, creating pack files...${NC}"
-
-  # Create pack directory if it doesn't exist
-  mkdir -p "$repo_path/objects/pack"
-
-  # Try different packing strategies
-  git -C "$repo_path" repack -ad 2>/dev/null ||
-    git -C "$repo_path" repack -a 2>/dev/null ||
-    git -C "$repo_path" gc --aggressive 2>/dev/null || true
 
   # Final check
   pack_count=$(find "$repo_path/objects/pack" -name "*.pack" 2>/dev/null | wc -l)
@@ -67,200 +63,181 @@ ensure_pack_files() {
   fi
 }
 
+# --- Start of Repository Generation ---
+
 # 1. Truly empty repository (no commits, no objects)
-echo -e "${GREEN}Creating empty repository...${NC}"
+echo -e "\n${GREEN}1. Creating empty repository...${NC}"
 REPO_PATH="$TESTDATA_DIR/empty-repo"
-
-# Create a bare repository with no commits
 git init --bare "$REPO_PATH" >/dev/null 2>&1
-
-# Set up basic config
 git -C "$REPO_PATH" config user.name "Test User"
 git -C "$REPO_PATH" config user.email "test@example.com"
-
-# Don't create any commits or objects - keep it truly empty
 ensure_pack_files "$REPO_PATH" true
 
 # 2. Simple linear repository
-echo -e "${GREEN}Creating simple-linear repository...${NC}"
+echo -e "\n${GREEN}2. Creating simple-linear repository...${NC}"
 REPO_PATH="$TESTDATA_DIR/simple-linear"
 WORK_DIR="$REPO_PATH.work"
-
 git init "$WORK_DIR" >/dev/null 2>&1
 git -C "$WORK_DIR" config user.name "Test User"
 git -C "$WORK_DIR" config user.email "test@example.com"
-
-# Commit 1
 echo "# Test Repository" >"$WORK_DIR/README.md"
 git -C "$WORK_DIR" add README.md
 git -C "$WORK_DIR" commit -m "Initial commit" >/dev/null 2>&1
-
-# Commit 2
 cat >"$WORK_DIR/main.go" <<'EOF'
 package main
-
 func main() {
     println("Hello, World!")
 }
 EOF
 git -C "$WORK_DIR" add main.go
 git -C "$WORK_DIR" commit -m "Add main.go" >/dev/null 2>&1
-
-# Commit 3
 echo "test content" >"$WORK_DIR/test.txt"
 git -C "$WORK_DIR" add test.txt
 git -C "$WORK_DIR" commit -m "Add test file" >/dev/null 2>&1
-
-# Clone as bare
 git clone --bare "$WORK_DIR" "$REPO_PATH" >/dev/null 2>&1
 rm -rf "$WORK_DIR"
-
 ensure_pack_files "$REPO_PATH"
-
-# Generate commit-graph
 git -C "$REPO_PATH" commit-graph write --reachable 2>/dev/null || true
 
 # 3. Repository with merges
-echo -e "${GREEN}Creating repository with merges...${NC}"
+echo -e "\n${GREEN}3. Creating repository with merges...${NC}"
 REPO_PATH="$TESTDATA_DIR/with-merges"
 WORK_DIR="$REPO_PATH.work"
-
 git init "$WORK_DIR" >/dev/null 2>&1
 git -C "$WORK_DIR" config user.name "Test User"
 git -C "$WORK_DIR" config user.email "test@example.com"
-
-# Initial commit on main
 echo "package main" >"$WORK_DIR/main.go"
 git -C "$WORK_DIR" add main.go
 git -C "$WORK_DIR" commit -m "Initial commit" >/dev/null 2>&1
-
-# Create and switch to feature branch
 git -C "$WORK_DIR" checkout -b feature >/dev/null 2>&1
-
-# Feature branch commit
 cat >"$WORK_DIR/feature.go" <<'EOF'
 package main
-
 func feature() {
     println("Feature")
 }
 EOF
 git -C "$WORK_DIR" add feature.go
 git -C "$WORK_DIR" commit -m "Add feature" >/dev/null 2>&1
-
-# Back to main branch
 git -C "$WORK_DIR" checkout main >/dev/null 2>&1 || git -C "$WORK_DIR" checkout master >/dev/null 2>&1
-
-# Main branch commit
 echo -e "package main\n\nfunc main() {\n    println(\"Updated\")\n}" >"$WORK_DIR/main.go"
 git -C "$WORK_DIR" add main.go
 git -C "$WORK_DIR" commit -m "Update main" >/dev/null 2>&1
-
-# Merge feature branch
 git -C "$WORK_DIR" merge feature -m "Merge feature branch" --no-ff >/dev/null 2>&1
-
-# Post-merge commit
 echo "After merge" >"$WORK_DIR/after_merge.txt"
 git -C "$WORK_DIR" add after_merge.txt
 git -C "$WORK_DIR" commit -m "Post-merge commit" >/dev/null 2>&1
-
-# Clone as bare
 git clone --bare "$WORK_DIR" "$REPO_PATH" >/dev/null 2>&1
 rm -rf "$WORK_DIR"
-
 ensure_pack_files "$REPO_PATH"
 git -C "$REPO_PATH" commit-graph write --reachable 2>/dev/null || true
 
 # 4. Repository without commit-graph
-echo -e "${GREEN}Creating repository without commit-graph...${NC}"
+echo -e "\n${GREEN}4. Creating repository without commit-graph...${NC}"
 REPO_PATH="$TESTDATA_DIR/no-commit-graph"
 WORK_DIR="$REPO_PATH.work"
-
 git init "$WORK_DIR" >/dev/null 2>&1
 git -C "$WORK_DIR" config user.name "Test User"
 git -C "$WORK_DIR" config user.email "test@example.com"
-
-# Set a fixed date for deterministic commits
 export GIT_AUTHOR_DATE="2023-01-01T12:00:00Z"
 export GIT_COMMITTER_DATE="2023-01-01T12:00:00Z"
-
-# Create 4 commits with substantial content
 echo "# Project README" >"$WORK_DIR/README.md"
 git -C "$WORK_DIR" add README.md
 git -C "$WORK_DIR" commit -m "Initial commit - add README" >/dev/null 2>&1
-
 echo "First file content line 1" >"$WORK_DIR/file1.txt"
 echo "First file content line 2" >>"$WORK_DIR/file1.txt"
 git -C "$WORK_DIR" add file1.txt
 git -C "$WORK_DIR" commit -m "Add file1.txt with multiple lines" >/dev/null 2>&1
-
 echo "Second file content line 1" >"$WORK_DIR/file2.txt"
 echo "Second file content line 2" >>"$WORK_DIR/file2.txt"
 git -C "$WORK_DIR" add file2.txt
 git -C "$WORK_DIR" commit -m "Add file2.txt with multiple lines" >/dev/null 2>&1
-
 echo "Third file content line 1" >"$WORK_DIR/file3.txt"
 echo "Third file content line 2" >>"$WORK_DIR/file3.txt"
 git -C "$WORK_DIR" add file3.txt
 git -C "$WORK_DIR" commit -m "Add file3.txt with multiple lines" >/dev/null 2>&1
-
-# Unset the fixed dates
 unset GIT_AUTHOR_DATE
 unset GIT_COMMITTER_DATE
-
-# Clone as bare
 git clone --bare "$WORK_DIR" "$REPO_PATH" >/dev/null 2>&1
 rm -rf "$WORK_DIR"
-
 ensure_pack_files "$REPO_PATH"
-
-# Remove commit-graph files to force packfile scanning
 rm -f "$REPO_PATH/objects/info/commit-graph" 2>/dev/null
 rm -rf "$REPO_PATH/objects/info/commit-graphs" 2>/dev/null
-
-# Verify the commits were created properly
 echo -e "  ${BLUE}Verifying commits in no-commit-graph repo...${NC}"
 commit_count=$(git -C "$REPO_PATH" rev-list --all --count 2>/dev/null || echo "0")
 if [ "$commit_count" -ne 4 ]; then
-  echo -e "  ${RED}✗ Expected 4 commits, got $commit_count${NC}"
+  echo -e "    ${RED}✗ Expected 4 commits, got $commit_count${NC}"
 else
-  echo -e "  ${GREEN}✓ Created 4 commits as expected${NC}"
+  echo -e "    ${GREEN}✓ Created 4 commits as expected${NC}"
 fi
 
-# 5. Large repository
-echo -e "${GREEN}Creating large repository (100 commits)...${NC}"
-REPO_PATH="$TESTDATA_DIR/large-repo"
-WORK_DIR="$REPO_PATH.work"
+# ==============================================================================
+# Reusable function to generate large repositories with a linear history
+# ==============================================================================
+# Arguments:
+#   $1: The base name for the repository (e.g., "large-repo")
+#   $2: The total number of commits to create.
+generate_large_linear_repo() {
+  local repo_name="$1"
+  local commit_count="$2"
 
-git init "$WORK_DIR" >/dev/null 2>&1
-git -C "$WORK_DIR" config user.name "Test User"
-git -C "$WORK_DIR" config user.email "test@example.com"
+  echo -e "\n${GREEN}Creating $repo_name repository with $commit_count commits...${NC}"
+  local REPO_PATH="$TESTDATA_DIR/$repo_name"
+  local WORK_DIR="$REPO_PATH.work"
 
-# Initial commit
-echo "# Large Repository" >"$WORK_DIR/README.md"
-git -C "$WORK_DIR" add README.md
-git -C "$WORK_DIR" commit -m "Initial commit" >/dev/null 2>&1
+  git init "$WORK_DIR" >/dev/null 2>&1
+  git -C "$WORK_DIR" config user.name "Test User"
+  git -C "$WORK_DIR" config user.email "test@example.com"
 
-# Create 99 more commits (total 100)
-for i in $(seq 2 100); do
-  echo "Content for file $i" >"$WORK_DIR/file_$i.txt"
-  git -C "$WORK_DIR" add "file_$i.txt"
-  git -C "$WORK_DIR" commit -m "Add file_$i.txt (commit $i)" >/dev/null 2>&1
+  # Initial commit
+  echo "# $repo_name" >"$WORK_DIR/README.md"
+  git -C "$WORK_DIR" add README.md
+  git -C "$WORK_DIR" commit -m "Initial commit" >/dev/null 2>&1
 
-  # Progress indicator
-  if [ $((i % 25)) -eq 0 ]; then
-    echo -e "  Created $i/100 commits..."
-  fi
-done
+  # Determine progress reporting step (report ~10 times)
+  local progress_step=$((commit_count / 10))
+  [ "$progress_step" -eq 0 ] && progress_step=1 # Avoid division by zero for small counts
 
-# Clone as bare
-git clone --bare "$WORK_DIR" "$REPO_PATH" >/dev/null 2>&1
-rm -rf "$WORK_DIR"
+  # Create remaining commits
+  for i in $(seq 2 "$commit_count"); do
+    echo "Content for file $i in $repo_name" >"$WORK_DIR/file_$i.txt"
+    git -C "$WORK_DIR" add "file_$i.txt"
+    git -C "$WORK_DIR" commit -m "Add file_$i.txt (commit $i of $commit_count)" >/dev/null 2>&1
 
-ensure_pack_files "$REPO_PATH"
-git -C "$REPO_PATH" commit-graph write --reachable 2>/dev/null || true
+    # Progress indicator
+    if [ $((i % progress_step)) -eq 0 ]; then
+      echo -e "  Created $i/$commit_count commits..."
+    fi
+  done
+  echo -e "  Created $commit_count/$commit_count commits..." # Final progress update
 
-# Final verification
+  # Clone as bare - this ensures all objects are properly transferred
+  echo -e "  ${BLUE}Cloning to bare repository...${NC}"
+  git clone --bare "$WORK_DIR" "$REPO_PATH" >/dev/null 2>&1
+  rm -rf "$WORK_DIR"
+
+  # Force pack file recreation and verification
+  ensure_pack_files "$REPO_PATH"
+
+  # Generate commit-graph AFTER packing to ensure consistency
+  echo -e "  ${BLUE}Generating commit-graph...${NC}"
+  git -C "$REPO_PATH" commit-graph write --reachable 2>/dev/null || {
+    echo -e "    ${RED}✗ Failed to create commit-graph${NC}"
+    return 1
+  }
+  echo -e "    ${GREEN}✓ Commit-graph created successfully${NC}"
+}
+
+# 5. Large repository (100 commits)
+generate_large_linear_repo "large-repo" 100
+
+# 6. Very large repository (1,000 commits)
+generate_large_linear_repo "very-large-repo-1k" 1000
+
+# 7. Super large repository (10,000 commits)
+# This may take a few minutes to generate depending on your machine.
+generate_large_linear_repo "super-large-repo-10k" 10000
+
+# --- Final Verification ---
 echo -e "\n${BLUE}Test data generation complete!${NC}"
 echo -e "${BLUE}Verifying repositories...${NC}"
 echo -e "${BLUE}═══════════════════════════════════════${NC}"
