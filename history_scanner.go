@@ -79,13 +79,13 @@ import (
 	"sync"
 )
 
-// CommitInfo holds the subset of Git commit metadata that the history
+// commitInfo holds the subset of Git commit metadata that the history
 // scanner needs for tree-to-tree diffing and topological walks.
 // It deliberately omits heavyweight details such as author/committer
 // identities and the commit message to keep allocations low.
-// A slice of CommitInfo values is produced by HistoryScanner.LoadAllCommits
+// A slice of commitInfo values is produced by HistoryScanner.LoadAllCommits
 // and can be processed concurrently.
-type CommitInfo struct {
+type commitInfo struct {
 	// OID is the object ID of the commit itself.
 	OID Hash
 
@@ -164,12 +164,12 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 	return &HistoryScanner{store: store, graphData: graph}, nil
 }
 
-// Addition holds metadata for a single "+" line that a commit introduced.
+// addition holds metadata for a single "+" line that a commit introduced.
 //
-// Values of Addition are streamed by HistoryScanner.DiffHistory concurrently,
+// Values of addition are streamed by HistoryScanner.DiffHistory concurrently,
 // enabling callers to process repository changes incrementally without
 // materializing whole diffs or commits in memory.
-type Addition struct {
+type addition struct {
 	// Commit identifies the commit that introduced the added line.
 	Commit Hash
 
@@ -204,10 +204,10 @@ type Addition struct {
 // DiffHistory never blocks the caller: both the additions channel and the
 // error channel are pre-buffered.
 // A nil error sent on errC signals a graceful end-of-stream.
-func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
+func (hs *HistoryScanner) DiffHistory() (<-chan addition, <-chan error) {
 	numWorkers := runtime.NumCPU()
 
-	out := make(chan Addition, numWorkers)
+	out := make(chan addition, numWorkers)
 	errC := make(chan error, 1)
 
 	go func() {
@@ -236,7 +236,7 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 				defer wg.Done()
 
 				for work := range workChan {
-					commit := CommitInfo{
+					commit := commitInfo{
 						OID:        work.oid,
 						TreeOID:    work.treeOID,
 						ParentOIDs: work.parentOIDs,
@@ -281,7 +281,7 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 
 // processCommitStreaming handles diff computation for a single commit and streams
 // additions directly to the output channel.
-func (hs *HistoryScanner) processCommitStreaming(tc *store, c CommitInfo, out chan<- Addition) error {
+func (hs *HistoryScanner) processCommitStreaming(tc *store, c commitInfo, out chan<- addition) error {
 	parents := c.ParentOIDs
 	if len(parents) == 0 {
 		// Root commit: diff against the implicit empty tree (Hash{}).
@@ -304,7 +304,7 @@ func (hs *HistoryScanner) processCommitStreaming(tc *store, c CommitInfo, out ch
 		oldBytes, _, _ := hs.store.Get(old)
 		newBytes, _, _ := hs.store.Get(newH)
 
-		out <- Addition{
+		out <- addition{
 			Commit: c.OID,
 			Path:   filepath.ToSlash(path),
 			Lines:  addedLines(oldBytes, newBytes),
@@ -314,8 +314,8 @@ func (hs *HistoryScanner) processCommitStreaming(tc *store, c CommitInfo, out ch
 }
 
 // processCommit handles diff computation for a single commit.
-func (hs *HistoryScanner) processCommit(tc *store, c CommitInfo) ([]Addition, error) {
-	var additions []Addition
+func (hs *HistoryScanner) processCommit(tc *store, c commitInfo) ([]addition, error) {
+	var additions []addition
 
 	parents := c.ParentOIDs
 	if len(parents) == 0 {
@@ -339,7 +339,7 @@ func (hs *HistoryScanner) processCommit(tc *store, c CommitInfo) ([]Addition, er
 		oldBytes, _, _ := hs.store.Get(old)
 		newBytes, _, _ := hs.store.Get(newH)
 
-		additions = append(additions, Addition{
+		additions = append(additions, addition{
 			Commit: c.OID,
 			Path:   filepath.ToSlash(path),
 			Lines:  addedLines(oldBytes, newBytes),
@@ -383,9 +383,7 @@ func (hs *HistoryScanner) SetMaxDeltaDepth(depth int) {
 // from packfiles. This provides additional integrity checking at the cost of
 // some performance. See the store documentation for details on CRC verification
 // behavior with different pack types.
-func (hs *HistoryScanner) SetVerifyCRC(verify bool) {
-	hs.store.VerifyCRC = verify
-}
+func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verify }
 
 // Close releases any mmap handles or file descriptors held by the underlying
 // object store.
@@ -405,17 +403,17 @@ func (hs *HistoryScanner) Close() error { return hs.store.Close() }
 //
 // TODO: Implement a fallback to scan packfiles when a commit-graph is not
 // available.
-func (hs *HistoryScanner) LoadAllCommits() ([]CommitInfo, error) {
+func (hs *HistoryScanner) LoadAllCommits() ([]commitInfo, error) {
 	return hs.loadFromGraph(), nil
 }
 
 // graph → []*CommitInfo  (O(#commits))
-func (hs *HistoryScanner) loadFromGraph() []CommitInfo {
+func (hs *HistoryScanner) loadFromGraph() []commitInfo {
 	n := len(hs.graphData.OrderedOIDs)
-	out := make([]CommitInfo, n)
+	out := make([]commitInfo, n)
 
 	for i, oid := range hs.graphData.OrderedOIDs {
-		out[i] = CommitInfo{
+		out[i] = commitInfo{
 			OID:        oid,
 			TreeOID:    hs.graphData.TreeOIDs[i],
 			ParentOIDs: hs.graphData.Parents[oid],
@@ -427,14 +425,14 @@ func (hs *HistoryScanner) loadFromGraph() []CommitInfo {
 // No commit‑graph: iterate every pack, inflate only commit objects.
 // TODO: This method is preserved for future fallback support when commit-graph is not available.
 // Currently not used since we require commit-graph files.
-func (hs *HistoryScanner) scanPackfiles() ([]CommitInfo, error) {
+func (hs *HistoryScanner) scanPackfiles() ([]commitInfo, error) {
 	if len(hs.store.packs) == 0 {
-		return []CommitInfo{}, nil // Return empty slice, not error
+		return []commitInfo{}, nil // Return empty slice, not error
 	}
 
 	var (
 		mu            sync.Mutex
-		commits       []CommitInfo
+		commits       []commitInfo
 		failedCommits = make(map[Hash]error)
 	)
 
@@ -478,19 +476,19 @@ func (hs *HistoryScanner) scanPackfiles() ([]CommitInfo, error) {
 // The function validates the format of "tree" and "parent" header lines and
 // returns an error if they are malformed. The committer timestamp is always
 // present.
-func parseCommitData(oid Hash, raw []byte) (CommitInfo, error) {
-	ci := CommitInfo{OID: oid}
+func parseCommitData(oid Hash, raw []byte) (commitInfo, error) {
+	ci := commitInfo{OID: oid}
 
 	if !bytes.HasPrefix(raw, []byte("tree ")) {
-		return CommitInfo{}, fmt.Errorf("commit %x: missing tree line", oid)
+		return commitInfo{}, fmt.Errorf("commit %x: missing tree line", oid)
 	}
 	treeEnd := bytes.IndexByte(raw[5:], '\n')
 	if treeEnd != 40 {
-		return CommitInfo{}, fmt.Errorf("commit %x: malformed tree line", oid)
+		return commitInfo{}, fmt.Errorf("commit %x: malformed tree line", oid)
 	}
 	tree, err := ParseHash(string(raw[5 : 5+treeEnd]))
 	if err != nil {
-		return CommitInfo{}, err
+		return commitInfo{}, err
 	}
 	ci.TreeOID = tree
 	raw = raw[5+treeEnd+1:]
@@ -498,11 +496,11 @@ func parseCommitData(oid Hash, raw []byte) (CommitInfo, error) {
 	for bytes.HasPrefix(raw, []byte("parent ")) {
 		end := bytes.IndexByte(raw[7:], '\n')
 		if end != 40 {
-			return CommitInfo{}, fmt.Errorf("commit %x: malformed parent line", oid)
+			return commitInfo{}, fmt.Errorf("commit %x: malformed parent line", oid)
 		}
 		p, err := ParseHash(string(raw[7 : 7+end]))
 		if err != nil {
-			return CommitInfo{}, err
+			return commitInfo{}, err
 		}
 		ci.ParentOIDs = append(ci.ParentOIDs, p)
 		raw = raw[7+end+1:]

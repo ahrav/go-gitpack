@@ -45,7 +45,7 @@ func TestLoadAllCommits_WithMergeCommits(t *testing.T) {
 	require.NoError(t, err)
 	assert.Len(t, commits, 5)
 
-	var mergeCommit CommitInfo
+	var mergeCommit commitInfo
 	for _, c := range commits {
 		if len(c.ParentOIDs) == 2 {
 			mergeCommit = c
