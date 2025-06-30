@@ -22,6 +22,7 @@ import (
 	"bytes"
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"sync"
 )
 
@@ -150,12 +151,11 @@ type Addition struct {
 // error channel are pre-buffered.
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
-	out := make(chan Addition, 64)
+	out := make(chan Addition, 1024) // Larger buffer for better throughput
 	errC := make(chan error, 1)
 
 	go func() {
 		defer close(out)
-		tc := newTreeCache(hs.store)
 
 		commits, err := hs.LoadAllCommits()
 		if err != nil {
@@ -163,44 +163,110 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 			return
 		}
 
-		for _, c := range commits {
-			parents := c.ParentOIDs
-			if len(parents) == 0 {
-				// Root commit: diff against the implicit empty tree (Hash{}).
-				parents = []Hash{{}}
+		numWorkers := runtime.NumCPU()
+
+		// Work item for each commit.
+		type workItem struct {
+			commit CommitInfo
+		}
+
+		workChan := make(chan workItem, numWorkers*2)
+		resultChan := make(chan struct {
+			additions []Addition
+			err       error
+		}, numWorkers*2)
+
+		var wg sync.WaitGroup
+
+		// Start workers
+		for i := 0; i < numWorkers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				// Each worker gets its own tree cache to avoid contention
+				tc := newTreeCache(hs.store)
+
+				for work := range workChan {
+					additions, err := hs.processCommit(tc, work.commit)
+					resultChan <- struct {
+						additions []Addition
+						err       error
+					}{
+						additions: additions,
+						err:       err,
+					}
+				}
+			}()
+		}
+
+		// Result collector goroutine.
+		go func() {
+			wg.Wait()
+			close(resultChan)
+		}()
+
+		// Feed work to workers.
+		go func() {
+			for _, c := range commits {
+				workChan <- workItem{commit: c}
 			}
+			close(workChan)
+		}()
 
-			pTree := Hash{}
-			if parents[0] != (Hash{}) && hs.graphData != nil {
-				if idx, ok := hs.graphData.OIDToIndex[parents[0]]; ok {
-					pTree = hs.graphData.TreeOIDs[idx]
-				}
-			}
-
-			err := walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, new Hash, mode uint32) error {
-				if mode&040000 != 0 {
-					return nil
-				}
-				// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
-				// the empty object, which `addedLines` handles correctly.
-				oldBytes, _, _ := hs.store.Get(old)
-				newBytes, _, _ := hs.store.Get(new)
-
-				out <- Addition{
-					Commit: c.OID,
-					Path:   filepath.ToSlash(path),
-					Lines:  addedLines(oldBytes, newBytes),
-				}
-				return nil
-			})
-			if err != nil {
-				errC <- err
+		// Collect results and send to output channel.
+		// Sending as they come since commit-graph order isn't strictly
+		// required for correctness.
+		for result := range resultChan {
+			if result.err != nil {
+				errC <- result.err
 				return
 			}
+			for _, addition := range result.additions {
+				out <- addition
+			}
 		}
+
 		errC <- nil
 	}()
+
 	return out, errC
+}
+
+// processCommit handles diff computation for a single commit.
+func (hs *HistoryScanner) processCommit(tc *treeCache, c CommitInfo) ([]Addition, error) {
+	var additions []Addition
+
+	parents := c.ParentOIDs
+	if len(parents) == 0 {
+		// Root commit: diff against the implicit empty tree (Hash{}).
+		parents = []Hash{{}}
+	}
+
+	pTree := Hash{}
+	if parents[0] != (Hash{}) && hs.graphData != nil {
+		if idx, ok := hs.graphData.OIDToIndex[parents[0]]; ok {
+			pTree = hs.graphData.TreeOIDs[idx]
+		}
+	}
+
+	err := walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, new Hash, mode uint32) error {
+		if mode&040000 != 0 {
+			return nil
+		}
+		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
+		// the empty object, which `addedLines` handles correctly.
+		oldBytes, _, _ := hs.store.Get(old)
+		newBytes, _, _ := hs.store.Get(new)
+
+		additions = append(additions, Addition{
+			Commit: c.OID,
+			Path:   filepath.ToSlash(path),
+			Lines:  addedLines(oldBytes, newBytes),
+		})
+		return nil
+	})
+
+	return additions, err
 }
 
 // GetStore returns the read-only object store that the HistoryScanner uses to
@@ -294,11 +360,11 @@ func (hs *HistoryScanner) scanPackfiles() ([]CommitInfo, error) {
 
 // parseCommitData extracts minimal commit metadata from the raw commit object.
 //
-// It expects raw to contain the canonical “commit” object encoding and does
+// It expects raw to contain the canonical "commit" object encoding and does
 // not allocate more than necessary: object IDs are sliced directly out of the
 // input buffer where possible.
 //
-// The function validates the format of “tree” and “parent” header lines and
+// The function validates the format of "tree" and "parent" header lines and
 // returns an error if they are malformed. The committer timestamp is always
 // present.
 func parseCommitData(oid Hash, raw []byte) (CommitInfo, error) {
