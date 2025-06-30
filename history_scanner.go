@@ -171,7 +171,6 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 			oid        Hash
 			treeOID    Hash
 			parentOIDs []Hash
-			timestamp  int64
 		}
 
 		workChan := make(chan workItem, numWorkers)
@@ -189,7 +188,6 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 						OID:        work.oid,
 						TreeOID:    work.treeOID,
 						ParentOIDs: work.parentOIDs,
-						Timestamp:  work.timestamp,
 					}
 					if err := hs.processCommitStreaming(hs.store, commit, out); err != nil {
 						errorChan <- err
@@ -212,7 +210,6 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 					oid:        oid,
 					treeOID:    hs.graphData.TreeOIDs[i],
 					parentOIDs: hs.graphData.Parents[oid],
-					timestamp:  hs.graphData.Timestamps[i],
 				}
 			}
 		}()
@@ -246,14 +243,14 @@ func (hs *HistoryScanner) processCommitStreaming(tc *Store, c CommitInfo, out ch
 		}
 	}
 
-	return walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, new Hash, mode uint32) error {
+	return walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
 		if mode&040000 != 0 {
 			return nil
 		}
 		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
 		// the empty object, which `addedLines` handles correctly.
 		oldBytes, _, _ := hs.store.Get(old)
-		newBytes, _, _ := hs.store.Get(new)
+		newBytes, _, _ := hs.store.Get(newH)
 
 		out <- Addition{
 			Commit: c.OID,
@@ -281,14 +278,14 @@ func (hs *HistoryScanner) processCommit(tc *Store, c CommitInfo) ([]Addition, er
 		}
 	}
 
-	err := walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, new Hash, mode uint32) error {
+	err := walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
 		if mode&040000 != 0 {
 			return nil
 		}
 		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
 		// the empty object, which `addedLines` handles correctly.
 		oldBytes, _, _ := hs.store.Get(old)
-		newBytes, _, _ := hs.store.Get(new)
+		newBytes, _, _ := hs.store.Get(newH)
 
 		additions = append(additions, Addition{
 			Commit: c.OID,
@@ -339,7 +336,6 @@ func (hs *HistoryScanner) loadFromGraph() []CommitInfo {
 			OID:        oid,
 			TreeOID:    hs.graphData.TreeOIDs[i],
 			ParentOIDs: hs.graphData.Parents[oid],
-			Timestamp:  hs.graphData.Timestamps[i],
 		}
 	}
 	return out

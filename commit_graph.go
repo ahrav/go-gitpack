@@ -74,10 +74,6 @@ type CommitGraphData struct {
 	// TreeOIDs records the root tree OID for each commit in OrderedOIDs.
 	TreeOIDs []Hash
 
-	// Timestamps stores the author timestamp, in seconds since the Unix
-	// epoch, for each commit in OrderedOIDs.
-	Timestamps []int64
-
 	// OIDToIndex provides O(1) reverse lookup from a commit OID to its
 	// index within OrderedOIDs and the parallel metadata slices.
 	OIDToIndex map[Hash]int
@@ -118,7 +114,6 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 	// Parse every graph file in the chain and concatenate their data.
 	var allOids []Hash
 	var allTrees []Hash
-	var allTimes []int64
 	fileInfo := make([]parsedGraph, len(chain))
 
 	for i, path := range chain {
@@ -133,10 +128,9 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 		fileInfo[i] = pg
 		allOids = append(allOids, pg.oids...)
 		allTrees = append(allTrees, pg.trees...)
-		allTimes = append(allTimes, pg.times...)
 	}
 
-	if len(allOids) != len(allTrees) || len(allOids) != len(allTimes) {
+	if len(allOids) != len(allTrees) {
 		for _, g := range fileInfo {
 			g.mr.Close()
 		}
@@ -174,7 +168,6 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 		Parents:     parents,
 		OrderedOIDs: allOids,
 		TreeOIDs:    allTrees,
-		Timestamps:  allTimes,
 		OIDToIndex:  oidToIndex,
 	}, nil
 }

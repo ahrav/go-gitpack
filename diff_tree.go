@@ -41,7 +41,7 @@ func walkDiff(
 	oldTree Hash,
 	newTree Hash,
 	prefix string, // path prefix accumulated so far ("" for the root)
-	fn func(path string, old, new Hash, mode uint32) error,
+	fn func(path string, old, newH Hash, mode uint32) error,
 ) error {
 
 	// Fast path: identical sub-tree ⇒ nothing to do.
@@ -192,7 +192,7 @@ func handleAdd(
 	prefix, name string,
 	oid Hash,
 	mode uint32,
-	fn func(path string, old, new Hash, mode uint32) error,
+	fn func(path string, old, newH Hash, mode uint32) error,
 ) error {
 	if mode&040000 != 0 { // directory
 		return walkDiff(tc, Hash{}, oid, filepath.Join(prefix, name), fn)
@@ -211,7 +211,7 @@ func handleDel(
 	prefix, name string,
 	oid Hash,
 	mode uint32,
-	fn func(path string, old, new Hash, mode uint32) error,
+	fn func(path string, old, newH Hash, mode uint32) error,
 ) error {
 	if mode&040000 != 0 { // directory
 		return walkDiff(tc, oid, Hash{}, filepath.Join(prefix, name), fn)
