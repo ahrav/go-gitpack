@@ -1,114 +1,220 @@
 package objstore
 
-// walkDiff walks the directory trees identified by parentOID and childOID
-// and calls emit for every file that is new or has changed in the child tree.
+import (
+	"errors"
+	"io"
+	"path/filepath"
+)
+
+// walkDiff streams the differences between two Git trees.
 //
-// The algorithm performs a merge-walk over the 2 sorted entry lists that make
-// up each tree object.  It behaves similarly to a 2-way diff: insertions and
-// modifications are reported to the caller, while deletions are *ignored* (the
-// caller can reconstruct them from the parent side if necessary).
+// walkDiff performs a *merge-like* traversal over the **sorted** directory
+// entries of `oldTree` and `newTree`.
+// Instead of materializing entire trees in memory, it obtains directory
+// contents lazily through `TreeIter`, which keeps peak memory usage constant
+// and enables diffing arbitrarily large repositories.
 //
-// For entries that are sub-trees (mode bit 040000) walkDiff recurses so that
-// the caller receives *file*-level changes, never tree objects themselves.
+// For every *file* that has changed, `fn` is invoked exactly once.
+// Directories are handled transparently: additions or deletions of a directory
+// cause `walkDiff` to recurse so that the callback is still issued per file,
+// never for the directory objects themselves.
 //
-// The supplied treeCache tc is consulted for every tree OID that needs to be
-// materialized.  This keeps repeated look-ups of the same subtree cheap.
+// The callback receives
 //
-// The emit callback receives
-//   - path   – the full, slash-separated path of the entry relative to the
-//     prefix that was passed to this invocation,
-//   - old    – the Hash of the entry in the parent tree (zero value if the
-//     entry did not previously exist),
-//   - new    – the Hash of the entry in the child tree,
-//   - mode   – the mode taken from the *child* side.
+//   - the path relative to the walk root (always Unix-style slashes),
+//   - the object ID in the old tree (zero if the file was just created),
+//   - the object ID in the new tree (zero if the file was deleted), and
+//   - the file mode that is recorded in the *new* tree (or the old mode if the
+//     file vanished).
 //
-// If emit returns a non-nil error the traversal stops immediately and that
-// error is propagated up-stack.
+// Error semantics
+//   - Any error returned by `TreeIter.Next` other than io.EOF is propagated
+//     verbatim.
+//   - An error returned by `fn` immediately aborts the traversal and is
+//     forwarded to the caller.
+//   - A `nil` error is returned when the diff completed successfully.
+//
+// Concurrency / side-effects: walkDiff itself is single-threaded and free of
+// global state; callers may invoke it concurrently on separate Stores.
 func walkDiff(
-	tc *treeCache,
-	parentOID, childOID Hash,
-	prefix string,
-	emit func(path string, old, new Hash, mode uint32) error,
+	tc *Store,
+	oldTree Hash,
+	newTree Hash,
+	prefix string, // path prefix accumulated so far ("" for the root)
+	fn func(path string, old, new Hash, mode uint32) error,
 ) error {
-	pt, err := tc.get(parentOID)
+
+	// Fast path: identical sub-tree ⇒ nothing to do.
+	if oldTree == newTree {
+		return nil
+	}
+
+	// Helper that turns a zero hash into a nil iterator to simplify the
+	// merge-loop below.
+	iterFor := func(h Hash) (*TreeIter, error) {
+		if h == (Hash{}) {
+			return nil, nil
+		}
+		return tc.TreeIter(h)
+	}
+
+	oldIter, err := iterFor(oldTree)
 	if err != nil {
 		return err
 	}
-	ct, err := tc.get(childOID)
+	newIter, err := iterFor(newTree)
 	if err != nil {
 		return err
 	}
 
-	// Merge-walk indices for parent and child tree entries.
-	pIdx, cIdx := 0, 0
-	pEntries, cEntries := pt.sortedEntries, ct.sortedEntries
+	// State of the “current” entry of each iterator.
+	var (
+		oln, nln         string // names
+		oidOld, oidNew   Hash
+		modeOld, modeNew uint32
+		okOld, okNew     bool
+	)
 
-	// Walk until both slices have been exhausted.
-	for pIdx < len(pEntries) || cIdx < len(cEntries) {
+	// nextOld / nextNew advance the respective iterators and normalize EOF to
+	// ok* == false so the main loop can treat “exhausted” like “empty”.
+	nextOld := func() error {
+		if oldIter == nil {
+			okOld = false
+			return nil
+		}
+		var err error
+		oln, oidOld, modeOld, okOld, err = oldIter.Next()
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		return nil
+	}
+	nextNew := func() error {
+		if newIter == nil {
+			okNew = false
+			return nil
+		}
+		var err error
+		nln, oidNew, modeNew, okNew, err = newIter.Next()
+		if err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
+		return nil
+	}
+
+	// Prime the pump.
+	if err := nextOld(); err != nil {
+		return err
+	}
+	if err := nextNew(); err != nil {
+		return err
+	}
+
+	for okOld || okNew {
 		switch {
-		case pIdx == len(pEntries):
-			// All entries in parent are consumed – cEntries[cIdx] is an insertion.
-			if err := walkEntry(tc, prefix, cEntries[cIdx], Hash{}, emit); err != nil {
+		case !okOld: // only additions remain
+			if err := handleAdd(tc, prefix, nln, oidNew, modeNew, fn); err != nil {
 				return err
 			}
-			cIdx++
+			if err := nextNew(); err != nil {
+				return err
+			}
 
-		case cIdx == len(cEntries):
-			// All entries in child are consumed – pEntries[pIdx] was deleted.
-			// Deletions are intentionally ignored.
-			pIdx++
+		case !okNew: // only deletions remain
+			if err := handleDel(tc, prefix, oln, oidOld, modeOld, fn); err != nil {
+				return err
+			}
+			if err := nextOld(); err != nil {
+				return err
+			}
 
-		default:
-			pEntry, cEntry := pEntries[pIdx], cEntries[cIdx]
+		case oln == nln: // possible modify / recurse / no-op
 			switch {
-			case pEntry.Name == cEntry.Name:
-				if pEntry.OID != cEntry.OID || pEntry.Mode != cEntry.Mode {
-					// Entry exists on both sides but differs.
-					if pEntry.Mode&040000 != 0 && cEntry.Mode&040000 != 0 {
-						// Both sides are trees – recurse.
-						if err := walkDiff(tc, pEntry.OID, cEntry.OID, prefix+pEntry.Name+"/", emit); err != nil {
-							return err
-						}
-					} else {
-						// Regular blob update.
-						if err := emit(prefix+pEntry.Name, pEntry.OID, cEntry.OID, cEntry.Mode); err != nil {
-							return err
-						}
-					}
-				}
-				// Advance both slices.
-				pIdx, cIdx = pIdx+1, cIdx+1
-
-			case pEntry.Name < cEntry.Name:
-				// pEntries[pIdx] was deleted – skip.
-				pIdx++
-
-			default:
-				// cEntries[cIdx] was inserted.
-				if err := walkEntry(tc, prefix, cEntry, Hash{}, emit); err != nil {
+			case oidOld == oidNew && modeOld == modeNew:
+				// Identical entry → skip.
+			case modeOld&040000 != 0 && modeNew&040000 != 0:
+				// Directory exists on both sides → recurse.
+				if err := walkDiff(
+					tc,
+					oidOld,
+					oidNew,
+					filepath.Join(prefix, nln),
+					fn,
+				); err != nil {
 					return err
 				}
-				cIdx++
+			default:
+				// File replaced or mode changed.
+				if err := fn(
+					filepath.ToSlash(filepath.Join(prefix, nln)),
+					oidOld,
+					oidNew,
+					modeNew,
+				); err != nil {
+					return err
+				}
+			}
+			if err := nextOld(); err != nil {
+				return err
+			}
+			if err := nextNew(); err != nil {
+				return err
+			}
+
+		case oln < nln: // deletion
+			if err := handleDel(tc, prefix, oln, oidOld, modeOld, fn); err != nil {
+				return err
+			}
+			if err := nextOld(); err != nil {
+				return err
+			}
+
+		default: // nln < oln → addition
+			if err := handleAdd(tc, prefix, nln, oidNew, modeNew, fn); err != nil {
+				return err
+			}
+			if err := nextNew(); err != nil {
+				return err
 			}
 		}
 	}
 	return nil
 }
 
-// walkEntry resolves a single tree entry.
-// If the entry is itself a tree it delegates to walkDiff so that callers
-// still receive changes on a per-file basis; otherwise it forwards the entry
-// directly to emit.
-func walkEntry(
-	tc *treeCache,
-	prefix string,
-	e treeEntry,
-	old Hash,
-	emit func(path string, old, new Hash, mode uint32) error,
+// handleAdd reports a newly added entry discovered by walkDiff.
+//
+// If the entry is a directory (mode & 040000 != 0) it recurses into the
+// sub-tree so that the user callback is eventually invoked once per *file*.
+// For regular files it calls fn immediately, passing Hash{} for the “old”
+// object ID.
+func handleAdd(
+	tc *Store,
+	prefix, name string,
+	oid Hash,
+	mode uint32,
+	fn func(path string, old, new Hash, mode uint32) error,
 ) error {
-	if e.Mode&040000 != 0 {
-		// Descend into the subtree with an empty parent (no counterpart).
-		return walkDiff(tc, Hash{}, e.OID, prefix+e.Name+"/", emit)
+	if mode&040000 != 0 { // directory
+		return walkDiff(tc, Hash{}, oid, filepath.Join(prefix, name), fn)
 	}
-	return emit(prefix+e.Name, old, e.OID, e.Mode)
+	return fn(filepath.ToSlash(filepath.Join(prefix, name)), Hash{}, oid, mode)
+}
+
+// handleDel reports a deleted entry discovered by walkDiff.
+//
+// If the entry is a directory it recurses into the sub-tree so that fn is
+// eventually called for each file that vanished.
+// For regular files it calls fn immediately, passing Hash{} for the “new”
+// object ID to signal that the file no longer exists.
+func handleDel(
+	tc *Store,
+	prefix, name string,
+	oid Hash,
+	mode uint32,
+	fn func(path string, old, new Hash, mode uint32) error,
+) error {
+	if mode&040000 != 0 { // directory
+		return walkDiff(tc, oid, Hash{}, filepath.Join(prefix, name), fn)
+	}
+	return fn(filepath.ToSlash(filepath.Join(prefix, name)), oid, Hash{}, mode)
 }
