@@ -148,24 +148,6 @@ type Store struct {
 	VerifyCRC bool
 }
 
-// ref locates an object inside a memory-mapped packfile.
-//
-// It is an internal handle stored in Store.index that maps a Git object
-// identifier to the packfile in which the object lives and to the byte
-// offset where the object header begins. A ref is immutable for the life
-// of the Store and can therefore be shared safely among concurrent
-// readers.
-type ref struct {
-	// packID indexes the Store.packs slice.
-	// It tells the caller which *.pack file contains the object.
-	packID int
-
-	// offset is the byte position of the object header inside the chosen
-	// packfile. The offset is 0-based and points to the first byte of the
-	// variable-length header as specified by the Git packfile format.
-	offset uint64
-}
-
 // Open scans dir for "*.pack" files, expects a matching "*.idx" companion for
 // each one, memory-maps every pair, and returns a read-only *Store.
 //
@@ -239,15 +221,15 @@ func Open(dir string) (*Store, error) {
 	}
 
 	// Glob all *.pack not already mapped by the midx.
-	for _, p := range packs {
-		if _, ok := packCache[p]; ok {
+	for _, pack := range packs {
+		if _, ok := packCache[pack]; ok {
 			continue
 		}
-		h, err := mmap.Open(p)
+		h, err := mmap.Open(pack)
 		if err != nil {
 			return nil, err
 		}
-		packCache[p] = h
+		packCache[pack] = h
 	}
 
 	store := &Store{
@@ -345,6 +327,20 @@ func (s *Store) Close() error {
 	return firstErr
 }
 
+// TreeIter returns a streaming iterator over the contents of the tree object
+// identified by oid.  The caller must consume the iterator before the returned
+// raw slice would otherwise be garbage‑collected.
+func (s *Store) TreeIter(oid Hash) (*TreeIter, error) {
+	raw, typ, err := s.Get(oid)
+	if err != nil {
+		return nil, err
+	}
+	if typ != ObjTree {
+		return nil, ErrTypeMismatch
+	}
+	return newTreeIter(raw), nil
+}
+
 // Get returns the fully materialized Git object identified by oid together
 // with its on-disk ObjectType.
 //
@@ -416,71 +412,29 @@ func (s *Store) inflateFromPack(
 	oid Hash,
 	ctx *deltaContext,
 ) ([]byte, ObjectType, error) {
-	// Fast header peek avoids unnecessary zlib work for commits that the
-	// commit-graph already covers.
+	// Cheap header peek: skip full inflation for commits that
+	// the commit-graph already covers.
 	objType, _, err := peekObjectType(p, off)
 	if err != nil {
 		return nil, ObjBad, err
 	}
-
 	if objType == ObjCommit {
-		// Commit‑graph supplies metadata → skip inflation entirely.
 		return nil, ObjCommit, nil
 	}
 
-	// Handle delta objects - they need decompression too!
+	// Delta objects – resolve the whole chain **iteratively**.
 	if objType == ObjOfsDelta || objType == ObjRefDelta {
-		// readRawObject returns the delta-instruction stream with the raw
-		// prefix (20-byte hash or variable-length offset) still attached so
-		// that parseDeltaHeader can reuse it.
-		_, deltaData, err := readRawObject(p, off)
+		full, baseType, err := s.inflateDeltaChain(p, off, oid, ctx)
 		if err != nil {
 			return nil, ObjBad, err
 		}
-
-		// Extract base reference and the delta instruction buffer.
-		baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, deltaData)
-		if err != nil {
-			return nil, ObjBad, err
-		}
-
-		// Resolve the base object
-		var base []byte
-		var baseType ObjectType
-		if objType == ObjRefDelta {
-			if err := ctx.checkRefDelta(baseHash); err != nil {
-				return nil, ObjBad, err
-			}
-			ctx.enterRefDelta(baseHash)
-			base, baseType, err = s.getWithContext(baseHash, ctx)
-			ctx.exit()
-		} else { // ObjOfsDelta
-			// For ofs-delta, calculate the actual offset
-			actualOffset := off - baseOff
-			if err := ctx.checkOfsDelta(actualOffset); err != nil {
-				return nil, ObjBad, err
-			}
-			ctx.enterOfsDelta(actualOffset)
-			base, baseType, err = readObjectAtOffsetWithContext(p, actualOffset, s, ctx)
-			ctx.exit()
-		}
-		if err != nil {
-			return nil, ObjBad, err
-		}
-
-		// Apply the delta to reconstruct the full object
-		full := applyDelta(base, deltaBuf)
-		if full == nil {
-			return nil, ObjBad, fmt.Errorf("delta application failed for object %x", oid)
-		}
-
-		// finalType := detectType(full)
+		// Update both caches.
 		s.dw.add(oid, full, baseType)
 		s.cache.Add(oid, cachedObj{data: full, typ: baseType})
 		return full, baseType, nil
 	}
 
-	// For regular objects (blob, tree, tag), use normal decompression
+	// Regular (non-delta) object: inflate once and cache.
 	_, data, err := readRawObject(p, off)
 	if err != nil {
 		return nil, ObjBad, err
@@ -488,13 +442,11 @@ func (s *Store) inflateFromPack(
 
 	// Optional CRC-32 integrity check.
 	if s.VerifyCRC {
-		crc, found := s.findCRCForObject(p, off, oid)
-		if found {
+		if crc, ok := s.findCRCForObject(p, off, oid); ok {
 			if err := s.verifyCRCForPackObject(p, off, crc); err != nil {
 				return nil, ObjBad, err
 			}
 		} else if s.midx != nil && s.midx.version >= 2 {
-			// For MIDX v2, we should have CRCs available.
 			return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", oid)
 		}
 	}
@@ -510,7 +462,7 @@ func (s *Store) inflateFromPack(
 func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
 	var buf [32]byte
 	n, err := r.ReadAt(buf[:], int64(off))
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return ObjBad, 0, err
 	}
 	if n == 0 {
@@ -612,67 +564,6 @@ func parseObjectHeaderUnsafe(data []byte) (ObjectType, uint64, int) {
 	return ObjBad, 0, -1
 }
 
-// readObjectAtOffsetWithContext inflates the object that starts at off,
-// transparently follows delta chains, and returns the fully materialized
-// object.
-//
-// A deltaContext is threaded through recursive calls so that the resolver can
-//   - detect circular references (both ref-delta and ofs-delta), and
-//   - enforce Store.maxDeltaDepth.
-//
-// The function is internal to the lookup path and may call back into
-// Store.getWithContext when a ref-delta points to an object in another pack.
-func readObjectAtOffsetWithContext(
-	r *mmap.ReaderAt,
-	off uint64,
-	s *Store,
-	ctx *deltaContext,
-) ([]byte, ObjectType, error) {
-	objType, data, err := readRawObject(r, off)
-	if err != nil {
-		return nil, ObjBad, err
-	}
-
-	if objType == ObjOfsDelta || objType == ObjRefDelta {
-		bhash, boff, deltaBuf, err := parseDeltaHeader(objType, data)
-		if err != nil {
-			return nil, ObjBad, err
-		}
-
-		var base []byte
-		var baseType ObjectType
-		if objType == ObjRefDelta {
-			if err := ctx.checkRefDelta(bhash); err != nil {
-				return nil, ObjBad, err
-			}
-			ctx.enterRefDelta(bhash)
-			base, baseType, err = s.getWithContext(bhash, ctx)
-			ctx.exit()
-		} else {
-			// Calculate offset for ofs-delta base object.
-			actualOffset := off - boff
-			if err := ctx.checkOfsDelta(actualOffset); err != nil {
-				return nil, ObjBad, err
-			}
-			ctx.enterOfsDelta(actualOffset)
-			base, baseType, err = readObjectAtOffsetWithContext(r, actualOffset, s, ctx)
-			ctx.exit()
-		}
-		if err != nil {
-			return nil, ObjBad, err
-		}
-
-		full := applyDelta(base, deltaBuf)
-		if full == nil {
-			return nil, ObjBad, fmt.Errorf("delta application failed")
-		}
-
-		return full, baseType, nil
-	}
-
-	return data, objType, nil
-}
-
 // readRawObject inflates the object that starts at off in the given
 // memory‑mapped packfile.
 //
@@ -684,10 +575,6 @@ func readObjectAtOffsetWithContext(
 //  3. Prepend the prefix to the inflated delta instructions so that
 //     parseDeltaHeader can still find it.
 //
-// All objects—large or small—now follow the same streaming code path; the
-// earlier "small object (<64 KiB) read‑into‑buffer" fast path has been
-// removed because it was the source of the mis‑alignment bug.
-//
 // The implementation follows these steps:
 //
 //  1. Parse the variable‑length object header to determine type and size;
@@ -697,11 +584,10 @@ func readObjectAtOffsetWithContext(
 //  3. Inflate the deflate stream that follows the header and prefix;
 //  4. Return [prefix||inflated] for deltas, or just the inflated body otherwise.
 func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
-	/* ---- 1. parse the generic variable‑length header ------------------ */
-
+	// Parse the generic variable‑length header.
 	var hdr [32]byte
 	n, err := r.ReadAt(hdr[:], int64(off))
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		return ObjBad, nil, err
 	}
 	if n == 0 {
@@ -715,8 +601,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 
 	pos := int64(off) + int64(hdrLen) // first byte *after* the generic header
 
-	/* ---- 2. read (and keep) the delta prefix, if any ------------------ */
-
+	// Read (and keep) the delta prefix, if any.
 	var prefix []byte
 	switch objType {
 	case ObjRefDelta:
@@ -727,7 +612,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 		pos += 20
 
 	case ObjOfsDelta:
-		// variable‑length negative offset
+		// variable‑length negative offset.
 		for {
 			var b [1]byte
 			if _, err := r.ReadAt(b[:], pos+int64(len(prefix))); err != nil {
@@ -744,7 +629,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 		}
 	}
 
-	/* ---- 3. inflate the deflate stream that follows ------------------- */
+	// Inflate the deflate stream that follows.
 
 	// We do not know the compressed length in advance, so we give
 	// SectionReader an "infinite" length; io.NewSectionReader caps reads at
@@ -752,8 +637,6 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	src := io.NewSectionReader(r, pos, 1<<63-1)
 	zr, err := zlib.NewReader(src)
 	if err != nil {
-		fmt.Printf("zlib error at pack=%p off=%d hdrLen=%d prefix=%d : %v\n",
-			r, off, hdrLen, len(prefix), err)
 		return ObjBad, nil, err
 	}
 	defer zr.Close()
@@ -770,7 +653,109 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	return objType, out.Bytes(), nil
 }
 
-// VerifyPackTrailers validates the SHA-1 trailer that closes every mapped
+// inflateDeltaChain resolves a delta chain iteratively and returns the fully
+// materialized object plus its final ObjectType (blob / tree / …).
+//
+// The algorithm:
+//
+//  1. Starting at (pack p, offset off) walk _up_ the chain, pushing each
+//     delta‑instruction stream onto `chain`, until we reach a non‑delta base.
+//  2. Apply the deltas in reverse order, re‑using the same output buffer.
+//
+// At most ctx.maxDepth hops are followed and ctx.detect… helpers prevent
+// cycles in both ref‑ and ofs‑deltas.
+func (s *Store) inflateDeltaChain(
+	p *mmap.ReaderAt,
+	off uint64,
+	oid Hash,
+	ctx *deltaContext,
+) ([]byte, ObjectType, error) {
+	type hop struct{ delta []byte }
+
+	var (
+		chain    []hop
+		basePack = p
+		baseOff  = off
+		baseData []byte
+		baseType ObjectType
+	)
+
+	for depth := 0; depth < ctx.maxDepth; depth++ {
+
+		typ, data, err := readRawObject(basePack, baseOff)
+		if err != nil {
+			return nil, ObjBad, err
+		}
+
+		if typ != ObjOfsDelta && typ != ObjRefDelta {
+			// Reached the non‑delta base object – stop walking.
+			baseData = data
+			baseType = typ
+			break
+		}
+
+		bHash, bOff, deltaBuf, err := parseDeltaHeader(typ, data)
+		if err != nil {
+			return nil, ObjBad, err
+		}
+
+		// Record this hop’s delta stream.
+		chain = append(chain, hop{delta: deltaBuf})
+
+		// Advance to the referenced base.
+		if typ == ObjRefDelta {
+			if err := ctx.checkRefDelta(bHash); err != nil {
+				return nil, ObjBad, err
+			}
+			ctx.enterRefDelta(bHash)
+
+			// Locate (maybe in another pack).
+			if s.midx != nil {
+				if np, noff, ok := s.midx.findObject(bHash); ok {
+					basePack, baseOff = np, noff
+					continue
+				}
+			}
+			found := false
+			for _, pf := range s.packs {
+				if noff, ok := pf.findObject(bHash); ok {
+					basePack, baseOff, found = pf.pack, noff, true
+					break
+				}
+			}
+			if !found {
+				return nil, ObjBad, fmt.Errorf("base object %x not found", bHash)
+			}
+
+		} else { // ObjOfsDelta
+			actual := baseOff - bOff
+			if err := ctx.checkOfsDelta(actual); err != nil {
+				return nil, ObjBad, err
+			}
+			ctx.enterOfsDelta(actual)
+
+			baseOff = actual
+		}
+	}
+
+	if baseData == nil {
+		return nil, ObjBad, fmt.Errorf("delta chain too deep (>%d)", ctx.maxDepth)
+	}
+
+	// Apply deltas bottom‑up.
+
+	out := baseData
+	for i := len(chain) - 1; i >= 0; i-- {
+		out = applyDelta(out, chain[i].delta)
+		if out == nil {
+			return nil, ObjBad, fmt.Errorf("delta application failed for %x", oid)
+		}
+	}
+
+	return out, baseType, nil
+}
+
+// verifyPackTrailers validates the SHA-1 trailer that closes every mapped
 // packfile.
 //
 // A Git pack ends with a 20-byte checksum that covers all preceding bytes.
@@ -782,7 +767,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 // no shared state in *Store is mutated.
 // Repeated invocations are cheap—the same mmap handle is processed only once
 // during a single call.
-func (s *Store) VerifyPackTrailers() error {
+func (s *Store) verifyPackTrailers() error {
 	if !s.VerifyCRC {
 		return nil
 	}
