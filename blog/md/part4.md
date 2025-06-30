@@ -76,64 +76,75 @@ Once we have the type and size, we can choose the optimal decompression strategy
 ```go
 // From the actual readRawObject implementation
 func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
-    // Read first 32 bytes for header (usually enough)
-    var headerBuf [32]byte
-    n, err := r.ReadAt(headerBuf[:], int64(off))
+    /* ---- 1. parse the generic variable‑length header ------------------ */
+
+    var hdr [32]byte
+    n, err := r.ReadAt(hdr[:], int64(off))
     if err != nil && err != io.EOF {
         return ObjBad, nil, err
     }
-
-    hdr := headerBuf[:n]
-    objType, size, headerLen := parseObjectHeaderUnsafe(hdr)
-    if headerLen <= 0 || headerLen > n {
-        // Handle cases where header is > 32 bytes
-        // ... extended header reading logic ...
+    if n == 0 {
+        return ObjBad, nil, errors.New("empty object")
     }
 
-    // For small objects, read everything at once
-    const (
-        smallObjectThreshold = 65536 // 64KB threshold
-        zlibOverheadSize     = 1024  // Extra space for zlib compression overhead
-    )
+    objType, _, hdrLen := parseObjectHeaderUnsafe(hdr[:n])
+    if hdrLen <= 0 {
+        return ObjBad, nil, errors.New("cannot parse object header")
+    }
 
-    if size < smallObjectThreshold {
-        compressedBuf := make([]byte, size+zlibOverheadSize) // Extra space for zlib overhead
-        n, err := r.ReadAt(compressedBuf, int64(off)+int64(headerLen))
-        if err != nil && err != io.EOF {
+    pos := int64(off) + int64(hdrLen) // first byte *after* the generic header
+
+    /* ---- 2. read (and keep) the delta prefix, if any ------------------ */
+
+    var prefix []byte
+    switch objType {
+    case ObjRefDelta:
+        prefix = make([]byte, 20)
+        if _, err := r.ReadAt(prefix, pos); err != nil {
             return ObjBad, nil, err
         }
+        pos += 20
 
-        zr, err := zlib.NewReader(bytes.NewReader(compressedBuf[:n]))
-        if err != nil {
-            return ObjBad, nil, err
+    case ObjOfsDelta:
+        // variable‑length negative offset
+        for {
+            var b [1]byte
+            if _, err := r.ReadAt(b[:], pos+int64(len(prefix))); err != nil {
+                return ObjBad, nil, err
+            }
+            prefix = append(prefix, b[0])
+            if b[0]&0x80 == 0 { // MSB clear → last byte
+                pos += int64(len(prefix))
+                break
+            }
+            if len(prefix) > 12 { // sanity limit
+                return ObjBad, nil, errors.New("ofs‑delta base‑ref too long")
+            }
         }
-        defer zr.Close()
-
-        result := make([]byte, 0, size)
-        buf := bytes.NewBuffer(result)
-        _, err = io.Copy(buf, zr)
-        return objType, buf.Bytes(), nil
     }
 
-    // For large objects, use streaming.
-    compressedLen := int64(size) + zlibOverheadSize
-    if compressedLen <= 0 {
-        return ObjBad, nil, errors.New("invalid compressed length")
-    }
-    src := io.NewSectionReader(r, int64(off)+int64(headerLen), compressedLen)
+    /* ---- 3. inflate the deflate stream that follows ------------------- */
+
+    // We do not know the compressed length in advance, so we give
+    // SectionReader an "infinite" length; io.NewSectionReader caps reads at
+    // EOF anyway.
+    src := io.NewSectionReader(r, pos, 1<<63-1)
     zr, err := zlib.NewReader(src)
     if err != nil {
         return ObjBad, nil, err
     }
     defer zr.Close()
 
-    var buf bytes.Buffer
-    buf.Grow(int(size)) // Pre-allocate
-    if _, err = buf.ReadFrom(zr); err != nil {
+    var out bytes.Buffer
+    if _, err := out.ReadFrom(zr); err != nil {
         return ObjBad, nil, err
     }
 
-    return objType, buf.Bytes(), nil
+    // Return [prefix||inflated] for deltas, or just the inflated body otherwise.
+    if len(prefix) != 0 {
+        return objType, append(prefix, out.Bytes()...), nil
+    }
+    return objType, out.Bytes(), nil
 }
 ```
 
@@ -261,7 +272,20 @@ func applyDelta(base, delta []byte) []byte {
                 cpOff |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 8
                 opIdx++
             }
-            // ... similar for remaining offset bytes ...
+            if op&0x04 != 0 {
+                if opIdx >= deltaLen {
+                    return nil
+                }
+                cpOff |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 16
+                opIdx++
+            }
+            if op&0x08 != 0 {
+                if opIdx >= deltaLen {
+                    return nil
+                }
+                cpOff |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 24
+                opIdx++
+            }
 
             // Unrolled length parsing
             if op&0x10 != 0 {
@@ -271,7 +295,20 @@ func applyDelta(base, delta []byte) []byte {
                 cpLen = uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx)))
                 opIdx++
             }
-            // ... similar for remaining length bytes ...
+            if op&0x20 != 0 {
+                if opIdx >= deltaLen {
+                    return nil
+                }
+                cpLen |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 8
+                opIdx++
+            }
+            if op&0x40 != 0 {
+                if opIdx >= deltaLen {
+                    return nil
+                }
+                cpLen |= uint32(*(*byte)(unsafe.Add(unsafe.Pointer(&delta[0]), opIdx))) << 16
+                opIdx++
+            }
 
             if cpLen == 0 {
                 cpLen = 65536
@@ -388,17 +425,10 @@ type deltaContext struct {
 
     // depth is the current recursion depth. It is incremented on entry to
     // a child delta and decremented on exit.
-### An Analogy: A Library Checkout System
-
-To understand the problem and the solution, think of a library managing its most popular books.
-
--   **A standard LRU cache is like a library with an overzealous, automated return policy.** It sees a textbook sitting on a table, notices it hasn't been physically touched in an hour, and whisks it back to deep storage. But a student was just about to use that textbook for their open-book exam! Now they have to waste precious time requesting it again. The system's focus on "recent use" completely missed that the book was still "in use."
-
--   **Our reference-counted cache is like a proper checkout system.** When the student checks out the textbook, they get a handle for it. The book cannot be returned to storage until that handle is explicitly returned. Even if the book sits on the table for hours, it's considered "in use" and remains available because the checkout is still active. Multiple students can check out the same book, and it will only be eligible for storage once every single one of them has returned it. This is exactly how our `refCountedDeltaWindow` works: an object cannot be evicted while a `Handle` to it exists.
-
     depth int
 
     // maxDepth is the maximum permitted depth before resolution aborts
+    // with an error. It is fixed when the context is created.
     maxDepth int
 }
 
@@ -435,18 +465,20 @@ Here's how all the pieces work together in the actual Store implementation:
 ```go
 // From the actual Store.Get implementation
 func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
-    // Fast path: check the reference-counted delta window
-    if handle, ok := s.dw.acquire(oid); ok {
-        defer handle.Release()
-        return handle.Data(), detectType(handle.Data()), nil
+    // Fast path: check the tiny "delta window" that holds the most recently
+    // materialized objects, which are likely to be referenced by upcoming
+    // deltas.
+    if b, ok := s.dw.acquire(oid); ok {
+        return b.Data(), detectType(b.Data()), nil
     }
 
-    // Second-level lookup in the larger ARC cache
+    // Second-level lookup in the larger ARC cache.
     if b, ok := s.cache.Get(oid); ok {
         return b, detectType(b), nil
     }
 
-    // Cache miss – inflate from pack with delta context
+    // Cache miss – inflate from pack while tracking delta depth to prevent
+    // cycles and excessive recursion.
     return s.getWithContext(oid, newDeltaContext(s.maxDeltaDepth))
 }
 
@@ -456,107 +488,91 @@ func (s *Store) inflateFromPack(
     oid Hash,
     ctx *deltaContext,
 ) ([]byte, ObjectType, error) {
-    // Quick header peek – avoids decompression for commit objects
+    // Fast header peek avoids unnecessary zlib work for commits that the
+    // commit-graph already covers.
     objType, _, err := peekObjectType(p, off)
     if err != nil {
         return nil, ObjBad, err
     }
 
     if objType == ObjCommit {
-        // Commit-graph supplies metadata → skip inflation entirely
+        // Commit‑graph supplies metadata → skip inflation entirely.
         return nil, ObjCommit, nil
     }
 
-    // For non-commits, we need the full object data
-    _, data, err := readRawObject(p, off)
-    if err != nil {
-        return nil, ObjBad, err
-    }
-
-    switch objType {
-    case ObjBlob, ObjTree, ObjTag:
-        // CRC verification if enabled
-        if s.VerifyCRC {
-            crc, found := s.findCRCForObject(p, off, oid)
-            if found {
-                if err := s.verifyCRCForPackObject(p, off, crc); err != nil {
-                    return nil, ObjBad, err
-                }
-            }
-        }
-        s.dw.add(oid, data)        // Add to delta window
-        s.cache.Add(oid, data)     // Add to main cache
-        return data, objType, nil
-
-    case ObjOfsDelta, ObjRefDelta:
-        baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, data)
+    // Handle delta objects - they need decompression too!
+    if objType == ObjOfsDelta || objType == ObjRefDelta {
+        // readRawObject returns the delta-instruction stream with the raw
+        // prefix (20-byte hash or variable-length offset) still attached so
+        // that parseDeltaHeader can reuse it.
+        _, deltaData, err := readRawObject(p, off)
         if err != nil {
             return nil, ObjBad, err
         }
 
+        // Extract base reference and the delta instruction buffer.
+        baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, deltaData)
+        if err != nil {
+            return nil, ObjBad, err
+        }
+
+        // Resolve the base object
         var base []byte
+        var baseType ObjectType
         if objType == ObjRefDelta {
             if err := ctx.checkRefDelta(baseHash); err != nil {
                 return nil, ObjBad, err
             }
             ctx.enterRefDelta(baseHash)
-            base, _, err = s.getWithContext(baseHash, ctx)
+            base, baseType, err = s.getWithContext(baseHash, ctx)
             ctx.exit()
-        } else {
-            if err := ctx.checkOfsDelta(baseOff); err != nil {
+        } else { // ObjOfsDelta
+            // For ofs-delta, calculate the actual offset
+            actualOffset := off - baseOff
+            if err := ctx.checkOfsDelta(actualOffset); err != nil {
                 return nil, ObjBad, err
             }
-            ctx.enterOfsDelta(baseOff)
-            base, _, err = readObjectAtOffsetWithContext(p, baseOff, s, ctx)
+            ctx.enterOfsDelta(actualOffset)
+            base, baseType, err = readObjectAtOffsetWithContext(p, actualOffset, s, ctx)
             ctx.exit()
         }
         if err != nil {
             return nil, ObjBad, err
         }
 
+        // Apply the delta to reconstruct the full object
         full := applyDelta(base, deltaBuf)
-        s.dw.add(oid, full)        // Cache for future delta resolution
-        s.cache.Add(oid, full)     // Cache for general access
-        return full, detectType(full), nil
+        if full == nil {
+            return nil, ObjBad, fmt.Errorf("delta application failed for object %x", oid)
+        }
 
-    default:
-        return nil, ObjBad, fmt.Errorf("unknown obj type %d", objType)
+        // finalType := detectType(full)
+        s.dw.add(oid, full)
+        s.cache.Add(oid, full)
+        return full, baseType, nil
     }
+
+    // For regular objects (blob, tree, tag), use normal decompression
+    _, data, err := readRawObject(p, off)
+    if err != nil {
+        return nil, ObjBad, err
+    }
+
+    // Optional CRC-32 integrity check.
+    if s.VerifyCRC {
+        crc, found := s.findCRCForObject(p, off, oid)
+        if found {
+            if err := s.verifyCRCForPackObject(p, off, crc); err != nil {
+                return nil, ObjBad, err
+            }
+        } else if s.midx != nil && s.midx.version >= 2 {
+            // For MIDX v2, we should have CRCs available.
+            return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", oid)
+        }
+    }
+
+    s.dw.add(oid, data)
+    s.cache.Add(oid, data)
+    return data, objType, nil
 }
 ```
-
----
-
-## 🎯 Key Takeaways
-
-We've conquered the packfile with a complete implementation:
-
-**Header Parsing**: Efficiently extract object type and size from variable-length headers using unsafe operations for maximum performance.
-
-**Zlib Decompression**: Smart handling of small vs large objects to optimize memory usage and decompression speed.
-
-**Delta Resolution**: Reconstruct objects from delta chains with robust cycle detection and depth limits.
-
-**Git-Optimized Caching**: Reference-counted cache designed specifically for Git's delta resolution patterns, delivering 10-17x performance improvements over generic LRU for Git workloads.
-
-**Concurrency Safety**: Handle-based API prevents data races and use-after-free bugs in multi-threaded environments.
-
-**Performance**: Two-level caching strategy optimized for Git's access patterns, with memory-mapped I/O and unsafe optimizations.
-
-This implementation handles all Git object types and storage formats, providing a complete foundation for accessing repository data safely and efficiently.
-
----
-
-## 🔮 Up Next
-
-We now have the complete object retrieval pipeline. We can take any SHA-1 hash, find it in a packfile, decompress it, and safely resolve any delta chains to get fully-inflated object data.
-
-However, to walk the repository's history efficiently, we need to avoid decompressing every single commit object just to find its parents. This is where Git's secret weapon comes in.
-
-In **Part 5: The Commit-Graph Advantage**, we'll explore:
-
-- How the commit-graph file provides a super-fast lane for history traversal.
-- Parsing the binary format of the commit-graph.
-- Building a component that reads this file to find commit parents and root trees without ever touching the packfile.
-
-This is the key to unlocking high-speed history walks, laying the foundation for our efficient diff engine.

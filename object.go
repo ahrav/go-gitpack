@@ -25,6 +25,8 @@ const (
 	// ObjTag is an annotated tag object.
 	ObjTag
 
+	_ // Ununused
+
 	// ObjOfsDelta is a delta object whose base is addressed by packfile offset.
 	ObjOfsDelta
 

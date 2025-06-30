@@ -177,64 +177,49 @@ func createTestPackWithDelta(t *testing.T) (packPath, idxPath string, cleanup fu
 	packPath = filepath.Join(dir, "test.pack")
 	idxPath = filepath.Join(dir, "test.idx")
 
-	blob1Data := []byte("base content")
-	blob1Hash := calculateHash(ObjBlob, blob1Data)
+	baseData := []byte("base content")
+	baseHash := calculateHash(ObjBlob, baseData)
 
-	blob2Data := []byte("modified data")
-	blob2Hash := calculateHash(ObjBlob, blob2Data)
+	// The target data is what the delta should produce when applied to the base.
+	targetData := []byte("modified data")
+	targetHash := calculateHash(ObjBlob, targetData)
 
-	packFile, err := os.Create(packPath)
-	require.NoError(t, err)
-	defer packFile.Close()
+	var packBuf bytes.Buffer
 
-	// Write pack header.
-	packFile.Write([]byte("PACK"))
-	binary.Write(packFile, binary.BigEndian, uint32(2))
-	binary.Write(packFile, binary.BigEndian, uint32(2))
+	packBuf.Write([]byte("PACK"))
+	binary.Write(&packBuf, binary.BigEndian, uint32(2)) // version
+	binary.Write(&packBuf, binary.BigEndian, uint32(2)) // 2 objects
 
-	offsets := make([]uint64, 2)
-	hashes := []Hash{blob1Hash, blob2Hash}
+	// Write the base object first as a regular blob.
+	baseHeader := encodeObjHeader(uint8(ObjBlob), uint64(len(baseData)))
+	packBuf.Write(baseHeader)
 
-	// Write first object as a base blob.
-	offsets[0] = 12 // After pack header
-	objHeader := byte((byte(ObjBlob) << 4) | byte(len(blob1Data)&0x0f))
-	require.True(t, len(blob1Data) < 16, "Test data too large for simple header")
-	packFile.Write([]byte{objHeader})
-
-	var compressedBuf bytes.Buffer
-	zw := zlib.NewWriter(&compressedBuf)
-	zw.Write(blob1Data)
+	var compressedBase bytes.Buffer
+	zw := zlib.NewWriter(&compressedBase)
+	zw.Write(baseData)
 	zw.Close()
-	packFile.Write(compressedBuf.Bytes())
+	packBuf.Write(compressedBase.Bytes())
 
-	// Write second object as a reference delta.
-	currentPos, err := packFile.Seek(0, io.SeekCurrent)
+	baseOffset := uint64(12) // after pack header
+
+	deltaOffset := uint64(packBuf.Len())
+
+	// Use the helper function to create a properly formatted REF_DELTA object.
+	refDeltaObj, err := createRefDeltaObject(baseHash, targetData, baseData)
 	require.NoError(t, err)
-	offsets[1] = uint64(currentPos)
+	packBuf.Write(refDeltaObj)
 
-	// Create delta data.
-	deltaData := createDelta(blob1Data, blob2Data)
+	packChecksum := sha1.Sum(packBuf.Bytes())
+	packBuf.Write(packChecksum[:])
 
-	// For ref-delta, the compressed data contains: base hash (20 bytes) + delta instructions.
-	var deltaPayload bytes.Buffer
-	deltaPayload.Write(blob1Hash[:])
-	deltaPayload.Write(deltaData)
+	err = os.WriteFile(packPath, packBuf.Bytes(), 0644)
+	require.NoError(t, err)
 
-	// Compress the entire delta payload (base hash + delta instructions).
-	var compressedDelta bytes.Buffer
-	zw = zlib.NewWriter(&compressedDelta)
-	zw.Write(deltaPayload.Bytes())
-	zw.Close()
-
-	// Write object header for ref-delta with the size of compressed delta data.
-	compressedSize := compressedDelta.Len()
-	deltaHeader := byte((byte(ObjRefDelta) << 4) | byte(compressedSize&0x0f))
-	packFile.Write([]byte{deltaHeader})
-
-	// Write the compressed delta data.
-	packFile.Write(compressedDelta.Bytes())
-
-	err = createV2IndexFile(idxPath, hashes, offsets)
+	err = createV2IndexFile(
+		idxPath,
+		[]Hash{baseHash, targetHash},
+		[]uint64{baseOffset, deltaOffset},
+	)
 	require.NoError(t, err)
 
 	cleanup = func() {
@@ -250,8 +235,7 @@ func createDelta(base, target []byte) []byte {
 	writeVarInt(&delta, uint64(len(base)))
 	writeVarInt(&delta, uint64(len(target)))
 
-	// Use insert operations for simplicity instead of optimized copy operations.
-	// In real Git, this would use copy operations where possible.
+	// Use simple insert operations instead of optimized copy operations for testing.
 	delta.WriteByte(byte(len(target)))
 	delta.Write(target)
 
@@ -275,7 +259,6 @@ func writeVarInt(w io.Writer, v uint64) {
 func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 	var buf bytes.Buffer
 
-	// Write header.
 	buf.Write([]byte{0xff, 0x74, 0x4f, 0x63})
 	binary.Write(&buf, binary.BigEndian, uint32(2))
 
@@ -290,7 +273,6 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		hashOffsets[i] = hashOffset{h, offsets[i]}
 	}
 
-	// Sort by hash in lexicographic order.
 	for i := range hashOffsets {
 		for j := i + 1; j < len(hashOffsets); j++ {
 			if bytes.Compare(hashOffsets[i].hash[:], hashOffsets[j].hash[:]) > 0 {
@@ -299,7 +281,6 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		}
 	}
 
-	// Extract sorted hashes and offsets.
 	sortedHashes := make([]Hash, len(hashes))
 	sortedOffsets := make([]uint64, len(offsets))
 	for i, ho := range hashOffsets {
@@ -307,7 +288,6 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		sortedOffsets[i] = ho.offset
 	}
 
-	// Check if we need the large offset table.
 	needsLargeOffsets := false
 	for _, offset := range sortedOffsets {
 		if offset > 0x7fffffff {
@@ -316,7 +296,6 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		}
 	}
 
-	// Create fanout table.
 	fanout := make([]uint32, 256)
 	for i, h := range sortedHashes {
 		firstByte := h[0]
@@ -328,50 +307,43 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 		binary.Write(&buf, binary.BigEndian, fanout[i])
 	}
 
-	// Write SHA hashes in sorted order.
 	for _, h := range sortedHashes {
 		buf.Write(h[:])
 	}
 
-	// Write CRC32s by computing actual values from pack data if available.
+	// Compute CRC32s from pack data if available, otherwise use dummy values.
 	packPath := strings.TrimSuffix(path, ".idx") + ".pack"
 	packData, err := os.ReadFile(packPath)
 	if err != nil {
-		// Use dummy values if pack file can't be read.
 		for range sortedHashes {
 			binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
 		}
 	} else {
 		for _, offset := range sortedOffsets {
-			// Find the object end to determine compressed data length.
 			var objEnd uint64
-			objEnd = uint64(len(packData) - 20) // default to pack trailer start.
+			objEnd = uint64(len(packData) - 20)
 			for _, nextOffset := range sortedOffsets {
 				if nextOffset > offset && nextOffset < objEnd {
 					objEnd = nextOffset
 				}
 			}
 
-			// Calculate CRC of the entire object data including header.
-			// This matches what verifyCRC32 does: from objOff to objEnd.
+			// Calculate CRC of entire object data to match verifyCRC32 behavior.
 			if offset < objEnd && objEnd <= uint64(len(packData)) {
 				objectData := packData[offset:objEnd]
 				crc := crc32.ChecksumIEEE(objectData)
 				binary.Write(&buf, binary.BigEndian, crc)
 			} else {
-				// Use dummy value if we can't calculate.
 				binary.Write(&buf, binary.BigEndian, uint32(0x12345678))
 			}
 		}
 	}
 
-	// Write offsets, handling both regular and large offsets.
+	// Handle both regular and large offsets.
 	if needsLargeOffsets {
-		// Write offsets with large offset references.
 		largeOffsetIndex := uint32(0)
 		for _, offset := range sortedOffsets {
 			if offset > 0x7fffffff {
-				// Use large offset table reference.
 				binary.Write(&buf, binary.BigEndian, uint32(0x80000000|largeOffsetIndex))
 				largeOffsetIndex++
 			} else {
@@ -379,20 +351,17 @@ func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 			}
 		}
 
-		// Write the large offset table.
 		for _, offset := range sortedOffsets {
 			if offset > 0x7fffffff {
 				binary.Write(&buf, binary.BigEndian, offset)
 			}
 		}
 	} else {
-		// Write all offsets as 32-bit values.
 		for _, off := range sortedOffsets {
 			binary.Write(&buf, binary.BigEndian, uint32(off))
 		}
 	}
 
-	// Write trailing checksums.
 	buf.Write(make([]byte, 20))
 
 	fileContentSoFar := buf.Bytes()
@@ -433,4 +402,34 @@ func buildSelfContainedDelta(blobBase, blobDelta []byte) []byte {
 	d.WriteByte(byte(len(blobDelta)))
 	d.Write(blobDelta)
 	return d.Bytes()
+}
+
+func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]byte, error) {
+	// Build the delta instructions that transform baseData into targetData.
+	deltaInstructions := buildSelfContainedDelta(baseData, targetData)
+
+	// For REF_DELTA, the size in the header is the size of the delta instructions only.
+	header := encodeObjHeader(uint8(ObjRefDelta), uint64(len(deltaInstructions)))
+
+	// Build the complete object: [header] [20-byte base OID uncompressed] [compressed delta instructions].
+	var buf bytes.Buffer
+
+	buf.Write(header)
+
+	// The base OID is stored uncompressed (20 bytes).
+	buf.Write(baseOID[:])
+
+	// Only the delta instructions are compressed using zlib.
+	var compressedDelta bytes.Buffer
+	zw := zlib.NewWriter(&compressedDelta)
+	if _, err := zw.Write(deltaInstructions); err != nil {
+		return nil, err
+	}
+	if err := zw.Close(); err != nil {
+		return nil, err
+	}
+
+	buf.Write(compressedDelta.Bytes())
+
+	return buf.Bytes(), nil
 }

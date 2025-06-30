@@ -367,14 +367,37 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 	return s.getWithContext(oid, newDeltaContext(s.maxDeltaDepth))
 }
 
-// inflateFromPack handles object inflation from a specific pack, with delta resolution.
+// inflateFromPack materializes the Git object that starts at off inside the
+// memory-mapped pack p.
+//
+// The helper is the workhorse of Store.Get. It
+//   - peeks at the pack header to determine the on-disk type with
+//     peekObjectType, short-circuiting OBJ_COMMIT objects that can be served
+//     from the commit-graph;
+//   - inflates non-delta objects directly with readRawObject;
+//   - resolves both ref-delta and ofs-delta chains recursively via
+//     deltaContext, bounded by Store.maxDeltaDepth and with cycle detection;
+//   - applies delta instructions with applyDelta to reconstruct the full
+//     byte stream; and
+//   - verifies CRC-32 checksums when Store.VerifyCRC is enabled, using either
+//     the *.idx side-file or, for multi-pack-index v2, the MIDX CRC table.
+//
+// A successful call returns a freshly-allocated buffer that the caller may
+// mutate, the detected ObjectType, and a nil error.
+// It returns ObjBad and a non-nil error when header parsing, delta
+// resolution, decompression, or CRC validation fails.
+//
+// The method is read-only with respect to *Store (aside from its caches) and
+// is safe for concurrent use; all shared state mutation is confined to the
+// cache helpers, which are internally synchronized.
 func (s *Store) inflateFromPack(
 	p *mmap.ReaderAt,
 	off uint64,
 	oid Hash,
 	ctx *deltaContext,
 ) ([]byte, ObjectType, error) {
-	// Quick header peek to determine object type
+	// Fast header peek avoids unnecessary zlib work for commits that the
+	// commit-graph already covers.
 	objType, _, err := peekObjectType(p, off)
 	if err != nil {
 		return nil, ObjBad, err
@@ -387,13 +410,15 @@ func (s *Store) inflateFromPack(
 
 	// Handle delta objects - they need decompression too!
 	if objType == ObjOfsDelta || objType == ObjRefDelta {
-		// Use readRawObject to get properly decompressed delta data
+		// readRawObject returns the delta-instruction stream with the raw
+		// prefix (20-byte hash or variable-length offset) still attached so
+		// that parseDeltaHeader can reuse it.
 		_, deltaData, err := readRawObject(p, off)
 		if err != nil {
 			return nil, ObjBad, err
 		}
 
-		// Parse the delta header to get base reference and delta instructions
+		// Extract base reference and the delta instruction buffer.
 		baseHash, baseOff, deltaBuf, err := parseDeltaHeader(objType, deltaData)
 		if err != nil {
 			return nil, ObjBad, err
@@ -401,12 +426,13 @@ func (s *Store) inflateFromPack(
 
 		// Resolve the base object
 		var base []byte
+		var baseType ObjectType
 		if objType == ObjRefDelta {
 			if err := ctx.checkRefDelta(baseHash); err != nil {
 				return nil, ObjBad, err
 			}
 			ctx.enterRefDelta(baseHash)
-			base, _, err = s.getWithContext(baseHash, ctx)
+			base, baseType, err = s.getWithContext(baseHash, ctx)
 			ctx.exit()
 		} else { // ObjOfsDelta
 			// For ofs-delta, calculate the actual offset
@@ -415,7 +441,7 @@ func (s *Store) inflateFromPack(
 				return nil, ObjBad, err
 			}
 			ctx.enterOfsDelta(actualOffset)
-			base, _, err = readObjectAtOffsetWithContext(p, actualOffset, s, ctx)
+			base, baseType, err = readObjectAtOffsetWithContext(p, actualOffset, s, ctx)
 			ctx.exit()
 		}
 		if err != nil {
@@ -428,10 +454,10 @@ func (s *Store) inflateFromPack(
 			return nil, ObjBad, fmt.Errorf("delta application failed for object %x", oid)
 		}
 
-		finalType := detectType(full)
+		// finalType := detectType(full)
 		s.dw.add(oid, full)
 		s.cache.Add(oid, full)
-		return full, finalType, nil
+		return full, baseType, nil
 	}
 
 	// For regular objects (blob, tree, tag), use normal decompression
@@ -440,6 +466,7 @@ func (s *Store) inflateFromPack(
 		return nil, ObjBad, err
 	}
 
+	// Optional CRC-32 integrity check.
 	if s.VerifyCRC {
 		crc, found := s.findCRCForObject(p, off, oid)
 		if found {
@@ -501,116 +528,6 @@ func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 	}
 
 	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
-}
-
-// readRawObject inflates the object that starts at off in the given
-// memory-mapped packfile.
-//
-// It first parses the variable-length object header (using the
-// highly-optimized parseObjectHeaderUnsafe helper), then decides between two
-// decompression strategies:
-//
-//   - Small objects (< 64 KiB) are read into an in-memory byte slice so that
-//     zlib.NewReader can operate on a contiguous buffer.
-//     This avoids the extra allocation incurred by io.SectionReader and is
-//     measurably faster for the common case of small blobs and trees.
-//
-//   - Large objects are streamed directly from the mmap'ed file through an
-//     io.SectionReader to keep the memory footprint bounded.
-//
-// The returned slice contains the fully-inflated object data and is safe for
-// the caller to modify.
-// The function never mutates shared state and is therefore safe for concurrent
-// use.
-func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
-	// Read first 32 bytes for header (usually enough).
-	var headerBuf [32]byte
-	n, err := r.ReadAt(headerBuf[:], int64(off))
-	if err != nil && err != io.EOF {
-		return ObjBad, nil, err
-	}
-	if n == 0 {
-		return ObjBad, nil, errors.New("empty object")
-	}
-
-	hdr := headerBuf[:n]
-	objType, size, headerLen := parseObjectHeaderUnsafe(hdr)
-	if headerLen <= 0 || headerLen > n {
-		// Need to read more header bytes - fallback to original logic.
-		var header [32]byte
-		var n int
-		for {
-			if _, err := r.ReadAt(header[n:n+1], int64(off)+int64(n)); err != nil {
-				return ObjBad, nil, err
-			}
-			if header[n]&0x80 == 0 {
-				n++
-				break
-			}
-			n++
-			if n >= len(header) {
-				return ObjBad, nil, errors.New("object header too long")
-			}
-		}
-		objType = ObjectType((header[0] >> 4) & 7)
-		size = uint64(header[0] & 0x0f)
-		shift := uint(4)
-		for i := 1; i < n; i++ {
-			size |= uint64(header[i]&0x7f) << shift
-			shift += 7
-		}
-		headerLen = n
-	}
-
-	// For small objects, read everything at once.
-	const (
-		smallObjectThreshold = 65536 // 64KB threshold
-		zlibOverheadSize     = 1024  // Extra space for zlib compression overhead
-	)
-
-	if size < smallObjectThreshold {
-		compressedBuf := make([]byte, size+zlibOverheadSize) // Extra space for zlib overhead
-		n, err := r.ReadAt(compressedBuf, int64(off)+int64(headerLen))
-		if err != nil && err != io.EOF {
-			return ObjBad, nil, err
-		}
-
-		zr, err := zlib.NewReader(bytes.NewReader(compressedBuf[:n]))
-		if err != nil {
-			return ObjBad, nil, err
-		}
-		defer zr.Close()
-
-		result := make([]byte, 0, size)
-		buf := bytes.NewBuffer(result)
-		_, err = io.Copy(buf, zr)
-		if err != nil {
-			return ObjBad, nil, err
-		}
-
-		return objType, buf.Bytes(), nil
-	}
-
-	// For large objects, use streaming.
-	// TODO: Should we return an io.Reader instead?
-	compressedLen := int64(size) + zlibOverheadSize
-	if compressedLen <= 0 {
-		return ObjBad, nil, errors.New("invalid compressed length")
-	}
-	src := io.NewSectionReader(r, int64(off)+int64(headerLen), compressedLen)
-	zr, err := zlib.NewReader(src)
-	if err != nil {
-		return ObjBad, nil, err
-	}
-	defer zr.Close()
-
-	var buf bytes.Buffer
-	buf.Grow(int(size)) // Pre-allocate
-	if _, err = buf.ReadFrom(zr); err != nil {
-		return ObjBad, nil, err
-	}
-
-	return objType, buf.Bytes(), nil
 }
 
 // parseObjectHeaderUnsafe parses the variable-length object header that
@@ -695,7 +612,6 @@ func readObjectAtOffsetWithContext(
 	}
 
 	if objType == ObjOfsDelta || objType == ObjRefDelta {
-		// data is already decompressed by readRawObject
 		bhash, boff, deltaBuf, err := parseDeltaHeader(objType, data)
 		if err != nil {
 			return nil, ObjBad, err
@@ -710,7 +626,7 @@ func readObjectAtOffsetWithContext(
 			base, _, err = s.getWithContext(bhash, ctx)
 			ctx.exit()
 		} else {
-			// For ofs-delta, calculate the actual offset
+			// Calculate offset for ofs-delta base object.
 			actualOffset := off - boff
 			if err := ctx.checkOfsDelta(actualOffset); err != nil {
 				return nil, ObjBad, err
@@ -732,6 +648,103 @@ func readObjectAtOffsetWithContext(
 	}
 
 	return data, objType, nil
+}
+
+// readRawObject inflates the object that starts at off in the given
+// memory‑mapped packfile.
+//
+// For *delta* objects we must:
+//
+//  1. Return the "prefix" (20‑byte base hash for OBJ_REF_DELTA, or the
+//     variable‑length offset for OBJ_OFS_DELTA) **uncompressed**;
+//  2. Start zlib inflation **after** that prefix;
+//  3. Prepend the prefix to the inflated delta instructions so that
+//     parseDeltaHeader can still find it.
+//
+// All objects—large or small—now follow the same streaming code path; the
+// earlier "small object (<64 KiB) read‑into‑buffer" fast path has been
+// removed because it was the source of the mis‑alignment bug.
+//
+// The implementation follows these steps:
+//
+//  1. Parse the variable‑length object header to determine type and size;
+//  2. Read (and keep) the delta prefix, if any:
+//     - For OBJ_REF_DELTA: 20‑byte SHA‑1 base hash
+//     - For OBJ_OFS_DELTA: variable‑length negative offset
+//  3. Inflate the deflate stream that follows the header and prefix;
+//  4. Return [prefix||inflated] for deltas, or just the inflated body otherwise.
+func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
+	/* ---- 1. parse the generic variable‑length header ------------------ */
+
+	var hdr [32]byte
+	n, err := r.ReadAt(hdr[:], int64(off))
+	if err != nil && err != io.EOF {
+		return ObjBad, nil, err
+	}
+	if n == 0 {
+		return ObjBad, nil, errors.New("empty object")
+	}
+
+	objType, _, hdrLen := parseObjectHeaderUnsafe(hdr[:n])
+	if hdrLen <= 0 {
+		return ObjBad, nil, errors.New("cannot parse object header")
+	}
+
+	pos := int64(off) + int64(hdrLen) // first byte *after* the generic header
+
+	/* ---- 2. read (and keep) the delta prefix, if any ------------------ */
+
+	var prefix []byte
+	switch objType {
+	case ObjRefDelta:
+		prefix = make([]byte, 20)
+		if _, err := r.ReadAt(prefix, pos); err != nil {
+			return ObjBad, nil, err
+		}
+		pos += 20
+
+	case ObjOfsDelta:
+		// variable‑length negative offset
+		for {
+			var b [1]byte
+			if _, err := r.ReadAt(b[:], pos+int64(len(prefix))); err != nil {
+				return ObjBad, nil, err
+			}
+			prefix = append(prefix, b[0])
+			if b[0]&0x80 == 0 { // MSB clear → last byte
+				pos += int64(len(prefix))
+				break
+			}
+			if len(prefix) > 12 { // sanity limit
+				return ObjBad, nil, errors.New("ofs‑delta base‑ref too long")
+			}
+		}
+	}
+
+	/* ---- 3. inflate the deflate stream that follows ------------------- */
+
+	// We do not know the compressed length in advance, so we give
+	// SectionReader an "infinite" length; io.NewSectionReader caps reads at
+	// EOF anyway.
+	src := io.NewSectionReader(r, pos, 1<<63-1)
+	zr, err := zlib.NewReader(src)
+	if err != nil {
+		fmt.Printf("zlib error at pack=%p off=%d hdrLen=%d prefix=%d : %v\n",
+			r, off, hdrLen, len(prefix), err)
+		return ObjBad, nil, err
+	}
+	defer zr.Close()
+
+	var out bytes.Buffer
+	if _, err := out.ReadFrom(zr); err != nil {
+		return ObjBad, nil, err
+	}
+
+	// Return [prefix||inflated] for deltas, or just the inflated body otherwise.
+	if len(prefix) != 0 {
+		return objType, append(prefix, out.Bytes()...), nil
+	}
+	return objType, out.Bytes(), nil
 }
 
 // VerifyPackTrailers validates the SHA-1 trailer that closes every mapped

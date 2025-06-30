@@ -876,47 +876,41 @@ func TestThinPackCrossPackViaMidx(t *testing.T) {
 		[]uint64{12},
 	))
 
-	// Build Pack B as a thin pack containing a REF_DELTA that references
-	// the base blob in Pack A.
+	// Build Pack B as a thin pack containing a REF_DELTA that references the base blob in Pack A.
 	blobDelta := []byte("cross-pack derived")
 	oidDelta := calculateHash(ObjBlob, blobDelta)
 
 	packB := filepath.Join(dir, "packB.pack")
-	var buf bytes.Buffer
-	buf.Write([]byte("PACK"))
-	binary.Write(&buf, binary.BigEndian, uint32(2))
-	binary.Write(&buf, binary.BigEndian, uint32(1))
+	var packBuf bytes.Buffer
 
-	deltaPayload := buildSelfContainedDelta(blobBase, blobDelta)
+	packBuf.Write([]byte("PACK"))
+	binary.Write(&packBuf, binary.BigEndian, uint32(2)) // version
+	binary.Write(&packBuf, binary.BigEndian, uint32(1)) // object count
 
-	var deltaObjectData bytes.Buffer
-	deltaObjectData.Write(oidBase[:])
-	deltaObjectData.Write(deltaPayload)
+	// Use the helper function to create a properly formatted REF_DELTA object.
+	refDeltaObj, err := createRefDeltaObject(oidBase, blobDelta, blobBase)
+	require.NoError(t, err)
 
-	var compressedDelta bytes.Buffer
-	zw := zlib.NewWriter(&compressedDelta)
-	zw.Write(deltaObjectData.Bytes())
-	zw.Close()
+	packBuf.Write(refDeltaObj)
 
-	sizeBits := encodeObjHeader(uint8(ObjRefDelta), uint64(deltaObjectData.Len()))
-	buf.Write(sizeBits)
-	buf.Write(compressedDelta.Bytes())
+	packChecksum := sha1.Sum(packBuf.Bytes())
+	packBuf.Write(packChecksum[:])
 
-	require.NoError(t, os.WriteFile(packB, buf.Bytes(), 0o644))
+	require.NoError(t, os.WriteFile(packB, packBuf.Bytes(), 0644))
 
 	require.NoError(t, createV2IndexFile(
 		strings.TrimSuffix(packB, ".pack")+".idx",
 		[]Hash{oidDelta},
-		[]uint64{12},
+		[]uint64{12}, // offset after pack header
 	))
 
-	// Create a multi-pack index that maps oidBase to packA and oidDelta to packB.
+	// Create a multi-pack index that maps both objects to their respective packs.
 	createTwoPackMidxFile(
 		t, dir,
 		[]string{filepath.Base(packA), filepath.Base(packB)},
 		[]Hash{oidBase, oidDelta},
-		[]uint32{0, 1},
-		[]uint64{12, 12},
+		[]uint32{0, 1},   // pack IDs
+		[]uint64{12, 12}, // offsets
 	)
 
 	// Verify that the store can resolve cross-pack deltas.
