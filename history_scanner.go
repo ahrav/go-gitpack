@@ -7,7 +7,7 @@
 //
 // IMPLEMENTATION:
 // The scanner currently requires commit-graph files for O(commits) scanning
-// with commits processed in their commit-graph storage order. A fallback mechanism to enumerate
+// with commits processed concurrently for maximum throughput. A fallback mechanism to enumerate
 // packfiles directly is planned but not yet implemented.
 // TODO: Add support for repositories without commit-graph by falling back to
 // packfile parsing that extracts tree and parent relationships from commit headers.
@@ -20,6 +20,7 @@ package objstore
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"runtime"
@@ -30,8 +31,8 @@ import (
 // scanner needs for tree-to-tree diffing and topological walks.
 // It deliberately omits heavyweight details such as author/committer
 // identities and the commit message to keep allocations low.
-// A slice of CommitInfo values is produced in commit-graph storage order by
-// HistoryScanner.LoadAllCommits and can be processed concurrently.
+// A slice of CommitInfo values is produced by HistoryScanner.LoadAllCommits
+// and can be processed concurrently.
 type CommitInfo struct {
 	// OID is the object ID of the commit itself.
 	OID Hash
@@ -51,7 +52,7 @@ type CommitInfo struct {
 // HistoryScanner provides read-only, high-throughput access to a Git
 // repository's commit history.  It abstracts over commit-graph files and
 // packfile iteration to expose streaming APIs such as DiffHistory that
-// deliver commits in commit-graph storage order with minimal memory footprint.
+// deliver commits concurrently with minimal memory footprint.
 // Instantiate a HistoryScanner when you need to traverse many commits or
 // compute incremental diffs without materializing full objects.
 type HistoryScanner struct {
@@ -78,8 +79,10 @@ func (e *ScanError) Error() string {
 	return fmt.Sprintf("failed to parse %d commits", len(e.FailedCommits))
 }
 
+var ErrCommitGraphRequired = errors.New("commit-graph required but not found")
+
 // NewHistoryScanner opens the Git repository at gitDir and returns a
-// HistoryScanner that streams commit data in commit-graph storage order.
+// HistoryScanner that streams commit data concurrently.
 //
 // The implementation currently relies on commit-graph files being present
 // inside .git/objects.
@@ -89,14 +92,13 @@ func (e *ScanError) Error() string {
 // The caller is responsible for invoking (*HistoryScanner).Close when finished
 // to release any mmap handles held by the store.
 func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
-	// 1. open the *.pack store
 	packDir := filepath.Join(gitDir, "objects", "pack")
 	store, err := Open(packDir)
 	if err != nil {
 		return nil, fmt.Errorf("open object store: %w", err)
 	}
 
-	// 2. require commit‑graph (TODO: add fallback to packfile parsing for repositories without commit-graph)
+	// Require commit‑graph (TODO: add fallback to packfile parsing for repositories without commit-graph)
 	graphDir := filepath.Join(gitDir, "objects")
 	graph, err := LoadCommitGraph(graphDir)
 	if err != nil || graph == nil {
@@ -104,7 +106,7 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 		if err != nil {
 			return nil, fmt.Errorf("commit-graph required but failed to load: %w", err)
 		}
-		return nil, fmt.Errorf("commit-graph required but not found")
+		return nil, ErrCommitGraphRequired
 	}
 
 	return &HistoryScanner{store: store, graphData: graph}, nil
@@ -112,9 +114,9 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 
 // Addition holds metadata for a single "+" line that a commit introduced.
 //
-// Values of Addition are streamed by HistoryScanner.DiffHistory in
-// commit-graph storage order, enabling callers to process repository changes
-// incrementally without materializing whole diffs or commits in memory.
+// Values of Addition are streamed by HistoryScanner.DiffHistory concurrently,
+// enabling callers to process repository changes incrementally without
+// materializing whole diffs or commits in memory.
 type Addition struct {
 	// Commit identifies the commit that introduced the added line.
 	Commit Hash
@@ -130,13 +132,13 @@ type Addition struct {
 	Lines [][]byte
 }
 
-// DiffHistory streams every added line in commit-graph storage order.
+// DiffHistory streams every added line from all commits.
 //
 // The caller receives a buffered channel of Addition values and a separate
 // channel for a single error value.
 // The method launches a goroutine that
-//  1. Performs the commit walk and diff computation.
-//  2. Sends each Addition to the `out` channel in commit-graph storage order.
+//  1. Performs the commit walk and diff computation concurrently.
+//  2. Sends each Addition to the `out` channel as soon as it's computed.
 //  3. Sends a non-nil error to `errC` and returns early on failure.
 //     Otherwise, it sends nil when the walk completes.
 //
@@ -151,78 +153,74 @@ type Addition struct {
 // error channel are pre-buffered.
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
-	out := make(chan Addition, 1024) // Larger buffer for better throughput
+	numWorkers := runtime.NumCPU()
+
+	out := make(chan Addition, numWorkers)
 	errC := make(chan error, 1)
 
 	go func() {
 		defer close(out)
 
-		commits, err := hs.LoadAllCommits()
-		if err != nil {
-			errC <- err
+		if hs.graphData == nil {
+			errC <- ErrCommitGraphRequired
 			return
 		}
 
-		numWorkers := runtime.NumCPU()
-
 		// Work item for each commit.
 		type workItem struct {
-			commit CommitInfo
+			oid        Hash
+			treeOID    Hash
+			parentOIDs []Hash
+			timestamp  int64
 		}
 
-		workChan := make(chan workItem, numWorkers*2)
-		resultChan := make(chan struct {
-			additions []Addition
-			err       error
-		}, numWorkers*2)
+		workChan := make(chan workItem, numWorkers)
+		errorChan := make(chan error, numWorkers)
 
 		var wg sync.WaitGroup
 
-		// Start workers
-		for i := 0; i < numWorkers; i++ {
+		for range numWorkers {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				// Each worker gets its own tree cache to avoid contention
-				tc := newTreeCache(hs.store)
 
 				for work := range workChan {
-					additions, err := hs.processCommit(tc, work.commit)
-					resultChan <- struct {
-						additions []Addition
-						err       error
-					}{
-						additions: additions,
-						err:       err,
+					commit := CommitInfo{
+						OID:        work.oid,
+						TreeOID:    work.treeOID,
+						ParentOIDs: work.parentOIDs,
+						Timestamp:  work.timestamp,
+					}
+					if err := hs.processCommitStreaming(hs.store, commit, out); err != nil {
+						errorChan <- err
+						return
 					}
 				}
 			}()
 		}
 
-		// Result collector goroutine.
 		go func() {
 			wg.Wait()
-			close(resultChan)
+			close(errorChan)
 		}()
 
-		// Feed work to workers.
+		// Stream commits directly from graph data to workers.
 		go func() {
-			for _, c := range commits {
-				workChan <- workItem{commit: c}
+			defer close(workChan)
+			for i, oid := range hs.graphData.OrderedOIDs {
+				workChan <- workItem{
+					oid:        oid,
+					treeOID:    hs.graphData.TreeOIDs[i],
+					parentOIDs: hs.graphData.Parents[oid],
+					timestamp:  hs.graphData.Timestamps[i],
+				}
 			}
-			close(workChan)
 		}()
 
-		// Collect results and send to output channel.
-		// Sending as they come since commit-graph order isn't strictly
-		// required for correctness.
-		for result := range resultChan {
-			if result.err != nil {
-				errC <- result.err
+		for err := range errorChan {
+			if err != nil {
+				errC <- err
 				return
-			}
-			for _, addition := range result.additions {
-				out <- addition
 			}
 		}
 
@@ -232,8 +230,42 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 	return out, errC
 }
 
+// processCommitStreaming handles diff computation for a single commit and streams
+// additions directly to the output channel.
+func (hs *HistoryScanner) processCommitStreaming(tc *Store, c CommitInfo, out chan<- Addition) error {
+	parents := c.ParentOIDs
+	if len(parents) == 0 {
+		// Root commit: diff against the implicit empty tree (Hash{}).
+		parents = []Hash{{}}
+	}
+
+	pTree := Hash{}
+	if parents[0] != (Hash{}) && hs.graphData != nil {
+		if idx, ok := hs.graphData.OIDToIndex[parents[0]]; ok {
+			pTree = hs.graphData.TreeOIDs[idx]
+		}
+	}
+
+	return walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, new Hash, mode uint32) error {
+		if mode&040000 != 0 {
+			return nil
+		}
+		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
+		// the empty object, which `addedLines` handles correctly.
+		oldBytes, _, _ := hs.store.Get(old)
+		newBytes, _, _ := hs.store.Get(new)
+
+		out <- Addition{
+			Commit: c.OID,
+			Path:   filepath.ToSlash(path),
+			Lines:  addedLines(oldBytes, newBytes),
+		}
+		return nil
+	})
+}
+
 // processCommit handles diff computation for a single commit.
-func (hs *HistoryScanner) processCommit(tc *treeCache, c CommitInfo) ([]Addition, error) {
+func (hs *HistoryScanner) processCommit(tc *Store, c CommitInfo) ([]Addition, error) {
 	var additions []Addition
 
 	parents := c.ParentOIDs
