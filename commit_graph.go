@@ -346,7 +346,7 @@ func discoverGraphFiles(objectsDir string) ([]string, error) {
 		var hash string
 		for {
 			_, err := fmt.Fscanln(f, &hash)
-			if err == io.EOF {
+			if errors.Is(err, io.EOF) {
 				break
 			}
 			if err != nil {
