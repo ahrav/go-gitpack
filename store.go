@@ -19,18 +19,7 @@
 // size-bounded cache avoids redundant decompression, and optional CRC-32
 // verification can be enabled for additional integrity checks.
 //
-// USAGE:
-//
-//	s, err := objstore.Open(".git/objects/pack")
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	defer s.Close()
-//
-//	data, typ, err := s.Get(oid)
-//	// handle data…
-//
-// Store is safe for concurrent readers and eliminates the need to shell out
+// The store is safe for concurrent readers and eliminates the need to shell out
 // to Git while providing high-performance object retrieval for read-only
 // workloads like indexing and content serving.
 package objstore
@@ -61,9 +50,9 @@ var hostLittle = func() bool {
 func init() {
 	// On Windows an mmapped file cannot be closed while any outstanding
 	// slices are still referenced. A finalizer makes sure users who forget
-	// to call (*Store).Close() do not trigger ERROR_LOCK_VIOLATION.
+	// to call (*store).Close() do not trigger ERROR_LOCK_VIOLATION.
 	if runtime.GOOS == "windows" {
-		runtime.SetFinalizer(&Store{}, func(s *Store) { _ = s.Close() })
+		runtime.SetFinalizer(&store{}, func(s *store) { _ = s.Close() })
 	}
 }
 
@@ -86,7 +75,7 @@ const (
 // cachedObj pairs a fully-materialized Git object with its on-disk
 // ObjectType.
 //
-// The ARC cache inside Store uses cachedObj as its value type so that a
+// The ARC cache inside store uses cachedObj as its value type so that a
 // cache hit returns both the raw bytes and the already-known object type.
 // This avoids having to call detectType on every lookup.
 //
@@ -101,24 +90,24 @@ type cachedObj struct {
 	typ ObjectType
 }
 
-// Store provides concurrent, read-only access to one or more memory-mapped
+// store provides concurrent, read-only access to one or more memory-mapped
 // Git packfiles with support for multi-pack-index (MIDX) files.
 //
-// A Store maps every *.pack / *.idx pair found in a directory, maintains an
+// A store maps every *.pack / *.idx pair found in a directory, maintains an
 // in-memory index from object ID to pack offset, inflates objects on demand,
 // and resolves delta chains up to maxDeltaDepth. All methods are safe for
 // concurrent use by multiple goroutines.
 //
 // CRC Verification:
-// When VerifyCRC is enabled, the Store validates CRC-32 checksums for each
+// When VerifyCRC is enabled, the store validates CRC-32 checksums for each
 // object read. For objects in regular packs with .idx files, CRCs are always
 // available. For objects that only appear in a multi-pack-index:
 //   - MIDX v1: CRC verification is silently skipped (no CRC data available)
 //   - MIDX v2: CRCs are read from the CRCS chunk and verified
 //
 // Note: Pack trailer checksums can be verified by calling verifyPackTrailers()
-// after opening the Store if additional integrity checking is required.
-type Store struct {
+// after opening the store if additional integrity checking is required.
+type store struct {
 	// packs contains one immutable idxFile per mapped pack.
 	packs []*idxFile
 
@@ -148,25 +137,25 @@ type Store struct {
 	VerifyCRC bool
 }
 
-// Open scans dir for "*.pack" files, expects a matching "*.idx" companion for
-// each one, memory-maps every pair, and returns a read-only *Store.
+// open scans dir for "*.pack" files, expects a matching "*.idx" companion for
+// each one, memory-maps every pair, and returns a read-only *store.
 //
-// Open eagerly parses all index files so that subsequent Store.Get calls are
+// open eagerly parses all index files so that subsequent store.Get calls are
 // an O(1) table lookup followed by lazy object inflation.
 // A small Adaptive-Replacement cache (ARC) is created up-front to avoid
 // repeated decompression of hot objects.
 //
 // Error semantics:
 //   - If no "*.pack" files are found in dir an error is returned.
-//   - If any "*.idx" companion is missing or malformed, Open fails.
+//   - If any "*.idx" companion is missing or malformed, open fails.
 //   - All I/O is performed with mmap; failures when mapping a file are
 //     surfaced immediately.
 //
-// The returned Store is safe for concurrent readers; no additional
+// The returned store is safe for concurrent readers; no additional
 // synchronization is required by the caller.
 //
 // For bare repositories pass ".git/objects/pack" as dir.
-func Open(dir string) (*Store, error) {
+func open(dir string) (*store, error) {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		return nil, err
@@ -203,7 +192,7 @@ func Open(dir string) (*Store, error) {
 	}
 	if len(packs) == 0 && midx == nil {
 		// Empty repository - return a valid but empty store.
-		store := &Store{
+		store := &store{
 			maxDeltaDepth: defaultMaxDeltaDepth,
 			packs:         []*idxFile{}, // Empty slice instead of nil
 			packMap:       make(map[string]*mmap.ReaderAt),
@@ -232,7 +221,7 @@ func Open(dir string) (*Store, error) {
 		packCache[pack] = h
 	}
 
-	store := &Store{
+	store := &store{
 		maxDeltaDepth: defaultMaxDeltaDepth,
 		midx:          midx,
 		packMap:       packCache,
@@ -282,7 +271,7 @@ func Open(dir string) (*Store, error) {
 // SetMaxDeltaDepth sets the maximum delta chain depth.
 //
 // SetMaxDeltaDepth changes the maximum number of recursive delta hops
-// (ref-delta or ofs-delta) that the Store will follow when materializing an
+// (ref-delta or ofs-delta) that the store will follow when materializing an
 // object.
 // The default of 50 matches Git's own hard limit.
 //
@@ -291,7 +280,7 @@ func Open(dir string) (*Store, error) {
 // overflow if a crafted repository contains excessively deep delta chains.
 //
 // This method is safe for concurrent use with Get.
-func (s *Store) SetMaxDeltaDepth(depth int) {
+func (s *store) SetMaxDeltaDepth(depth int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maxDeltaDepth = depth
@@ -299,12 +288,12 @@ func (s *Store) SetMaxDeltaDepth(depth int) {
 
 // Close unmaps all pack and idx files.
 //
-// Close releases every memory-mapped file that Open created.
-// After Close returns, the Store must not be used.
+// Close releases every memory-mapped file that open created.
+// After Close returns, the store must not be used.
 //
 // Calling Close multiple times is safe; the first error that occurs while
 // unmapping a file is returned.
-func (s *Store) Close() error {
+func (s *store) Close() error {
 	if s == nil {
 		return nil
 	}
@@ -330,7 +319,7 @@ func (s *Store) Close() error {
 // TreeIter returns a streaming iterator over the contents of the tree object
 // identified by oid.  The caller must consume the iterator before the returned
 // raw slice would otherwise be garbage‑collected.
-func (s *Store) TreeIter(oid Hash) (*TreeIter, error) {
+func (s *store) TreeIter(oid Hash) (*TreeIter, error) {
 	raw, typ, err := s.Get(oid)
 	if err != nil {
 		return nil, err
@@ -353,17 +342,17 @@ func (s *Store) TreeIter(oid Hash) (*TreeIter, error) {
 //
 // On a miss, Get inflates the object from the underlying packfile.
 // If the object is stored as a delta, the method follows the delta chain—
-// capped by Store.maxDeltaDepth—until it reaches the base object, then
+// capped by store.maxDeltaDepth—until it reaches the base object, then
 // applies each delta in order to reconstruct the full byte stream.
 //
-// When Store.VerifyCRC is true, Get validates the CRC-32 checksum recorded
+// When store.VerifyCRC is true, Get validates the CRC-32 checksum recorded
 // in the corresponding *.idx file (or multi-pack-index v2) and returns an
 // error on mismatch.
 //
 // The returned slice is always a fresh allocation; callers may mutate it at
 // will.
 // Get is safe for concurrent use by multiple goroutines.
-func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
+func (s *store) Get(oid Hash) ([]byte, ObjectType, error) {
 	// Fast path: check the tiny "delta window" that holds the most recently
 	// materialized objects, which are likely to be referenced by upcoming
 	// deltas.
@@ -386,16 +375,16 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 // inflateFromPack materializes the Git object that starts at off inside the
 // memory-mapped pack p.
 //
-// The helper is the workhorse of Store.Get. It
+// The helper is the workhorse of store.Get. It
 //   - peeks at the pack header to determine the on-disk type with
 //     peekObjectType, short-circuiting OBJ_COMMIT objects that can be served
 //     from the commit-graph;
 //   - inflates non-delta objects directly with readRawObject;
 //   - resolves both ref-delta and ofs-delta chains recursively via
-//     deltaContext, bounded by Store.maxDeltaDepth and with cycle detection;
+//     deltaContext, bounded by store.maxDeltaDepth and with cycle detection;
 //   - applies delta instructions with applyDelta to reconstruct the full
 //     byte stream; and
-//   - verifies CRC-32 checksums when Store.VerifyCRC is enabled, using either
+//   - verifies CRC-32 checksums when store.VerifyCRC is enabled, using either
 //     the *.idx side-file or, for multi-pack-index v2, the MIDX CRC table.
 //
 // A successful call returns a freshly-allocated buffer that the caller may
@@ -403,10 +392,10 @@ func (s *Store) Get(oid Hash) ([]byte, ObjectType, error) {
 // It returns ObjBad and a non-nil error when header parsing, delta
 // resolution, decompression, or CRC validation fails.
 //
-// The method is read-only with respect to *Store (aside from its caches) and
+// The method is read-only with respect to *store (aside from its caches) and
 // is safe for concurrent use; all shared state mutation is confined to the
 // cache helpers, which are internally synchronized.
-func (s *Store) inflateFromPack(
+func (s *store) inflateFromPack(
 	p *mmap.ReaderAt,
 	off uint64,
 	oid Hash,
@@ -476,7 +465,7 @@ func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
 }
 
 // getWithContext handles object retrieval with delta cycle detection.
-func (s *Store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
+func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
 		b.Release()
@@ -664,7 +653,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 //
 // At most ctx.maxDepth hops are followed and ctx.detect… helpers prevent
 // cycles in both ref‑ and ofs‑deltas.
-func (s *Store) inflateDeltaChain(
+func (s *store) inflateDeltaChain(
 	p *mmap.ReaderAt,
 	off uint64,
 	oid Hash,
@@ -699,7 +688,7 @@ func (s *Store) inflateDeltaChain(
 			return nil, ObjBad, err
 		}
 
-		// Record this hop’s delta stream.
+		// Record this hop's delta stream.
 		chain = append(chain, hop{delta: deltaBuf})
 
 		// Advance to the referenced base.
@@ -762,12 +751,12 @@ func (s *Store) inflateDeltaChain(
 // VerifyPackTrailers re-computes that checksum for each unique *.pack mapping
 // and returns an error if any mismatch is found.
 //
-// The method is a no-op unless the caller has enabled Store.VerifyCRC.
+// The method is a no-op unless the caller has enabled store.VerifyCRC.
 // It is safe for concurrent use; all work is performed on local variables and
-// no shared state in *Store is mutated.
+// no shared state in *store is mutated.
 // Repeated invocations are cheap—the same mmap handle is processed only once
 // during a single call.
-func (s *Store) verifyPackTrailers() error {
+func (s *store) verifyPackTrailers() error {
 	if !s.VerifyCRC {
 		return nil
 	}
@@ -789,7 +778,7 @@ func (s *Store) verifyPackTrailers() error {
 	return nil
 }
 
-// (s *Store) findCRCForObject returns the CRC-32 checksum Git recorded for
+// (s *store) findCRCForObject returns the CRC-32 checksum Git recorded for
 // the object identified by oid.
 //
 // It looks for the checksum in the per-pack *.idx files first and, if it
@@ -798,9 +787,9 @@ func (s *Store) verifyPackTrailers() error {
 //
 // The bool result reports whether a checksum was found.
 // The method is read-only, safe for concurrent use, and does not depend on
-// Store.VerifyCRC—that flag merely controls whether the caller decides to
+// store.VerifyCRC—that flag merely controls whether the caller decides to
 // invoke this helper.
-func (s *Store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32, bool) {
+func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32, bool) {
 	for _, pf := range s.packs {
 		if pf.pack == p && pf.entriesByOff != nil {
 			if entry, ok := pf.entriesByOff[off]; ok {
@@ -834,7 +823,7 @@ func (s *Store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32
 	return 0, false
 }
 
-// (s *Store) verifyCRCForPackObject validates the CRC-32 checksum of the
+// (s *store) verifyCRCForPackObject validates the CRC-32 checksum of the
 // object that starts at byte offset off inside the memory-mapped pack p.
 //
 // The helper locates the corresponding idxFile in s.packs and delegates the
@@ -846,7 +835,7 @@ func (s *Store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32
 //
 // An error is returned when either the pack cannot be located or the checksum
 // does not match.
-func (s *Store) verifyCRCForPackObject(p *mmap.ReaderAt, off uint64, crc uint32) error {
+func (s *store) verifyCRCForPackObject(p *mmap.ReaderAt, off uint64, crc uint32) error {
 	for _, pf := range s.packs {
 		if pf.pack == p {
 			if pf.sortedOffsets == nil {

@@ -1,3 +1,9 @@
+// store_test_helpers.go provides test helpers for accessing unexported store functionality.
+//
+// This file contains functions that are only intended for use in tests to access
+// the unexported store type and open function. These helpers should not be used
+// in production code.
+
 package objstore
 
 import (
@@ -432,4 +438,11 @@ func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]b
 	buf.Write(compressedDelta.Bytes())
 
 	return buf.Bytes(), nil
+}
+
+// OpenForTesting is a test helper that provides access to the unexported open function.
+// This function should only be used in tests that need direct access to the store
+// functionality. Production code should use NewHistoryScanner instead.
+func OpenForTesting(dir string) (*store, error) {
+	return open(dir)
 }

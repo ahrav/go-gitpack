@@ -74,6 +74,10 @@ type CommitGraphData struct {
 	// TreeOIDs records the root tree OID for each commit in OrderedOIDs.
 	TreeOIDs []Hash
 
+	// Timestamps records the author timestamp, in seconds since the Unix epoch,
+	// for each commit in OrderedOIDs.
+	Timestamps []int64
+
 	// OIDToIndex provides O(1) reverse lookup from a commit OID to its
 	// index within OrderedOIDs and the parallel metadata slices.
 	OIDToIndex map[Hash]int
@@ -112,15 +116,18 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 	}
 
 	// Parse every graph file in the chain and concatenate their data.
-	var allOids []Hash
-	var allTrees []Hash
+	var (
+		allOids  []Hash
+		allTrees []Hash
+		allTimes []int64
+	)
 	fileInfo := make([]parsedGraph, len(chain))
 
 	for i, path := range chain {
 		pg, err := parseGraphFile(path)
 		if err != nil {
 			// Close opened mmaps before returning.
-			for j := 0; j < i; j++ {
+			for j := range i {
 				fileInfo[j].mr.Close()
 			}
 			return nil, err
@@ -128,6 +135,7 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 		fileInfo[i] = pg
 		allOids = append(allOids, pg.oids...)
 		allTrees = append(allTrees, pg.trees...)
+		allTimes = append(allTimes, pg.times...)
 	}
 
 	if len(allOids) != len(allTrees) {
@@ -168,6 +176,7 @@ func LoadCommitGraph(objectsDir string) (*CommitGraphData, error) {
 		Parents:     parents,
 		OrderedOIDs: allOids,
 		TreeOIDs:    allTrees,
+		Timestamps:  allTimes,
 		OIDToIndex:  oidToIndex,
 	}, nil
 }
@@ -383,8 +392,8 @@ func parseGraphFile(path string) (parsedGraph, error) {
 	if _, err = mr.ReadAt(hdr[:], 0); err != nil {
 		return parsedGraph{}, err
 	}
-	if string(hdr[0:4]) != graphSignature {
-		return parsedGraph{}, fmt.Errorf("bad commit-graph signature: got %q, expected %q", string(hdr[0:4]), graphSignature)
+	if btostr(hdr[0:4]) != graphSignature {
+		return parsedGraph{}, fmt.Errorf("bad commit-graph signature: got %q, expected %q", btostr(hdr[0:4]), graphSignature)
 	}
 	if hdr[4] != 1 && hdr[4] != 2 {
 		return parsedGraph{}, fmt.Errorf("unsupported graph version %d", hdr[4])

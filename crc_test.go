@@ -29,7 +29,7 @@ func TestVerifyCRC32_ValidObject(t *testing.T) {
 	idxPath := filepath.Join(dir, "test.idx")
 	require.NoError(t, createV2IndexFile(idxPath, []Hash{hash}, []uint64{12}))
 
-	store, err := Open(dir)
+	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -199,7 +199,7 @@ func TestStore_VerifyPackTrailers(t *testing.T) {
 	createValidPackWithTrailer(t, filepath.Join(dir, "good.pack"))
 	createCorruptPackWithTrailer(t, filepath.Join(dir, "bad.pack"))
 
-	store, err := Open(dir)
+	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 

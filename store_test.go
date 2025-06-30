@@ -25,7 +25,7 @@ type packObjectsInfo struct {
 func TestOpen(t *testing.T) {
 	t.Run("empty directory returns empty store", func(t *testing.T) {
 		emptyDir := t.TempDir()
-		store, err := Open(emptyDir)
+		store, err := OpenForTesting(emptyDir)
 		require.NoError(t, err)
 		require.NotNil(t, store)
 		defer store.Close()
@@ -41,7 +41,7 @@ func TestOpen(t *testing.T) {
 
 		require.NoError(t, os.WriteFile(packPath, []byte("PACK"), 0644))
 
-		_, err := Open(dir)
+		_, err := OpenForTesting(dir)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "mmap idx")
 	})
@@ -54,7 +54,7 @@ func TestOpen(t *testing.T) {
 		require.NoError(t, os.WriteFile(packPath, []byte("invalid"), 0644))
 		require.NoError(t, os.WriteFile(idxPath, []byte("invalid"), 0644))
 
-		_, err := Open(dir)
+		_, err := OpenForTesting(dir)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "parse idx")
 	})
@@ -63,7 +63,7 @@ func TestOpen(t *testing.T) {
 		packPath, _, cleanup := createTestPackWithDelta(t)
 		defer cleanup()
 
-		store, err := Open(filepath.Dir(packPath))
+		store, err := OpenForTesting(filepath.Dir(packPath))
 		require.NoError(t, err)
 		defer store.Close()
 
@@ -87,7 +87,7 @@ func TestOpen(t *testing.T) {
 			require.NoError(t, createV2IndexFile(idxPath, []Hash{hash}, []uint64{12}))
 		}
 
-		store, err := Open(dir)
+		store, err := OpenForTesting(dir)
 		require.NoError(t, err)
 		defer store.Close()
 
@@ -249,7 +249,7 @@ func TestStoreBasic(t *testing.T) {
 
 	packDir := filepath.Dir(packPath)
 
-	store, err := Open(packDir)
+	store, err := OpenForTesting(packDir)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -296,7 +296,7 @@ func TestCacheEviction(t *testing.T) {
 	packPath, _, cleanup := createTestPackWithDelta(t)
 	defer cleanup()
 
-	store, err := Open(filepath.Dir(packPath))
+	store, err := OpenForTesting(filepath.Dir(packPath))
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -341,16 +341,16 @@ func TestDeltaCycleDetection(t *testing.T) {
 	assert.Error(t, ctx2.checkRefDelta(hash3), "Should hit depth limit")
 }
 
-func ExampleStore() {
-	store, err := Open("/path/to/repo/.git/objects/pack")
+func ExampleHistoryScanner() {
+	scanner, err := NewHistoryScanner("/path/to/repo/.git")
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
 	}
-	defer store.Close()
+	defer scanner.Close()
 
 	hash, _ := ParseHash("89e5a3e7d8f6c4b2a1e0d9c8b7a6f5e4d3c2b1a0")
-	data, objType, err := store.Get(hash)
+	data, objType, err := scanner.Get(hash)
 	if err != nil {
 		fmt.Printf("Object not found: %v\n", err)
 		return
@@ -404,7 +404,7 @@ func packObjects(b *testing.B, repoDir, packDir string) {
 func benchmarkGet(b *testing.B, cacheWarm bool) {
 	packDir := setupBenchmarkRepo(b)
 
-	store, err := Open(packDir)
+	store, err := OpenForTesting(packDir)
 	require.NoError(b, err)
 	defer store.Close()
 
@@ -463,7 +463,7 @@ func BenchmarkOpen(b *testing.B) {
 
 	b.SetBytes(int64(len(packDir)))
 	for b.Loop() {
-		s, err := Open(packDir)
+		s, err := OpenForTesting(packDir)
 		require.NoError(b, err)
 		s.Close()
 	}
@@ -537,7 +537,7 @@ func TestTinyRepoHappyPath(t *testing.T) {
 		[]uint64{12},
 	))
 
-	store, err := Open(dir)
+	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -615,7 +615,7 @@ func TestStore_DeltaObjectRetrieval(t *testing.T) {
 		packPath, _, cleanup := createTestPackWithDelta(t)
 		defer cleanup()
 
-		store, err := Open(filepath.Dir(packPath))
+		store, err := OpenForTesting(filepath.Dir(packPath))
 		require.NoError(t, err)
 		defer store.Close()
 
@@ -646,7 +646,7 @@ func TestStore_DeltaObjectRetrieval(t *testing.T) {
 		packPath, _, cleanup := createTestPackWithDelta(t)
 		defer cleanup()
 
-		store, err := Open(filepath.Dir(packPath))
+		store, err := OpenForTesting(filepath.Dir(packPath))
 		require.NoError(t, err)
 		defer store.Close()
 

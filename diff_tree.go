@@ -37,15 +37,14 @@ import (
 // Concurrency / side-effects: walkDiff itself is single-threaded and free of
 // global state; callers may invoke it concurrently on separate Stores.
 func walkDiff(
-	tc *Store,
-	oldTree Hash,
-	newTree Hash,
-	prefix string, // path prefix accumulated so far ("" for the root)
-	fn func(path string, old, newH Hash, mode uint32) error,
+	tc *store,
+	oldTreeOID, newTreeOID Hash,
+	prefix string,
+	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
 
 	// Fast path: identical sub-tree ⇒ nothing to do.
-	if oldTree == newTree {
+	if oldTreeOID == newTreeOID {
 		return nil
 	}
 
@@ -58,16 +57,16 @@ func walkDiff(
 		return tc.TreeIter(h)
 	}
 
-	oldIter, err := iterFor(oldTree)
+	oldIter, err := iterFor(oldTreeOID)
 	if err != nil {
 		return err
 	}
-	newIter, err := iterFor(newTree)
+	newIter, err := iterFor(newTreeOID)
 	if err != nil {
 		return err
 	}
 
-	// State of the “current” entry of each iterator.
+	// State of the "current" entry of each iterator.
 	var (
 		oln, nln         string // names
 		oidOld, oidNew   Hash
@@ -76,7 +75,7 @@ func walkDiff(
 	)
 
 	// nextOld / nextNew advance the respective iterators and normalize EOF to
-	// ok* == false so the main loop can treat “exhausted” like “empty”.
+	// ok* == false so the main loop can treat "exhausted" like "empty".
 	nextOld := func() error {
 		if oldIter == nil {
 			okOld = false
@@ -185,14 +184,14 @@ func walkDiff(
 //
 // If the entry is a directory (mode & 040000 != 0) it recurses into the
 // sub-tree so that the user callback is eventually invoked once per *file*.
-// For regular files it calls fn immediately, passing Hash{} for the “old”
+// For regular files it calls fn immediately, passing Hash{} for the "old"
 // object ID.
 func handleAdd(
-	tc *Store,
+	tc *store,
 	prefix, name string,
 	oid Hash,
 	mode uint32,
-	fn func(path string, old, newH Hash, mode uint32) error,
+	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
 	if mode&040000 != 0 { // directory
 		return walkDiff(tc, Hash{}, oid, filepath.Join(prefix, name), fn)
@@ -204,14 +203,14 @@ func handleAdd(
 //
 // If the entry is a directory it recurses into the sub-tree so that fn is
 // eventually called for each file that vanished.
-// For regular files it calls fn immediately, passing Hash{} for the “new”
+// For regular files it calls fn immediately, passing Hash{} for the "new"
 // object ID to signal that the file no longer exists.
 func handleDel(
-	tc *Store,
+	tc *store,
 	prefix, name string,
 	oid Hash,
 	mode uint32,
-	fn func(path string, old, newH Hash, mode uint32) error,
+	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
 	if mode&040000 != 0 { // directory
 		return walkDiff(tc, oid, Hash{}, filepath.Join(prefix, name), fn)

@@ -62,8 +62,8 @@ func diffTestOctStr(n uint32) string {
 }
 
 // buildTestStore creates a Store with pre-cached tree objects for testing.
-func buildTestStore(trees map[Hash][]byte) *Store {
-	store := &Store{
+func buildTestStore(trees map[Hash][]byte) *store {
+	store := &store{
 		maxDeltaDepth: defaultMaxDeltaDepth,
 		packs:         []*idxFile{},
 		packMap:       make(map[string]*mmap.ReaderAt),
@@ -91,7 +91,7 @@ type change struct {
 	NewMode  uint32
 }
 
-func collect(tc *Store, parent, child Hash, prefix string) ([]change, error) {
+func collect(tc *store, parent, child Hash, prefix string) ([]change, error) {
 	var out []change
 	err := walkDiff(tc, parent, child, prefix, func(p string, old, new Hash, mode uint32) error {
 		out = append(out, change{p, old, new, mode})
@@ -110,7 +110,7 @@ func equalChanges(a, b []change) bool {
 }
 
 func TestWalkDiff_EmptyAndIdenticalTrees(t *testing.T) {
-	tc := &Store{}
+	tc := &store{}
 
 	ch, err := collect(tc, Hash{}, Hash{}, "")
 	assert.NoError(t, err)

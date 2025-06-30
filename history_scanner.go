@@ -5,6 +5,58 @@
 // parents, timestamp) without inflating full commit objects, enabling fast
 // repository traversal and change detection.
 //
+// USAGE:
+//
+// The HistoryScanner provides the main entry point for accessing Git repository
+// data. It wraps an internal object store and exposes a clean public API:
+//
+//	// Open a Git repository
+//	scanner, err := objstore.NewHistoryScanner(".git")
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	defer scanner.Close()
+//
+//	// Configure scanner options
+//	scanner.SetMaxDeltaDepth(100)      // Adjust delta chain limits
+//	scanner.SetVerifyCRC(true)         // Enable integrity checking
+//
+//	// Access individual Git objects
+//	data, objType, err := scanner.Get(oid)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Iterate over tree contents
+//	iter, err := scanner.TreeIter(treeOID)
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//	for {
+//	    name, childOID, mode, ok, err := iter.Next()
+//	    if err != nil || !ok {
+//	        break
+//	    }
+//	    fmt.Printf("%s: %x (mode: %o)\n", name, childOID, mode)
+//	}
+//
+//	// Load all commits from commit-graph
+//	commits, err := scanner.LoadAllCommits()
+//	if err != nil {
+//	    log.Fatal(err)
+//	}
+//
+//	// Stream commit diffs concurrently
+//	additions, errors := scanner.DiffHistory()
+//	go func() {
+//	    for addition := range additions {
+//	        fmt.Printf("+ %s: %s\n", addition.Path, addition.Lines)
+//	    }
+//	}()
+//	if err := <-errors; err != nil {
+//	    log.Fatal(err)
+//	}
+//
 // IMPLEMENTATION:
 // The scanner currently requires commit-graph files for O(commits) scanning
 // with commits processed concurrently for maximum throughput. A fallback mechanism to enumerate
@@ -58,7 +110,7 @@ type CommitInfo struct {
 type HistoryScanner struct {
 	// store backs object retrieval and remains read-only for the lifetime
 	// of the scanner.
-	store *Store
+	store *store
 
 	// graphData is the parsed commit-graph for the repository.
 	// It is nil when the repository lacks a commit-graph file, in which
@@ -93,7 +145,7 @@ var ErrCommitGraphRequired = errors.New("commit-graph required but not found")
 // to release any mmap handles held by the store.
 func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 	packDir := filepath.Join(gitDir, "objects", "pack")
-	store, err := Open(packDir)
+	store, err := open(packDir)
 	if err != nil {
 		return nil, fmt.Errorf("open object store: %w", err)
 	}
@@ -229,7 +281,7 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 
 // processCommitStreaming handles diff computation for a single commit and streams
 // additions directly to the output channel.
-func (hs *HistoryScanner) processCommitStreaming(tc *Store, c CommitInfo, out chan<- Addition) error {
+func (hs *HistoryScanner) processCommitStreaming(tc *store, c CommitInfo, out chan<- Addition) error {
 	parents := c.ParentOIDs
 	if len(parents) == 0 {
 		// Root commit: diff against the implicit empty tree (Hash{}).
@@ -262,7 +314,7 @@ func (hs *HistoryScanner) processCommitStreaming(tc *Store, c CommitInfo, out ch
 }
 
 // processCommit handles diff computation for a single commit.
-func (hs *HistoryScanner) processCommit(tc *Store, c CommitInfo) ([]Addition, error) {
+func (hs *HistoryScanner) processCommit(tc *store, c CommitInfo) ([]Addition, error) {
 	var additions []Addition
 
 	parents := c.ParentOIDs
@@ -298,11 +350,42 @@ func (hs *HistoryScanner) processCommit(tc *Store, c CommitInfo) ([]Addition, er
 	return additions, err
 }
 
-// GetStore returns the read-only object store that the HistoryScanner uses to
-// load Git objects.
-// Callers must treat the returned *Store as immutable for the lifetime of the
-// scanner.
-func (hs *HistoryScanner) GetStore() *Store { return hs.store }
+// Get returns the fully materialized Git object identified by oid together
+// with its on-disk ObjectType.
+//
+// This method delegates to the underlying store and provides the same
+// functionality as the store's Get method. See store.Get for detailed
+// documentation on caching, delta resolution, and CRC verification.
+func (hs *HistoryScanner) Get(oid Hash) ([]byte, ObjectType, error) {
+	return hs.store.Get(oid)
+}
+
+// TreeIter returns a streaming iterator over the contents of the tree object
+// identified by oid.
+//
+// This method delegates to the underlying store. The caller must consume the
+// iterator before the returned raw slice would otherwise be garbage‑collected.
+func (hs *HistoryScanner) TreeIter(oid Hash) (*TreeIter, error) {
+	return hs.store.TreeIter(oid)
+}
+
+// SetMaxDeltaDepth sets the maximum delta chain depth for object retrieval.
+//
+// This method delegates to the underlying store. See store.SetMaxDeltaDepth
+// for detailed documentation on the implications of different depth values.
+func (hs *HistoryScanner) SetMaxDeltaDepth(depth int) {
+	hs.store.SetMaxDeltaDepth(depth)
+}
+
+// SetVerifyCRC enables or disables CRC-32 validation for all object reads.
+//
+// When enabled, the scanner validates CRC-32 checksums for each object read
+// from packfiles. This provides additional integrity checking at the cost of
+// some performance. See the store documentation for details on CRC verification
+// behavior with different pack types.
+func (hs *HistoryScanner) SetVerifyCRC(verify bool) {
+	hs.store.VerifyCRC = verify
+}
 
 // Close releases any mmap handles or file descriptors held by the underlying
 // object store.

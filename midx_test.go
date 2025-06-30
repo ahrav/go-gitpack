@@ -185,7 +185,7 @@ func TestStoreWithMidx(t *testing.T) {
 	createValidMidxFile(t, dir, filepath.Base(packPath), []Hash{oid}, []uint64{12})
 
 	// Open() must pick the .midx automatically.
-	store, err := Open(dir)
+	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -593,7 +593,7 @@ func BenchmarkOpenWithMidx(b *testing.B) {
 
 	b.ResetTimer()
 	for b.Loop() {
-		store, err := Open(packDir)
+		store, err := OpenForTesting(packDir)
 		require.NoError(b, err)
 
 		// Verify that the midx was successfully loaded and utilized.
@@ -609,7 +609,7 @@ func BenchmarkOpenWithMidx(b *testing.B) {
 func BenchmarkGetMidxCold(b *testing.B) {
 	packDir := setupBenchmarkRepoWithMidx(b)
 
-	store, err := Open(packDir)
+	store, err := OpenForTesting(packDir)
 	require.NoError(b, err)
 	defer store.Close()
 
@@ -638,7 +638,7 @@ func BenchmarkGetMidxCold(b *testing.B) {
 func BenchmarkGetMidxWarm(b *testing.B) {
 	packDir := setupBenchmarkRepoWithMidx(b)
 
-	store, err := Open(packDir)
+	store, err := OpenForTesting(packDir)
 	require.NoError(b, err)
 	defer store.Close()
 
@@ -669,7 +669,7 @@ func BenchmarkGetMidxWarm(b *testing.B) {
 func BenchmarkFindObject_MidxVsIdx(b *testing.B) {
 	packDir := setupBenchmarkRepoWithMidx(b)
 
-	store, err := Open(packDir)
+	store, err := OpenForTesting(packDir)
 	require.NoError(b, err)
 	defer store.Close()
 
@@ -718,7 +718,7 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 	b.Run("with_midx", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			store, err := Open(packDir)
+			store, err := OpenForTesting(packDir)
 			require.NoError(b, err)
 
 			// Exercise the data structures to ensure realistic allocation patterns.
@@ -739,7 +739,7 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 	b.Run("without_midx", func(b *testing.B) {
 		b.ReportAllocs()
 		for b.Loop() {
-			store, err := Open(packDir)
+			store, err := OpenForTesting(packDir)
 			require.NoError(b, err)
 
 			// Perform equivalent operations using traditional pack index lookup.
@@ -768,7 +768,7 @@ func TestStore_MidxOnly_NoIdx(t *testing.T) {
 	createValidMidxFile(t, dir, filepath.Base(pack), []Hash{oid}, []uint64{12})
 	require.NoError(t, os.Remove(idxPath)) // simulate "only midx"
 
-	store, err := Open(dir)
+	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -821,7 +821,7 @@ func TestCRCVerification(t *testing.T) {
 	require.NoError(t, err)
 
 	// Open store & fetch object with CRC verification.
-	store, err := Open(packDir)
+	store, err := OpenForTesting(packDir)
 	require.NoError(t, err)
 	defer store.Close()
 	store.VerifyCRC = true
@@ -833,7 +833,7 @@ func TestCRCVerification(t *testing.T) {
 func TestMidxFanoutAcrossPacks(t *testing.T) {
 	packDir := setupBenchmarkRepoWithMidx(t)
 
-	store, err := Open(packDir)
+	store, err := OpenForTesting(packDir)
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -914,7 +914,7 @@ func TestThinPackCrossPackViaMidx(t *testing.T) {
 	)
 
 	// Verify that the store can resolve cross-pack deltas.
-	store, err := Open(dir)
+	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 
