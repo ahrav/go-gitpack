@@ -152,8 +152,8 @@ func TestDiffHistory(t *testing.T) {
 			additionCount := 0
 
 			for add := range additions {
-				filesFound[add.Path] = true
-				additionCount += len(add.Lines)
+				filesFound[add.path] = true
+				additionCount++
 			}
 
 			err := <-errC
@@ -258,9 +258,9 @@ func TestDiffHistory_LargeRepo(t *testing.T) {
 	linesByFile := make(map[string]int)
 
 	for add := range additions {
-		filesFound[add.Path] = true
-		additionCount += len(add.Lines)
-		linesByFile[add.Path] += len(add.Lines)
+		filesFound[add.path] = true
+		additionCount++
+		linesByFile[add.path]++
 	}
 
 	err := <-errC
@@ -298,9 +298,9 @@ func TestDiffHistory_VeryLargeRepo(t *testing.T) {
 	linesByFile := make(map[string]int)
 
 	for add := range additions {
-		filesFound[add.Path] = true
-		additionCount += len(add.Lines)
-		linesByFile[add.Path] += len(add.Lines)
+		filesFound[add.path] = true
+		additionCount++
+		linesByFile[add.path]++
 	}
 
 	err := <-errC
@@ -338,8 +338,8 @@ func TestDiffHistory_SuperLargeRepo(t *testing.T) {
 	additionCount := 0
 
 	for add := range additions {
-		filesFound[add.Path] = true
-		additionCount += len(add.Lines)
+		filesFound[add.path] = true
+		additionCount++
 	}
 
 	err := <-errC

@@ -116,6 +116,9 @@ type HistoryScanner struct {
 	// It is nil when the repository lacks a commit-graph file, in which
 	// case the scanner falls back to packfile enumeration.
 	graphData *commitGraphData
+
+	// meta provides cached access to commit author/committer metadata
+	meta *metaCache
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -161,28 +164,58 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 		return nil, ErrCommitGraphRequired
 	}
 
-	return &HistoryScanner{store: store, graphData: graph}, nil
+	mc := newMetaCache(graph, store)
+
+	return &HistoryScanner{
+		store:     store,
+		graphData: graph,
+		meta:      mc,
+	}, nil
 }
 
-// addition holds metadata for a single "+" line that a commit introduced.
+// Addition holds metadata for a single "+" line that a commit introduced.
 //
-// Values of addition are streamed by HistoryScanner.DiffHistory concurrently,
+// Values of Addition are streamed by HistoryScanner.DiffHistory concurrently,
 // enabling callers to process repository changes incrementally without
 // materializing whole diffs or commits in memory.
-type addition struct {
-	// Commit identifies the commit that introduced the added line.
-	Commit Hash
+type Addition struct {
+	// commit identifies the commit that introduced the added line.
+	commit Hash
 
-	// Path specifies the file to which the line was added.
+	// path specifies the file to which the line was added.
 	// It always uses forward-slash (Unix style) separators, independent
 	// of the host operating system.
-	Path string
+	path string
 
-	// Lines contains the raw bytes of the added line without the leading
-	// "+" diff marker. The outer slice allows the caller to handle data
-	// in its original chunking or regroup it as needed.
-	Lines [][]byte
+	// line is the 1-based line number in the new version of the file
+	line int
+
+	// text contains the raw bytes of the added line without the leading
+	// "+" diff marker.
+	text []byte
 }
+
+// String returns a human-readable representation of the addition.
+func (a *Addition) String() string { return fmt.Sprintf("%s: %s:%d", a.commit, a.path, a.line) }
+
+// Lines returns the raw bytes of the added line without the leading
+// "+" diff marker. The outer slice allows the caller to handle data
+// in its original chunking or regroup it as needed.
+func (a *Addition) Lines() [][]byte { return [][]byte{a.text} }
+
+// Text returns the raw bytes of the added line.
+func (a *Addition) Text() []byte { return a.text }
+
+// Line returns the 1-based line number in the new version of the file.
+func (a *Addition) Line() int { return a.line }
+
+// Commit returns the commit that introduced the added line.
+func (a *Addition) Commit() Hash { return a.commit }
+
+// Path returns the file to which the line was added.
+// It always uses forward-slash (Unix style) separators, independent
+// of the host operating system.
+func (a *Addition) Path() string { return a.path }
 
 // DiffHistory streams every added line from all commits.
 //
@@ -204,10 +237,10 @@ type addition struct {
 // DiffHistory never blocks the caller: both the additions channel and the
 // error channel are pre-buffered.
 // A nil error sent on errC signals a graceful end-of-stream.
-func (hs *HistoryScanner) DiffHistory() (<-chan addition, <-chan error) {
+func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 	numWorkers := runtime.NumCPU()
 
-	out := make(chan addition, numWorkers)
+	out := make(chan Addition, numWorkers)
 	errC := make(chan error, 1)
 
 	go func() {
@@ -281,7 +314,7 @@ func (hs *HistoryScanner) DiffHistory() (<-chan addition, <-chan error) {
 
 // processCommitStreaming handles diff computation for a single commit and streams
 // additions directly to the output channel.
-func (hs *HistoryScanner) processCommitStreaming(tc *store, c commitInfo, out chan<- addition) error {
+func (hs *HistoryScanner) processCommitStreaming(tc *store, c commitInfo, out chan<- Addition) error {
 	parents := c.ParentOIDs
 	if len(parents) == 0 {
 		// Root commit: diff against the implicit empty tree (Hash{}).
@@ -300,22 +333,25 @@ func (hs *HistoryScanner) processCommitStreaming(tc *store, c commitInfo, out ch
 			return nil
 		}
 		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
-		// the empty object, which `addedLines` handles correctly.
+		// the empty object, which `addedLinesWithPos` handles correctly.
 		oldBytes, _, _ := hs.store.Get(old)
 		newBytes, _, _ := hs.store.Get(newH)
 
-		out <- addition{
-			Commit: c.OID,
-			Path:   filepath.ToSlash(path),
-			Lines:  addedLines(oldBytes, newBytes),
+		for _, al := range addedLinesWithPos(oldBytes, newBytes) {
+			out <- Addition{
+				commit: c.OID,
+				path:   filepath.ToSlash(path),
+				line:   al.Line,
+				text:   al.Text,
+			}
 		}
 		return nil
 	})
 }
 
 // processCommit handles diff computation for a single commit.
-func (hs *HistoryScanner) processCommit(tc *store, c commitInfo) ([]addition, error) {
-	var additions []addition
+func (hs *HistoryScanner) processCommit(tc *store, c commitInfo) ([]Addition, error) {
+	var additions []Addition
 
 	parents := c.ParentOIDs
 	if len(parents) == 0 {
@@ -335,15 +371,18 @@ func (hs *HistoryScanner) processCommit(tc *store, c commitInfo) ([]addition, er
 			return nil
 		}
 		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
-		// the empty object, which `addedLines` handles correctly.
+		// the empty object, which `addedLinesWithPos` handles correctly.
 		oldBytes, _, _ := hs.store.Get(old)
 		newBytes, _, _ := hs.store.Get(newH)
 
-		additions = append(additions, addition{
-			Commit: c.OID,
-			Path:   filepath.ToSlash(path),
-			Lines:  addedLines(oldBytes, newBytes),
-		})
+		for _, al := range addedLinesWithPos(oldBytes, newBytes) {
+			additions = append(additions, Addition{
+				commit: c.OID,
+				path:   filepath.ToSlash(path),
+				line:   al.Line,
+				text:   al.Text,
+			})
+		}
 		return nil
 	})
 
@@ -389,6 +428,16 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // object store.
 // It is safe to call Close multiple times; subsequent calls are no-ops.
 func (hs *HistoryScanner) Close() error { return hs.store.Close() }
+
+// Timestamp returns the commit's committer time (Unix seconds) if known.
+func (hs *HistoryScanner) Timestamp(oid Hash) (int64, bool) {
+	return hs.meta.timestamp(oid)
+}
+
+// Author lazily inflates the commit header once and returns author info.
+func (hs *HistoryScanner) Author(oid Hash) (AuthorInfo, error) {
+	return hs.meta.author(oid)
+}
 
 // LoadAllCommits returns all commits in commit-graph storage order.
 //
