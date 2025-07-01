@@ -744,6 +744,120 @@ func (s *store) inflateDeltaChain(
 	return out, baseType, nil
 }
 
+const maxHdr = 4096
+
+// zrPool reuses zlib.Reader instances to reduce allocations.
+// We create a fresh one on demand the first time New() is hit, because
+// there is no exported zero-value constructor for zlib.Reader.
+var zrPool = sync.Pool{New: func() any { return nil }}
+
+// bufPool returns a 0-length slice with a 4 KiB backing array,
+// just large enough for the worst-case header we are willing to read.
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, maxHdr)
+		return &b
+	},
+}
+
+// getZlibReader fetches a reader from zrPool or allocates a new one and
+// resets it to src.
+func getZlibReader(src io.Reader) (io.ReadCloser, error) {
+	if v := zrPool.Get(); v != nil {
+		if zr, ok := v.(interface {
+			Reset(io.Reader, io.Reader) error
+		}); ok {
+			if err := zr.Reset(src, nil); err == nil {
+				return zr.(io.ReadCloser), nil
+			}
+		}
+		// Could not reset (corrupt stream) - fall through to fresh alloc.
+	}
+	return zlib.NewReader(src)
+}
+
+// putZlibReader returns r to the pool.
+func putZlibReader(r io.ReadCloser) { zrPool.Put(r) }
+
+// readUntilLF returns one complete line—including the terminating
+// '\n' byte—read from r.
+func readUntilLF(r io.Reader) ([]byte, error) {
+	var line []byte
+	var b [1]byte
+	for {
+		n, err := r.Read(b[:])
+		if n == 1 {
+			line = append(line, b[0])
+			if b[0] == '\n' { // done
+				return line, nil
+			}
+		}
+		if err != nil {
+			return line, err
+		}
+	}
+}
+
+// findPackedObject locates oid in any mapped packfile and returns the
+// pack handle, its byte offset, and ok == true on success.
+// It falls back to the multi-pack-index when available.
+func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
+	if s.midx != nil {
+		if p, off, ok := s.midx.findObject(oid); ok {
+			return p, off, true
+		}
+	}
+	for _, pf := range s.packs {
+		if off, ok := pf.findObject(oid); ok {
+			return pf.pack, off, true
+		}
+	}
+	return nil, 0, false
+}
+
+// readCommitHeader inflates at most 4 KiB of a commit object and returns
+// the raw header up to (and including) the first author/committer line.
+func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
+	// Locate commit object and skip the generic object header.
+	p, off, ok := s.findPackedObject(oid)
+	if !ok {
+		return nil, fmt.Errorf("object %x not found", oid)
+	}
+	typ, hdrLen, err := peekObjectType(p, off)
+	if err != nil {
+		return nil, err
+	}
+	if typ != ObjCommit {
+		return nil, fmt.Errorf("%x is not a commit", oid)
+	}
+	off += uint64(hdrLen)
+
+	// Decompress only as far as necessary (usually < 512 B).
+	zr, err := getZlibReader(io.NewSectionReader(p, int64(off), 1<<63-1))
+	if err != nil {
+		return nil, err
+	}
+	defer putZlibReader(zr)
+
+	buf := bufPool.Get().(*[]byte)
+	defer bufPool.Put(buf)
+
+	for len(*buf) < maxHdr {
+		line, err := readUntilLF(zr)
+		*buf = append(*buf, line...)
+		if bytes.HasPrefix(line, []byte("author ")) ||
+			bytes.HasPrefix(line, []byte("committer ")) {
+			// We have the line we were looking for - copy and return.
+			return append([]byte(nil), *buf...), nil
+		}
+		if err != nil { // EOF before finding the author/committer line
+			return nil, err
+		}
+	}
+
+	return nil, fmt.Errorf("commit header exceeds %d bytes without author line", maxHdr)
+}
+
 // verifyPackTrailers validates the SHA-1 trailer that closes every mapped
 // packfile.
 //
