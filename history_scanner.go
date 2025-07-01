@@ -300,14 +300,14 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			}
 		}()
 
+		var firstErr error
 		for err := range errorChan {
-			if err != nil {
-				errC <- err
-				return
+			if err != nil && firstErr == nil {
+				firstErr = err
 			}
 		}
 
-		errC <- nil
+		errC <- firstErr
 	}()
 
 	return out, errC
