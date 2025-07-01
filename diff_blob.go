@@ -66,19 +66,19 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 				text := strings.TrimSuffix(ln.Content, "\n")
 
 				if currentHunk == nil {
-					// Start new hunk
+					// Start new hunk.
 					currentHunk = &AddedHunk{
 						StartLine: lineNo,
 						Lines:     [][]byte{[]byte(text)},
 					}
 				} else {
-					// Continue current hunk
+					// Continue current hunk.
 					currentHunk.Lines = append(currentHunk.Lines, []byte(text))
 				}
 				lineNo++
 
 			case gotextdiff.Equal, gotextdiff.Delete:
-				// End current hunk if we hit non-insertion
+				// End current hunk if we hit non-insertion.
 				if currentHunk != nil {
 					hunks = append(hunks, *currentHunk)
 					currentHunk = nil
@@ -89,7 +89,7 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 			}
 		}
 
-		// Don't forget the last hunk at end of this diff hunk
+		// Don't forget the last hunk at end of this diff hunk.
 		if currentHunk != nil {
 			hunks = append(hunks, *currentHunk)
 			currentHunk = nil

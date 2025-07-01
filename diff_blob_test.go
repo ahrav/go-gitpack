@@ -8,7 +8,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// Concurrency smoke‑test for map+mutex cache.
 func TestMetaCacheConcurrency(t *testing.T) {
 	// minimal fake objects
 	var h Hash
