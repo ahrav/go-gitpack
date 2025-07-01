@@ -350,7 +350,7 @@ func ExampleHistoryScanner() {
 	defer scanner.Close()
 
 	hash, _ := ParseHash("89e5a3e7d8f6c4b2a1e0d9c8b7a6f5e4d3c2b1a0")
-	data, objType, err := scanner.Get(hash)
+	data, objType, err := scanner.get(hash)
 	if err != nil {
 		fmt.Printf("Object not found: %v\n", err)
 		return

@@ -42,7 +42,7 @@ func TestCommitAttributionIntegration(t *testing.T) {
 				commit := commits[i]
 
 				// First verify this is actually a commit object
-				data, objType, err := scanner.Get(commit.OID)
+				data, objType, err := scanner.get(commit.OID)
 				if err != nil {
 					t.Logf("Skipping object %x: could not retrieve: %v", commit.OID, err)
 					continue
@@ -57,24 +57,20 @@ func TestCommitAttributionIntegration(t *testing.T) {
 				// Note: Empty data is expected for commit objects in this implementation
 				t.Logf("Testing commit %x (data len: %d)", commit.OID, len(data))
 
-				// Test Author method
-				ai, err := scanner.Author(commit.OID)
+				// Test GetCommitMetadata method.
+				meta, err := scanner.GetCommitMetadata(commit.OID)
 				if err != nil {
-					t.Logf("Skipping commit %x: could not get author: %v", commit.OID, err)
+					t.Logf("Skipping commit %x: could not get metadata: %v", commit.OID, err)
 					continue
 				}
 
-				assert.NotEmpty(t, ai.Name, "Author name should not be empty for commit %x", commit.OID)
-				assert.NotEmpty(t, ai.Email, "Author email should not be empty for commit %x", commit.OID)
-				assert.False(t, ai.When.IsZero(), "Author timestamp should not be zero for commit %x", commit.OID)
+				assert.NotEmpty(t, meta.Author.Name, "Author name should not be empty for commit %x", commit.OID)
+				assert.NotEmpty(t, meta.Author.Email, "Author email should not be empty for commit %x", commit.OID)
+				assert.False(t, meta.Author.When.IsZero(), "Author timestamp should not be zero for commit %x", commit.OID)
+				assert.Greater(t, meta.Timestamp, int64(0), "Timestamp should be positive for commit %x", commit.OID)
 
-				// Test Timestamp method
-				timestamp, found := scanner.Timestamp(commit.OID)
-				assert.True(t, found, "Should find timestamp for commit %x", commit.OID)
-				assert.Greater(t, timestamp, int64(0), "Timestamp should be positive for commit %x", commit.OID)
-
-				// Verify timestamp consistency between methods
-				assert.Equal(t, ai.When.Unix(), timestamp, "Timestamp from Author and Timestamp methods should match for commit %x", commit.OID)
+				// Verify timestamp consistency.
+				assert.Equal(t, meta.Author.When.Unix(), meta.Timestamp, "Timestamp from AuthorInfo and CommitMetadata should match for commit %x", commit.OID)
 
 				validCommitsTested++
 			}

@@ -135,14 +135,21 @@ func TestMetaCacheTimestamp(t *testing.T) {
 				tt.setup(graph)
 			}
 
-			cache := &metaCache{
-				graph: graph,
-				ts:    graph.Timestamps,
+			mockReader := newMockCommitHeaderReader()
+			// Add commit data for all test OIDs that should be found
+			if tt.wantFound {
+				mockReader.addCommit(tt.oid, "Test Author", "test@example.com", tt.wantTS)
 			}
 
-			ts, found := cache.timestamp(tt.oid)
-			assert.Equal(t, tt.wantTS, ts)
-			assert.Equal(t, tt.wantFound, found)
+			cache := newMetaCache(graph, mockReader)
+
+			metadata, err := cache.get(tt.oid)
+			if tt.wantFound {
+				assert.NoError(t, err)
+				assert.Equal(t, tt.wantTS, metadata.Timestamp)
+			} else {
+				assert.Error(t, err)
+			}
 		})
 	}
 }
@@ -292,31 +299,40 @@ func TestParseAuthorHeader(t *testing.T) {
 func TestMetaCacheAuthor(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo),
+	graph := &commitGraphData{
+		Timestamps: []int64{1000, 2000, 3000},
+		OIDToIndex: map[Hash]int{
+			{1, 2, 3}: 0,
+			{4, 5, 6}: 1,
+		},
 	}
+
+	metaCache := newMetaCache(graph, mockReader)
 
 	t.Run("successful retrieval and caching", func(t *testing.T) {
 		oid := Hash{1, 2, 3}
 		mockReader.addCommit(oid, "John Doe", "john@example.com", 1234567890)
 
-		ai1, err := metaCache.author(oid)
+		metadata1, err := metaCache.get(oid)
 		assert.NoError(t, err)
-		assert.Equal(t, "John Doe", ai1.Name)
-		assert.Equal(t, "john@example.com", ai1.Email)
-		assert.Equal(t, time.Unix(1234567890, 0).UTC(), ai1.When)
+		assert.Equal(t, "John Doe", metadata1.Author.Name)
+		assert.Equal(t, "john@example.com", metadata1.Author.Email)
+		assert.Equal(t, time.Unix(1234567890, 0).UTC(), metadata1.Author.When)
 
-		assert.Contains(t, metaCache.m, oid)
+		// Check caching
+		metaCache.mu.RLock()
+		_, cached := metaCache.m[oid]
+		metaCache.mu.RUnlock()
+		assert.True(t, cached)
 
-		ai2, err := metaCache.author(oid)
+		metadata2, err := metaCache.get(oid)
 		assert.NoError(t, err)
-		assert.Equal(t, ai1, ai2)
+		assert.Equal(t, metadata1.Author, metadata2.Author)
 	})
 
 	t.Run("object not found", func(t *testing.T) {
 		oid := Hash{99, 99, 99}
-		_, err := metaCache.author(oid)
+		_, err := metaCache.get(oid)
 		assert.Error(t, err)
 	})
 
@@ -324,7 +340,7 @@ func TestMetaCacheAuthor(t *testing.T) {
 		oid := Hash{4, 5, 6}
 		mockReader.addRawHeader(oid, []byte("invalid header"))
 
-		_, err := metaCache.author(oid)
+		_, err := metaCache.get(oid)
 		assert.Error(t, err)
 	})
 }
@@ -332,10 +348,19 @@ func TestMetaCacheAuthor(t *testing.T) {
 func TestMetaCacheConcurrentAccess(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo),
+	graph := &commitGraphData{
+		Timestamps: make([]int64, 50),
+		OIDToIndex: make(map[Hash]int),
 	}
+
+	// Setup graph data
+	for i := range 50 {
+		oid := Hash{byte(i)}
+		graph.OIDToIndex[oid] = i
+		graph.Timestamps[i] = int64(1500000000 + i)
+	}
+
+	metaCache := newMetaCache(graph, mockReader)
 
 	numObjects := 50
 	for i := range numObjects {
@@ -355,7 +380,7 @@ func TestMetaCacheConcurrentAccess(t *testing.T) {
 
 			for i := range numReadsPerGoroutine {
 				oid := Hash{byte(i % numObjects)}
-				ai, err := metaCache.author(oid)
+				metadata, err := metaCache.get(oid)
 
 				if err != nil {
 					errors <- fmt.Errorf("goroutine %d: %w", goroutine, err)
@@ -363,9 +388,9 @@ func TestMetaCacheConcurrentAccess(t *testing.T) {
 				}
 
 				expectedName := fmt.Sprintf("User%d", oid[0])
-				if ai.Name != expectedName {
+				if metadata.Author.Name != expectedName {
 					errors <- fmt.Errorf("goroutine %d: expected name %s, got %s",
-						goroutine, expectedName, ai.Name)
+						goroutine, expectedName, metadata.Author.Name)
 				}
 			}
 		}(g)
@@ -496,13 +521,17 @@ func BenchmarkParseAuthorHeader(b *testing.B) {
 func BenchmarkMetaCacheAuthor(b *testing.B) {
 	mockReader := newMockCommitHeaderReader()
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo),
+	graph := &commitGraphData{
+		Timestamps: make([]int64, 1000),
+		OIDToIndex: make(map[Hash]int),
 	}
+
+	metaCache := newMetaCache(graph, mockReader)
 
 	for i := range 1000 {
 		oid := Hash{byte(i)}
+		graph.OIDToIndex[oid] = i
+		graph.Timestamps[i] = int64(1500000000 + i)
 		metaCache.m[oid] = AuthorInfo{
 			Name:  fmt.Sprintf("User%d", i),
 			Email: fmt.Sprintf("user%d@example.com", i),
@@ -519,7 +548,7 @@ func BenchmarkMetaCacheAuthor(b *testing.B) {
 	b.Run("cached", func(b *testing.B) {
 		for i := 0; b.Loop(); i++ {
 			oid := oids[i%len(oids)]
-			_, _ = metaCache.author(oid)
+			_, _ = metaCache.get(oid)
 		}
 	})
 }
@@ -527,14 +556,18 @@ func BenchmarkMetaCacheAuthor(b *testing.B) {
 func BenchmarkMetaCacheConcurrent(b *testing.B) {
 	mockReader := newMockCommitHeaderReader()
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo),
+	graph := &commitGraphData{
+		Timestamps: make([]int64, 100),
+		OIDToIndex: make(map[Hash]int),
 	}
+
+	metaCache := newMetaCache(graph, mockReader)
 
 	// Pre-populate
 	for i := range 100 {
 		oid := Hash{byte(i)}
+		graph.OIDToIndex[oid] = i
+		graph.Timestamps[i] = int64(1500000000 + i)
 		metaCache.m[oid] = AuthorInfo{
 			Name:  fmt.Sprintf("User%d", i),
 			Email: fmt.Sprintf("user%d@example.com", i),
@@ -547,7 +580,7 @@ func BenchmarkMetaCacheConcurrent(b *testing.B) {
 		i := 0
 		for pb.Next() {
 			oid := Hash{byte(i % 100)}
-			_, _ = metaCache.author(oid)
+			_, _ = metaCache.get(oid)
 			i++
 		}
 	})
@@ -556,16 +589,20 @@ func BenchmarkMetaCacheConcurrent(b *testing.B) {
 func BenchmarkMetaCacheAuthorSlow(b *testing.B) {
 	mockReader := newMockCommitHeaderReader()
 
+	graph := &commitGraphData{
+		Timestamps: make([]int64, 10000),
+		OIDToIndex: make(map[Hash]int),
+	}
+
 	// Pre-populate the mock reader with many more headers to avoid cache hits.
 	for i := range 10_000 {
 		oid := Hash{byte(i), byte(i >> 8), byte(i >> 16)}
+		graph.OIDToIndex[oid] = i
+		graph.Timestamps[i] = int64(1500000000 + i)
 		mockReader.addCommit(oid, fmt.Sprintf("User%d", i), fmt.Sprintf("user%d@example.com", i), int64(1500000000+i))
 	}
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo, 1024), // Start with empty cache
-	}
+	metaCache := newMetaCache(graph, mockReader)
 
 	b.ResetTimer()
 	for i := 0; b.Loop(); i++ {
@@ -578,12 +615,21 @@ func BenchmarkMetaCacheAuthorSlow(b *testing.B) {
 
 		// Use a wide range of OIDs to minimize cache hits.
 		oid := Hash{byte(i), byte(i >> 8), byte(i >> 16)}
-		_, _ = metaCache.author(oid)
+		_, _ = metaCache.get(oid)
 	}
 }
 
 func TestMetaCacheAuthorSlowPath(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
+
+	graph := &commitGraphData{
+		Timestamps: []int64{1500000000, 1600000000, 1700000000},
+		OIDToIndex: map[Hash]int{
+			{0x01, 0x00, 0x00}: 0,
+			{0x02, 0x00, 0x00}: 1,
+			{0x03, 0x00, 0x00}: 2,
+		},
+	}
 
 	testOID1 := Hash{0x01, 0x00, 0x00}
 	testOID2 := Hash{0x02, 0x00, 0x00}
@@ -593,62 +639,70 @@ func TestMetaCacheAuthorSlowPath(t *testing.T) {
 	mockReader.addCommit(testOID2, "Bob Smith", "bob@test.org", 1600000000)
 	mockReader.addCommit(testOID3, "Carol Williams", "carol@company.net", 1700000000)
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo, 1024),
-	}
+	metaCache := newMetaCache(graph, mockReader)
 
+	// Ensure cache miss by clearing the cache
 	metaCache.mu.Lock()
 	delete(metaCache.m, testOID1)
 	metaCache.mu.Unlock()
 
-	result1, err := metaCache.author(testOID1)
+	result1, err := metaCache.get(testOID1)
 	require.NoError(t, err)
 
-	assert.Equal(t, "Alice Johnson", result1.Name)
-	assert.Equal(t, "alice@example.com", result1.Email)
-	assert.True(t, result1.When.Equal(time.Unix(1500000000, 0).UTC()))
+	assert.Equal(t, "Alice Johnson", result1.Author.Name)
+	assert.Equal(t, "alice@example.com", result1.Author.Email)
+	assert.True(t, result1.Author.When.Equal(time.Unix(1500000000, 0).UTC()))
 
+	// Check that result is now cached
 	metaCache.mu.RLock()
 	cached1, exists1 := metaCache.m[testOID1]
 	metaCache.mu.RUnlock()
 
 	assert.True(t, exists1, "Expected result to be cached after slow path execution")
-	assert.Equal(t, result1, cached1, "Cached result should match returned result")
+	assert.Equal(t, result1.Author, cached1, "Cached result should match returned result")
 }
 
 func TestMetaCacheAuthorFastPathAfterCache(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
+
+	graph := &commitGraphData{
+		Timestamps: []int64{1500000000},
+		OIDToIndex: map[Hash]int{
+			{0x01, 0x00, 0x00}: 0,
+		},
+	}
+
 	testOID := Hash{0x01, 0x00, 0x00}
 	mockReader.addCommit(testOID, "Alice Johnson", "alice@example.com", 1500000000)
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo, 1024),
-	}
+	metaCache := newMetaCache(graph, mockReader)
 
-	result1, err := metaCache.author(testOID)
+	result1, err := metaCache.get(testOID)
 	require.NoError(t, err)
 
-	result2, err := metaCache.author(testOID)
+	result2, err := metaCache.get(testOID)
 	require.NoError(t, err)
 
-	assert.Equal(t, result1, result2, "Cache hit should return identical result")
+	assert.Equal(t, result1.Author, result2.Author, "Cache hit should return identical result")
 }
 
 func TestMetaCacheAuthorSlowPathError(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
-	nonExistentOID := Hash{0xFF, 0xFF, 0xFF}
 
-	metaCache := &metaCache{
-		store: mockReader,
-		m:     make(map[Hash]AuthorInfo, 1024),
+	graph := &commitGraphData{
+		Timestamps: []int64{},
+		OIDToIndex: map[Hash]int{},
 	}
 
+	nonExistentOID := Hash{0xFF, 0xFF, 0xFF}
+
+	metaCache := newMetaCache(graph, mockReader)
+
+	// Ensure cache miss
 	metaCache.mu.Lock()
 	delete(metaCache.m, nonExistentOID)
 	metaCache.mu.Unlock()
 
-	_, err := metaCache.author(nonExistentOID)
+	_, err := metaCache.get(nonExistentOID)
 	assert.Error(t, err, "Expected error for non-existent commit")
 }

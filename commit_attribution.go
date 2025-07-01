@@ -71,39 +71,42 @@ func newMetaCache(g *commitGraphData, s commitHeaderReader) *metaCache {
 	}
 }
 
-func (c *metaCache) timestamp(oid Hash) (int64, bool) {
-	if idx, ok := c.graph.OIDToIndex[oid]; ok && idx < len(c.ts) {
-		return c.ts[idx], true
-	}
-	return 0, false
-}
-
-// ---------- lazy author -------------------------------------
-
-func (c *metaCache) author(oid Hash) (AuthorInfo, error) {
-	// Fast read‑only path.
+func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
+	// Fast read-only path for author info.
 	c.mu.RLock()
-	if ai, ok := c.m[oid]; ok {
-		c.mu.RUnlock()
-		return ai, nil
-	}
+	ai, ok := c.m[oid]
 	c.mu.RUnlock()
 
-	// Slow path – inflate header once.
-	hdr, err := c.store.readCommitHeader(oid)
-	if err != nil {
-		return AuthorInfo{}, err
-	}
-	ai, err := parseAuthorHeader(hdr)
-	if err != nil {
-		return AuthorInfo{}, err
+	if !ok {
+		// Slow path – inflate header once.
+		hdr, err := c.store.readCommitHeader(oid)
+		if err != nil {
+			return CommitMetadata{}, err
+		}
+		ai, err = parseAuthorHeader(hdr)
+		if err != nil {
+			return CommitMetadata{}, err
+		}
+
+		// Promote to cache.
+		c.mu.Lock()
+		c.m[oid] = ai
+		c.mu.Unlock()
 	}
 
-	// Promote to cache.
-	c.mu.Lock()
-	c.m[oid] = ai
-	c.mu.Unlock()
-	return ai, nil
+	// Timestamp from commit-graph is faster if available.
+	var ts int64
+	if idx, ok := c.graph.OIDToIndex[oid]; ok && idx < len(c.ts) {
+		ts = c.ts[idx]
+	} else {
+		// Fallback to timestamp from parsed header.
+		ts = ai.When.Unix()
+	}
+
+	return CommitMetadata{
+		Author:    ai,
+		Timestamp: ts,
+	}, nil
 }
 
 var (

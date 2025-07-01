@@ -351,32 +351,21 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 	})
 }
 
-// Get returns the fully materialized Git object identified by oid together
+// get returns the fully materialized Git object identified by oid together
 // with its on-disk ObjectType.
 //
 // This method delegates to the underlying store and provides the same
-// functionality as the store's Get method. See store.Get for detailed
+// functionality as the store's get method. See store.get for detailed
 // documentation on caching, delta resolution, and CRC verification.
-func (hs *HistoryScanner) Get(oid Hash) ([]byte, ObjectType, error) {
+func (hs *HistoryScanner) get(oid Hash) ([]byte, ObjectType, error) {
 	return hs.store.Get(oid)
-}
-
-// TreeIter returns a streaming iterator over the contents of the tree object
-// identified by oid.
-//
-// This method delegates to the underlying store. The caller must consume the
-// iterator before the returned raw slice would otherwise be garbage‑collected.
-func (hs *HistoryScanner) TreeIter(oid Hash) (*TreeIter, error) {
-	return hs.store.TreeIter(oid)
 }
 
 // SetMaxDeltaDepth sets the maximum delta chain depth for object retrieval.
 //
 // This method delegates to the underlying store. See store.SetMaxDeltaDepth
 // for detailed documentation on the implications of different depth values.
-func (hs *HistoryScanner) SetMaxDeltaDepth(depth int) {
-	hs.store.SetMaxDeltaDepth(depth)
-}
+func (hs *HistoryScanner) SetMaxDeltaDepth(depth int) { hs.store.SetMaxDeltaDepth(depth) }
 
 // SetVerifyCRC enables or disables CRC-32 validation for all object reads.
 //
@@ -391,14 +380,18 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // It is safe to call Close multiple times; subsequent calls are no-ops.
 func (hs *HistoryScanner) Close() error { return hs.store.Close() }
 
-// Timestamp returns the commit's committer time (Unix seconds) if known.
-func (hs *HistoryScanner) Timestamp(oid Hash) (int64, bool) {
-	return hs.meta.timestamp(oid)
+// CommitMetadata holds the author and timestamp of a commit.
+// This information is loaded lazily from the underlying object store
+// and cached.
+type CommitMetadata struct {
+	Author    AuthorInfo
+	Timestamp int64
 }
 
-// Author lazily inflates the commit header once and returns author info.
-func (hs *HistoryScanner) Author(oid Hash) (AuthorInfo, error) {
-	return hs.meta.author(oid)
+// GetCommitMetadata returns the commit's author and committer time (Unix seconds).
+// This method lazily inflates the commit object and caches the result.
+func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
+	return s.meta.get(oid)
 }
 
 // LoadAllCommits returns all commits in commit-graph storage order.

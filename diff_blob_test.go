@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestMetaCacheConcurrency(t *testing.T) {
@@ -13,18 +15,22 @@ func TestMetaCacheConcurrency(t *testing.T) {
 	var h Hash
 	g := &commitGraphData{Timestamps: []int64{123}, OrderedOIDs: []Hash{h},
 		OIDToIndex: map[Hash]int{h: 0}}
-	s := &store{} // nil internals; we won't call author()
+	s := &store{} // nil internals; we won't call get() which would call readCommitHeader
 
 	mc := newMetaCache(g, s)
-	if ts, ok := mc.timestamp(h); !ok || ts != 123 {
+	mc.m[h] = AuthorInfo{Name: "test", Email: "test@test.com", When: time.Unix(123, 0)}
+
+	meta, err := mc.get(h)
+	require.NoError(t, err)
+	if meta.Timestamp != 123 {
 		t.Fatalf("timestamp mismatch")
 	}
 
-	// run 100 goroutines that hit timestamp()
+	// run 100 goroutines that hit get()
 	done := make(chan struct{}, 100)
 	for i := 0; i < 100; i++ {
 		go func() {
-			mc.timestamp(h)
+			_, _ = mc.get(h)
 			done <- struct{}{}
 		}()
 	}
