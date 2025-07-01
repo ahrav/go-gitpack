@@ -11,6 +11,10 @@ import (
 // The zero value is the all-zero hash, which never resolves to a real object.
 type Hash [20]byte
 
+// String returns the hexadecimal string representation of the hash.
+// This is the canonical 40-character format used by Git.
+func (h Hash) String() string { return hex.EncodeToString(h[:]) }
+
 // ParseHash converts a 40-char hex string to Hash.
 //
 // ParseHash converts the canonical, 40-character hexadecimal SHA-1 string

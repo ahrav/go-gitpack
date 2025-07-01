@@ -50,3 +50,35 @@ func TestHash(t *testing.T) {
 		})
 	}
 }
+
+func TestHashString(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		expected string
+	}{
+		{
+			name:     "valid hash",
+			input:    "89e5a3e7d8f6c4b2a1e0d9c8b7a6f5e4d3c2b1a0",
+			expected: "89e5a3e7d8f6c4b2a1e0d9c8b7a6f5e4d3c2b1a0",
+		},
+		{
+			name:     "all zeros",
+			input:    "0000000000000000000000000000000000000000",
+			expected: "0000000000000000000000000000000000000000",
+		},
+		{
+			name:     "all ones",
+			input:    "ffffffffffffffffffffffffffffffffffffffff",
+			expected: "ffffffffffffffffffffffffffffffffffffffff",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			hash, err := ParseHash(tt.input)
+			require.NoError(t, err)
+			assert.Equal(t, tt.expected, hash.String())
+		})
+	}
+}
