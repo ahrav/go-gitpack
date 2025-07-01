@@ -1,4 +1,4 @@
-// diff_blob.go – “+” lines via gotextdiff/myers  (FIXED)
+// diff_blob.go  – final "all additions" implementation
 package objstore
 
 import (
@@ -10,42 +10,64 @@ import (
 	"github.com/hexops/gotextdiff/span"
 )
 
-// addedLines returns every line that is *present in new but absent in old*.
-// The slice elements are the raw line bytes with the trailing '\n' removed.
-// The implementation relies on gotextdiff's Myers algorithm and requires Go ≥1.20
-// for zero‑copy slice→string conversion via unsafe.String.
-func addedLines(old, new []byte) [][]byte {
-	// Short‑circuit: identical blobs
-	if bytes.Equal(old, new) {
+// AddedLine describes one line that exists in the _new_ revision of a file
+// but not in the _old_ revision produced by a diff.
+// It is returned by addedLinesWithPos and serves as a minimal, value-type
+// representation of an insertion hunk: the caller gets the inserted text
+// together with the 1-based line number at which it appears in the new file.
+// Consumers should treat the fields as read-only; the zero value is not
+// meaningful.
+type AddedLine struct {
+	// Text holds the entire contents of the inserted line with the trailing
+	// newline already stripped.
+	Text []byte
+
+	// Line records the 1-based line number of the inserted line in the new
+	// version of the file.
+	Line int
+}
+
+// addedLinesWithPos returns every line that exists in *new* but not in *old*,
+// preserving the 1-based line number in the new file.
+//
+// It performs a line-oriented diff using the Myers algorithm provided by
+// github.com/hexops/gotextdiff. Only insertion hunks are converted to
+// AddedLine values; unchanged and deletion hunks are ignored.
+//
+// The function pre-allocates the result slice to roughly half the number of
+// edits, a heuristic that tracks the fact that an insertion hunk generally
+// consumes two edits (one Insert, one Equal).
+// If the two byte slices are identical or the diff contains no insertions,
+// addedLinesWithPos returns nil.
+func addedLinesWithPos(oldB, newB []byte) []AddedLine {
+	if bytes.Equal(oldB, newB) {
 		return nil
 	}
 
-	a := btostr(old)
-	b := btostr(new)
-
-	// Compute full‑line edits.
+	a, b := btostr(oldB), btostr(newB)
 	edits := myers.ComputeEdits(span.URIFromPath(""), a, b)
-	edits = gotextdiff.LineEdits(a, edits)
+	u := gotextdiff.ToUnified("", "", a, edits) // structured diff
 
-	var out [][]byte
-	for _, e := range edits {
-		if e.NewText == "" {
-			continue // pure deletions
-		}
-		lines := strings.Split(e.NewText, "\n")
+	if len(u.Hunks) == 0 {
+		return nil
+	}
 
-		// Drop final empty element that follows the trailing '\n'.
-		if len(lines) > 0 && lines[len(lines)-1] == "" {
-			lines = lines[:len(lines)-1]
-		}
+	// Rough capacity: #insert hunks ≈ len(edits)/2 (heuristic).
+	out := make([]AddedLine, 0, len(edits))
 
-		for _, line := range lines {
-			// Filter unified‑diff headers and “+” false‑positives.
-			if strings.HasPrefix(line, "+++ ") || (len(line) > 0 && line[0] == '+') {
-				continue
+	for _, h := range u.Hunks {
+		lineNo := h.ToLine // already 1-based
+
+		for _, ln := range h.Lines {
+			switch ln.Kind {
+			case gotextdiff.Insert:
+				// ln.Content still ends with "\n"; trim cheaply.
+				text := strings.TrimSuffix(ln.Content, "\n")
+				out = append(out, AddedLine{Text: []byte(text), Line: lineNo})
+				lineNo++
+			case gotextdiff.Equal:
+				lineNo++
 			}
-			// Preserve exact bytes (including CR for CRLF).
-			out = append(out, []byte(line))
 		}
 	}
 	return out

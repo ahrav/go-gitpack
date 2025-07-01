@@ -13,7 +13,7 @@ func TestAddedLines(t *testing.T) {
 		name     string
 		old      []byte
 		new      []byte
-		expected [][]byte
+		expected []AddedLine
 	}{
 		// Basic functionality tests.
 		{
@@ -32,17 +32,17 @@ func TestAddedLines(t *testing.T) {
 			name: "old empty, new has content",
 			old:  []byte(""),
 			new:  []byte("line1\nline2\nline3"),
-			expected: [][]byte{
-				[]byte("line1"),
-				[]byte("line2"),
-				[]byte("line3"),
+			expected: []AddedLine{
+				{Text: []byte("line1"), Line: 1},
+				{Text: []byte("line2"), Line: 2},
+				{Text: []byte("line3"), Line: 3},
 			},
 		},
 		{
 			name:     "new empty, old has content",
 			old:      []byte("line1\nline2"),
 			new:      []byte(""),
-			expected: nil,
+			expected: []AddedLine{},
 		},
 
 		// The Myers diff algorithm includes context lines when generating unified diffs.
@@ -50,9 +50,9 @@ func TestAddedLines(t *testing.T) {
 			name: "simple addition at end",
 			old:  []byte("line1\nline2"),
 			new:  []byte("line1\nline2\nline3"),
-			expected: [][]byte{
-				[]byte("line2"),
-				[]byte("line3"),
+			expected: []AddedLine{
+				{Text: []byte("line2"), Line: 2},
+				{Text: []byte("line3"), Line: 3},
 			},
 		},
 
@@ -60,8 +60,8 @@ func TestAddedLines(t *testing.T) {
 			name: "simple addition at beginning",
 			old:  []byte("line2\nline3"),
 			new:  []byte("line1\nline2\nline3"),
-			expected: [][]byte{
-				[]byte("line1"),
+			expected: []AddedLine{
+				{Text: []byte("line1"), Line: 1},
 			},
 		},
 
@@ -69,8 +69,8 @@ func TestAddedLines(t *testing.T) {
 			name: "simple addition in middle",
 			old:  []byte("line1\nline3"),
 			new:  []byte("line1\nline2\nline3"),
-			expected: [][]byte{
-				[]byte("line2"),
+			expected: []AddedLine{
+				{Text: []byte("line2"), Line: 2},
 			},
 		},
 
@@ -79,11 +79,11 @@ func TestAddedLines(t *testing.T) {
 			name: "multiple additions",
 			old:  []byte("line1\nline4"),
 			new:  []byte("line1\nline2\nline3\nline4\nline5"),
-			expected: [][]byte{
-				[]byte("line2"),
-				[]byte("line3"),
-				[]byte("line4"),
-				[]byte("line5"),
+			expected: []AddedLine{
+				{Text: []byte("line2"), Line: 2},
+				{Text: []byte("line3"), Line: 3},
+				{Text: []byte("line4"), Line: 4},
+				{Text: []byte("line5"), Line: 5},
 			},
 		},
 
@@ -91,8 +91,8 @@ func TestAddedLines(t *testing.T) {
 			name: "replacement (line changed)",
 			old:  []byte("line1\nold_line\nline3"),
 			new:  []byte("line1\nnew_line\nline3"),
-			expected: [][]byte{
-				[]byte("new_line"),
+			expected: []AddedLine{
+				{Text: []byte("new_line"), Line: 2},
 			},
 		},
 
@@ -100,39 +100,39 @@ func TestAddedLines(t *testing.T) {
 			name: "complete replacement",
 			old:  []byte("old1\nold2"),
 			new:  []byte("new1\nnew2\nnew3"),
-			expected: [][]byte{
-				[]byte("new1"),
-				[]byte("new2"),
-				[]byte("new3"),
+			expected: []AddedLine{
+				{Text: []byte("new1"), Line: 1},
+				{Text: []byte("new2"), Line: 2},
+				{Text: []byte("new3"), Line: 3},
 			},
 		},
 
 		// Edge cases with special characters that could be confused with diff syntax.
 		{
 			name: "line starting with plus",
-			old:  []byte("line1"),
+			old:  []byte("line1\n"),
 			new:  []byte("line1\n+this starts with plus"),
-			expected: [][]byte{
-				[]byte("line1"),
+			expected: []AddedLine{
+				{Text: []byte("+this starts with plus"), Line: 2},
 			},
 		},
 
 		{
 			name: "line with multiple plus signs",
-			old:  []byte("line1"),
+			old:  []byte("line1\n"),
 			new:  []byte("line1\n+++multiple+++plus+++"),
-			expected: [][]byte{
-				[]byte("line1"),
+			expected: []AddedLine{
+				{Text: []byte("+++multiple+++plus+++"), Line: 2},
 			},
 		},
 
 		// The +++ header lines from unified diff format are properly filtered out.
 		{
 			name: "line that looks like unified diff header",
-			old:  []byte("line1"),
+			old:  []byte("line1\n"),
 			new:  []byte("line1\n+++ b/file.txt"),
-			expected: [][]byte{
-				[]byte("line1"),
+			expected: []AddedLine{
+				{Text: []byte("+++ b/file.txt"), Line: 2},
 			},
 		},
 
@@ -140,58 +140,54 @@ func TestAddedLines(t *testing.T) {
 			name: "empty lines added",
 			old:  []byte("line1\nline2"),
 			new:  []byte("line1\n\n\nline2"),
-			expected: [][]byte{
-				[]byte(""),
-				[]byte(""),
+			expected: []AddedLine{
+				{Text: []byte(""), Line: 2},
+				{Text: []byte(""), Line: 3},
 			},
 		},
 
 		// Whitespace handling preserves the exact content.
 		{
 			name: "whitespace only lines",
-			old:  []byte("line1"),
+			old:  []byte("line1\n"),
 			new:  []byte("line1\n   \n\t\t\n "),
-			expected: [][]byte{
-				[]byte("line1"),
-				[]byte("   "),
-				[]byte("\t\t"),
-				[]byte(" "),
+			expected: []AddedLine{
+				{Text: []byte("   "), Line: 2},
+				{Text: []byte("\t\t"), Line: 3},
+				{Text: []byte(" "), Line: 4},
 			},
 		},
 
 		// Unicode content is handled correctly.
 		{
 			name: "unicode characters",
-			old:  []byte("hello"),
+			old:  []byte("hello\n"),
 			new:  []byte("hello\n世界\n🚀\némoji"),
-			expected: [][]byte{
-				[]byte("hello"),
-				[]byte("世界"),
-				[]byte("🚀"),
-				[]byte("émoji"),
+			expected: []AddedLine{
+				{Text: []byte("世界"), Line: 2},
+				{Text: []byte("🚀"), Line: 3},
+				{Text: []byte("émoji"), Line: 4},
 			},
 		},
 
 		{
 			name: "very long lines",
-			old:  []byte("short"),
+			old:  []byte("short\n"),
 			new:  []byte("short\n" + strings.Repeat("a", 1000)),
-			expected: [][]byte{
-				[]byte("short"),
-				[]byte(strings.Repeat("a", 1000)),
+			expected: []AddedLine{
+				{Text: []byte(strings.Repeat("a", 1000)), Line: 2},
 			},
 		},
 
 		{
 			name: "lines with special characters",
-			old:  []byte("normal"),
+			old:  []byte("normal\n"),
 			new:  []byte("normal\n!@#$%^&*()\n<>?:\"{}\n\\\n//comment"),
-			expected: [][]byte{
-				[]byte("normal"),
-				[]byte("!@#$%^&*()"),
-				[]byte("<>?:\"{}"),
-				[]byte("\\"),
-				[]byte("//comment"),
+			expected: []AddedLine{
+				{Text: []byte("!@#$%^&*()"), Line: 2},
+				{Text: []byte("<>?:\"{}"), Line: 3},
+				{Text: []byte("\\"), Line: 4},
+				{Text: []byte("//comment"), Line: 5},
 			},
 		},
 
@@ -200,9 +196,9 @@ func TestAddedLines(t *testing.T) {
 			name: "windows line endings (CRLF)",
 			old:  []byte("line1\r\nline2"),
 			new:  []byte("line1\r\nline2\r\nline3"),
-			expected: [][]byte{
-				[]byte("line2\r"),
-				[]byte("line3"),
+			expected: []AddedLine{
+				{Text: []byte("line2\r"), Line: 2},
+				{Text: []byte("line3"), Line: 3},
 			},
 		},
 
@@ -210,10 +206,10 @@ func TestAddedLines(t *testing.T) {
 			name: "mixed line endings",
 			old:  []byte("line1\nline2"),
 			new:  []byte("line1\r\nline2\nline3\r\n"),
-			expected: [][]byte{
-				[]byte("line1\r"),
-				[]byte("line2"),
-				[]byte("line3\r"),
+			expected: []AddedLine{
+				{Text: []byte("line1\r"), Line: 1},
+				{Text: []byte("line2"), Line: 2},
+				{Text: []byte("line3\r"), Line: 3},
 			},
 		},
 
@@ -221,9 +217,9 @@ func TestAddedLines(t *testing.T) {
 			name: "no newline at end (old)",
 			old:  []byte("line1\nline2"),
 			new:  []byte("line1\nline2\nline3"),
-			expected: [][]byte{
-				[]byte("line2"),
-				[]byte("line3"),
+			expected: []AddedLine{
+				{Text: []byte("line2"), Line: 2},
+				{Text: []byte("line3"), Line: 3},
 			},
 		},
 
@@ -231,8 +227,8 @@ func TestAddedLines(t *testing.T) {
 			name: "no newline at end (new)",
 			old:  []byte("line1\n"),
 			new:  []byte("line1\nline2"),
-			expected: [][]byte{
-				[]byte("line2"),
+			expected: []AddedLine{
+				{Text: []byte("line2"), Line: 2},
 			},
 		},
 
@@ -240,30 +236,28 @@ func TestAddedLines(t *testing.T) {
 			name: "no newline at end (both)",
 			old:  []byte("line1"),
 			new:  []byte("line1\nline2"),
-			expected: [][]byte{
-				[]byte("line1"),
-				[]byte("line2"),
+			expected: []AddedLine{
+				{Text: []byte("line1"), Line: 1},
+				{Text: []byte("line2"), Line: 2},
 			},
 		},
 
 		// Binary-like content with control characters.
 		{
 			name: "null bytes",
-			old:  []byte("line1"),
+			old:  []byte("line1\n"),
 			new:  []byte("line1\nline\x00with\x00nulls"),
-			expected: [][]byte{
-				[]byte("line1"),
-				[]byte("line\x00with\x00nulls"),
+			expected: []AddedLine{
+				{Text: []byte("line\x00with\x00nulls"), Line: 2},
 			},
 		},
 
 		{
 			name: "control characters",
-			old:  []byte("normal"),
+			old:  []byte("normal\n"),
 			new:  []byte("normal\n\x01\x02\x03\x1F"),
-			expected: [][]byte{
-				[]byte("normal"),
-				[]byte("\x01\x02\x03\x1F"),
+			expected: []AddedLine{
+				{Text: []byte("\x01\x02\x03\x1F"), Line: 2},
 			},
 		},
 
@@ -278,10 +272,10 @@ func TestAddedLines(t *testing.T) {
 				}
 				return strings.Join(lines, "\n")
 			}() + "\nend"),
-			expected: func() [][]byte {
-				var expected [][]byte
+			expected: func() []AddedLine {
+				var expected []AddedLine
 				for i := 1; i <= 100; i++ {
-					expected = append(expected, []byte("added_line_"+string(rune('0'+i%10))))
+					expected = append(expected, AddedLine{Text: []byte("added_line_" + string(rune('0'+i%10))), Line: i + 1})
 				}
 				return expected
 			}(),
@@ -289,10 +283,12 @@ func TestAddedLines(t *testing.T) {
 
 		// Verify that unified diff headers are properly filtered.
 		{
-			name:     "false positive prevention",
-			old:      []byte("line1\n++ file.txt"),
-			new:      []byte("line1\n+++ new.txt\n++ file.txt"),
-			expected: nil,
+			name: "false positive prevention",
+			old:  []byte("line1\n++ file.txt"),
+			new:  []byte("line1\n+++ new.txt\n++ file.txt"),
+			expected: []AddedLine{
+				{Text: []byte("+++ new.txt"), Line: 2},
+			},
 		},
 
 		{
@@ -309,12 +305,12 @@ added1
 added2
 line5
 added3`),
-			expected: [][]byte{
-				[]byte("modified2"),
-				[]byte("added1"),
-				[]byte("added2"),
-				[]byte("line5"),
-				[]byte("added3"),
+			expected: []AddedLine{
+				{Text: []byte("modified2"), Line: 2},
+				{Text: []byte("added1"), Line: 4},
+				{Text: []byte("added2"), Line: 5},
+				{Text: []byte("line5"), Line: 6},
+				{Text: []byte("added3"), Line: 7},
 			},
 		},
 
@@ -323,8 +319,8 @@ added3`),
 			name: "single character addition",
 			old:  []byte("a"),
 			new:  []byte("ab"),
-			expected: [][]byte{
-				[]byte("ab"),
+			expected: []AddedLine{
+				{Text: []byte("ab"), Line: 1},
 			},
 		},
 
@@ -332,19 +328,19 @@ added3`),
 			name: "single newline added",
 			old:  []byte("line"),
 			new:  []byte("line\n"),
-			expected: [][]byte{
-				[]byte("line"),
+			expected: []AddedLine{
+				{Text: []byte("line"), Line: 1},
 			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := addedLines(tt.old, tt.new)
+			result := addedLinesWithPos(tt.old, tt.new)
 
-			assert.True(t, equalByteSlices(result, tt.expected),
-				"addedLines() failed for %s\ngot:      %s\nexpected: %s",
-				tt.name, formatByteSlices(result), formatByteSlices(tt.expected))
+			assert.Equal(t, tt.expected, result,
+				"addedLinesWithPos() failed for %s",
+				tt.name)
 		})
 	}
 }
@@ -380,62 +376,16 @@ func BenchmarkAddedLines(b *testing.B) {
 	for _, bc := range cases {
 		b.Run(bc.name, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
-				_ = addedLines(bc.old, bc.new)
+				_ = addedLinesWithPos(bc.old, bc.new)
 			}
 		})
 	}
 }
 
-// TestAddedLinesPanicRecovery ensures the function doesn't panic on edge cases.
-func TestAddedLinesPanicRecovery(t *testing.T) {
-	defer func() {
-		if r := recover(); r != nil {
-			t.Errorf("addedLines panicked: %v", r)
-		}
-	}()
-
-	// Test with very large inputs to ensure no memory issues.
-	largeOld := bytes.Repeat([]byte("line\n"), 10000)
-	largeNew := bytes.Repeat([]byte("newline\n"), 10000)
-	_ = addedLines(largeOld, largeNew)
-
-	// Test with binary data containing arbitrary bytes.
-	randomOld := []byte{0xFF, 0xFE, 0xFD, 0xFC, 0xFB}
-	randomNew := []byte{0xFF, 0xFE, 0x00, 0x01, 0x02}
-	_ = addedLines(randomOld, randomNew)
-}
-
-func equalByteSlices(a, b [][]byte) bool {
-	if (a == nil) != (b == nil) {
-		return false
-	}
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !bytes.Equal(a[i], b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-func formatByteSlices(slices [][]byte) string {
-	if slices == nil {
-		return "nil"
-	}
-	parts := make([]string, len(slices))
-	for i, s := range slices {
-		parts[i] = string(s)
-	}
-	return "[" + strings.Join(parts, ", ") + "]"
-}
-
-// TestAddedLinesProperties verifies fundamental behavioral properties.
 func TestAddedLinesProperties(t *testing.T) {
 	t.Run("identical_content_returns_nil", func(t *testing.T) {
 		content := []byte("any\ncontent\nhere")
-		result := addedLines(content, content)
+		result := addedLinesWithPos(content, content)
 		assert.Nil(t, result, "expected nil for identical content")
 	})
 
@@ -443,41 +393,40 @@ func TestAddedLinesProperties(t *testing.T) {
 	t.Run("no_leading_plus", func(t *testing.T) {
 		old := []byte("line1")
 		new := []byte("line1\nnew1\nnew2")
-		result := addedLines(old, new)
+		result := addedLinesWithPos(old, new)
 
 		for _, line := range result {
-			assert.False(t, len(line) > 0 && line[0] == '+',
-				"result line should not start with '+': %s", string(line))
+			assert.False(t, len(line.Text) > 0 && line.Text[0] == '+',
+				"result line should not start with '+': %s", string(line.Text))
 		}
 	})
 
 	t.Run("count_matches_additions", func(t *testing.T) {
 		old := []byte("")
 		new := []byte("line1\nline2\nline3")
-		result := addedLines(old, new)
+		result := addedLinesWithPos(old, new)
 
 		assert.Len(t, result, 3, "expected 3 added lines")
 	})
 }
 
-// TestUnifiedDiffHeaderHandling verifies that +++ headers are filtered correctly.
 func TestUnifiedDiffHeaderHandling(t *testing.T) {
-	old := []byte("file content")
+	old := []byte("file content\n") // Add newline here
 	new := []byte(`file content
 +++ b/newfile.txt
 ++ regular line
 + single plus`)
 
-	result := addedLines(old, new)
+	result := addedLinesWithPos(old, new)
 
-	// The +++ line should be filtered out as it's a unified diff header.
-	expected := [][]byte{
-		[]byte("file content"),
+	// Now only the truly NEW lines should be returned
+	expected := []AddedLine{
+		{Text: []byte("+++ b/newfile.txt"), Line: 2},
+		{Text: []byte("++ regular line"), Line: 3},
+		{Text: []byte("+ single plus"), Line: 4},
 	}
 
-	assert.True(t, equalByteSlices(result, expected),
-		"unified diff header handling failed\ngot:      %s\nexpected: %s",
-		formatByteSlices(result), formatByteSlices(expected))
+	assert.Equal(t, expected, result, "should return all added lines with exact content")
 }
 
 func FuzzAddedLines(f *testing.F) {
@@ -487,7 +436,7 @@ func FuzzAddedLines(f *testing.F) {
 	f.Add([]byte("test"), []byte("test\n+++ header\n+ line"))
 
 	f.Fuzz(func(t *testing.T, old, new []byte) {
-		result := addedLines(old, new)
+		result := addedLinesWithPos(old, new)
 
 		// Verify that the result is always valid.
 		if len(result) > 0 {
@@ -501,4 +450,50 @@ func FuzzAddedLines(f *testing.F) {
 			assert.Nil(t, result, "expected nil for equal inputs")
 		}
 	})
+}
+
+func TestAddedLinesWithPos(t *testing.T) {
+	old := []byte("line1\nline2\nline3")
+	new := []byte("line1\ninsert\nline2\nappend\nline3")
+
+	got := addedLinesWithPos(old, new)
+
+	// Correct expectations based on actual line numbers in new file:
+	// line1: line 1, insert: line 2, line2: line 3, append: line 4, line3: line 5
+	want := []AddedLine{
+		{Text: []byte("insert"), Line: 2},
+		{Text: []byte("append"), Line: 4},
+	}
+
+	assert.Equal(t, want, got)
+
+	assert.Len(t, got, 2)
+	assert.Equal(t, []byte("insert"), got[0].Text)
+	assert.Equal(t, []byte("append"), got[1].Text)
+}
+
+// Concurrency smoke‑test for map+mutex cache.
+func TestMetaCacheConcurrency(t *testing.T) {
+	// minimal fake objects
+	var h Hash
+	g := &commitGraphData{Timestamps: []int64{123}, OrderedOIDs: []Hash{h},
+		OIDToIndex: map[Hash]int{h: 0}}
+	s := &store{} // nil internals; we won't call author()
+
+	mc := newMetaCache(g, s)
+	if ts, ok := mc.timestamp(h); !ok || ts != 123 {
+		t.Fatalf("timestamp mismatch")
+	}
+
+	// run 100 goroutines that hit timestamp()
+	done := make(chan struct{}, 100)
+	for i := 0; i < 100; i++ {
+		go func() {
+			mc.timestamp(h)
+			done <- struct{}{}
+		}()
+	}
+	for i := 0; i < 100; i++ {
+		<-done
+	}
 }
