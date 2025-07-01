@@ -46,11 +46,11 @@
 //	    log.Fatal(err)
 //	}
 //
-//	// Stream commit diffs concurrently
-//	additions, errors := scanner.DiffHistory()
+//	// Stream commit diffs concurrently as hunks
+//	hunks, errors := scanner.DiffHistoryHunks()
 //	go func() {
-//	    for addition := range additions {
-//	        fmt.Printf("+ %s: %s\n", addition.Path, addition.Lines)
+//	    for hunk := range hunks {
+//	        fmt.Printf("+ %s: %d-%d (%d lines)\n", hunk.Path(), hunk.StartLine(), hunk.EndLine(), len(hunk.Lines()))
 //	    }
 //	}()
 //	if err := <-errors; err != nil {
@@ -103,7 +103,7 @@ type commitInfo struct {
 
 // HistoryScanner provides read-only, high-throughput access to a Git
 // repository's commit history.  It abstracts over commit-graph files and
-// packfile iteration to expose streaming APIs such as DiffHistory that
+// packfile iteration to expose streaming APIs such as DiffHistoryHunks that
 // deliver commits concurrently with minimal memory footprint.
 // Instantiate a HistoryScanner when you need to traverse many commits or
 // compute incremental diffs without materializing full objects.
@@ -173,74 +173,75 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 	}, nil
 }
 
-// Addition holds metadata for a single "+" line that a commit introduced.
+// HunkAddition holds metadata for a contiguous block of added lines that a commit introduced.
 //
-// Values of Addition are streamed by HistoryScanner.DiffHistory concurrently,
-// enabling callers to process repository changes incrementally without
-// materializing whole diffs or commits in memory.
-type Addition struct {
-	// commit identifies the commit that introduced the added line.
+// Values of HunkAddition are streamed by HistoryScanner.DiffHistoryHunks concurrently,
+// enabling callers to process repository changes in larger chunks for better context
+// and performance when dealing with large additions.
+type HunkAddition struct {
+	// commit identifies the commit that introduced the added hunk.
 	commit Hash
 
-	// path specifies the file to which the line was added.
+	// path specifies the file to which the hunk was added.
 	// It always uses forward-slash (Unix style) separators, independent
 	// of the host operating system.
 	path string
 
-	// line is the 1-based line number in the new version of the file
-	line int
+	// startLine is the 1-based line number where this hunk begins
+	// in the new version of the file.
+	startLine int
 
-	// text contains the raw bytes of the added line without the leading
-	// "+" diff marker.
-	text []byte
+	// endLine is the 1-based line number where this hunk ends
+	// in the new version of the file.
+	endLine int
+
+	// lines contains all the added lines in this hunk without the leading
+	// "+" diff markers.
+	lines [][]byte
 }
 
-// String returns a human-readable representation of the addition.
-func (a *Addition) String() string { return fmt.Sprintf("%s: %s:%d", a.commit, a.path, a.line) }
+// String returns a human-readable representation of the hunk addition.
+func (h *HunkAddition) String() string {
+	return fmt.Sprintf("%s: %s:%d-%d (%d lines)", h.commit, h.path, h.startLine, h.endLine, len(h.lines))
+}
 
-// Lines returns the raw bytes of the added line without the leading
-// "+" diff marker. The outer slice allows the caller to handle data
-// in its original chunking or regroup it as needed.
-func (a *Addition) Lines() [][]byte { return [][]byte{a.text} }
+// Lines returns all the added lines in this hunk without the leading
+// "+" diff markers.
+func (h *HunkAddition) Lines() [][]byte { return h.lines }
 
-// Text returns the raw bytes of the added line.
-func (a *Addition) Text() []byte { return a.text }
+// StartLine returns the 1-based line number where this hunk begins
+// in the new version of the file.
+func (h *HunkAddition) StartLine() int { return h.startLine }
 
-// Line returns the 1-based line number in the new version of the file.
-func (a *Addition) Line() int { return a.line }
+// EndLine returns the 1-based line number where this hunk ends
+// in the new version of the file.
+func (h *HunkAddition) EndLine() int { return h.endLine }
 
-// Commit returns the commit that introduced the added line.
-func (a *Addition) Commit() Hash { return a.commit }
+// Commit returns the commit that introduced the added hunk.
+func (h *HunkAddition) Commit() Hash { return h.commit }
 
-// Path returns the file to which the line was added.
+// Path returns the file to which the hunk was added.
 // It always uses forward-slash (Unix style) separators, independent
 // of the host operating system.
-func (a *Addition) Path() string { return a.path }
+func (h *HunkAddition) Path() string { return h.path }
 
-// DiffHistory streams every added line from all commits.
+// DiffHistoryHunks streams every added hunk from all commits.
 //
-// The caller receives a buffered channel of Addition values and a separate
+// The caller receives a buffered channel of HunkAddition values and a separate
 // channel for a single error value.
-// The method launches a goroutine that
-//  1. Performs the commit walk and diff computation concurrently.
-//  2. Sends each Addition to the `out` channel as soon as it's computed.
-//  3. Sends a non-nil error to `errC` and returns early on failure.
-//     Otherwise, it sends nil when the walk completes.
-//
-// Closing the `out` channel before it is exhausted aborts the walk
-// because any subsequent send will panic, which unwinds the goroutine.
+// The method launches a goroutine that performs the commit walk and diff computation
+// concurrently, grouping consecutive line additions into hunks for better context
+// and performance when processing large additions.
 //
 // The function never blocks the caller: both result channels are buffered.
-// Results are produced concurrently, so consumers should drain `out`
+// Results are produced concurrently, so consumers should drain the output
 // promptly or close it to cancel.
 //
-// DiffHistory never blocks the caller: both the additions channel and the
-// error channel are pre-buffered.
 // A nil error sent on errC signals a graceful end-of-stream.
-func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
+func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
 	numWorkers := runtime.NumCPU()
 
-	out := make(chan Addition, numWorkers)
+	out := make(chan HunkAddition, numWorkers)
 	errC := make(chan error, 1)
 
 	go func() {
@@ -274,7 +275,7 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 						TreeOID:    work.treeOID,
 						ParentOIDs: work.parentOIDs,
 					}
-					if err := hs.processCommitStreaming(hs.store, commit, out); err != nil {
+					if err := hs.processCommitStreamingHunks(hs.store, commit, out); err != nil {
 						errorChan <- err
 						return
 					}
@@ -312,9 +313,9 @@ func (hs *HistoryScanner) DiffHistory() (<-chan Addition, <-chan error) {
 	return out, errC
 }
 
-// processCommitStreaming handles diff computation for a single commit and streams
-// additions directly to the output channel.
-func (hs *HistoryScanner) processCommitStreaming(tc *store, c commitInfo, out chan<- Addition) error {
+// processCommitStreamingHunks handles diff computation for a single commit and streams
+// hunk additions directly to the output channel.
+func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, out chan<- HunkAddition) error {
 	parents := c.ParentOIDs
 	if len(parents) == 0 {
 		// Root commit: diff against the implicit empty tree (Hash{}).
@@ -333,60 +334,21 @@ func (hs *HistoryScanner) processCommitStreaming(tc *store, c commitInfo, out ch
 			return nil
 		}
 		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
-		// the empty object, which `addedLinesWithPos` handles correctly.
+		// the empty object, which `addedHunksWithPos` handles correctly.
 		oldBytes, _, _ := hs.store.Get(old)
 		newBytes, _, _ := hs.store.Get(newH)
 
-		for _, al := range addedLinesWithPos(oldBytes, newBytes) {
-			out <- Addition{
-				commit: c.OID,
-				path:   filepath.ToSlash(path),
-				line:   al.Line,
-				text:   al.Text,
+		for _, hunk := range addedHunksWithPos(oldBytes, newBytes) {
+			out <- HunkAddition{
+				commit:    c.OID,
+				path:      filepath.ToSlash(path),
+				startLine: hunk.StartLine,
+				endLine:   hunk.EndLine(),
+				lines:     hunk.Lines,
 			}
 		}
 		return nil
 	})
-}
-
-// processCommit handles diff computation for a single commit.
-func (hs *HistoryScanner) processCommit(tc *store, c commitInfo) ([]Addition, error) {
-	var additions []Addition
-
-	parents := c.ParentOIDs
-	if len(parents) == 0 {
-		// Root commit: diff against the implicit empty tree (Hash{}).
-		parents = []Hash{{}}
-	}
-
-	pTree := Hash{}
-	if parents[0] != (Hash{}) && hs.graphData != nil {
-		if idx, ok := hs.graphData.OIDToIndex[parents[0]]; ok {
-			pTree = hs.graphData.TreeOIDs[idx]
-		}
-	}
-
-	err := walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
-		if mode&040000 != 0 {
-			return nil
-		}
-		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
-		// the empty object, which `addedLinesWithPos` handles correctly.
-		oldBytes, _, _ := hs.store.Get(old)
-		newBytes, _, _ := hs.store.Get(newH)
-
-		for _, al := range addedLinesWithPos(oldBytes, newBytes) {
-			additions = append(additions, Addition{
-				commit: c.OID,
-				path:   filepath.ToSlash(path),
-				line:   al.Line,
-				text:   al.Text,
-			})
-		}
-		return nil
-	})
-
-	return additions, err
 }
 
 // Get returns the fully materialized Git object identified by oid together

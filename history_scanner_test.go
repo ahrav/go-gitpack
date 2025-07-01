@@ -119,25 +119,25 @@ func TestLoadAllCommits_WithoutCommitGraph_ShouldFail(t *testing.T) {
 	assert.Error(t, err, "Should fail when commit-graph is not available")
 }
 
-func TestDiffHistory(t *testing.T) {
+func TestDiffHistoryHunks(t *testing.T) {
 	tests := []struct {
 		name          string
 		repo          string
 		expectedFiles []string
-		minAdditions  int
-		maxAdditions  int
+		minHunks      int
+		maxHunks      int
 	}{
 		{
-			name:          "simple additions",
+			name:          "simple additions - hunks",
 			repo:          "simple-linear",
 			expectedFiles: []string{"README.md", "main.go", "test.txt"},
-			minAdditions:  3, // At least one line per file
+			minHunks:      3, // At least one hunk per file
 		},
 		{
-			name:          "with merges",
+			name:          "with merges - hunks",
 			repo:          "with-merges",
 			expectedFiles: []string{"main.go", "feature.go", "after_merge.txt"},
-			minAdditions:  5,
+			minHunks:      3,
 		},
 	}
 
@@ -146,14 +146,27 @@ func TestDiffHistory(t *testing.T) {
 			scanner := createScannerForRepo(t, tt.repo)
 			defer scanner.Close()
 
-			additions, errC := scanner.DiffHistory()
+			hunks, errC := scanner.DiffHistoryHunks()
 
 			filesFound := make(map[string]bool)
-			additionCount := 0
+			hunkCount := 0
+			totalLines := 0
 
-			for add := range additions {
-				filesFound[add.path] = true
-				additionCount++
+			for hunk := range hunks {
+				filesFound[hunk.Path()] = true
+				hunkCount++
+				totalLines += len(hunk.Lines())
+
+				// Validate hunk properties
+				assert.Greater(t, hunk.StartLine(), 0, "StartLine should be positive")
+				assert.GreaterOrEqual(t, hunk.EndLine(), hunk.StartLine(), "EndLine should be >= StartLine")
+				assert.NotEmpty(t, hunk.Lines(), "Hunk should have at least one line")
+				assert.NotEmpty(t, hunk.Path(), "Hunk should have a path")
+				assert.NotEqual(t, Hash{}, hunk.Commit(), "Hunk should have a valid commit")
+
+				// Verify EndLine calculation
+				expectedEndLine := hunk.StartLine() + len(hunk.Lines()) - 1
+				assert.Equal(t, expectedEndLine, hunk.EndLine(), "EndLine calculation should be correct")
 			}
 
 			err := <-errC
@@ -161,13 +174,18 @@ func TestDiffHistory(t *testing.T) {
 
 			for _, expectedFile := range tt.expectedFiles {
 				assert.True(t, filesFound[expectedFile],
-					"Expected file %s not found in additions", expectedFile)
+					"Expected file %s not found in hunks", expectedFile)
 			}
 
-			assert.GreaterOrEqual(t, additionCount, tt.minAdditions)
-			if tt.maxAdditions > 0 {
-				assert.LessOrEqual(t, additionCount, tt.maxAdditions)
+			assert.GreaterOrEqual(t, hunkCount, tt.minHunks)
+			if tt.maxHunks > 0 {
+				assert.LessOrEqual(t, hunkCount, tt.maxHunks)
 			}
+
+			// Verify we have some lines in total
+			assert.Greater(t, totalLines, 0, "Should have some lines in hunks")
+
+			t.Logf("Found %d hunks with %d total lines", hunkCount, totalLines)
 		})
 	}
 }
@@ -211,17 +229,17 @@ func BenchmarkLoadAllCommits(b *testing.B) {
 	}
 }
 
-func BenchmarkDiffHistory(b *testing.B) {
+func BenchmarkDiffHistoryHunks(b *testing.B) {
 	tests := []struct {
-		name         string
-		repo         string
-		minAdditions int
+		name     string
+		repo     string
+		minHunks int
 	}{
 		{"SimpleLinear", "simple-linear", 3},
-		{"WithMerges", "with-merges", 5},
-		{"LargeRepo", "large-repo", 100},
-		{"VeryLargeRepo1k", "very-large-repo-1k", 1000},
-		// {"SuperLargeRepo10k", "super-large-repo-10k", 10000},
+		{"WithMerges", "with-merges", 3},
+		{"LargeRepo", "large-repo", 50},
+		{"VeryLargeRepo1k", "very-large-repo-1k", 500},
+		// {"SuperLargeRepo10k", "super-large-repo-10k", 5000},
 	}
 
 	for _, tt := range tests {
@@ -230,44 +248,51 @@ func BenchmarkDiffHistory(b *testing.B) {
 			defer scanner.Close()
 
 			for b.Loop() {
-				additions, errC := scanner.DiffHistory()
+				hunks, errC := scanner.DiffHistoryHunks()
 
-				// Consume all additions.
+				// Consume all hunks.
 				count := 0
-				for range additions {
+				for range hunks {
 					count++
 				}
 
 				err := <-errC
 				require.NoError(b, err)
-				require.GreaterOrEqual(b, count, tt.minAdditions)
+				require.GreaterOrEqual(b, count, tt.minHunks)
 			}
 		})
 	}
 }
 
-func TestDiffHistory_LargeRepo(t *testing.T) {
+func TestDiffHistoryHunks_LargeRepo(t *testing.T) {
 	scanner := createScannerForRepo(t, "large-repo")
 	defer scanner.Close()
 
 	startTime := time.Now()
-	additions, errC := scanner.DiffHistory()
+	hunks, errC := scanner.DiffHistoryHunks()
 
 	filesFound := make(map[string]bool)
-	additionCount := 0
+	hunkCount := 0
+	totalLines := 0
 	linesByFile := make(map[string]int)
 
-	for add := range additions {
-		filesFound[add.path] = true
-		additionCount++
-		linesByFile[add.path]++
+	for hunk := range hunks {
+		filesFound[hunk.Path()] = true
+		hunkCount++
+		totalLines += len(hunk.Lines())
+		linesByFile[hunk.Path()] += len(hunk.Lines())
+
+		// Validate hunk properties
+		assert.Greater(t, hunk.StartLine(), 0, "StartLine should be positive")
+		assert.GreaterOrEqual(t, hunk.EndLine(), hunk.StartLine(), "EndLine should be >= StartLine")
+		assert.NotEmpty(t, hunk.Lines(), "Hunk should have at least one line")
 	}
 
 	err := <-errC
 	require.NoError(t, err)
 
 	duration := time.Since(startTime)
-	t.Logf("Processed 100 commits in %v", duration)
+	t.Logf("Processed 100 commits as hunks in %v", duration)
 
 	assert.Equal(t, 100, len(filesFound), "Should find 100 files")
 	assert.True(t, filesFound["README.md"], "Should find README.md")
@@ -276,13 +301,19 @@ func TestDiffHistory_LargeRepo(t *testing.T) {
 		filename := fmt.Sprintf("file_%d.txt", i)
 		assert.True(t, filesFound[filename], "Should find %s", filename)
 		assert.Greater(t, linesByFile[filename], 0,
-			"File %s should have additions", filename)
+			"File %s should have lines in hunks", filename)
 	}
 
-	assert.GreaterOrEqual(t, additionCount, 100)
+	// Hunks should be fewer than individual line additions since consecutive lines get grouped
+	assert.GreaterOrEqual(t, hunkCount, 50)
+	assert.LessOrEqual(t, hunkCount, 200) // Should be significantly fewer than line count
+	assert.GreaterOrEqual(t, totalLines, 100)
+
+	t.Logf("Found %d hunks with %d total lines (avg %.1f lines per hunk)",
+		hunkCount, totalLines, float64(totalLines)/float64(hunkCount))
 }
 
-func TestDiffHistory_VeryLargeRepo(t *testing.T) {
+func TestDiffHistoryHunks_VeryLargeRepo(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping very large repo test in short mode")
 	}
@@ -291,23 +322,28 @@ func TestDiffHistory_VeryLargeRepo(t *testing.T) {
 	defer scanner.Close()
 
 	startTime := time.Now()
-	additions, errC := scanner.DiffHistory()
+	hunks, errC := scanner.DiffHistoryHunks()
 
 	filesFound := make(map[string]bool)
-	additionCount := 0
-	linesByFile := make(map[string]int)
+	hunkCount := 0
+	totalLines := 0
 
-	for add := range additions {
-		filesFound[add.path] = true
-		additionCount++
-		linesByFile[add.path]++
+	for hunk := range hunks {
+		filesFound[hunk.Path()] = true
+		hunkCount++
+		totalLines += len(hunk.Lines())
+
+		// Validate properties
+		assert.Greater(t, hunk.StartLine(), 0)
+		assert.GreaterOrEqual(t, hunk.EndLine(), hunk.StartLine())
+		assert.NotEmpty(t, hunk.Lines())
 	}
 
 	err := <-errC
 	require.NoError(t, err)
 
 	duration := time.Since(startTime)
-	t.Logf("Processed 1,000 commits in %v", duration)
+	t.Logf("Processed 1,000 commits as hunks in %v", duration)
 
 	assert.Equal(t, 1000, len(filesFound), "Should find 1,000 files")
 	assert.True(t, filesFound["README.md"], "Should find README.md")
@@ -316,14 +352,16 @@ func TestDiffHistory_VeryLargeRepo(t *testing.T) {
 	for i := 2; i <= 1000; i += 100 { // Check every 100th file
 		filename := fmt.Sprintf("file_%d.txt", i)
 		assert.True(t, filesFound[filename], "Should find %s", filename)
-		assert.Greater(t, linesByFile[filename], 0,
-			"File %s should have additions", filename)
 	}
 
-	assert.GreaterOrEqual(t, additionCount, 1000)
+	assert.GreaterOrEqual(t, hunkCount, 500)
+	assert.GreaterOrEqual(t, totalLines, 1000)
+
+	t.Logf("Found %d hunks with %d total lines (avg %.1f lines per hunk)",
+		hunkCount, totalLines, float64(totalLines)/float64(hunkCount))
 }
 
-func TestDiffHistory_SuperLargeRepo(t *testing.T) {
+func TestDiffHistoryHunks_SuperLargeRepo(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping super large repo test in short mode")
 	}
@@ -332,21 +370,23 @@ func TestDiffHistory_SuperLargeRepo(t *testing.T) {
 	defer scanner.Close()
 
 	startTime := time.Now()
-	additions, errC := scanner.DiffHistory()
+	hunks, errC := scanner.DiffHistoryHunks()
 
 	filesFound := make(map[string]bool)
-	additionCount := 0
+	hunkCount := 0
+	totalLines := 0
 
-	for add := range additions {
-		filesFound[add.path] = true
-		additionCount++
+	for hunk := range hunks {
+		filesFound[hunk.Path()] = true
+		hunkCount++
+		totalLines += len(hunk.Lines())
 	}
 
 	err := <-errC
 	require.NoError(t, err)
 
 	duration := time.Since(startTime)
-	t.Logf("Processed 10,000 commits in %v", duration)
+	t.Logf("Processed 10,000 commits as hunks in %v", duration)
 
 	assert.Equal(t, 10000, len(filesFound), "Should find 10,000 files")
 	assert.True(t, filesFound["README.md"], "Should find README.md")
@@ -357,7 +397,11 @@ func TestDiffHistory_SuperLargeRepo(t *testing.T) {
 		assert.True(t, filesFound[filename], "Should find %s", filename)
 	}
 
-	assert.GreaterOrEqual(t, additionCount, 10000)
+	assert.GreaterOrEqual(t, hunkCount, 5000)
+	assert.GreaterOrEqual(t, totalLines, 10000)
+
+	t.Logf("Found %d hunks with %d total lines (avg %.1f lines per hunk)",
+		hunkCount, totalLines, float64(totalLines)/float64(hunkCount))
 }
 
 func TestLoadAllCommits_VeryLargeRepo(t *testing.T) {

@@ -1,4 +1,4 @@
-// diff_blob.go  – final "all additions" implementation
+// diff_blob.go  – hunk-based diff implementation
 package objstore
 
 import (
@@ -10,36 +10,38 @@ import (
 	"github.com/hexops/gotextdiff/span"
 )
 
-// AddedLine describes one line that exists in the _new_ revision of a file
-// but not in the _old_ revision produced by a diff.
-// It is returned by addedLinesWithPos and serves as a minimal, value-type
-// representation of an insertion hunk: the caller gets the inserted text
-// together with the 1-based line number at which it appears in the new file.
-// Consumers should treat the fields as read-only; the zero value is not
-// meaningful.
-type AddedLine struct {
-	// Text holds the entire contents of the inserted line with the trailing
-	// newline already stripped.
-	Text []byte
+// AddedHunk represents a contiguous block of added lines in a diff.
+// Multiple consecutive insertions are grouped into a single hunk to
+// provide better context for processing large additions.
+type AddedHunk struct {
+	// Lines contains all the added lines in this hunk, with trailing
+	// newlines already stripped.
+	Lines [][]byte
 
-	// Line records the 1-based line number of the inserted line in the new
-	// version of the file.
-	Line int
+	// StartLine is the 1-based line number where this hunk begins
+	// in the new version of the file.
+	StartLine int
 }
 
-// addedLinesWithPos returns every line that exists in *new* but not in *old*,
-// preserving the 1-based line number in the new file.
+// EndLine returns the 1-based line number where this hunk ends
+// in the new version of the file.
+func (h *AddedHunk) EndLine() int {
+	if len(h.Lines) == 0 {
+		return h.StartLine
+	}
+	return h.StartLine + len(h.Lines) - 1
+}
+
+// addedHunksWithPos returns contiguous blocks of lines that exist in *new* but not in *old*,
+// grouping consecutive insertions into hunks with their position in the new file.
 //
 // It performs a line-oriented diff using the Myers algorithm provided by
-// github.com/hexops/gotextdiff. Only insertion hunks are converted to
-// AddedLine values; unchanged and deletion hunks are ignored.
+// github.com/hexops/gotextdiff. Consecutive insertion lines are grouped into
+// a single AddedHunk to provide better context for processing large additions.
 //
-// The function pre-allocates the result slice to roughly half the number of
-// edits, a heuristic that tracks the fact that an insertion hunk generally
-// consumes two edits (one Insert, one Equal).
 // If the two byte slices are identical or the diff contains no insertions,
-// addedLinesWithPos returns nil.
-func addedLinesWithPos(oldB, newB []byte) []AddedLine {
+// addedHunksWithPos returns nil.
+func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 	if bytes.Equal(oldB, newB) {
 		return nil
 	}
@@ -52,8 +54,8 @@ func addedLinesWithPos(oldB, newB []byte) []AddedLine {
 		return nil
 	}
 
-	// Rough capacity: #insert hunks ≈ len(edits)/2 (heuristic).
-	out := make([]AddedLine, 0, len(edits))
+	var hunks []AddedHunk
+	var currentHunk *AddedHunk
 
 	for _, h := range u.Hunks {
 		lineNo := h.ToLine // already 1-based
@@ -61,14 +63,38 @@ func addedLinesWithPos(oldB, newB []byte) []AddedLine {
 		for _, ln := range h.Lines {
 			switch ln.Kind {
 			case gotextdiff.Insert:
-				// ln.Content still ends with "\n"; trim cheaply.
 				text := strings.TrimSuffix(ln.Content, "\n")
-				out = append(out, AddedLine{Text: []byte(text), Line: lineNo})
+
+				if currentHunk == nil {
+					// Start new hunk
+					currentHunk = &AddedHunk{
+						StartLine: lineNo,
+						Lines:     [][]byte{[]byte(text)},
+					}
+				} else {
+					// Continue current hunk
+					currentHunk.Lines = append(currentHunk.Lines, []byte(text))
+				}
 				lineNo++
-			case gotextdiff.Equal:
-				lineNo++
+
+			case gotextdiff.Equal, gotextdiff.Delete:
+				// End current hunk if we hit non-insertion
+				if currentHunk != nil {
+					hunks = append(hunks, *currentHunk)
+					currentHunk = nil
+				}
+				if ln.Kind == gotextdiff.Equal {
+					lineNo++
+				}
 			}
 		}
+
+		// Don't forget the last hunk at end of this diff hunk
+		if currentHunk != nil {
+			hunks = append(hunks, *currentHunk)
+			currentHunk = nil
+		}
 	}
-	return out
+
+	return hunks
 }
