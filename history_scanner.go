@@ -380,11 +380,26 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // It is safe to call Close multiple times; subsequent calls are no-ops.
 func (hs *HistoryScanner) Close() error { return hs.store.Close() }
 
-// CommitMetadata holds the author and timestamp of a commit.
-// This information is loaded lazily from the underlying object store
-// and cached.
+// CommitMetadata bundles the author identity and commit timestamp for a
+// single Git commit.
+//
+// Callers obtain a CommitMetadata instance through HistoryScanner.
+// GetCommitMetadata when they need lightweight identity data without
+// performing a full object walk.  On the first request for a given commit
+// the scanner inflates only the commit header, parses the “author”
+// (or fallback “committer”) line, and caches the result.  Later requests
+// return the cached value with zero additional I/O.
+//
+// The type is immutable and therefore safe for concurrent reads.
 type CommitMetadata struct {
-	Author    AuthorInfo
+	// Author describes the commit author exactly as recorded in the
+	// commit header.  The field is never modified after creation and can
+	// be shared freely between goroutines.
+	Author AuthorInfo
+
+	// Timestamp holds the committer time in seconds since the Unix epoch.
+	// It originates from the commit-graph if available; otherwise it is
+	// parsed from the commit header on the first cache miss.
 	Timestamp int64
 }
 
