@@ -69,7 +69,7 @@ const (
 	hashSize     = 20 // Full SHA-1 hash.
 	largeOffSize = 8  // 64-bit offset for objects beyond the 2 GiB boundary.
 
-	defaultMaxDeltaDepth = 50
+	defaultMaxDeltaDepth = 100
 )
 
 // cachedObj pairs a fully-materialized Git object with its on-disk
