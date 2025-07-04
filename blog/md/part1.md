@@ -17,7 +17,7 @@ git log -p --all
 
 When you run `git log -p --all`, you're forcing Git to walk through every commit, decompress every object, and compute a diff just to print a human-friendly patch. We then discard about half of that output (the "-" lines) and pipe the rest into our scanner.
 
-This is inefficient. The core problem is that we're asking Git to act as a middle-man when we could be accessing its underlying database directly.
+This is inefficient. The core problem is that we're asking Git to act as a middle-man, forcing it through slow, safe code paths when we could be accessing its underlying database directly with more advanced techniques.
 
 **Spoiler alert**: We can, and it's surprisingly straightforward once you understand how Git stores its data.
 
@@ -80,7 +80,7 @@ These objects link together to form what we call a **Directed Acyclic Graph (DAG
 
 ## 📦 The Packed Object Store: Git's Efficiency Engine
 
-Storing millions of tiny object files is inefficient. Git solves this by bundling loose objects into `.pack` files during garbage collection.
+Storing millions of tiny object files is inefficient. Git solves this by bundling loose objects into `.pack` files during garbage collection. To make access even faster, we'll use memory-mapped I/O, which allows us to treat these large packfiles as if they were in memory, avoiding costly read operations.
 
 ### Key Components
 
@@ -177,13 +177,13 @@ Time:   O(1) - binary search in sorted index
 **2. Inflate/Delta Resolution**
 ```
 Read bytes at offset 12345 → "∆base_sha +5 Hello"
-Resolve delta chain → "Hello, World!"
+Resolve delta chain using a single-pass, streaming algorithm → "Hello, World!"
 Decompress with zlib → actual file content
 ```
 
 **3. Commit-Graph Traversal**
 ```
-Instead of: Parse full commit object (slow)
+Instead of: Parse full commit object (slow), we'll use `unsafe` pointer operations to quickly parse just the headers.
 We use:    Pre-computed metadata (fast)
 Result:    Parent SHAs + root tree SHA
 ```

@@ -189,31 +189,33 @@ This keeps the index compact for most repositories while scaling to enormous siz
 ### File Integrity Verification
 
 ```go
-// Pack trailer verification from the actual implementation
+// verifyPackTrailer validates the SHA-1 checksum at the end of a pack file.
+// This should be called once per pack to ensure the trailer hasn't been corrupted.
 func verifyPackTrailer(pack *mmap.ReaderAt) error {
-    size := pack.Len()
-    if size < hashSize {
-        return fmt.Errorf("pack too small for trailer")
-    }
+	size := pack.Len()
+	if size < hashSize {
+		return fmt.Errorf("pack too small for trailer")
+	}
 
-    // Read the 20-byte SHA-1 trailer
-    trailer := make([]byte, hashSize)
-    if _, err := pack.ReadAt(trailer, int64(size-hashSize)); err != nil {
-        return fmt.Errorf("failed to read pack trailer: %w", err)
-    }
+	// Read the trailer checksum.
+	trailer := make([]byte, hashSize)
+	if _, err := pack.ReadAt(trailer, int64(size-hashSize)); err != nil {
+		return fmt.Errorf("failed to read pack trailer: %w", err)
+	}
 
-    // Compute checksum over entire pack except trailer
-    h := sha1.New()
-    sec := io.NewSectionReader(pack, 0, int64(size-hashSize))
-    if _, err := io.Copy(h, sec); err != nil {
-        return fmt.Errorf("failed to checksum pack: %w", err)
-    }
+	// Compute checksum over entire pack except the trailer itself.
+	h := sha1.New()
+	sec := io.NewSectionReader(pack, 0, int64(size-hashSize))
+	if _, err := io.Copy(h, sec); err != nil {
+		return fmt.Errorf("failed to checksum pack: %w", err)
+	}
 
-    computed := h.Sum(nil)
-    if !bytes.Equal(computed, trailer) {
-        return ErrPackTrailerCorrupt
-    }
-    return nil
+	computed := h.Sum(nil)
+	if !bytes.Equal(computed, trailer) {
+		return ErrPackTrailerCorrupt
+	}
+
+	return nil
 }
 ```
 
@@ -324,7 +326,7 @@ With Fan-Out:
 └── Total Time: ~0.15ms
 
 Speed Improvement: 1.67x faster
-Memory Efficiency: 256x better cache locality
+Memory Efficiency: 256x better cache locality, amplified by our multi-level cache (ARC + delta window).
 ```
 
 The real win isn't just speed - it's **predictable performance**. The fan-out ensures that lookups stay fast regardless of repository size.
