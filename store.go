@@ -75,7 +75,7 @@ const (
 	largeOffSize = 8
 
 	// defaultMaxDeltaDepth is the default maximum depth for resolving delta chains.
-	defaultMaxDeltaDepth = 50
+	defaultMaxDeltaDepth = 100
 	// maxCacheableSize is the maximum size of an object that will be stored in the cache.
 	maxCacheableSize = 4 << 20 // 4 MiB
 )
