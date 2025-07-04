@@ -31,7 +31,8 @@ func TestAddedHunksIntegration(t *testing.T) {
 				"+added",
 			},
 			wantHunks: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("inserted"), []byte("line2"), []byte("added")}},
+				{StartLine: 2, Lines: []string{"inserted"}},
+				{StartLine: 4, Lines: []string{"added"}},
 			},
 		},
 		{
@@ -44,8 +45,9 @@ func TestAddedHunksIntegration(t *testing.T) {
 				"+line6",
 			},
 			wantHunks: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("line2")}},
-				{StartLine: 4, Lines: [][]byte{[]byte("line4"), []byte("line5"), []byte("line6")}},
+				{StartLine: 2, Lines: []string{"line2"}},
+				{StartLine: 4, Lines: []string{"line4"}},
+				{StartLine: 6, Lines: []string{"line6"}},
 			},
 		},
 		{
@@ -58,7 +60,7 @@ func TestAddedHunksIntegration(t *testing.T) {
 				"+line4",
 			},
 			wantHunks: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("line2"), []byte("line3"), []byte("line4")}},
+				{StartLine: 2, Lines: []string{"line2", "line3", "line4"}},
 			},
 		},
 		{
@@ -69,7 +71,7 @@ func TestAddedHunksIntegration(t *testing.T) {
 				"+@@ -1,1 +1,2 @@",
 			},
 			wantHunks: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("@@ -1,1 +1,2 @@")}},
+				{StartLine: 2, Lines: []string{"@@ -1,1 +1,2 @@"}},
 			},
 		},
 		{
@@ -81,7 +83,7 @@ func TestAddedHunksIntegration(t *testing.T) {
 				"++++ b/file",
 			},
 			wantHunks: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("--- a/file"), []byte("+++ b/file")}},
+				{StartLine: 2, Lines: []string{"--- a/file", "+++ b/file"}},
 			},
 		},
 	}
@@ -101,7 +103,12 @@ func TestAddedHunksIntegration(t *testing.T) {
 
 			// Verify EndLine calculations for all hunks
 			for i, hunk := range result {
-				expectedEndLine := hunk.StartLine + len(hunk.Lines) - 1
+				var expectedEndLine uint32
+				if len(hunk.Lines) == 0 {
+					expectedEndLine = hunk.StartLine
+				} else {
+					expectedEndLine = hunk.StartLine + uint32(len(hunk.Lines)) - 1
+				}
 				assert.Equal(t, expectedEndLine, hunk.EndLine(),
 					"EndLine calculation incorrect for hunk %d", i)
 			}
@@ -127,7 +134,7 @@ func TestAddedHunksEdgeCases(t *testing.T) {
 			old:  []byte("line1"),
 			new:  []byte("line1\nline2"),
 			expected: []AddedHunk{
-				{StartLine: 1, Lines: [][]byte{[]byte("line1"), []byte("line2")}},
+				{StartLine: 2, Lines: []string{"line2"}},
 			},
 		},
 		{
@@ -135,7 +142,7 @@ func TestAddedHunksEdgeCases(t *testing.T) {
 			old:  []byte(""),
 			new:  []byte("new\ncontent"),
 			expected: []AddedHunk{
-				{StartLine: 1, Lines: [][]byte{[]byte("new"), []byte("content")}},
+				{StartLine: 1, Lines: []string{"new", "content"}},
 			},
 		},
 		{
@@ -149,8 +156,9 @@ func TestAddedHunksEdgeCases(t *testing.T) {
 			old:  []byte("keep1\nkeep3\nkeep5"),
 			new:  []byte("keep1\nadd2\nkeep3\nadd4\nkeep5\nadd6"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("add2")}},
-				{StartLine: 4, Lines: [][]byte{[]byte("add4"), []byte("keep5"), []byte("add6")}},
+				{StartLine: 2, Lines: []string{"add2"}},
+				{StartLine: 4, Lines: []string{"add4"}},
+				{StartLine: 6, Lines: []string{"add6"}},
 			},
 		},
 	}
@@ -162,9 +170,15 @@ func TestAddedHunksEdgeCases(t *testing.T) {
 
 			// Validate all hunks have proper properties
 			for i, hunk := range result {
-				assert.Greater(t, hunk.StartLine, 0, "Hunk %d StartLine should be positive", i)
+				assert.Greater(t, hunk.StartLine, uint32(0), "Hunk %d StartLine should be positive", i)
 				assert.NotEmpty(t, hunk.Lines, "Hunk %d should have lines", i)
-				assert.Equal(t, hunk.StartLine+len(hunk.Lines)-1, hunk.EndLine(),
+				var expectedEndLine uint32
+				if len(hunk.Lines) == 0 {
+					expectedEndLine = hunk.StartLine
+				} else {
+					expectedEndLine = hunk.StartLine + uint32(len(hunk.Lines)) - 1
+				}
+				assert.Equal(t, expectedEndLine, hunk.EndLine(),
 					"Hunk %d EndLine calculation should be correct", i)
 			}
 		})

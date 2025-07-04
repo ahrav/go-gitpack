@@ -11,7 +11,6 @@ import (
 )
 
 func TestMetaCacheConcurrency(t *testing.T) {
-	// minimal fake objects
 	var h Hash
 	g := &commitGraphData{Timestamps: []int64{123}, OrderedOIDs: []Hash{h},
 		OIDToIndex: map[Hash]int{h: 0}}
@@ -26,15 +25,14 @@ func TestMetaCacheConcurrency(t *testing.T) {
 		t.Fatalf("timestamp mismatch")
 	}
 
-	// run 100 goroutines that hit get()
 	done := make(chan struct{}, 100)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		go func() {
 			_, _ = mc.get(h)
 			done <- struct{}{}
 		}()
 	}
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		<-done
 	}
 }
@@ -64,7 +62,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte(""),
 			new:  []byte("line1\nline2\nline3"),
 			expected: []AddedHunk{
-				{StartLine: 1, Lines: [][]byte{[]byte("line1"), []byte("line2"), []byte("line3")}},
+				{StartLine: 1, Lines: []string{"line1", "line2", "line3"}},
 			},
 		},
 		{
@@ -80,7 +78,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\nline2"),
 			new:  []byte("line1\nline2\nline3"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("line2"), []byte("line3")}},
+				{StartLine: 3, Lines: []string{"line3"}},
 			},
 		},
 
@@ -89,7 +87,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line2\nline3"),
 			new:  []byte("line1\nline2\nline3"),
 			expected: []AddedHunk{
-				{StartLine: 1, Lines: [][]byte{[]byte("line1")}},
+				{StartLine: 1, Lines: []string{"line1"}},
 			},
 		},
 
@@ -98,7 +96,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\nline3"),
 			new:  []byte("line1\nline2\nline3"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("line2")}},
+				{StartLine: 2, Lines: []string{"line2"}},
 			},
 		},
 
@@ -108,7 +106,8 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\nline4"),
 			new:  []byte("line1\nline2\nline3\nline4\nline5"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("line2"), []byte("line3"), []byte("line4"), []byte("line5")}},
+				{StartLine: 2, Lines: []string{"line2", "line3"}},
+				{StartLine: 5, Lines: []string{"line5"}},
 			},
 		},
 
@@ -117,8 +116,9 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\nline3\nline5"),
 			new:  []byte("line1\nline2\nline3\nline4\nline5\nline6"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("line2")}},
-				{StartLine: 4, Lines: [][]byte{[]byte("line4"), []byte("line5"), []byte("line6")}},
+				{StartLine: 2, Lines: []string{"line2"}},
+				{StartLine: 4, Lines: []string{"line4"}},
+				{StartLine: 6, Lines: []string{"line6"}},
 			},
 		},
 
@@ -127,7 +127,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\nold_line\nline3"),
 			new:  []byte("line1\nnew_line\nline3"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("new_line")}},
+				{StartLine: 2, Lines: []string{"new_line"}},
 			},
 		},
 
@@ -136,7 +136,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("old1\nold2"),
 			new:  []byte("new1\nnew2\nnew3"),
 			expected: []AddedHunk{
-				{StartLine: 1, Lines: [][]byte{[]byte("new1"), []byte("new2"), []byte("new3")}},
+				{StartLine: 1, Lines: []string{"new1", "new2", "new3"}},
 			},
 		},
 
@@ -146,7 +146,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\n"),
 			new:  []byte("line1\n+this starts with plus\n++multiple plus"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("+this starts with plus"), []byte("++multiple plus")}},
+				{StartLine: 2, Lines: []string{"+this starts with plus", "++multiple plus"}},
 			},
 		},
 
@@ -155,7 +155,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\nline2"),
 			new:  []byte("line1\n\n\nline2"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte(""), []byte("")}},
+				{StartLine: 2, Lines: []string{"", ""}},
 			},
 		},
 
@@ -165,7 +165,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\n"),
 			new:  []byte("line1\n   \n\t\t\n "),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("   "), []byte("\t\t"), []byte(" ")}},
+				{StartLine: 2, Lines: []string{"   ", "\t\t", " "}},
 			},
 		},
 
@@ -175,7 +175,7 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("hello\n"),
 			new:  []byte("hello\n世界\n🚀\némoji"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("世界"), []byte("🚀"), []byte("émoji")}},
+				{StartLine: 2, Lines: []string{"世界", "🚀", "émoji"}},
 			},
 		},
 
@@ -185,27 +185,18 @@ func TestAddedHunks(t *testing.T) {
 			old:  []byte("line1\r\nline2"),
 			new:  []byte("line1\r\nline2\r\nline3"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("line2\r"), []byte("line3")}},
+				{StartLine: 2, Lines: []string{"line2\r", "line3"}},
 			},
 		},
 
 		{
 			name: "mixed additions and context",
-			old: []byte(`line1
-line2
-line3
-line4
-line5`),
-			new: []byte(`line1
-modified2
-line3
-added1
-added2
-line5
-added3`),
+			old:  []byte("line1\nline2\nline3\nline4\nline5"),
+			new:  []byte("line1\nmodified2\nline3\nadded1\nadded2\nline5\nadded3"),
 			expected: []AddedHunk{
-				{StartLine: 2, Lines: [][]byte{[]byte("modified2")}},
-				{StartLine: 4, Lines: [][]byte{[]byte("added1"), []byte("added2"), []byte("line5"), []byte("added3")}},
+				{StartLine: 2, Lines: []string{"modified2"}},
+				{StartLine: 4, Lines: []string{"added1", "added2"}},
+				{StartLine: 7, Lines: []string{"added3"}},
 			},
 		},
 	}
@@ -219,7 +210,12 @@ added3`),
 
 			// Verify EndLine method works correctly.
 			for i, hunk := range result {
-				expectedEndLine := hunk.StartLine + len(hunk.Lines) - 1
+				var expectedEndLine uint32
+				if len(hunk.Lines) == 0 {
+					expectedEndLine = hunk.StartLine
+				} else {
+					expectedEndLine = hunk.StartLine + uint32(len(hunk.Lines)) - 1
+				}
 				assert.Equal(t, expectedEndLine, hunk.EndLine(),
 					"EndLine() mismatch for hunk %d in test %s", i, tt.name)
 			}
@@ -237,25 +233,25 @@ func TestAddedHunkProperties(t *testing.T) {
 	t.Run("endline_calculation", func(t *testing.T) {
 		hunk := AddedHunk{
 			StartLine: 5,
-			Lines:     [][]byte{[]byte("line1"), []byte("line2"), []byte("line3")},
+			Lines:     []string{"line1", "line2", "line3"},
 		}
-		assert.Equal(t, 7, hunk.EndLine(), "EndLine should be StartLine + len(Lines) - 1")
+		assert.Equal(t, uint32(7), hunk.EndLine(), "EndLine should be StartLine + len(Lines) - 1")
 	})
 
 	t.Run("empty_hunk_endline", func(t *testing.T) {
 		hunk := AddedHunk{
 			StartLine: 10,
-			Lines:     [][]byte{},
+			Lines:     []string{},
 		}
-		assert.Equal(t, 10, hunk.EndLine(), "Empty hunk EndLine should equal StartLine")
+		assert.Equal(t, uint32(10), hunk.EndLine(), "Empty hunk EndLine should equal StartLine")
 	})
 
 	t.Run("single_line_hunk", func(t *testing.T) {
 		hunk := AddedHunk{
 			StartLine: 3,
-			Lines:     [][]byte{[]byte("single line")},
+			Lines:     []string{"single line"},
 		}
-		assert.Equal(t, 3, hunk.EndLine(), "Single line hunk EndLine should equal StartLine")
+		assert.Equal(t, uint32(3), hunk.EndLine(), "Single line hunk EndLine should equal StartLine")
 	})
 }
 
@@ -289,7 +285,7 @@ func BenchmarkAddedHunks(b *testing.B) {
 
 	for _, bc := range cases {
 		b.Run(bc.name, func(b *testing.B) {
-			for i := 0; i < b.N; i++ {
+			for b.Loop() {
 				_ = addedHunksWithPos(bc.old, bc.new)
 			}
 		})
@@ -307,7 +303,7 @@ func FuzzAddedHunks(f *testing.F) {
 
 		// Verify that the result is always valid.
 		for _, hunk := range result {
-			assert.Greater(t, hunk.StartLine, 0, "StartLine must be positive")
+			assert.Greater(t, hunk.StartLine, uint32(0), "StartLine must be positive")
 			assert.GreaterOrEqual(t, hunk.EndLine(), hunk.StartLine, "EndLine must be >= StartLine")
 			assert.NotNil(t, hunk.Lines, "Lines should not be nil")
 		}
