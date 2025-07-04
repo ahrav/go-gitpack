@@ -52,3 +52,25 @@ func getBR(r io.Reader) *bufio.Reader {
 
 // putBR returns a bufio.Reader to the pool for reuse.
 func putBR(br *bufio.Reader) { brPool.Put(br) }
+
+const MaxHdr = 4096
+
+// bufPool returns a 0-length slice with a 4 KiB backing array,
+// just large enough for the worst-case header we are willing to read.
+var bufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 0, MaxHdr)
+		return &b
+	},
+}
+
+// GetBuf gets a buffer from the bufPool.
+func GetBuf() *[]byte {
+	return bufPool.Get().(*[]byte)
+}
+
+// PutBuf returns a buffer to the bufPool.
+func PutBuf(buf *[]byte) {
+	*buf = (*buf)[:0]
+	bufPool.Put(buf)
+}

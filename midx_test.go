@@ -192,7 +192,7 @@ func TestStoreWithMidx(t *testing.T) {
 	assert.NotNil(t, store.midx, "Store should contain parsed midx")
 	assert.True(t, len(store.midx.objectIDs) > 0, "midx should index at least one object")
 
-	data, typ, err := store.Get(oid)
+	data, typ, err := store.get(oid)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, content, data)
@@ -627,7 +627,7 @@ func BenchmarkGetMidxCold(b *testing.B) {
 	for b.Loop() {
 		// Force cold cache lookup by purging cached objects.
 		store.cache.Purge()
-		_, _, err := store.Get(someHash)
+		_, _, err := store.get(someHash)
 		require.NoError(b, err)
 	}
 }
@@ -653,12 +653,12 @@ func BenchmarkGetMidxWarm(b *testing.B) {
 	someHash := store.midx.objectIDs[0]
 
 	// Warm the cache with an initial lookup.
-	_, _, err = store.Get(someHash)
+	_, _, err = store.get(someHash)
 	require.NoError(b, err)
 
 	b.ResetTimer()
 	for b.Loop() {
-		_, _, err := store.Get(someHash)
+		_, _, err := store.get(someHash)
 		require.NoError(b, err)
 	}
 }
@@ -724,7 +724,7 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 			// Exercise the data structures to ensure realistic allocation patterns.
 			if store.midx != nil && len(store.midx.objectIDs) > 0 {
 				hash := store.midx.objectIDs[0]
-				store.Get(hash)
+				store.get(hash)
 			}
 
 			store.Close()
@@ -745,7 +745,7 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 			// Perform equivalent operations using traditional pack index lookup.
 			if len(store.packs) > 0 && len(store.packs[0].oidTable) > 0 {
 				hash := store.packs[0].oidTable[0]
-				store.Get(hash)
+				store.get(hash)
 			}
 
 			store.Close()
@@ -774,7 +774,7 @@ func TestStore_MidxOnly_NoIdx(t *testing.T) {
 
 	assert.Nil(t, store.packs[0].idx, "Store should tolerate missing .idx when midx present")
 
-	data, typ, err := store.Get(oid)
+	data, typ, err := store.get(oid)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, blob, data)
@@ -826,7 +826,7 @@ func TestCRCVerification(t *testing.T) {
 	defer store.Close()
 	store.VerifyCRC = true
 
-	_, _, err = store.Get(headHash)
+	_, _, err = store.get(headHash)
 	require.NoError(t, err)
 }
 
@@ -857,7 +857,7 @@ func TestMidxFanoutAcrossPacks(t *testing.T) {
 		t.Skip("benchmark helper did not place objects in 3rd pack")
 	}
 
-	_, _, err = store.Get(target)
+	_, _, err = store.get(target)
 	require.NoError(t, err, "midx fan‑out should locate object across packs")
 }
 
@@ -918,7 +918,7 @@ func TestThinPackCrossPackViaMidx(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
-	data, typ, err := store.Get(oidDelta)
+	data, typ, err := store.get(oidDelta)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, blobDelta, data)

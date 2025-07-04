@@ -305,8 +305,8 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 			return nil
 		}
 
-		oldBytes, _, _ := hs.store.Get(old)
-		newBytes, _, _ := hs.store.Get(newH)
+		oldBytes, _, _ := hs.store.get(old)
+		newBytes, _, _ := hs.store.get(newH)
 
 		for _, h := range addedHunksWithPos(oldBytes, newBytes) {
 			out <- HunkAddition{
@@ -323,7 +323,7 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 
 // get returns the fully materialized object identified by oid plus its type.
 func (hs *HistoryScanner) get(oid Hash) ([]byte, ObjectType, error) {
-	return hs.store.Get(oid)
+	return hs.store.get(oid)
 }
 
 // SetMaxDeltaDepth sets the maximum delta‑chain depth for object retrieval.
@@ -400,7 +400,7 @@ func (hs *HistoryScanner) scanPackfiles() ([]commitInfo, error) {
 			if err != nil || typ != ObjCommit {
 				continue
 			}
-			raw, _, err := hs.store.Get(oid)
+			raw, _, err := hs.store.get(oid)
 			if err != nil {
 				failedCommits[oid] = err
 				continue

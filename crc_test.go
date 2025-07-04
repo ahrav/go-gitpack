@@ -55,7 +55,7 @@ func TestVerifyCRC32_ValidObject(t *testing.T) {
 
 	store.VerifyCRC = true
 
-	data, typ, err := store.Get(hash)
+	data, typ, err := store.get(hash)
 	assert.NoError(t, err, "CRC verification should pass for valid object")
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, blob, data)

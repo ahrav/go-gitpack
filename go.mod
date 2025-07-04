@@ -7,7 +7,12 @@ require (
 	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
 )
 
-require github.com/hashicorp/golang-lru/v2 v2.0.7 // indirect
+require github.com/hashicorp/golang-lru/v2 v2.0.7
+
+require (
+	github.com/kr/pretty v0.1.0 // indirect
+	gopkg.in/check.v1 v1.0.0-20190902080502-41f04d3bba15 // indirect
+)
 
 require (
 	github.com/davecgh/go-spew v1.1.1 // indirect

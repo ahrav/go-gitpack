@@ -54,7 +54,7 @@ func walkDiff(
 		if h == (Hash{}) {
 			return nil, nil
 		}
-		return tc.TreeIter(h)
+		return tc.treeIter(h)
 	}
 
 	oldIter, err := iterFor(oldTreeOID)
