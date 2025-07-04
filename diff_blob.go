@@ -76,6 +76,34 @@ func tokenize(src []byte) []string {
 	return lines
 }
 
+// FuseHunks merges consecutive AddedHunks if the gap between them
+// (in untouched lines) is <= 2*ctx + inter.
+//
+// ctx   – lines of ordinary context you intend to show around each hunk
+// inter – extra “inter‑hunk” budget (Git’s --inter-hunk-context)
+func FuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
+	if len(hunks) < 2 {
+		return hunks
+	}
+	maxGap := 2*ctx + inter
+	out := make([]AddedHunk, 0, len(hunks))
+	cur := hunks[0]
+
+	for i := 1; i < len(hunks); i++ {
+		gap := int(hunks[i].StartLine) - int(cur.EndLine()) - 1
+		if gap <= maxGap {
+			// Merge – we *do not* insert the untouched lines into Lines,
+			// we just extend the range & byte count.
+			cur.Lines = append(cur.Lines, hunks[i].Lines...)
+		} else {
+			out = append(out, cur)
+			cur = hunks[i]
+		}
+	}
+	out = append(out, cur)
+	return out
+}
+
 // addedHunksWithPos compares two byte slices and identifies contiguous blocks of added lines.
 // The function performs a line-by-line comparison between oldB and newB to find additions.
 // It groups consecutive added lines into hunks for efficient diff representation.

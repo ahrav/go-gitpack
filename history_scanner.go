@@ -308,7 +308,7 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 		oldBytes, _, _ := hs.store.get(old)
 		newBytes, _, _ := hs.store.get(newH)
 
-		for _, h := range addedHunksWithPos(oldBytes, newBytes) {
+		for _, h := range FuseHunks(addedHunksWithPos(oldBytes, newBytes), 3, 3) {
 			out <- HunkAddition{
 				commit:    c.OID,
 				path:      filepath.ToSlash(path),
@@ -325,9 +325,6 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 func (hs *HistoryScanner) get(oid Hash) ([]byte, ObjectType, error) {
 	return hs.store.get(oid)
 }
-
-// SetMaxDeltaDepth sets the maximum delta‑chain depth for object retrieval.
-func (hs *HistoryScanner) SetMaxDeltaDepth(depth int) { hs.store.SetMaxDeltaDepth(depth) }
 
 // SetVerifyCRC enables or disables CRC‑32 verification on all object reads.
 func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verify }
