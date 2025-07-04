@@ -314,3 +314,111 @@ func FuzzAddedHunks(f *testing.F) {
 		}
 	})
 }
+
+func TestFuseHunks(t *testing.T) {
+	type args struct {
+		hunks []AddedHunk
+		ctx   int
+		inter int
+	}
+	makeH := func(start uint32, lines ...string) AddedHunk {
+		b := 0
+		for _, l := range lines {
+			b += len(l)
+		}
+		return AddedHunk{StartLine: start, Lines: lines}
+	}
+
+	tests := []struct {
+		name string
+		args args
+		want []AddedHunk
+	}{
+		{
+			name: "merge_defaultCtx",
+			args: args{
+				// gaps: 2 & 4  -> total 6  (<= 2*3+0) so merge
+				hunks: []AddedHunk{
+					makeH(1, "a"),
+					makeH(4, "b"), // gap = 4‑1‑1 = 2
+					makeH(7, "c"), // gap = 7‑4‑1 = 2
+				},
+				ctx: 3, inter: 0,
+			},
+			want: []AddedHunk{
+				makeH(1, "a", "b", "c"),
+			},
+		},
+		{
+			name: "no_merge_defaultCtx",
+			args: args{
+				hunks: []AddedHunk{
+					makeH(1, "a"),
+					makeH(9, "b"), // gap = 9‑1‑1 = 7  (>6) so keep split
+				},
+				ctx: 3, inter: 0,
+			},
+			want: []AddedHunk{
+				makeH(1, "a"),
+				makeH(9, "b"),
+			},
+		},
+		{
+			name: "merge_zeroCtx_inter",
+			args: args{
+				hunks: []AddedHunk{
+					makeH(1, "a"),
+					makeH(3, "b"), // gap = 1 (<= inter=2) – merge
+				},
+				ctx: 0, inter: 2,
+			},
+			want: []AddedHunk{
+				makeH(1, "a", "b"),
+			},
+		},
+		{
+			name: "cascade_merge",
+			args: args{
+				// 1↔2 gap 2   2↔3 gap 2   all within maxGap 4
+				hunks: []AddedHunk{
+					makeH(10, "x"),
+					makeH(13, "y"),
+					makeH(16, "z"),
+				},
+				ctx: 2, inter: 0, // maxGap = 4
+			},
+			want: []AddedHunk{
+				makeH(10, "x", "y", "z"),
+			},
+		},
+		{
+			name: "preserve_bytes_and_lines",
+			args: args{
+				hunks: []AddedHunk{
+					makeH(1, "123"),
+					makeH(3, "45"),
+				},
+				ctx: 1, inter: 1, // gap = 1 <= 3
+			},
+			want: []AddedHunk{
+				{StartLine: 1, Lines: []string{"123", "45"}},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := FuseHunks(tt.args.hunks, tt.args.ctx, tt.args.inter)
+			assert.Equal(t, tt.want, got, "FuseHunks result mismatch")
+
+			// Additional invariant: StartLine/EndLine monotone and non‑overlapping.
+			prevEnd := uint32(0)
+			for i, h := range got {
+				assert.Greater(t, h.StartLine, uint32(0), "hunk %d StartLine <= 0", i)
+				assert.GreaterOrEqual(t, h.EndLine(), h.StartLine, "hunk %d EndLine < StartLine", i)
+				assert.Greater(t, h.StartLine, prevEnd, "hunks overlap or unordered")
+				prevEnd = h.EndLine()
+			}
+		})
+	}
+}

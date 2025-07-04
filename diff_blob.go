@@ -76,11 +76,14 @@ func tokenize(src []byte) []string {
 	return lines
 }
 
-// FuseHunks merges consecutive AddedHunks if the gap between them
-// (in untouched lines) is <= 2*ctx + inter.
+// FuseHunks merges consecutive AddedHunks when the number of untouched lines
+// between them is less than or equal to 2*ctx + inter.
 //
-// ctx   – lines of ordinary context you intend to show around each hunk
-// inter – extra “inter‑hunk” budget (Git’s --inter-hunk-context)
+// ctx specifies the amount of ordinary “context” you intend to display around
+// each hunk, while inter represents an additional “inter-hunk” allowance
+// (equivalent to Git’s --inter-hunk-context flag).
+// The function never inserts the untouched lines into the resulting hunks; it
+// only extends the range metadata and concatenates the added lines.
 func FuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
 	if len(hunks) < 2 {
 		return hunks
