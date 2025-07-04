@@ -58,7 +58,10 @@ var (
 // A nil return value signals that the on-disk CRC matches the expected one.
 func verifyCRC32(pf *idxFile, objOff uint64, want uint32) error {
 	// Locate objOff in the monotonically-sorted offset slice.
-	idx := sort.Search(len(pf.sortedOffsets), func(i int) bool { return pf.sortedOffsets[i] >= objOff })
+	idx := sort.Search(
+		len(pf.sortedOffsets),
+		func(i int) bool { return pf.sortedOffsets[i] >= objOff },
+	)
 	if idx >= len(pf.sortedOffsets) || pf.sortedOffsets[idx] != objOff {
 		return fmt.Errorf("offset %d not found in index", objOff)
 	}

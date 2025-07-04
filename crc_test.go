@@ -3,6 +3,7 @@ package objstore
 
 import (
 	"bytes"
+	"compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
@@ -23,7 +24,26 @@ func TestVerifyCRC32_ValidObject(t *testing.T) {
 
 	packPath := filepath.Join(dir, "test.pack")
 	blob := []byte("test content for CRC")
-	require.NoError(t, createMinimalPack(packPath, blob))
+
+	var packBuf bytes.Buffer
+	packBuf.Write([]byte("PACK"))
+	binary.Write(&packBuf, binary.BigEndian, uint32(2))
+	binary.Write(&packBuf, binary.BigEndian, uint32(1))
+
+	var compressedData bytes.Buffer
+	zw, _ := zlib.NewWriterLevel(&compressedData, zlib.DefaultCompression)
+	_, err := zw.Write(blob)
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+
+	packBuf.WriteByte(0xb4) // type blob, size > 15
+	packBuf.WriteByte(0x01) // remaining size
+	packBuf.Write(compressedData.Bytes())
+
+	// Pack trailer.
+	checksum := sha1.Sum(packBuf.Bytes())
+	packBuf.Write(checksum[:])
+	require.NoError(t, os.WriteFile(packPath, packBuf.Bytes(), 0644))
 
 	hash := calculateHash(ObjBlob, blob)
 	idxPath := filepath.Join(dir, "test.idx")
@@ -245,16 +265,12 @@ func createCorruptPackWithTrailer(t *testing.T, packPath string) {
 	require.NoError(t, createV2IndexFile(idxPath, []Hash{}, []uint64{}))
 }
 
-// Add other MIDX v2 tests here...
-
-// TestMidxV2CRCParsing tests parsing of MIDX v2 files with CRC data.
 func TestMidxV2CRCParsing(t *testing.T) {
-	// NOTE: This test will fail until MIDX v2 support is implemented in parseMidx
+	// NOTE: This test will fail until MIDX v2 support is implemented in parseMidx.
 	t.Skip("MIDX v2 parsing not yet implemented")
 
 	dir := t.TempDir()
 
-	// Create a pack with known objects
 	packPath := filepath.Join(dir, "test.pack")
 	blob := []byte("test blob for midx v2")
 	hash := calculateHash(ObjBlob, blob)
@@ -267,10 +283,9 @@ func TestMidxV2CRCParsing(t *testing.T) {
 		[]uint64{12},
 	))
 
-	// Create MIDX v2 with CRCS chunk
+	// Create MIDX v2 with CRCS chunk.
 	createMidxV2WithCRCs(t, dir, "test.pack", []Hash{hash}, []uint64{12}, []uint32{expectedCRC})
 
-	// Parse the MIDX
 	midxRA, err := mmap.Open(filepath.Join(dir, "multi-pack-index"))
 	require.NoError(t, err)
 	defer midxRA.Close()
@@ -279,13 +294,12 @@ func TestMidxV2CRCParsing(t *testing.T) {
 	midx, err := parseMidx(dir, midxRA, packCache)
 	require.NoError(t, err)
 
-	// Verify version and CRC data
 	assert.Equal(t, byte(2), midx.version, "Should parse as version 2")
 	assert.Len(t, midx.entries, 1)
 	assert.Equal(t, expectedCRC, midx.entries[0].crc, "Should parse CRC from CRCS chunk")
 }
 
-// createMidxV2WithCRCs creates a MIDX v2 file with CRCS chunk
+// createMidxV2WithCRCs creates a MIDX v2 file with CRCS chunk.
 func createMidxV2WithCRCs(
 	t *testing.T,
 	packDir string,
@@ -297,7 +311,6 @@ func createMidxV2WithCRCs(
 	require.Equal(t, len(hashes), len(offsets))
 	require.Equal(t, len(hashes), len(crcs))
 
-	// Sort objects by hash
 	type obj struct {
 		h     Hash
 		off32 uint32
@@ -312,7 +325,7 @@ func createMidxV2WithCRCs(
 		return bytes.Compare(objs[i].h[:], objs[j].h[:]) < 0
 	})
 
-	// Build chunks
+	// Build chunks.
 	var pnam bytes.Buffer
 	pnam.WriteString(packName)
 	pnam.WriteByte(0)
@@ -340,13 +353,11 @@ func createMidxV2WithCRCs(
 		binary.Write(&ooff, binary.BigEndian, o.off32)
 	}
 
-	// NEW: CRCS chunk for v2
 	var crcsChunk bytes.Buffer
 	for _, o := range objs {
 		binary.Write(&crcsChunk, binary.BigEndian, o.crc)
 	}
 
-	// Assemble file
 	type chunk struct {
 		id   string
 		data []byte
@@ -356,7 +367,7 @@ func createMidxV2WithCRCs(
 		{"OIDL", oidl.Bytes()},
 		{"OOFF", ooff.Bytes()},
 		{"PNAM", pnam.Bytes()},
-		{"CRCS", crcsChunk.Bytes()}, // NEW
+		{"CRCS", crcsChunk.Bytes()},
 	}
 
 	const headerSize = 12
@@ -365,7 +376,7 @@ func createMidxV2WithCRCs(
 
 	var file bytes.Buffer
 
-	// Header with version 2
+	// Header with version 2.
 	file.WriteString("MIDX")
 	file.WriteByte(2) // Version 2!
 	file.WriteByte(1) // SHA-1
@@ -373,17 +384,17 @@ func createMidxV2WithCRCs(
 	file.WriteByte(0)
 	binary.Write(&file, binary.BigEndian, uint32(1)) // pack-count
 
-	// Chunk table
+	// Chunk table.
 	for _, c := range chunks {
 		file.WriteString(fmt.Sprintf("%-4s", c.id)[:4])
 		binary.Write(&file, binary.BigEndian, uint64(offset))
 		offset += len(c.data)
 	}
-	// Sentinel
+	// Sentinel.
 	file.Write([]byte{0, 0, 0, 0})
 	binary.Write(&file, binary.BigEndian, uint64(offset))
 
-	// Payload
+	// Payload.
 	for _, c := range chunks {
 		file.Write(c.data)
 	}
