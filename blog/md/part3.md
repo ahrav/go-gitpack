@@ -158,6 +158,8 @@ for i, start := 0, 0; i < packCount; i++ {
 ```
 
 **OIDF & OIDL (Object ID Fan-Out & List)**
+You might notice the `unsafe` package here. We're using it to directly cast our byte slices into slices of `uint32` or `Hash` types. This avoids copying data from the memory-mapped region into Go's memory, giving us a zero-copy read for maximum performance. It's a powerful, but delicate, optimization.
+
 ```go
 // Same fan-out optimization as .idx files
 var fanout [fanoutEntries]uint32
@@ -279,7 +281,7 @@ type Store struct {
     // packMap tracks unique mmap handles to prevent duplicate mappings
     packMap map[string]*mmap.ReaderAt
 
-    // Other fields...
+    // Other fields, including our advanced ARC cache for hot objects
     cache         *arc.ARCCache[Hash, []byte]
     maxDeltaDepth int
     VerifyCRC     bool
@@ -364,7 +366,7 @@ Now it's time to read the actual data. In **Part 4**, we'll crack open the packf
 
 - How Git uses zlib compression for storage efficiency
 - How delta compression stores objects as changes against other objects
-- The algorithms to inflate compressed data and reconstruct original objects
+- A single-pass, stack-based algorithm for resolving delta chains on the fly
 - Building a complete object reader that handles all Git's storage optimizations
 
 We're getting closer to our final goal: lightning-fast diffs that only show the lines we need to scan for secrets.
