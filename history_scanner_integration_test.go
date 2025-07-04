@@ -12,7 +12,6 @@ import (
 )
 
 func TestDiffHistoryHunks_AdditionIntegrity(t *testing.T) {
-	// Keep it small for focused testing
 	repo := "simple-linear"
 	repoPath := filepath.Join("testdata", "repos", repo)
 	scanner := createScannerForRepo(t, repo)
@@ -20,7 +19,7 @@ func TestDiffHistoryHunks_AdditionIntegrity(t *testing.T) {
 
 	hunks, errC := scanner.DiffHistoryHunks()
 
-	// Group by commit+path => []*HunkAddition for easier post‑processing
+	// Group by commit+path => []*HunkAddition for easier post‑processing.
 	type key struct{ commit, path string }
 	group := make(map[key][]HunkAddition)
 
@@ -31,7 +30,7 @@ func TestDiffHistoryHunks_AdditionIntegrity(t *testing.T) {
 	require.NoError(t, <-errC)
 
 	for k, hunkList := range group {
-		// Fetch authoritative file snapshot via `git show <commit>:<path>`
+		// Fetch authoritative file snapshot via `git show <commit>:<path>`.
 		out, err := exec.Command("git", "-C", repoPath,
 			"show", k.commit+":"+k.path).Output()
 		require.NoErrorf(t, err, "git show failed for %s:%s", k.commit[:8], k.path)
@@ -46,22 +45,22 @@ func TestDiffHistoryHunks_AdditionIntegrity(t *testing.T) {
 		require.NoError(t, scanner.Err())
 
 		for _, hunk := range hunkList {
-			// Validate hunk properties
+			// Validate hunk properties.
 			assert.Greater(t, hunk.StartLine(), 0, "StartLine should be positive")
 			assert.GreaterOrEqual(t, hunk.EndLine(), hunk.StartLine(), "EndLine should be >= StartLine")
 			assert.NotEmpty(t, hunk.Lines(), "Hunk should have at least one line")
 
-			// Verify each line in the hunk matches the authoritative file
+			// Verify each line in the hunk matches the authoritative file.
 			for i, hunkLine := range hunk.Lines() {
 				lineNo := hunk.StartLine() + i
 				want, ok := lines[lineNo]
 				assert.True(t, ok, "commit %s file %s: claimed line %d does not exist in hunk starting at %d",
 					k.commit[:8], k.path, lineNo, hunk.StartLine())
-				assert.Equal(t, want, hunkLine, "commit %s file %s line %d: text mismatch in hunk starting at %d",
+				assert.Equal(t, want, []byte(hunkLine), "commit %s file %s line %d: text mismatch in hunk starting at %d",
 					k.commit[:8], k.path, lineNo, hunk.StartLine())
 			}
 
-			// Verify EndLine calculation
+			// Verify EndLine calculation.
 			expectedEndLine := hunk.StartLine() + len(hunk.Lines()) - 1
 			assert.Equal(t, expectedEndLine, hunk.EndLine(),
 				"EndLine calculation incorrect for hunk in %s:%s starting at line %d",

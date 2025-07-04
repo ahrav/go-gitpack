@@ -33,7 +33,7 @@ func TestLoadAllCommits_LinearHistory(t *testing.T) {
 	for _, c := range commits {
 		assert.NotEqual(t, Hash{}, c.OID)
 		assert.NotEqual(t, Hash{}, c.TreeOID)
-		// assert.Greater(t, c.Timestamp, int64(0))
+		assert.Greater(t, c.Timestamp, int64(0))
 	}
 }
 
@@ -87,7 +87,7 @@ func TestLoadAllCommits_LargeRepo(t *testing.T) {
 	for i, c := range commits {
 		assert.NotEqual(t, Hash{}, c.OID, "Commit %d should have valid OID", i)
 		assert.NotEqual(t, Hash{}, c.TreeOID, "Commit %d should have valid TreeOID", i)
-		// assert.Greater(t, c.Timestamp, int64(0), "Commit %d should have valid timestamp", i)
+		assert.Greater(t, c.Timestamp, int64(0), "Commit %d should have valid timestamp", i)
 
 		// Count root commits (no parents).
 		if len(c.ParentOIDs) == 0 {
@@ -157,14 +157,14 @@ func TestDiffHistoryHunks(t *testing.T) {
 				hunkCount++
 				totalLines += len(hunk.Lines())
 
-				// Validate hunk properties
+				// Validate hunk properties.
 				assert.Greater(t, hunk.StartLine(), 0, "StartLine should be positive")
 				assert.GreaterOrEqual(t, hunk.EndLine(), hunk.StartLine(), "EndLine should be >= StartLine")
 				assert.NotEmpty(t, hunk.Lines(), "Hunk should have at least one line")
 				assert.NotEmpty(t, hunk.Path(), "Hunk should have a path")
 				assert.NotEqual(t, Hash{}, hunk.Commit(), "Hunk should have a valid commit")
 
-				// Verify EndLine calculation
+				// Verify EndLine calculation.
 				expectedEndLine := hunk.StartLine() + len(hunk.Lines()) - 1
 				assert.Equal(t, expectedEndLine, hunk.EndLine(), "EndLine calculation should be correct")
 			}
@@ -182,7 +182,6 @@ func TestDiffHistoryHunks(t *testing.T) {
 				assert.LessOrEqual(t, hunkCount, tt.maxHunks)
 			}
 
-			// Verify we have some lines in total
 			assert.Greater(t, totalLines, 0, "Should have some lines in hunks")
 
 			t.Logf("Found %d hunks with %d total lines", hunkCount, totalLines)
@@ -282,7 +281,6 @@ func TestDiffHistoryHunks_LargeRepo(t *testing.T) {
 		totalLines += len(hunk.Lines())
 		linesByFile[hunk.Path()] += len(hunk.Lines())
 
-		// Validate hunk properties
 		assert.Greater(t, hunk.StartLine(), 0, "StartLine should be positive")
 		assert.GreaterOrEqual(t, hunk.EndLine(), hunk.StartLine(), "EndLine should be >= StartLine")
 		assert.NotEmpty(t, hunk.Lines(), "Hunk should have at least one line")
@@ -304,7 +302,7 @@ func TestDiffHistoryHunks_LargeRepo(t *testing.T) {
 			"File %s should have lines in hunks", filename)
 	}
 
-	// Hunks should be fewer than individual line additions since consecutive lines get grouped
+	// Hunks should be fewer than individual line additions since consecutive lines get grouped.
 	assert.GreaterOrEqual(t, hunkCount, 50)
 	assert.LessOrEqual(t, hunkCount, 200) // Should be significantly fewer than line count
 	assert.GreaterOrEqual(t, totalLines, 100)
@@ -391,7 +389,6 @@ func TestDiffHistoryHunks_SuperLargeRepo(t *testing.T) {
 	assert.Equal(t, 10000, len(filesFound), "Should find 10,000 files")
 	assert.True(t, filesFound["README.md"], "Should find README.md")
 
-	// Check a sampling of files to avoid excessive assertions
 	for i := 2; i <= 10000; i += 1000 { // Check every 1000th file
 		filename := fmt.Sprintf("file_%d.txt", i)
 		assert.True(t, filesFound[filename], "Should find %s", filename)
@@ -421,12 +418,11 @@ func TestLoadAllCommits_VeryLargeRepo(t *testing.T) {
 
 	t.Logf("Loaded 1,000 commits in %v", duration)
 
-	// Validate structure
 	rootCommitCount := 0
 	for _, c := range commits {
 		assert.NotEqual(t, Hash{}, c.OID)
 		assert.NotEqual(t, Hash{}, c.TreeOID)
-		// assert.Greater(t, c.Timestamp, int64(0))
+		assert.Greater(t, c.Timestamp, int64(0))
 
 		if len(c.ParentOIDs) == 0 {
 			rootCommitCount++
@@ -453,12 +449,11 @@ func TestLoadAllCommits_SuperLargeRepo(t *testing.T) {
 
 	t.Logf("Loaded 10,000 commits in %v", duration)
 
-	// Validate structure
 	rootCommitCount := 0
 	for _, c := range commits {
 		assert.NotEqual(t, Hash{}, c.OID)
 		assert.NotEqual(t, Hash{}, c.TreeOID)
-		// assert.Greater(t, c.Timestamp, int64(0))
+		assert.Greater(t, c.Timestamp, int64(0))
 
 		if len(c.ParentOIDs) == 0 {
 			rootCommitCount++

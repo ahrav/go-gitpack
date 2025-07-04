@@ -1,73 +1,46 @@
-// history_scanner.go
+// Package objstore offers a content‑addressable store optimized for Git
+// packfiles and commit‑graph data.
 //
-// High-performance Git commit history scanner optimized for tree-to-tree
-// diffing workflows. The scanner extracts minimal commit metadata (OID, tree,
-// parents, timestamp) without inflating full commit objects, enabling fast
-// repository traversal and change detection.
+// This file defines HistoryScanner, a high‑throughput helper that streams
+// commit‑level information and tree‑to‑tree diffs without inflating full commit
+// objects.
 //
-// USAGE:
+// # Overview
 //
-// The HistoryScanner provides the main entry point for accessing Git repository
-// data. It wraps an internal object store and exposes a clean public API:
+// A HistoryScanner wraps an internal object store plus (optionally) the
+// repository's commit‑graph.  It exposes a composable API layer focused on
+// **read‑only** analytics workloads such as:
 //
-//	// Open a Git repository
-//	scanner, err := objstore.NewHistoryScanner(".git")
+//   - Scanning every commit once to extract change hunks.
+//   - Iterating trees to build custom indexes.
+//   - Fetching lightweight commit metadata (author, timestamp) on demand.
+//
+// Callers should construct exactly one HistoryScanner per repository and reuse
+// it for the lifetime of the program.  All methods are safe for concurrent
+// use unless their doc comment states otherwise.
+//
+// # Quick start
+//
+//	// Open an existing repository.
+//	s, err := objstore.NewHistoryScanner(".git")
 //	if err != nil {
 //	    log.Fatal(err)
 //	}
-//	defer scanner.Close()
+//	defer s.Close()
 //
-//	// Configure scanner options
-//	scanner.SetMaxDeltaDepth(100)      // Adjust delta chain limits
-//	scanner.SetVerifyCRC(true)         // Enable integrity checking
+//	s.SetMaxDeltaDepth(100) // Tune delta resolution
+//	s.SetVerifyCRC(true)    // Extra integrity checking
 //
-//	// Access individual Git objects
-//	data, objType, err := scanner.Get(oid)
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//
-//	// Iterate over tree contents
-//	iter, err := scanner.TreeIter(treeOID)
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//	for {
-//	    name, childOID, mode, ok, err := iter.Next()
-//	    if err != nil || !ok {
-//	        break
-//	    }
-//	    fmt.Printf("%s: %x (mode: %o)\n", name, childOID, mode)
-//	}
-//
-//	// Load all commits from commit-graph
-//	commits, err := scanner.LoadAllCommits()
-//	if err != nil {
-//	    log.Fatal(err)
-//	}
-//
-//	// Stream commit diffs concurrently as hunks
-//	hunks, errors := scanner.DiffHistoryHunks()
+//	// Stream added hunks from every commit.
+//	hunks, errs := s.DiffHistoryHunks()
 //	go func() {
-//	    for hunk := range hunks {
-//	        fmt.Printf("+ %s: %d-%d (%d lines)\n", hunk.Path(), hunk.StartLine(), hunk.EndLine(), len(hunk.Lines()))
+//	    for h := range hunks {
+//	        fmt.Println(h)
 //	    }
 //	}()
-//	if err := <-errors; err != nil {
+//	if err := <-errs; err != nil {
 //	    log.Fatal(err)
 //	}
-//
-// IMPLEMENTATION:
-// The scanner currently requires commit-graph files for O(commits) scanning
-// with commits processed concurrently for maximum throughput. A fallback mechanism to enumerate
-// packfiles directly is planned but not yet implemented.
-// TODO: Add support for repositories without commit-graph by falling back to
-// packfile parsing that extracts tree and parent relationships from commit headers.
-//
-// The implementation avoids full commit message parsing and focuses on the
-// minimal metadata required for tree traversal. Optional tree preloading
-// supports workflows requiring random access to tree objects.
-
 package objstore
 
 import (
@@ -79,73 +52,87 @@ import (
 	"sync"
 )
 
-// commitInfo holds the subset of Git commit metadata that the history
-// scanner needs for tree-to-tree diffing and topological walks.
-// It deliberately omits heavyweight details such as author/committer
-// identities and the commit message to keep allocations low.
-// A slice of commitInfo values is produced by HistoryScanner.LoadAllCommits
-// and can be processed concurrently.
+// commitInfo holds the minimal subset of commit metadata needed for
+// HistoryScanner operations.
+//
+// Only OID, tree, parents, and committer timestamp are retained, which keeps
+// allocation pressure low during repository‑wide walks.
+// The struct is produced by HistoryScanner.LoadAllCommits and can be processed
+// concurrently.
+//
+// NOTE: commitInfo is unexported because it is an implementation detail; the
+// public API returns the slice directly but does not force callers to spell
+// the type name.
 type commitInfo struct {
 	// OID is the object ID of the commit itself.
 	OID Hash
 
-	// TreeOID is the object ID of the commit's root tree.
+	// TreeOID identifies the root tree of the commit.
 	TreeOID Hash
 
-	// ParentOIDs lists the object IDs of the commit's direct parents in
-	// the order they appear in the commit object.  The slice is empty for
-	// the repository root commit.
+	// ParentOIDs lists the direct parents in the order stored in the commit
+	// object. The slice is empty for a repository root commit.
 	ParentOIDs []Hash
 
 	// Timestamp records the committer time in seconds since the Unix epoch.
 	Timestamp int64
 }
 
-// HistoryScanner provides read-only, high-throughput access to a Git
-// repository's commit history.  It abstracts over commit-graph files and
-// packfile iteration to expose streaming APIs such as DiffHistoryHunks that
-// deliver commits concurrently with minimal memory footprint.
+// HistoryScanner provides read‑only, high‑throughput access to a Git
+// repository's commit history.
+//
+// It abstracts over commit‑graph files and packfile iteration to expose
+// streaming APIs such as DiffHistoryHunks that deliver results concurrently
+// while holding only a small working set in memory.
+//
 // Instantiate a HistoryScanner when you need to traverse many commits or
-// compute incremental diffs without materializing full objects.
+// compute incremental diffs without materializing full commit objects.
+// The zero value is invalid; use NewHistoryScanner.
 type HistoryScanner struct {
-	// store backs object retrieval and remains read-only for the lifetime
-	// of the scanner.
+	// store backs object retrieval for the lifetime of the scanner.
 	store *store
 
-	// graphData is the parsed commit-graph for the repository.
-	// It is nil when the repository lacks a commit-graph file, in which
-	// case the scanner falls back to packfile enumeration.
+	// graphData is the parsed commit‑graph. A nil value signals that the
+	// repository lacks a commit‑graph; packfile fallbacks will eventually be
+	// implemented to cover this case.
 	graphData *commitGraphData
 
-	// meta provides cached access to commit author/committer metadata
+	// meta caches author/committer lines for cheap GetCommitMetadata calls.
 	meta *metaCache
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
-// The error is non-fatal; callers should decide whether the missing commits
-// are relevant for their workflow.
+//
+// The error is non‑fatal; callers decide whether the missing commits are
+// relevant for their workflow.
 type ScanError struct {
-	// FailedCommits maps each problematic commit OID to the parsing error
-	// that was encountered.
+	// FailedCommits maps each problematic commit OID to the error encountered
+	// while decoding it.
 	FailedCommits map[Hash]error
 }
 
+// Error implements the error interface.
 func (e *ScanError) Error() string {
 	return fmt.Sprintf("failed to parse %d commits", len(e.FailedCommits))
 }
 
-var ErrCommitGraphRequired = errors.New("commit-graph required but not found")
+// ErrCommitGraphRequired is returned by NewHistoryScanner and DiffHistoryHunks
+// when the caller requested an operation that currently depends on
+// commit‑graph files but the repository does not provide one.
+var ErrCommitGraphRequired = errors.New("commit‑graph required but not found")
 
-// NewHistoryScanner opens the Git repository at gitDir and returns a
-// HistoryScanner that streams commit data concurrently.
+// NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
+// commit data concurrently.
 //
-// The implementation currently relies on commit-graph files being present
-// inside .git/objects.
-// If the commit-graph cannot be loaded, the function returns a non-nil error
-// and the underlying object store is closed immediately.
+// The current implementation **requires** a commit‑graph under
 //
-// The caller is responsible for invoking (*HistoryScanner).Close when finished
-// to release any mmap handles held by the store.
+//	<gitDir>/objects/commit‑graph
+//
+// If the commit‑graph cannot be loaded the function returns a non‑nil error
+// and any resources acquired by the underlying object store are released.
+//
+// The caller must invoke (*HistoryScanner).Close when finished to free mmap
+// handles and file descriptors.
 func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 	packDir := filepath.Join(gitDir, "objects", "pack")
 	store, err := open(packDir)
@@ -153,13 +140,13 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 		return nil, fmt.Errorf("open object store: %w", err)
 	}
 
-	// Require commit‑graph (TODO: add fallback to packfile parsing for repositories without commit-graph)
+	// Require commit‑graph (TODO: add fallback to packfile parsing).
 	graphDir := filepath.Join(gitDir, "objects")
 	graph, err := loadCommitGraph(graphDir)
 	if err != nil || graph == nil {
-		store.Close() // Clean up store if we can't load commit graph
+		store.Close()
 		if err != nil {
-			return nil, fmt.Errorf("commit-graph required but failed to load: %w", err)
+			return nil, fmt.Errorf("commit‑graph required but failed to load: %w", err)
 		}
 		return nil, ErrCommitGraphRequired
 	}
@@ -173,71 +160,58 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 	}, nil
 }
 
-// HunkAddition holds metadata for a contiguous block of added lines that a commit introduced.
+// HunkAddition describes a contiguous block of added lines introduced by a
+// commit.
 //
-// Values of HunkAddition are streamed by HistoryScanner.DiffHistoryHunks concurrently,
-// enabling callers to process repository changes in larger chunks for better context
-// and performance when dealing with large additions.
+// Values are streamed by HistoryScanner.DiffHistoryHunks and can be consumed
+// concurrently by the caller.
 type HunkAddition struct {
-	// commit identifies the commit that introduced the added hunk.
+	// commit is the commit that introduced the hunk.
 	commit Hash
 
-	// path specifies the file to which the hunk was added.
-	// It always uses forward-slash (Unix style) separators, independent
-	// of the host operating system.
+	// path is the file path using forward‑slash separators, regardless of OS.
 	path string
 
-	// startLine is the 1-based line number where this hunk begins
-	// in the new version of the file.
+	// startLine is the 1‑based line number where the hunk begins in the new
+	// version of the file.
 	startLine int
 
-	// endLine is the 1-based line number where this hunk ends
-	// in the new version of the file.
+	// endLine is the 1‑based line number where the hunk ends.
 	endLine int
 
-	// lines contains all the added lines in this hunk without the leading
-	// "+" diff markers.
-	lines [][]byte
+	// lines holds the added lines without leading '+' markers.
+	lines []string
 }
 
-// String returns a human-readable representation of the hunk addition.
+// String returns a human‑readable representation.
 func (h *HunkAddition) String() string {
 	return fmt.Sprintf("%s: %s:%d-%d (%d lines)", h.commit, h.path, h.startLine, h.endLine, len(h.lines))
 }
 
-// Lines returns all the added lines in this hunk without the leading
-// "+" diff markers.
-func (h *HunkAddition) Lines() [][]byte { return h.lines }
+// Lines returns all added lines without leading '+' markers.
+func (h *HunkAddition) Lines() []string { return h.lines }
 
-// StartLine returns the 1-based line number where this hunk begins
-// in the new version of the file.
+// StartLine returns the first line number (1‑based) of the hunk.
 func (h *HunkAddition) StartLine() int { return h.startLine }
 
-// EndLine returns the 1-based line number where this hunk ends
-// in the new version of the file.
+// EndLine returns the last line number (1‑based) of the hunk.
 func (h *HunkAddition) EndLine() int { return h.endLine }
 
-// Commit returns the commit that introduced the added hunk.
+// Commit returns the commit that introduced the hunk.
 func (h *HunkAddition) Commit() Hash { return h.commit }
 
-// Path returns the file to which the hunk was added.
-// It always uses forward-slash (Unix style) separators, independent
-// of the host operating system.
+// Path returns the file to which the hunk was added, using forward‑slash
+// separators.
 func (h *HunkAddition) Path() string { return h.path }
 
 // DiffHistoryHunks streams every added hunk from all commits.
 //
-// The caller receives a buffered channel of HunkAddition values and a separate
-// channel for a single error value.
-// The method launches a goroutine that performs the commit walk and diff computation
-// concurrently, grouping consecutive line additions into hunks for better context
-// and performance when processing large additions.
+// It returns two buffered channels: one for HunkAddition values and one for a
+// single error.
+// The function never blocks the caller; all writes to the channels are
+// non‑blocking.
 //
-// The function never blocks the caller: both result channels are buffered.
-// Results are produced concurrently, so consumers should drain the output
-// promptly or close it to cancel.
-//
-// A nil error sent on errC signals a graceful end-of-stream.
+// A nil error sent on errC signals a graceful end‑of‑stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
 	numWorkers := runtime.NumCPU()
 
@@ -252,7 +226,6 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			return
 		}
 
-		// Work item for each commit.
 		type workItem struct {
 			oid        Hash
 			treeOID    Hash
@@ -268,14 +241,13 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-
 				for work := range workChan {
-					commit := commitInfo{
+					c := commitInfo{
 						OID:        work.oid,
 						TreeOID:    work.treeOID,
 						ParentOIDs: work.parentOIDs,
 					}
-					if err := hs.processCommitStreamingHunks(hs.store, commit, out); err != nil {
+					if err := hs.processCommitStreamingHunks(hs.store, c, out); err != nil {
 						errorChan <- err
 						return
 					}
@@ -288,7 +260,7 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			close(errorChan)
 		}()
 
-		// Stream commits directly from graph data to workers.
+		// Feed commits to the workers.
 		go func() {
 			defer close(workChan)
 			for i, oid := range hs.graphData.OrderedOIDs {
@@ -313,13 +285,12 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 	return out, errC
 }
 
-// processCommitStreamingHunks handles diff computation for a single commit and streams
-// hunk additions directly to the output channel.
+// processCommitStreamingHunks diffs a single commit against its first parent
+// (or the empty tree for a root commit) and streams added hunks to out.
 func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, out chan<- HunkAddition) error {
 	parents := c.ParentOIDs
 	if len(parents) == 0 {
-		// Root commit: diff against the implicit empty tree (Hash{}).
-		parents = []Hash{{}}
+		parents = []Hash{{}} // Root commit: diff against empty tree.
 	}
 
 	pTree := Hash{}
@@ -330,103 +301,66 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 	}
 
 	return walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
-		if mode&040000 != 0 {
+		if mode&040000 != 0 { // Skip sub‑trees; we care only about blobs.
 			return nil
 		}
-		// `hs.store.Get(Hash{})` is safe: it returns a nil slice for
-		// the empty object, which `addedHunksWithPos` handles correctly.
+
 		oldBytes, _, _ := hs.store.Get(old)
 		newBytes, _, _ := hs.store.Get(newH)
 
-		for _, hunk := range addedHunksWithPos(oldBytes, newBytes) {
+		for _, h := range addedHunksWithPos(oldBytes, newBytes) {
 			out <- HunkAddition{
 				commit:    c.OID,
 				path:      filepath.ToSlash(path),
-				startLine: hunk.StartLine,
-				endLine:   hunk.EndLine(),
-				lines:     hunk.Lines,
+				startLine: int(h.StartLine),
+				endLine:   int(h.EndLine()),
+				lines:     h.Lines,
 			}
 		}
 		return nil
 	})
 }
 
-// get returns the fully materialized Git object identified by oid together
-// with its on-disk ObjectType.
-//
-// This method delegates to the underlying store and provides the same
-// functionality as the store's get method. See store.get for detailed
-// documentation on caching, delta resolution, and CRC verification.
+// get returns the fully materialized object identified by oid plus its type.
 func (hs *HistoryScanner) get(oid Hash) ([]byte, ObjectType, error) {
 	return hs.store.Get(oid)
 }
 
-// SetMaxDeltaDepth sets the maximum delta chain depth for object retrieval.
-//
-// This method delegates to the underlying store. See store.SetMaxDeltaDepth
-// for detailed documentation on the implications of different depth values.
+// SetMaxDeltaDepth sets the maximum delta‑chain depth for object retrieval.
 func (hs *HistoryScanner) SetMaxDeltaDepth(depth int) { hs.store.SetMaxDeltaDepth(depth) }
 
-// SetVerifyCRC enables or disables CRC-32 validation for all object reads.
-//
-// When enabled, the scanner validates CRC-32 checksums for each object read
-// from packfiles. This provides additional integrity checking at the cost of
-// some performance. See the store documentation for details on CRC verification
-// behavior with different pack types.
+// SetVerifyCRC enables or disables CRC‑32 verification on all object reads.
 func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verify }
 
-// Close releases any mmap handles or file descriptors held by the underlying
-// object store.
-// It is safe to call Close multiple times; subsequent calls are no-ops.
+// Close releases any mmap handles or file descriptors held by the scanner.
+// It is idempotent; subsequent calls are no‑ops.
 func (hs *HistoryScanner) Close() error { return hs.store.Close() }
 
-// CommitMetadata bundles the author identity and commit timestamp for a
-// single Git commit.
+// CommitMetadata bundles the author identity and commit timestamp for a single
+// commit.
 //
-// Callers obtain a CommitMetadata instance through HistoryScanner.
-// GetCommitMetadata when they need lightweight identity data without
-// performing a full object walk.  On the first request for a given commit
-// the scanner inflates only the commit header, parses the “author”
-// (or fallback “committer”) line, and caches the result.  Later requests
-// return the cached value with zero additional I/O.
-//
-// The type is immutable and therefore safe for concurrent reads.
+// Instances are immutable and therefore safe for concurrent reads.
 type CommitMetadata struct {
-	// Author describes the commit author exactly as recorded in the
-	// commit header.  The field is never modified after creation and can
-	// be shared freely between goroutines.
+	// Author records the commit author exactly as stored in the commit header.
 	Author AuthorInfo
 
 	// Timestamp holds the committer time in seconds since the Unix epoch.
-	// It originates from the commit-graph if available; otherwise it is
-	// parsed from the commit header on the first cache miss.
 	Timestamp int64
 }
 
-// GetCommitMetadata returns the commit's author and committer time (Unix seconds).
-// This method lazily inflates the commit object and caches the result.
+// GetCommitMetadata returns (and caches) the commit's author and timestamp.
 func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
-// LoadAllCommits returns all commits in commit-graph storage order.
-//
-// The method currently reads commit metadata exclusively from commit-graph
-// files, which makes the call O(#commits) and allocation-friendly.
-// When the repository lacks a commit-graph, callers should expect this method
-// to fail once the TODO fallback to packfile scanning is implemented.
-//
-// The slice elements are owned by the caller; modifying them does not affect
-// the scanner.
-// The method never returns a nil slice.
-//
-// TODO: Implement a fallback to scan packfiles when a commit-graph is not
-// available.
+// LoadAllCommits returns all commits in commit‑graph topological order.
+// The slice is never nil; it may be empty when the repository contains no
+// commits.
 func (hs *HistoryScanner) LoadAllCommits() ([]commitInfo, error) {
 	return hs.loadFromGraph(), nil
 }
 
-// graph → []*CommitInfo  (O(#commits))
+// loadFromGraph converts commit‑graph rows into commitInfo values.
 func (hs *HistoryScanner) loadFromGraph() []commitInfo {
 	n := len(hs.graphData.OrderedOIDs)
 	out := make([]commitInfo, n)
@@ -436,17 +370,18 @@ func (hs *HistoryScanner) loadFromGraph() []commitInfo {
 			OID:        oid,
 			TreeOID:    hs.graphData.TreeOIDs[i],
 			ParentOIDs: hs.graphData.Parents[oid],
+			Timestamp:  hs.graphData.Timestamps[i], // if available
 		}
 	}
 	return out
 }
 
-// No commit‑graph: iterate every pack, inflate only commit objects.
-// TODO: This method is preserved for future fallback support when commit-graph is not available.
-// Currently not used since we require commit-graph files.
+// scanPackfiles is reserved for a future fallback path when the repository has
+// no commit‑graph. The body is preserved here as a placeholder and is not used
+// by the current implementation.
 func (hs *HistoryScanner) scanPackfiles() ([]commitInfo, error) {
 	if len(hs.store.packs) == 0 {
-		return []commitInfo{}, nil // Return empty slice, not error
+		return []commitInfo{}, nil
 	}
 
 	var (
@@ -486,15 +421,8 @@ func (hs *HistoryScanner) scanPackfiles() ([]commitInfo, error) {
 	return commits, nil
 }
 
-// parseCommitData extracts minimal commit metadata from the raw commit object.
-//
-// It expects raw to contain the canonical "commit" object encoding and does
-// not allocate more than necessary: object IDs are sliced directly out of the
-// input buffer where possible.
-//
-// The function validates the format of "tree" and "parent" header lines and
-// returns an error if they are malformed. The committer timestamp is always
-// present.
+// parseCommitData extracts the minimal commit metadata from raw, which must
+// contain a canonical "commit" object.
 func parseCommitData(oid Hash, raw []byte) (commitInfo, error) {
 	ci := commitInfo{OID: oid}
 
