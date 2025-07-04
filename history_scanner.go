@@ -220,6 +220,7 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 
 	go func() {
 		defer close(out)
+		defer close(errC)
 
 		if hs.graphData == nil {
 			errC <- ErrCommitGraphRequired

@@ -1,6 +1,7 @@
 package objstore
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -9,8 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"bufio"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -72,7 +71,7 @@ func TestOpen(t *testing.T) {
 		assert.NotNil(t, store)
 		assert.Len(t, store.packs, 1)
 		assert.Greater(t, len(store.packs[0].oidTable), 0)
-		assert.Equal(t, 50, store.maxDeltaDepth)
+		assert.Equal(t, defaultMaxDeltaDepth, store.maxDeltaDepth)
 	})
 
 	t.Run("multiple pack files", func(t *testing.T) {
