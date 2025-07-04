@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"bufio"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/mmap"
@@ -222,24 +224,32 @@ func TestParseIdx(t *testing.T) {
 	})
 }
 
-func TestDecodeVarInt(t *testing.T) {
+func TestReadVarIntFromReader(t *testing.T) {
 	tests := []struct {
-		data     []byte
-		expected uint64
-		consumed int
+		data        []byte
+		expected    uint64
+		consumed    int
+		expectError bool
 	}{
-		{[]byte{0x00}, 0, 1},
-		{[]byte{0x7f}, 127, 1},
-		{[]byte{0x80, 0x01}, 128, 2},
-		{[]byte{0xff, 0x7f}, 16383, 2},
-		{[]byte{0x80, 0x80, 0x01}, 16384, 3},
-		{[]byte{}, 0, 0}, // empty buffer
+		{[]byte{0x00}, 0, 1, false},
+		{[]byte{0x7f}, 127, 1, false},
+		{[]byte{0x80, 0x01}, 128, 2, false},
+		{[]byte{0xff, 0x7f}, 16383, 2, false},
+		{[]byte{0x80, 0x80, 0x01}, 16384, 3, false},
+		{[]byte{}, 0, -1, true}, // empty buffer now returns error
 	}
 
 	for _, test := range tests {
-		value, consumed := decodeVarInt(test.data)
-		assert.Equal(t, test.expected, value)
-		assert.Equal(t, test.consumed, consumed)
+		reader := bufio.NewReader(bytes.NewReader(test.data))
+		value, consumed, err := readVarIntFromReader(reader)
+
+		if test.expectError {
+			assert.Error(t, err)
+		} else {
+			assert.NoError(t, err)
+			assert.Equal(t, test.expected, value)
+			assert.Equal(t, test.consumed, consumed)
+		}
 	}
 }
 
@@ -256,7 +266,7 @@ func TestStoreBasic(t *testing.T) {
 	blob1Data := []byte("base content")
 	blob1Hash := calculateHash(ObjBlob, blob1Data)
 
-	data, objType, err := store.Get(blob1Hash)
+	data, objType, err := store.get(blob1Hash)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, objType)
 	assert.Equal(t, blob1Data, data)
@@ -265,31 +275,10 @@ func TestStoreBasic(t *testing.T) {
 	blob2Data := []byte("modified data")
 	blob2Hash := calculateHash(ObjBlob, blob2Data)
 
-	data, objType, err = store.Get(blob2Hash)
+	data, objType, err = store.get(blob2Hash)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, objType)
 	assert.Equal(t, blob2Data, data)
-}
-
-func TestApplyDelta(t *testing.T) {
-	base := []byte("Hello World")
-	target := []byte("Hello Go")
-
-	var delta bytes.Buffer
-
-	writeVarInt(&delta, uint64(len(base)))
-	writeVarInt(&delta, uint64(len(target)))
-
-	// 0x90 = copy operation (0x80) with length follows (0x10), no offset follows (offset = 0).
-	delta.WriteByte(0x90) // copy operation: length follows, offset is 0
-	delta.WriteByte(6)    // copy 6 bytes
-
-	// Insert "Go".
-	delta.WriteByte(2) // insert 2 bytes
-	delta.Write([]byte("Go"))
-
-	result := applyDelta(base, delta.Bytes())
-	assert.Equal(t, target, result)
 }
 
 func TestCacheEviction(t *testing.T) {
@@ -306,17 +295,17 @@ func TestCacheEviction(t *testing.T) {
 	blob2Hash := calculateHash(ObjBlob, blob2Data)
 
 	// Test that cache stores and retrieves objects correctly.
-	data1, objType1, err := store.Get(blob1Hash)
+	data1, objType1, err := store.get(blob1Hash)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, objType1)
 	assert.Equal(t, blob1Data, data1)
 
-	data2, objType2, err := store.Get(blob2Hash)
+	data2, objType2, err := store.get(blob2Hash)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, objType2)
 	assert.Equal(t, blob2Data, data2)
 
-	data1Again, objType1Again, err := store.Get(blob1Hash)
+	data1Again, objType1Again, err := store.get(blob1Hash)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, objType1Again)
 	assert.Equal(t, blob1Data, data1Again)
@@ -415,46 +404,25 @@ func benchmarkGet(b *testing.B, cacheWarm bool) {
 
 	if cacheWarm {
 		b.ResetTimer()
-		store.Get(someHash)
+		store.get(someHash)
 	}
 
 	for b.Loop() {
-		store.Get(someHash)
+		store.get(someHash)
 	}
 }
 
 func BenchmarkGetCold(b *testing.B) { benchmarkGet(b, false) }
 func BenchmarkGetWarm(b *testing.B) { benchmarkGet(b, true) }
 
-func BenchmarkApplyDelta(b *testing.B) {
-	base := []byte("Hello World! This is a test base content for benchmarking delta operations.")
-	target := []byte("Hello Go! This is a test modified content for benchmarking delta operations.")
-
-	var delta bytes.Buffer
-	writeVarInt(&delta, uint64(len(base)))
-	writeVarInt(&delta, uint64(len(target)))
-
-	// Copy first 6 bytes ("Hello ").
-	delta.WriteByte(0x90) // copy operation: length follows, offset is 0
-	delta.WriteByte(6)    // copy 6 bytes
-
-	// Insert "Go! This is a test modified content for benchmarking delta operations."
-	remaining := target[6:]
-	delta.WriteByte(byte(len(remaining))) // insert operation
-	delta.Write(remaining)
-
-	deltaBytes := delta.Bytes()
-
-	for b.Loop() {
-		applyDelta(base, deltaBytes)
-	}
-}
-
-func BenchmarkDecodeVarInt(b *testing.B) {
+func BenchmarkReadVarIntFromReader(b *testing.B) {
 	buf := []byte{0xff, 0xff, 0x7f}
+	reader := bufio.NewReader(bytes.NewReader(buf))
 
-	for b.Loop() {
-		decodeVarInt(buf)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		reader = bufio.NewReader(bytes.NewReader(buf))
+		readVarIntFromReader(reader)
 	}
 }
 
@@ -541,7 +509,7 @@ func TestTinyRepoHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 
-	data, typ, err := store.Get(oid)
+	data, typ, err := store.get(oid)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, payload, data)
@@ -625,7 +593,7 @@ func TestStore_DeltaObjectRetrieval(t *testing.T) {
 		// Test each object in the pack - this will include both base and delta objects.
 		for i, oid := range store.packs[0].oidTable {
 			t.Run(fmt.Sprintf("object_%d_%x", i, oid[:4]), func(t *testing.T) {
-				data, objType, err := store.Get(oid)
+				data, objType, err := store.get(oid)
 
 				if err != nil {
 					assert.NotContains(t, err.Error(), "zlib: invalid header",
@@ -661,7 +629,7 @@ func TestStore_DeltaObjectRetrieval(t *testing.T) {
 			if objType == ObjRefDelta || objType == ObjOfsDelta {
 				t.Logf("Testing %s object %x at offset %d", objType, oid[:4], offset)
 
-				data, retrievedType, err := store.Get(oid)
+				data, retrievedType, err := store.get(oid)
 				require.NoError(t, err,
 					"Getting %s object should not fail with zlib error", objType)
 
