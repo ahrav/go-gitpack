@@ -93,26 +93,59 @@ func detectType(data []byte) ObjectType {
 		}
 	}
 
+	const (
+		parentMarker = "parent "
+		authorMarker = "author "
+		tagMarker    = "tag "
+	)
+
 	// Check for commit markers ("parent " or "author ").
 	if len(data) >= 7 {
 		first7 := string(data[:7])
-		if first7 == "parent " || first7 == "author " {
+		if first7 == parentMarker || first7 == authorMarker {
 			return ObjCommit
 		}
 	}
 
-	if len(data) >= 4 && string(data[:4]) == "tag " {
+	if len(data) >= 4 && string(data[:4]) == tagMarker {
 		return ObjTag
 	}
 
 	return ObjBlob
 }
 
+var (
+	ErrEmptyObjectHeader       = errors.New("empty object header")
+	ErrCannotParseObjectHeader = errors.New("cannot parse object header")
+)
+
+// peekObjectType reads the object header to determine type without inflating the body.
+// The function returns the object type and header length in bytes.
+//
+// This optimization allows skipping full decompression for objects that
+// can be served from other sources like the commit-graph.
+func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
+	var buf [32]byte
+	n, err := r.ReadAt(buf[:], int64(off))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return ObjBad, 0, err
+	}
+	if n == 0 {
+		return ObjBad, 0, ErrEmptyObjectHeader
+	}
+	ot, _, hdrLen := parseObjectHeaderUnsafe(buf[:n])
+	if hdrLen <= 0 {
+		return ObjBad, 0, ErrCannotParseObjectHeader
+	}
+	return ot, hdrLen, nil
+}
+
 // parseObjectHeaderUnsafe parses a Git object header using unsafe pointer operations.
 // The header encodes object type in bits 6-4 of the first byte and size as a
 // variable-length integer.
 //
-// parseObjectHeaderUnsafe returns the object type, decompressed size, and number of header bytes consumed.
+// parseObjectHeaderUnsafe returns the object type, decompressed size,
+// and number of header bytes consumed.
 // The function uses unsafe operations for performance but never panics.
 func parseObjectHeaderUnsafe(data []byte) (ObjectType, uint64, int) {
 	if len(data) == 0 {
@@ -155,30 +188,4 @@ func parseObjectHeaderUnsafe(data []byte) (ObjectType, uint64, int) {
 	}
 
 	return ObjBad, 0, -1
-}
-
-var (
-	ErrEmptyObjectHeader       = errors.New("empty object header")
-	ErrCannotParseObjectHeader = errors.New("cannot parse object header")
-)
-
-// peekObjectType reads the object header to determine type without inflating the body.
-// The function returns the object type and header length in bytes.
-//
-// This optimization allows skipping full decompression for objects that
-// can be served from other sources like the commit-graph.
-func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
-	var buf [32]byte
-	n, err := r.ReadAt(buf[:], int64(off))
-	if err != nil && !errors.Is(err, io.EOF) {
-		return ObjBad, 0, err
-	}
-	if n == 0 {
-		return ObjBad, 0, ErrEmptyObjectHeader
-	}
-	ot, _, hdrLen := parseObjectHeaderUnsafe(buf[:n])
-	if hdrLen <= 0 {
-		return ObjBad, 0, ErrCannotParseObjectHeader
-	}
-	return ot, hdrLen, nil
 }
