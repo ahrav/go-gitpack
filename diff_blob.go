@@ -20,6 +20,31 @@ package objstore
 
 import (
 	"bytes"
+	"fmt"
+
+	"github.com/dgryski/go-farm"
+)
+
+// Size‑selection thresholds used by computeAddedHunks.
+const (
+	// SmallFileThreshold is 1 MB (1 << 20). Files at or below this size are
+	// diffed with the position‑tracking algorithm, which preserves line
+	// ordering information for the most accurate output.
+	SmallFileThreshold = 1 << 20 // 1 MB
+
+	// MediumFileThreshold is 50 MB (50 << 20). Files larger than
+	// SmallFileThreshold and up to this limit are diffed with the memory‑
+	// optimized line‑set algorithm.
+	MediumFileThreshold = 50 << 20 // 50 MB
+
+	// LargeFileThreshold is 500 MB (500 << 20). Files whose size exceeds
+	// MediumFileThreshold and is at or below this limit trigger the hash‑
+	// based algorithm, which stores only 64‑bit hashes of each line.
+	LargeFileThreshold = 500 << 20 // 500 MB
+
+	// MaxDiffSize is 1 GB (1 << 30). If either blob is larger than this limit
+	// computeAddedHunks skips the diff and returns a single placeholder hunk.
+	MaxDiffSize = 1 << 30 // 1 GB
 )
 
 // AddedHunk represents a contiguous block of added lines in a diff.
@@ -28,11 +53,17 @@ import (
 type AddedHunk struct {
 	// Lines contains the actual text content of the added lines.
 	// Each string represents one line without its trailing newline character.
+	// For binary files, this will contain a single element with the raw binary data.
 	Lines []string
 
 	// StartLine indicates the 1-based line number where this hunk begins in the new file.
 	// Line numbers start at 1 to match standard diff output conventions.
+	// For binary files, this is always 1.
 	StartLine uint32
+
+	// IsBinary indicates whether this hunk contains binary data.
+	// When true, Lines contains the raw binary content as a single string.
+	IsBinary bool
 }
 
 // EndLine returns the 1-based line number of the last line in this hunk.
@@ -76,15 +107,15 @@ func tokenize(src []byte) []string {
 	return lines
 }
 
-// FuseHunks merges consecutive AddedHunks when the number of untouched lines
+// fuseHunks merges consecutive AddedHunks when the number of untouched lines
 // between them is less than or equal to 2*ctx + inter.
 //
-// ctx specifies the amount of ordinary “context” you intend to display around
-// each hunk, while inter represents an additional “inter-hunk” allowance
-// (equivalent to Git’s --inter-hunk-context flag).
+// ctx specifies the amount of ordinary "context" you intend to display around
+// each hunk, while inter represents an additional "inter-hunk" allowance
+// (equivalent to Git's --inter-hunk-context flag).
 // The function never inserts the untouched lines into the resulting hunks; it
 // only extends the range metadata and concatenates the added lines.
-func FuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
+func fuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
 	if len(hunks) < 2 {
 		return hunks
 	}
@@ -105,6 +136,119 @@ func FuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
 	}
 	out = append(out, cur)
 	return out
+}
+
+// isBinary reports whether the first 8 KiB of data contains a null byte,
+// which is a strong indicator that the blob is a binary file.
+func isBinary(data []byte) bool {
+	checkSize := min(len(data), 8192)
+	return bytes.IndexByte(data[:checkSize], 0) != -1
+}
+
+// computeAddedHunks returns the contiguous blocks of lines that are present in
+// newOID but not in oldOID.
+//
+// The routine follows this order of checks:
+//
+//  1. Load both blobs from the store.
+//  2. Abort when either blob exceeds MaxDiffSize.
+//  3. Handle pure deletion or pure addition.
+//  4. If one side is binary, fall back to a whole-file binary diff.
+//  5. Otherwise perform a text diff, picking the algorithm by file size.
+//
+// The returned slice is nil when there are no additions, or contains at least
+// one hunk (possibly a single placeholder line) in every other case.
+func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
+	if oldOID.IsZero() && newOID.IsZero() {
+		return nil, nil // Nothing to diff.
+	}
+
+	oldBytes, newBytes, err := loadBlobs(store, oldOID, newOID)
+	if err != nil {
+		return nil, err
+	}
+
+	oldSize, newSize := int64(len(oldBytes)), int64(len(newBytes))
+
+	// Hard size limit — users would rather see a placeholder than wait.
+	if oldSize > MaxDiffSize || newSize > MaxDiffSize {
+		placeholder := AddedHunk{
+			StartLine: 1,
+			Lines:     []string{fmt.Sprintf("[File too large to diff: old=%d new=%d bytes]", oldSize, newSize)},
+			IsBinary:  false,
+		}
+		return []AddedHunk{placeholder}, nil
+	}
+
+	// Pure deletion: nothing to show on the added-line side.
+	if newOID.IsZero() {
+		return nil, nil
+	}
+
+	// Pure addition: everything in newBytes is new.
+	if oldOID.IsZero() {
+		if len(newBytes) > 0 && isBinary(newBytes) {
+			hunk := AddedHunk{
+				StartLine: 1,
+				Lines:     []string{string(newBytes)},
+				IsBinary:  true,
+			}
+			return []AddedHunk{hunk}, nil
+		}
+
+		lines := tokenize(newBytes)
+		if len(lines) == 0 {
+			return nil, nil // Empty file added.
+		}
+		hunk := AddedHunk{StartLine: 1, Lines: lines, IsBinary: false}
+		return []AddedHunk{hunk}, nil
+	}
+
+	isMixedChange := (len(oldBytes) > 0 && isBinary(oldBytes)) || (len(newBytes) > 0 && isBinary(newBytes))
+
+	if isMixedChange { // Mixed binary/text change: fall back to whole-file diff.
+		if bytes.Equal(oldBytes, newBytes) {
+			return nil, nil // No changes.
+		}
+		hunk := AddedHunk{
+			StartLine: 1,
+			Lines:     []string{string(newBytes)},
+			IsBinary:  true,
+		}
+		return []AddedHunk{hunk}, nil
+	}
+
+	// Both files are text — choose the diff algorithm by size.
+	if oldSize <= SmallFileThreshold && newSize <= SmallFileThreshold {
+		return addedHunksWithPos(oldBytes, newBytes), nil
+	}
+
+	return addedHunksForLargeFiles(oldBytes, newBytes), nil
+}
+
+// loadBlobs retrieves the raw contents of the provided object IDs from store.
+//
+// A zero Hash yields an empty slice.  Errors are wrapped with context.
+func loadBlobs(s *store, oldOID, newOID Hash) ([]byte, []byte, error) {
+	var (
+		oldB []byte
+		newB []byte
+		err  error
+	)
+
+	if !oldOID.IsZero() {
+		if oldB, _, err = s.get(oldOID); err != nil {
+			return nil, nil, fmt.Errorf("getting old blob: %w", err)
+		}
+	}
+
+	if !newOID.IsZero() {
+		if newB, _, err = s.get(newOID); err != nil {
+			return nil, nil, fmt.Errorf("getting new blob: %w", err)
+		}
+	}
+
+	return oldB, newB, nil
 }
 
 // addedHunksWithPos compares two byte slices and identifies contiguous blocks of added lines.
@@ -220,5 +364,94 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 		hunks = append(hunks, *cur)
 	}
 
+	return hunks
+}
+
+// addedHunksForLargeFiles chooses between the line‑set and hash‑based
+// algorithms based on the size of the input blobs.
+func addedHunksForLargeFiles(oldBytes, newBytes []byte) []AddedHunk {
+	oldSize, newSize := int64(len(oldBytes)), int64(len(newBytes))
+
+	if oldSize > LargeFileThreshold || newSize > LargeFileThreshold {
+		return addedHunksWithHashing(oldBytes, newBytes)
+	}
+	return addedHunksWithLineSet(oldBytes, newBytes)
+}
+
+// addedHunksWithHashing diff‑computes added hunks by hashing each line with
+// Farm Hash64 and storing only the hashes of the old file. This keeps memory
+// usage proportional to the number of unique lines rather than their total
+// length.
+func addedHunksWithHashing(oldBytes, newBytes []byte) []AddedHunk {
+	oldLines := tokenize(oldBytes)
+	oldLineHashes := make(map[uint64]struct{}, len(oldLines))
+	for _, line := range oldLines {
+		oldLineHashes[farm.Hash64([]byte(line))] = struct{}{}
+	}
+	oldLines = nil // Free memory.
+
+	newLines := tokenize(newBytes)
+
+	var hunks []AddedHunk
+	var cur *AddedHunk
+
+	for i, line := range newLines {
+		lineNum := uint32(i) + 1
+		if _, exists := oldLineHashes[farm.Hash64([]byte(line))]; !exists {
+			if cur == nil || lineNum != cur.EndLine()+1 {
+				if cur != nil {
+					hunks = append(hunks, *cur)
+				}
+				cur = &AddedHunk{StartLine: lineNum}
+			}
+			cur.Lines = append(cur.Lines, line)
+		} else if cur != nil {
+			hunks = append(hunks, *cur)
+			cur = nil
+		}
+	}
+
+	if cur != nil {
+		hunks = append(hunks, *cur)
+	}
+	return hunks
+}
+
+// addedHunksWithLineSet diff‑computes added hunks by placing every unique
+// line of the old file in a map. The map provides fast existence checks while
+// avoiding position tracking, making this strategy suitable for medium‑sized
+// inputs that do not warrant full hashing.
+func addedHunksWithLineSet(oldBytes, newBytes []byte) []AddedHunk {
+	oldLines := tokenize(oldBytes)
+	oldLineSet := make(map[string]struct{}, len(oldLines))
+	for _, line := range oldLines {
+		oldLineSet[line] = struct{}{}
+	}
+	oldLines = nil // Free memory.
+
+	newLines := tokenize(newBytes)
+
+	var hunks []AddedHunk
+	var cur *AddedHunk
+
+	for i, line := range newLines {
+		lineNum := uint32(i) + 1
+		if _, exists := oldLineSet[line]; !exists {
+			if cur == nil || lineNum != cur.EndLine()+1 {
+				if cur != nil {
+					hunks = append(hunks, *cur)
+				}
+				cur = &AddedHunk{StartLine: lineNum}
+			}
+			cur.Lines = append(cur.Lines, line)
+		} else if cur != nil {
+			hunks = append(hunks, *cur)
+			cur = nil
+		}
+	}
+
+	if cur != nil {
+		hunks = append(hunks, *cur)
+	}
 	return hunks
 }

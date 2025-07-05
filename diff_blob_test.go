@@ -408,7 +408,7 @@ func TestFuseHunks(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := FuseHunks(tt.args.hunks, tt.args.ctx, tt.args.inter)
+			got := fuseHunks(tt.args.hunks, tt.args.ctx, tt.args.inter)
 			assert.Equal(t, tt.want, got, "FuseHunks result mismatch")
 
 			// Additional invariant: StartLine/EndLine monotone and non‑overlapping.

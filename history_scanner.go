@@ -44,7 +44,6 @@
 package objstore
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -166,6 +165,9 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 // Values are streamed by HistoryScanner.DiffHistoryHunks and can be consumed
 // concurrently by the caller.
 type HunkAddition struct {
+	// lines holds the added lines without leading '+' markers.
+	lines []string
+
 	// commit is the commit that introduced the hunk.
 	commit Hash
 
@@ -179,8 +181,8 @@ type HunkAddition struct {
 	// endLine is the 1‑based line number where the hunk ends.
 	endLine int
 
-	// lines holds the added lines without leading '+' markers.
-	lines []string
+	// isBinary indicates whether this hunk contains binary data.
+	isBinary bool
 }
 
 // String returns a human‑readable representation.
@@ -203,6 +205,9 @@ func (h *HunkAddition) Commit() Hash { return h.commit }
 // Path returns the file to which the hunk was added, using forward‑slash
 // separators.
 func (h *HunkAddition) Path() string { return h.path }
+
+// IsBinary returns whether this hunk contains binary data.
+func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 
 // DiffHistoryHunks streams every added hunk from all commits.
 //
@@ -295,7 +300,7 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 	}
 
 	pTree := Hash{}
-	if parents[0] != (Hash{}) && hs.graphData != nil {
+	if !parents[0].IsZero() && hs.graphData != nil {
 		if idx, ok := hs.graphData.OIDToIndex[parents[0]]; ok {
 			pTree = hs.graphData.TreeOIDs[idx]
 		}
@@ -306,16 +311,36 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 			return nil
 		}
 
-		oldBytes, _, _ := hs.store.get(old)
-		newBytes, _, _ := hs.store.get(newH)
+		hunks, err := computeAddedHunks(hs.store, old, newH)
+		if err != nil {
+			fmt.Printf("ERROR: %v\n", err)
+			return nil
+		}
 
-		for _, h := range FuseHunks(addedHunksWithPos(oldBytes, newBytes), 3, 3) {
-			out <- HunkAddition{
-				commit:    c.OID,
-				path:      filepath.ToSlash(path),
-				startLine: int(h.StartLine),
-				endLine:   int(h.EndLine()),
-				lines:     h.Lines,
+		for _, hunk := range hunks {
+			if hunk.IsBinary { // Don't fuse binary hunks
+				// Binary files are always sent as a single hunk.
+				out <- HunkAddition{
+					commit:    c.OID,
+					path:      filepath.ToSlash(path),
+					startLine: int(hunk.StartLine),
+					endLine:   int(hunk.StartLine), // Binary files are one "line"
+					lines:     hunk.Lines,
+					isBinary:  true,
+				}
+				continue
+			}
+
+			fusedHunks := fuseHunks([]AddedHunk{hunk}, 3, 3)
+			for _, fused := range fusedHunks {
+				out <- HunkAddition{
+					commit:    c.OID,
+					path:      filepath.ToSlash(path),
+					startLine: int(fused.StartLine),
+					endLine:   int(fused.EndLine()),
+					lines:     fused.Lines,
+					isBinary:  false,
+				}
 			}
 		}
 		return nil
@@ -372,95 +397,4 @@ func (hs *HistoryScanner) loadFromGraph() []commitInfo {
 		}
 	}
 	return out
-}
-
-// scanPackfiles is reserved for a future fallback path when the repository has
-// no commit‑graph. The body is preserved here as a placeholder and is not used
-// by the current implementation.
-func (hs *HistoryScanner) scanPackfiles() ([]commitInfo, error) {
-	if len(hs.store.packs) == 0 {
-		return []commitInfo{}, nil
-	}
-
-	var (
-		mu            sync.Mutex
-		commits       []commitInfo
-		failedCommits = make(map[Hash]error)
-	)
-
-	for _, pf := range hs.store.packs {
-		if pf.oidTable == nil || pf.entries == nil {
-			continue
-		}
-		for i, oid := range pf.oidTable {
-			off := pf.entries[i].offset
-			typ, _, err := peekObjectType(pf.pack, off)
-			if err != nil || typ != ObjCommit {
-				continue
-			}
-			raw, _, err := hs.store.get(oid)
-			if err != nil {
-				failedCommits[oid] = err
-				continue
-			}
-			ci, err := parseCommitData(oid, raw)
-			if err != nil {
-				failedCommits[oid] = err
-				continue
-			}
-			mu.Lock()
-			commits = append(commits, ci)
-			mu.Unlock()
-		}
-	}
-	if len(failedCommits) > 0 {
-		return commits, &ScanError{FailedCommits: failedCommits}
-	}
-	return commits, nil
-}
-
-// parseCommitData extracts the minimal commit metadata from raw, which must
-// contain a canonical "commit" object.
-func parseCommitData(oid Hash, raw []byte) (commitInfo, error) {
-	ci := commitInfo{OID: oid}
-
-	if !bytes.HasPrefix(raw, []byte("tree ")) {
-		return commitInfo{}, fmt.Errorf("commit %x: missing tree line", oid)
-	}
-	treeEnd := bytes.IndexByte(raw[5:], '\n')
-	if treeEnd != 40 {
-		return commitInfo{}, fmt.Errorf("commit %x: malformed tree line", oid)
-	}
-	tree, err := ParseHash(string(raw[5 : 5+treeEnd]))
-	if err != nil {
-		return commitInfo{}, err
-	}
-	ci.TreeOID = tree
-	raw = raw[5+treeEnd+1:]
-
-	for bytes.HasPrefix(raw, []byte("parent ")) {
-		end := bytes.IndexByte(raw[7:], '\n')
-		if end != 40 {
-			return commitInfo{}, fmt.Errorf("commit %x: malformed parent line", oid)
-		}
-		p, err := ParseHash(string(raw[7 : 7+end]))
-		if err != nil {
-			return commitInfo{}, err
-		}
-		ci.ParentOIDs = append(ci.ParentOIDs, p)
-		raw = raw[7+end+1:]
-	}
-
-	if idx := bytes.Index(raw, []byte("\ncommitter ")); idx >= 0 {
-		lineEnd := bytes.IndexByte(raw[idx+1:], '\n')
-		if lineEnd > 0 {
-			fields := bytes.Fields(raw[idx+11 : idx+1+lineEnd])
-			if n := len(fields); n >= 2 {
-				var ts int64
-				fmt.Sscan(string(fields[n-2]), &ts)
-				ci.Timestamp = ts
-			}
-		}
-	}
-	return ci, nil
 }
