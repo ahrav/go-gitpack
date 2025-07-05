@@ -66,7 +66,7 @@ func detectType(data []byte) ObjectType {
 	// Use an aligned uint32 load so we can compare four bytes at once.
 	first4 := *(*uint32)(unsafe.Pointer(&data[0]))
 
-	// Compare against little-endian representations
+	// Compare against little-endian representations.
 	const (
 		treeLE = 0x65657274 // "tree" in little-endian
 		blobLE = 0x626f6c62 // "blob" in little-endian
@@ -84,7 +84,7 @@ func detectType(data []byte) ObjectType {
 			}
 		}
 	} else {
-		// Big-endian comparisons
+		// Big-endian comparisons.
 		if first4 == 0x74726565 && len(data) > 4 && data[4] == ' ' {
 			return ObjTree
 		}
@@ -157,6 +157,11 @@ func parseObjectHeaderUnsafe(data []byte) (ObjectType, uint64, int) {
 	return ObjBad, 0, -1
 }
 
+var (
+	ErrEmptyObjectHeader       = errors.New("empty object header")
+	ErrCannotParseObjectHeader = errors.New("cannot parse object header")
+)
+
 // peekObjectType reads the object header to determine type without inflating the body.
 // The function returns the object type and header length in bytes.
 //
@@ -169,11 +174,11 @@ func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
 		return ObjBad, 0, err
 	}
 	if n == 0 {
-		return ObjBad, 0, errors.New("empty object header")
+		return ObjBad, 0, ErrEmptyObjectHeader
 	}
 	ot, _, hdrLen := parseObjectHeaderUnsafe(buf[:n])
 	if hdrLen <= 0 {
-		return ObjBad, 0, errors.New("cannot parse object header")
+		return ObjBad, 0, ErrCannotParseObjectHeader
 	}
 	return ot, hdrLen, nil
 }
