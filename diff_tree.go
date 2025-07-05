@@ -51,7 +51,7 @@ func walkDiff(
 	// Helper that turns a zero hash into a nil iterator to simplify the
 	// merge-loop below.
 	iterFor := func(h Hash) (*TreeIter, error) {
-		if h == (Hash{}) {
+		if h.IsZero() {
 			return nil, nil
 		}
 		return tc.treeIter(h)

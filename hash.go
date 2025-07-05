@@ -15,6 +15,9 @@ type Hash [20]byte
 // This is the canonical 40-character format used by Git.
 func (h Hash) String() string { return hex.EncodeToString(h[:]) }
 
+// IsZero returns true if the hash is the zero value.
+func (h Hash) IsZero() bool { return h == (Hash{}) }
+
 // ParseHash converts a 40-char hex string to Hash.
 //
 // ParseHash converts the canonical, 40-character hexadecimal SHA-1 string
