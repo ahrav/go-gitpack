@@ -132,6 +132,30 @@ func putDeltaArena(arena *deltaArena) {
 	deltaArenaPool.Put(arena)
 }
 
+// inflationParams bundles the inputs required by inflateDeltaChainStreaming to
+// reconstruct an object that is stored as a chain of pack-file deltas.
+//
+// Callers populate an inflationParams value and pass it unchanged to
+// inflateDeltaChainStreaming.  The struct is merely a data carrier; it enforces
+// no invariants beyond the expectation that pointer fields are non-nil.
+type inflationParams struct {
+	// p provides random-access reads to the pack that contains the first delta
+	// object. It must remain valid for the entire lifetime of the inflation.
+	p *mmap.ReaderAt
+
+	// off specifies the zero-based byte offset of the initial delta object
+	// within p.
+	off uint64
+
+	// oid identifies the final object that will result from applying the delta
+	// chain. It is consulted for diagnostics and cycle detection only.
+	oid Hash
+
+	// ctx carries per-call state such as recursion depth and visited nodes.
+	// Obtain it via newDeltaContext before invoking the inflation routine.
+	ctx *deltaContext
+}
+
 // inflateDeltaChainStreaming reconstructs an object that is stored as a
 // chain of pack-file deltas.  The algorithm is deliberately split into two
 // distinct phases so that it can run with a *single* bounded memory
@@ -187,14 +211,12 @@ func putDeltaArena(arena *deltaArena) {
 //
 // The function fails with an error when the chain is too deep, cyclic, the
 // pack-file is corrupted, or any delta instruction is invalid.
-func inflateDeltaChainStreaming(
-	s *store,
-	p *mmap.ReaderAt,
-	off uint64,
-	oid Hash,
-	ctx *deltaContext,
-) ([]byte, ObjectType, error) {
-	base, baseType, stack, err := walkUpDeltaChain(s, p, off, oid, ctx)
+// IMPORTANT: Because the slice is mutated in-place it MUST NOT be reused once
+// resolution is complete.  applyDeltaStack treats the slice as read-only and
+// does not retain it after the call returns.
+func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, ObjectType, error) {
+	var stack deltaStack // will be mutated in-place
+	base, baseType, err := walkUpDeltaChain(s, params, &stack)
 	if err != nil {
 		return nil, ObjBad, err
 	}
@@ -211,47 +233,52 @@ func inflateDeltaChainStreaming(
 //	– the stack of deltas that still need to be applied (deltaStack)
 //
 // The function enforces depth/cycle constraints via ctx.
+//
+// Parameter notes:
+//   - stack – Must be non-nil.  The slice is mutated *in place*: every delta
+//     encountered during the walk is appended to it so that the caller (and
+//     subsequent applyDeltaStack invocation) see the final, complete list.
 func walkUpDeltaChain(
 	s *store,
-	p *mmap.ReaderAt,
-	off uint64,
-	oid Hash,
-	ctx *deltaContext,
-) (baseData []byte, baseType ObjectType, stack deltaStack, err error) {
-	currPack, currOff := p, off
-	for depth := 0; depth < ctx.maxDepth; depth++ {
-		var typ ObjectType
-		typ, _, err = peekObjectType(currPack, currOff)
+	params inflationParams,
+	stack *deltaStack,
+) ([]byte, ObjectType, error) {
+	if stack == nil {
+		return nil, ObjBad, errors.New("stack is nil")
+	}
+
+	currPack, currOff := params.p, params.off
+	for depth := 0; depth < params.ctx.maxDepth; depth++ {
+		typ, _, err := peekObjectType(currPack, currOff)
 		if err != nil {
-			return nil, ObjBad, nil, err
+			return nil, ObjBad, err
 		}
 
 		if typ != ObjOfsDelta && typ != ObjRefDelta {
-			_, baseData, err = readRawObject(currPack, currOff)
+			_, baseData, err := readRawObject(currPack, currOff)
 			if err != nil {
-				return nil, ObjBad, nil, err
+				return nil, ObjBad, err
 			}
-			baseType = typ
-			return baseData, baseType, stack, nil
+			return baseData, typ, nil
 		}
 
-		stack = append(stack, deltaInfo{currPack, currOff, typ})
+		*stack = append(*stack, deltaInfo{currPack, currOff, typ})
 
 		if typ == ObjRefDelta {
 			var baseOID Hash
 			_, _, baseOID, err = readRefDeltaHeader(currPack, currOff)
 			if err != nil {
-				return nil, ObjBad, nil, err
+				return nil, ObjBad, err
 			}
-			if err = ctx.checkRefDelta(baseOID); err != nil { // Cycle detection check.
-				return nil, ObjBad, nil, err
+			if err = params.ctx.checkRefDelta(baseOID); err != nil { // Cycle detection check.
+				return nil, ObjBad, err
 			}
-			ctx.enterRefDelta(baseOID) // Mark this ref-delta as visited.
+			params.ctx.enterRefDelta(baseOID) // Mark this ref-delta as visited.
 
 			var ok bool
 			currPack, currOff, ok = s.findPackedObject(baseOID)
 			if !ok {
-				return nil, ObjBad, nil, fmt.Errorf("base object %s not found", baseOID)
+				return nil, ObjBad, fmt.Errorf("base object %s not found", baseOID)
 			}
 			continue
 		}
@@ -260,17 +287,18 @@ func walkUpDeltaChain(
 		var back uint64
 		_, _, back, err = readOfsDeltaHeader(currPack, currOff)
 		if err != nil {
-			return nil, ObjBad, nil, err
+			return nil, ObjBad, err
 		}
 		currOff -= back
 	}
 
-	return nil, ObjBad, nil, fmt.Errorf("delta chain too deep (max %d)", ctx.maxDepth)
+	return nil, ObjBad, fmt.Errorf("delta chain too deep (max %d)", params.ctx.maxDepth)
 }
 
-// applyDeltaStack takes the base object returned by walkUpDeltaChain together
-// with the collected stack of deltas and resolves them using the existing
-// ping-pong arena strategy.
+// applyDeltaStack consumes the *same* deltaStack that was filled by
+// walkUpDeltaChain.  The slice is treated as read-only here; no mutations are
+// performed after the walk-up phase has completed.  The function then resolves
+// the chain using the established ping-pong arena strategy.
 func applyDeltaStack(
 	stack deltaStack,
 	baseData []byte,
