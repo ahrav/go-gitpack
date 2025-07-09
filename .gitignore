@@ -48,3 +48,4 @@ testdata/repos/
 multi-pack-index
 commit-graph
 commit-graphs/
+.env
