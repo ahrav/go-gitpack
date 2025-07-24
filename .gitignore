@@ -31,6 +31,12 @@ go.work.sum
 .idea/
 .vscode/
 memory-bank/**
+CLAUDE.md
+settings.local.json
+project.yml
+guidelines.md
+.serena/**
+.claude/**
 
 *.pprof
 
@@ -49,3 +55,4 @@ multi-pack-index
 commit-graph
 commit-graphs/
 .env
+
