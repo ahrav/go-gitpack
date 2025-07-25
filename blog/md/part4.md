@@ -349,6 +349,111 @@ func applyDelta(base, delta []byte) []byte {
 }
 ```
 
+This implementation works well for applying a single delta, but what happens when we need to resolve a chain of deltas? That's where things get more interesting.
+
+---
+
+## 🔄 The Ping-Pong Buffer Strategy: Resolving Delta Chains Efficiently
+
+When Git stores an object as a delta chain (delta → delta → delta → base), we need to apply each delta in sequence. The naive approach would allocate a new buffer for each step, but that's wasteful. Instead, we use a clever "ping-pong" buffer strategy that reuses memory throughout the entire chain resolution.
+
+### The Two-Phase Approach
+
+Our implementation splits delta chain resolution into two distinct phases:
+
+**1. Walk-Up Phase: Analyzing the Chain**
+Starting from the target object, we walk *up* the delta chain until we reach a non-delta base object. During this phase, we:
+- Build a stack of all deltas we'll need to apply
+- Check for cycles and enforce depth limits
+- Calculate the maximum buffer size we'll need
+- But we don't actually apply any deltas yet!
+
+**2. Apply-Down (Ping-Pong) Phase: Applying Deltas**
+Once we know the full chain, we allocate a single arena with two equal halves:
+
+```
++----------------------+----------------------+
+|  Buffer A (input)    |  Buffer B (output)   |
++----------------------+----------------------+
+```
+
+Then we apply deltas by "ping-ponging" between these buffers:
+1. Start with the base object in Buffer A
+2. Apply the first delta: read from A, write to B
+3. Swap roles: B becomes input, A becomes output
+4. Apply the next delta: read from B, write to A
+5. Continue swapping until all deltas are applied
+
+### Why This Matters
+
+This approach has several advantages:
+- **Single allocation**: We allocate memory once for the entire chain
+- **No copying**: Buffers swap roles instead of copying data
+- **Bounded memory**: We know the exact size needed before starting
+- **Cache-friendly**: Data stays in the same memory region
+
+Here's a simplified view of how it works in practice:
+
+```go
+// From the actual implementation in delta.go
+func applyDeltaStack(
+    stack deltaStack,
+    baseData []byte,
+    baseType ObjectType,
+) ([]byte, ObjectType, error) {
+    // Get a reusable arena from the pool
+    arena := getDeltaArena()
+    defer putDeltaArena(arena)
+
+    // Calculate the maximum size we'll need
+    maxTarget := peekLargestTarget(stack)
+    if bs := uint64(len(baseData)); bs > maxTarget {
+        maxTarget = bs
+    }
+
+    // Split arena into two halves for ping-pong
+    bufA := arena.data[:maxTarget]
+    bufB := arena.data[maxTarget : maxTarget*2]
+
+    // Start with base data in bufA
+    current := bufA[:len(baseData)]
+    copy(current, baseData)
+
+    // Track which buffer we're using
+    usingA := true
+
+    // Apply deltas in reverse order (oldest to newest)
+    for i := len(stack) - 1; i >= 0; i-- {
+        d := stack[i]
+
+        // Choose output buffer (the one we're NOT using)
+        var out []byte
+        if usingA {
+            out = bufB[:0]
+        } else {
+            out = bufA[:0]
+        }
+
+        // Apply delta: read from current, write to out
+        result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out)
+        if err != nil {
+            return nil, ObjBad, err
+        }
+
+        // Swap: output becomes the new input
+        current = result
+        usingA = !usingA
+    }
+
+    // Copy final result to return
+    final := make([]byte, len(current))
+    copy(final, current)
+    return final, baseType, nil
+}
+```
+
+The ping-pong approach elegantly solves the problem of applying multiple deltas without excessive allocations or copies. It's a perfect example of how understanding the problem domain (Git's delta chains) leads to optimized solutions.
+
 ---
 
 ## 🎯 Preventing Re-inflation: A Git-Optimized Cache

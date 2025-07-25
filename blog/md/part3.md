@@ -366,7 +366,7 @@ Now it's time to read the actual data. In **Part 4**, we'll crack open the packf
 
 - How Git uses zlib compression for storage efficiency
 - How delta compression stores objects as changes against other objects
-- A single-pass, stack-based algorithm for resolving delta chains on the fly
+- A two-phase, ping-pong buffer algorithm for resolving delta chains efficiently
 - Building a complete object reader that handles all Git's storage optimizations
 
 We're getting closer to our final goal: lightning-fast diffs that only show the lines we need to scan for secrets.
