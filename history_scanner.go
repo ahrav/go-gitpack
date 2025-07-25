@@ -311,9 +311,7 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			}
 		}
 
-		if firstErr != nil {
-			errC <- firstErr
-		}
+		errC <- firstErr
 	}()
 
 	return out, errC
