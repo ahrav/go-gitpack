@@ -79,9 +79,12 @@ func (hs *HistoryScanner) startProfiling() error {
 
 	if hs.profiling.EnableProfiling {
 		mux := http.NewServeMux()
-		// pprof handlers are already registered in the default mux by importing net/http/pprof
-		// We create a new mux to avoid conflicts with any existing default server.
-		mux.HandleFunc("/debug/pprof/", http.HandlerFunc(http.DefaultServeMux.ServeHTTP))
+		// Register pprof handlers explicitly to avoid dependency on the default mux.
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
 
 		hs.profileServer = &http.Server{
 			Addr:    hs.profiling.ProfileAddr,
