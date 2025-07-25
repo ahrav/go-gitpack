@@ -114,7 +114,7 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 			return nil, err
 		}
 
-		// Compare the recorded pack checksum with the one we already verified
+		// Compare the recorded pack checksum with the one we already verified.
 		// while loading *.idx.  Skip when pf.pack is nil (rare midx‑only case).
 		if pf.pack != nil {
 			gotPack := make([]byte, hashSize)

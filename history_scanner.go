@@ -46,6 +46,8 @@ package objstore
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -98,6 +100,16 @@ type HistoryScanner struct {
 
 	// meta caches author/committer lines for cheap GetCommitMetadata calls.
 	meta *metaCache
+
+	// profiling holds optional profiling configuration.
+	// When non-nil, enables HTTP profiling server and/or trace.
+	profiling *ProfilingConfig
+
+	// profileServer is the HTTP server for pprof endpoints.
+	profileServer *http.Server
+
+	// traceFile holds the file handle for execution trace output.
+	traceFile *os.File
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -130,9 +142,12 @@ var ErrCommitGraphRequired = errors.New("commit‑graph required but not found")
 // If the commit‑graph cannot be loaded the function returns a non‑nil error
 // and any resources acquired by the underlying object store are released.
 //
+// Options can be provided to configure scanner behavior, such as enabling
+// profiling with WithProfiling.
+//
 // The caller must invoke (*HistoryScanner).Close when finished to free mmap
 // handles and file descriptors.
-func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
+func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, error) {
 	packDir := filepath.Join(gitDir, "objects", "pack")
 	store, err := open(packDir)
 	if err != nil {
@@ -152,11 +167,17 @@ func NewHistoryScanner(gitDir string) (*HistoryScanner, error) {
 
 	mc := newMetaCache(graph, store)
 
-	return &HistoryScanner{
+	hs := &HistoryScanner{
 		store:     store,
 		graphData: graph,
 		meta:      mc,
-	}, nil
+	}
+
+	for _, opt := range opts {
+		opt(hs)
+	}
+
+	return hs, nil
 }
 
 // HunkAddition describes a contiguous block of added lines introduced by a
@@ -226,6 +247,11 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 	go func() {
 		defer close(out)
 		defer close(errC)
+		defer hs.stopProfiling() // Ensure profiling is stopped even on error
+
+		if err := hs.startProfiling(); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
+		}
 
 		if hs.graphData == nil {
 			errC <- ErrCommitGraphRequired
@@ -254,7 +280,7 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 						ParentOIDs: work.parentOIDs,
 					}
 					if err := hs.processCommitStreamingHunks(hs.store, c, out); err != nil {
-						errorChan <- err
+						errorChan <- fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err)
 						return
 					}
 				}
@@ -285,7 +311,9 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			}
 		}
 
-		errC <- firstErr
+		if firstErr != nil {
+			errC <- firstErr
+		}
 	}()
 
 	return out, errC
@@ -313,8 +341,7 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 
 		hunks, err := computeAddedHunks(hs.store, old, newH)
 		if err != nil {
-			fmt.Printf("ERROR: %v\n", err)
-			return nil
+			return fmt.Errorf("compute added hunks: %w", err)
 		}
 
 		for _, hunk := range hunks {

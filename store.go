@@ -315,10 +315,13 @@ func (s *store) Close() error {
 func (s *store) treeIter(oid Hash) (*TreeIter, error) {
 	raw, typ, err := s.get(oid)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get tree %s: %w", oid, err)
 	}
 	if typ != ObjTree {
-		return nil, ErrTypeMismatch
+		return nil, fmt.Errorf("expected tree type for %s, got %v", oid, typ)
+	}
+	if len(raw) > 0 && raw[0] == 0 {
+		return nil, fmt.Errorf("tree %s starts with null byte (likely corrupted)", oid)
 	}
 	return newTreeIter(raw), nil
 }
