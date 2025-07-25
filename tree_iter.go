@@ -8,7 +8,9 @@ package objstore
 
 import (
 	"bytes"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 )
 
@@ -39,7 +41,7 @@ func newTreeIter(raw []byte) *TreeIter { return &TreeIter{rest: raw} }
 
 // Next parses and returns the next entry in the raw Git tree.
 //
-// It yields the entry’s file name, object ID, and file mode.
+// It yields the entry's file name, object ID, and file mode.
 // When ok is false the iterator has been exhausted and, by convention,
 // err is io.EOF.
 // Any malformed input results in ok == false and a non-nil err,
@@ -55,15 +57,21 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 		return "", Hash{}, 0, false, io.EOF
 	}
 
+	// Safety check: if we have less than the minimum possible tree entry
+	// (at least 1 char mode + space + 1 char name + null + 20 bytes SHA)
+	if len(it.rest) < 24 {
+		return "", Hash{}, 0, false, fmt.Errorf("%w: insufficient data for tree entry (%d bytes)", ErrCorruptTree, len(it.rest))
+	}
+
 	/* ---- <mode> (octal) -------------------------------------------- */
 	// Scan up to the first space; everything before it must be an octal digit.
 	sp := bytes.IndexByte(it.rest, ' ')
 	if sp < 0 {
-		return "", Hash{}, 0, false, ErrCorruptTree
+		return "", Hash{}, 0, false, fmt.Errorf("%w: no space after mode (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
 	}
 	for _, b := range it.rest[:sp] {
 		if b < '0' || b > '7' {
-			return "", Hash{}, 0, false, ErrCorruptTree
+			return "", Hash{}, 0, false, fmt.Errorf("%w: invalid octal digit '%c' in mode (mode so far: %o)", ErrCorruptTree, b, mode)
 		}
 		// Build the mode one octal digit at a time, avoiding strconv allocations.
 		mode = mode<<3 | uint32(b-'0')
@@ -74,7 +82,7 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 	// The entry name is NUL-terminated.
 	nul := bytes.IndexByte(it.rest, 0)
 	if nul < 0 {
-		return "", Hash{}, 0, false, ErrCorruptTree
+		return "", Hash{}, 0, false, fmt.Errorf("%w: no null terminator after filename (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
 	}
 	// Convert the slice header to string without copying bytes.
 	name = btostr(it.rest[:nul])
@@ -82,7 +90,7 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 
 	/* ---- <sha1> (20 bytes) ----------------------------------------- */
 	if len(it.rest) < 20 {
-		return "", Hash{}, 0, false, ErrCorruptTree
+		return "", Hash{}, 0, false, fmt.Errorf("%w: insufficient bytes for SHA (%d < 20), name=%q, mode=%o", ErrCorruptTree, len(it.rest), name, mode)
 	}
 	// Copy the 20-byte object ID into the Hash we return.
 	copy(oid[:], it.rest[:20])

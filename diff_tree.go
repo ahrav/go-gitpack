@@ -2,6 +2,7 @@ package objstore
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"path/filepath"
 )
@@ -54,7 +55,11 @@ func walkDiff(
 		if h.IsZero() {
 			return nil, nil
 		}
-		return tc.treeIter(h)
+		iter, err := tc.treeIter(h)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create tree iterator for %s: %w", h, err)
+		}
+		return iter, nil
 	}
 
 	oldIter, err := iterFor(oldTreeOID)
