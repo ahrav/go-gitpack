@@ -326,19 +326,36 @@ func applyDeltaStack(
 	bufA := arena.data[:maxTarget]
 	bufB := arena.data[maxTarget : maxTarget*2]
 
-	in := bufA[:len(baseData)]
-	copy(in, baseData)
-	out := bufB
+	// Start with base data in bufA.
+	current := bufA[:len(baseData)]
+	copy(current, baseData)
+
+	// Track which buffer we're using.
+	usingA := true
 
 	for i := len(stack) - 1; i >= 0; i-- {
 		d := stack[i]
-		var err error
-		in, err = applyDeltaStreaming(d.pack, d.offset, d.typ, in, out)
+
+		// Choose output buffer (the one we're NOT currently using).
+		var out []byte
+		if usingA {
+			out = bufB[:0]
+		} else {
+			out = bufA[:0]
+		}
+
+		result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out)
 		if err != nil {
 			return nil, ObjBad, err
 		}
-		in, out = out[:len(in)], in[:0] // ping-pong swap
+
+		// The result is now in 'out' buffer, make it the current for next iteration.
+		current = result
+		usingA = !usingA // Switch which buffer we're using
 	}
+
+	// Copy final result.
+	in := current
 
 	final := make([]byte, len(in))
 	copy(final, in)

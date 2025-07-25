@@ -111,6 +111,115 @@ Addition #2:
   ...
 ```
 
+### 3. Profiling Example (`profiling/`)
+
+A performance profiling example that demonstrates how to diagnose memory and CPU performance issues when scanning large repositories using the built-in profiling capabilities of `HistoryScanner`.
+
+**Functionality:**
+
+-   Enables HTTP profiling server exposing pprof endpoints for real-time performance analysis.
+-   Streams repository history using `DiffHistoryHunks()` for memory-efficient processing.
+-   Provides configurable profiling options via command-line flags.
+-   Displays progress statistics during scanning including processing rate.
+-   Supports execution tracing for detailed runtime analysis.
+-   Allows limiting the number of hunks processed for controlled profiling sessions.
+
+**Command-line Flags:**
+
+-   `-repo`: Path to .git directory to scan (auto-detects if not specified)
+-   `-profile`: Enable HTTP profiling server (default: true)
+-   `-profile-addr`: Address for profiling HTTP server (default: ":6060")
+-   `-trace`: Enable execution tracing (default: false)
+-   `-trace-path`: Path for trace output (default: "./trace.out")
+-   `-max-hunks`: Maximum number of hunks to process, 0 for all (default: 0)
+
+**Execution:**
+
+```bash
+cd examples/profiling
+go run main.go
+
+# With custom options:
+go run main.go -repo /path/to/large/repo/.git -profile-addr :8080 -max-hunks 10000
+```
+
+**Expected Output:**
+
+```
+No repository specified, using default: /path/to/go-gitpack/.git
+Scanning repository: /path/to/go-gitpack/.git
+Profiling server: true (address: :6060)
+Execution trace: false
+
+📊 Profiling endpoints available at http://:6060/debug/pprof/
+Capture profiles during the scan with:
+  CPU (30s):  curl http://:6060/debug/pprof/profile?seconds=30 > cpu.prof
+  Heap:       curl http://:6060/debug/pprof/heap > heap.prof
+  Goroutines: curl http://:6060/debug/pprof/goroutine > goroutine.prof
+  Allocs:     curl http://:6060/debug/pprof/allocs > allocs.prof
+
+🚀 Starting scan...
+Progress: 1000 hunks, 15234 lines, 89 commits, 245.3 hunks/sec
+Progress: 2000 hunks, 31567 lines, 124 commits, 267.8 hunks/sec
+...
+
+✅ Scan completed successfully!
+
+📊 Scan Statistics:
+   Total hunks processed: 5432
+   Total lines analyzed: 89123
+   Unique commits: 124
+   Time elapsed: 21.3s
+   Processing rate: 255.0 hunks/sec
+
+📈 Profile Analysis:
+While the scan is running, capture profiles from another terminal:
+   # CPU profile (30 seconds):
+   curl http://:6060/debug/pprof/profile?seconds=30 > cpu.prof
+   go tool pprof cpu.prof
+
+   # Memory profile:
+   curl http://:6060/debug/pprof/heap > heap.prof
+   go tool pprof heap.prof
+
+   # Live profiling:
+   go tool pprof http://:6060/debug/pprof/heap
+   go tool pprof http://:6060/debug/pprof/profile?seconds=30
+
+💡 Common pprof commands:
+   top10          - Show top 10 functions by CPU/memory
+   list <func>    - Show source code for a function
+   web            - Open interactive graph in browser
+   png > out.png  - Save graph as image
+```
+
+**Capturing Profiles During Scan:**
+
+While the profiling example is running, open another terminal and capture profiles:
+
+```bash
+# Capture a 30-second CPU profile
+curl http://localhost:6060/debug/pprof/profile?seconds=30 > cpu.prof
+
+# Capture heap (memory) profile
+curl http://localhost:6060/debug/pprof/heap > heap.prof
+
+# Capture goroutine profile
+curl http://localhost:6060/debug/pprof/goroutine > goroutine.prof
+
+# Analyze profiles
+go tool pprof cpu.prof
+go tool pprof heap.prof
+```
+
+**Use Cases:**
+
+-   **Performance Optimization**: Identify CPU bottlenecks in large repository scans
+-   **Memory Usage Analysis**: Track memory allocation patterns and find leaks
+-   **Goroutine Analysis**: Understand concurrency patterns and potential deadlocks
+-   **Execution Tracing**: Detailed runtime behavior analysis with `go tool trace`
+-   **Benchmarking**: Compare performance across different repository sizes and configurations
+
 ## Key Features Demonstrated
 
 This section provides code snippets that highlight key features of the `HistoryScanner`.
@@ -187,6 +296,22 @@ if author, err := scanner.Author(commitOID); err == nil {
 ```
 
 This example demonstrates how to retrieve commit metadata, such as the timestamp and author information. The `Timestamp()` function retrieves the commit timestamp, and the `Author()` function retrieves the author's name and email.
+
+#### Enabling Profiling
+
+```go
+// Create scanner with profiling configuration
+scanner, err := objstore.NewHistoryScanner(gitDir,
+    objstore.WithProfiling(&objstore.ProfilingConfig{
+        EnableProfiling: true,
+        ProfileAddr:     ":6060",
+        Trace:           false,
+        TraceOutputPath: "./trace.out",
+    }),
+)
+```
+
+This snippet shows how to enable profiling when creating a `HistoryScanner`. The `WithProfiling` option allows you to configure HTTP profiling server settings and execution tracing. Once enabled, you can capture CPU profiles, heap profiles, and other runtime metrics through the exposed pprof endpoints.
 
 ## Understanding the Output
 
