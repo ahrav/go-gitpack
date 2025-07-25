@@ -393,7 +393,7 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		})
 	}
 
-	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
+	return nil, ObjBad, fmt.Errorf("object %s not found", oid)
 }
 
 // inflateFromPack reads and materializes an object from a packfile.
@@ -443,7 +443,7 @@ func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, err
 				return nil, ObjBad, err
 			}
 		} else if s.midx != nil && s.midx.version >= 2 {
-			return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", params.oid)
+			return nil, ObjBad, fmt.Errorf("no CRC found for object %s in MIDX v2", params.oid)
 		}
 	}
 
@@ -481,14 +481,14 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	// Locate the commit object and skip past its generic object header.
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		return nil, fmt.Errorf("object %x not found", oid)
+		return nil, fmt.Errorf("object %s not found", oid)
 	}
 	typ, hdrLen, err := peekObjectType(p, off)
 	if err != nil {
 		return nil, err
 	}
 	if typ != ObjCommit {
-		return nil, fmt.Errorf("%x is not a commit", oid)
+		return nil, fmt.Errorf("%s is not a commit", oid)
 	}
 	off += uint64(hdrLen)
 

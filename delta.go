@@ -96,7 +96,7 @@ func (ctx *deltaContext) checkRefDelta(hash Hash) error {
 		return fmt.Errorf("delta chain too deep (max %d)", ctx.maxDepth)
 	}
 	if ctx.visited[hash] {
-		return fmt.Errorf("circular delta reference detected for %x", hash)
+		return fmt.Errorf("circular delta reference detected for %s", hash)
 	}
 	return nil
 }
