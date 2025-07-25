@@ -37,6 +37,7 @@ project.yml
 guidelines.md
 .serena/**
 .claude/**
+todo.md
 
 *.pprof
 
