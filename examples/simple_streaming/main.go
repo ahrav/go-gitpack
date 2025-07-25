@@ -10,7 +10,6 @@ import (
 )
 
 // findGitDir traverses the directory tree upwards from startDir to locate the ".git" directory.
-// findGitDir traverses the directory tree upwards from startDir to locate the ".git" directory.
 // It returns the path to the ".git" directory if found, otherwise an empty string.
 func findGitDir(startDir string) string {
 	dir := startDir
