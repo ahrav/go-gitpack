@@ -52,36 +52,33 @@ func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) erro
 		}
 		seen[oid] = struct{}{}
 
-		info, ok := hs.takePrefetchedCommit(oid)
-		if !ok {
-			hdr, err := hs.store.readCommitHeader(oid)
-			if err != nil {
-				if errors.Is(err, ErrObjectNotFound) {
-					// Stale refs and shallow parents can legitimately point to objects
-					// absent from local packs. Skip and continue the reachable walk.
-					continue
-				}
-				if !errors.Is(err, ErrObjectNotCommit) {
-					return fmt.Errorf("read commit header %s: %w", oid, err)
-				}
-				// Non-commit refs (tags, trees, etc.) are allowed.
-				target, ok, tagErr := hs.resolveTagTarget(oid)
-				if tagErr != nil {
-					if errors.Is(tagErr, ErrObjectNotFound) {
-						continue
-					}
-					return tagErr
-				}
-				if ok {
-					stack = append(stack, target)
-				}
+		hdr, err := hs.store.readCommitHeader(oid)
+		if err != nil {
+			if errors.Is(err, ErrObjectNotFound) {
+				// Stale refs and shallow parents can legitimately point to objects
+				// absent from local packs. Skip and continue the reachable walk.
 				continue
 			}
-
-			info, err = parseCommitInfoFromHeader(oid, hdr)
-			if err != nil {
-				return err
+			if !errors.Is(err, ErrObjectNotCommit) {
+				return fmt.Errorf("read commit header %s: %w", oid, err)
 			}
+			// Non-commit refs (tags, trees, etc.) are allowed.
+			target, ok, tagErr := hs.resolveTagTarget(oid)
+			if tagErr != nil {
+				if errors.Is(tagErr, ErrObjectNotFound) {
+					continue
+				}
+				return tagErr
+			}
+			if ok {
+				stack = append(stack, target)
+			}
+			continue
+		}
+
+		info, err := parseCommitInfoFromHeader(oid, hdr)
+		if err != nil {
+			return err
 		}
 		if err := visit(info); err != nil {
 			return err

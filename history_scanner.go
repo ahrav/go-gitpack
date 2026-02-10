@@ -121,12 +121,6 @@ type HistoryScanner struct {
 	commitsOnce sync.Once
 	commits     []commitInfo
 	commitsErr  error
-
-	// prefetchedCommits stores commit headers parsed during parent-tree
-	// lookups so the subsequent ref walk can consume them without a second
-	// object read. Entries are short-lived and removed once consumed.
-	prefetchedMu      sync.Mutex
-	prefetchedCommits map[Hash]commitInfo
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -169,12 +163,11 @@ func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, e
 	mc := newMetaCache(nil, store)
 
 	hs := &HistoryScanner{
-		gitDir:            gitDir,
-		scanMode:          ScanModeBlob,
-		store:             store,
-		graphData:         nil,
-		meta:              mc,
-		prefetchedCommits: make(map[Hash]commitInfo, 128),
+		gitDir:    gitDir,
+		scanMode:  ScanModeBlob,
+		store:     store,
+		graphData: nil,
+		meta:      mc,
 	}
 
 	for _, opt := range opts {
@@ -336,25 +329,6 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // errScanAborted marks an internal early-stop condition used to unwind commit walks.
 var errScanAborted = errors.New("scan aborted")
 
-func (hs *HistoryScanner) putPrefetchedCommit(info commitInfo) {
-	if info.OID.IsZero() {
-		return
-	}
-	hs.prefetchedMu.Lock()
-	hs.prefetchedCommits[info.OID] = info
-	hs.prefetchedMu.Unlock()
-}
-
-func (hs *HistoryScanner) takePrefetchedCommit(oid Hash) (commitInfo, bool) {
-	hs.prefetchedMu.Lock()
-	info, ok := hs.prefetchedCommits[oid]
-	if ok {
-		delete(hs.prefetchedCommits, oid)
-	}
-	hs.prefetchedMu.Unlock()
-	return info, ok
-}
-
 // firstParentTree resolves the tree OID for a commit's first parent.
 // Missing or non-commit parents are treated as an empty tree.
 func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
@@ -375,7 +349,6 @@ func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
 	if err != nil {
 		return Hash{}, err
 	}
-	hs.putPrefetchedCommit(parentInfo)
 	return parentInfo.TreeOID, nil
 }
 
