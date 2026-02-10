@@ -46,7 +46,14 @@ var hostLittle = func() bool {
 	return *(*byte)(unsafe.Pointer(&i)) == 1
 }()
 
-var ErrObjectNotCommit = errors.New("object is not a commit")
+var (
+	ErrObjectNotCommit = errors.New("object is not a commit")
+	ErrObjectNotFound  = errors.New("object not found")
+)
+
+func objectNotFoundError(oid Hash) error {
+	return fmt.Errorf("%w: %x", ErrObjectNotFound, oid)
+}
 
 func init() {
 	// On Windows an mmapped file cannot be closed while any outstanding
@@ -390,7 +397,7 @@ func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
 
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		return nil, ObjBad, fmt.Errorf("object %x not found", oid)
+		return nil, ObjBad, objectNotFoundError(oid)
 	}
 
 	return s.inflateFromPackWithOptions(inflationParams{
@@ -442,7 +449,7 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		})
 	}
 
-	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
+	return nil, ObjBad, objectNotFoundError(oid)
 }
 
 // inflateFromPack reads and materializes an object from a packfile.
@@ -534,7 +541,7 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	// Locate the commit object and skip past its generic object header.
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		return nil, fmt.Errorf("object %x not found", oid)
+		return nil, objectNotFoundError(oid)
 	}
 	typ, hdrLen, err := peekObjectType(p, off)
 	if err != nil {

@@ -93,6 +93,10 @@ type HistoryScanner struct {
 	// gitDir is the repository .git directory used for ref-based fallbacks.
 	gitDir string
 
+	// scanMode controls which scanning strategy is used by Scan.
+	// Blob mode is the default.
+	scanMode ScanMode
+
 	// store backs object retrieval for the lifetime of the scanner.
 	store *store
 
@@ -166,6 +170,7 @@ func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, e
 
 	hs := &HistoryScanner{
 		gitDir:    gitDir,
+		scanMode:  ScanModeBlob,
 		store:     store,
 		graphData: graph,
 		meta:      mc,
