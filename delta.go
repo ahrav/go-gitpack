@@ -48,8 +48,13 @@ type deltaInfo struct {
 	hdrLen int
 }
 
-// deltaStack is a stack of deltaInfo objects, used to iteratively
-// resolve a delta chain.
+// deltaStack is a stack of deltaInfo objects, used to iteratively resolve a
+// delta chain.
+//
+// Ordering invariant: elements are pushed during the walk-up phase in
+// encounter order (child delta first, base-adjacent delta last). During the
+// apply-down phase the stack is iterated in reverse (from len-1 to 0) so
+// that the delta closest to the base object is applied first.
 type deltaStack []deltaInfo
 
 // deltaContext carries per‑lookup state while resolving a chain of deltas.
@@ -271,9 +276,20 @@ func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, Objec
 }
 
 // inflateDeltaChainBorrowed is like inflateDeltaChainStreaming but skips the
-// final copy from the arena. The returned data is only valid until the next
-// delta resolution on the same goroutine. Callers must finish consuming the
-// data before calling any other delta-resolution functions.
+// final copy from the arena, returning a slice that is backed by a pooled
+// deltaArena buffer.
+//
+// Lifetime / invalidation contract:
+// The returned []byte is valid ONLY until ANY of the following events occurs:
+//   - The caller invokes any other delta-resolution function on the same
+//     goroutine (inflateDeltaChainStreaming, inflateDeltaChainBorrowed,
+//     applyDeltaStack, or any store method that inflates a delta).
+//   - The deltaArena is returned to deltaArenaPool (which happens at the end
+//     of applyDeltaStack via the deferred putDeltaArena call).
+//   - The goroutine exits (the runtime may reclaim pooled objects at any GC).
+//
+// In practice, callers must copy or fully consume the returned data
+// synchronously before performing any further object inflation.
 func inflateDeltaChainBorrowed(s *store, params inflationParams) ([]byte, ObjectType, error) {
 	stack := make(deltaStack, 0, 16)
 	base, baseType, err := walkUpDeltaChain(s, params, &stack)
@@ -343,7 +359,16 @@ func walkUpDeltaChain(
 			continue
 		}
 
-		// ofs-delta: read the variable-length backward offset directly.
+		// ofs-delta: read the variable-length backward offset and subtract
+		// it from the current position to reach the base object.
+		//
+		// Acyclicity reasoning: every ofs-delta stores a strictly positive
+		// backward byte offset within the same packfile, so the base always
+		// sits at a lower file position than the delta that references it.
+		// Because file offsets decrease monotonically on each hop, the walk
+		// must terminate -- it cannot revisit a previously seen offset. This
+		// structural property makes explicit cycle detection unnecessary for
+		// ofs-delta chains (though the depth limit still applies).
 		pos := int64(currOff) + int64(hdrLen)
 		back := readOfsDeltaOffset(currPack, pos)
 		currOff -= back
@@ -353,9 +378,20 @@ func walkUpDeltaChain(
 }
 
 // applyDeltaStack consumes the *same* deltaStack that was filled by
-// walkUpDeltaChain.  The slice is treated as read-only here; no mutations are
-// performed after the walk-up phase has completed.  The function then resolves
+// walkUpDeltaChain. The slice is treated as read-only here; no mutations are
+// performed after the walk-up phase has completed. The function then resolves
 // the chain using the established ping-pong arena strategy.
+//
+// When borrowed is true, the returned []byte is backed by the arena and
+// must be consumed before the next delta resolution (see the lifetime
+// contract documented on inflateDeltaChainBorrowed). When borrowed is false,
+// a fresh heap allocation is returned that the caller may retain indefinitely.
+//
+// Ordering invariant: the stack is iterated from len(stack)-1 down to 0.
+// walkUpDeltaChain pushes deltas in walk-up order (child first, base last),
+// so iterating in reverse applies the oldest (closest-to-base) delta first
+// and the newest (closest-to-target) delta last, which is the correct
+// application order for reconstructing the final object.
 func applyDeltaStack(
 	stack deltaStack,
 	baseData []byte,
@@ -456,9 +492,27 @@ func applyDeltaStack(
 	return final, baseType, nil
 }
 
-// readOfsDeltaOffset reads a variable-length offset from an ofs-delta object.
-// The offset encoding uses the MSB as a continuation bit.
-// Up to 9 bytes are read in a single ReadAt to avoid per-byte kernel crossings.
+// readOfsDeltaOffset reads a variable-length backward offset from an
+// ofs-delta object header.
+//
+// Encoding algorithm (from the Git pack format spec):
+//
+// The first byte contributes its lower 7 bits directly. Each subsequent
+// byte, if the previous byte had its MSB (continuation bit) set, is
+// folded in as follows:
+//
+//	offset++                                   // +1 bias
+//	offset = (offset << 7) | (byte & 0x7f)    // shift and merge
+//
+// The +1 before each shift is critical: it ensures that the encoding is
+// non-ambiguous. Without it, a leading 0x00 continuation byte would be
+// indistinguishable from "no more bytes", making the encoding
+// non-canonical. The +1 guarantees that every distinct offset has exactly
+// one valid encoding and that the decoder never produces a zero offset
+// from a non-empty continuation sequence.
+//
+// Up to 9 bytes are read in a single ReadAt to avoid per-byte syscall
+// overhead on the memory-mapped file.
 func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) uint64 {
 	var buf [9]byte
 	n, _ := pack.ReadAt(buf[:], pos)
@@ -657,6 +711,16 @@ func decodeCopyCommand(cmd byte, br *bufio.Reader) (offset, size int, err error)
 }
 
 // popcount7 returns the number of set bits in the lower 7 bits of b.
+//
+// Only 7 bits are counted (not 8) because the MSB of a Git delta copy
+// command byte is the copy/insert discriminator flag (0x80), not an
+// operand-presence indicator. The lower 7 bits (bits 0-6) each signal
+// whether a corresponding operand byte follows in the stream:
+//   - bits 0-3: offset bytes (up to 4)
+//   - bits 4-6: size bytes (up to 3)
+//
+// The implementation uses a standard parallel bit-count (SWAR) algorithm
+// restricted to 7 bits.
 func popcount7(b byte) int {
 	b = b & 0x7f
 	b = (b & 0x55) + ((b >> 1) & 0x55)

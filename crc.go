@@ -100,6 +100,19 @@ func verifyCRC32(pf *idxFile, objOff uint64, want uint32) error {
 
 // verifyPackTrailer validates the SHA-1 checksum at the end of a pack file.
 // This should be called once per pack to ensure the trailer hasn't been corrupted.
+//
+// The trailer is the final hashSize bytes of the pack (see store.go for the
+// hashSize constant, currently 20 for SHA-1). The function computes SHA-1 over
+// every byte preceding the trailer and compares it to the stored value.
+//
+// Error semantics:
+//   - Returns an error wrapping a descriptive message if the pack is smaller
+//     than hashSize bytes (i.e., too small to contain a valid trailer).
+//   - Returns a wrapped error if reading the trailer or checksumming fails.
+//   - Returns ErrPackTrailerCorrupt when the computed checksum does not match
+//     the stored trailer. The caller should treat this as an unrecoverable
+//     corruption signal for the entire pack.
+//   - A nil return means the on-disk trailer is valid.
 func verifyPackTrailer(pack *mmap.ReaderAt) error {
 	size := pack.Len()
 	if size < hashSize {

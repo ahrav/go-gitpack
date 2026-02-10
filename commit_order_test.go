@@ -1,7 +1,28 @@
+// commit_order_test.go tests the topological ordering of commits used to
+// ensure that parent commits are always processed before their children during
+// history scanning.
+
 package objstore
 
 import "testing"
 
+// TestOrderCommitsParentFirst verifies that orderCommitsParentFirst produces a
+// topological ordering where every parent appears before all of its children.
+//
+// The test uses the following DAG:
+//
+//	root (t=10)
+//	├── mid  (t=20)
+//	│   └── leaf (t=30)
+//	└── side (t=25)
+//
+// The input slice is deliberately unsorted (leaf, side, root, mid) to confirm
+// that the function does not depend on input order. The assertions check:
+//   - root appears before both mid and side.
+//   - mid appears before leaf.
+//
+// No ordering constraint exists between mid and side because they are on
+// independent branches.
 func TestOrderCommitsParentFirst(t *testing.T) {
 	root := Hash{1}
 	mid := Hash{2}

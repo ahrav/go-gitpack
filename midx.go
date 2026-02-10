@@ -105,7 +105,14 @@ func (m *midxFile) findObject(h Hash) (p *mmap.ReaderAt, off uint64, ok bool) {
 // PNAM chunk can be mmap'ed right away.
 //
 // Note: midx v1 is the current format (different from pack index v2)
-// midx files have their own versioning scheme starting at 1
+// midx files have their own versioning scheme starting at 1.
+//
+// packCache is a caller-owned map used for deduplication: packs already
+// opened elsewhere are looked up by their full filesystem path. Any newly
+// opened *mmap.ReaderAt is inserted into the map so that later callers
+// (including other midx or idx parsers) can reuse the handle. Ownership
+// of the handles is shared: the caller is responsible for closing every
+// value in the map once the store is shut down.
 func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderAt) (*midxFile, error) {
 	// === HEADER SECTION ===
 	var hdr [12]byte
@@ -124,6 +131,9 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		return nil, fmt.Errorf("only SHA‑1 midx supported")
 	}
 
+	// hdr[6] is the number of TOC (chunk table) entries.
+	// hdr[7] is reserved by Git and must currently be zero; we skip
+	// validation because future MIDX versions may assign it meaning.
 	chunks := int(hdr[6])
 	packCount := int(binary.BigEndian.Uint32(hdr[8:12]))
 
@@ -145,6 +155,12 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 	// Calculate size for each chunk by looking at the next offset.
 	sort.Slice(cd, func(i, j int) bool { return cd[i].off < cd[j].off })
 
+	// findChunk locates the chunk with the given 4-byte identifier (e.g.
+	// chunkPNAM, chunkOIDL) in the sorted chunk descriptor table. It
+	// returns the chunk's starting offset and its byte size (computed as
+	// the distance to the next chunk's offset). This relies on the cd
+	// slice being sorted by ascending offset above, which guarantees that
+	// cd[i+1].off - cd[i].off gives the exact chunk size.
 	findChunk := func(id uint32) (off int64, size int64, err error) {
 		for i := 0; i < len(cd)-1; i++ {
 			chunkID := binary.BigEndian.Uint32(cd[i].id[:])
@@ -291,6 +307,11 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 		rawOff := binary.BigEndian.Uint32(offRaw[i*8+4 : i*8+8])
 
 		var off64 uint64
+		// Bit 31 (0x80000000) is the large-offset flag defined by the MIDX
+		// specification. When clear, the remaining 31 bits encode the pack
+		// offset directly. When set, the remaining 31 bits are an index
+		// into the separate LOFF (large-offset) chunk, which stores full
+		// 64-bit offsets for packs exceeding 2 GiB.
 		if rawOff&0x80000000 == 0 {
 			off64 = uint64(rawOff)
 		} else {

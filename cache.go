@@ -1,6 +1,24 @@
 // package objstore provides a minimal, memory-mapped Git object store that
 // resolves objects directly from *.pack files without shelling out to the
 // Git executable.
+//
+// This file implements two cache layers used during object resolution:
+//
+//   - refCountedDeltaWindow: a bounded, reference-counted LRU cache for
+//     intermediate delta bases. It keeps recently resolved objects in memory
+//     so that subsequent delta applications can reuse them without re-reading
+//     the packfile. The window cooperates with Handle-based reference
+//     counting so that actively-used entries are never evicted.
+//
+//   - arcCache: an Adaptive Replacement Cache (ARC) that sits above the delta
+//     window and caches fully resolved objects. ARC balances recency and
+//     frequency to handle both scan-like (one-pass) and lookup-like (repeated
+//     access) workloads.
+//
+// The two caches serve complementary roles: the delta window is scoped to
+// packfile delta resolution and is consulted during the innermost inflate
+// loop, while the ARC cache is the top-level "have I already resolved this
+// OID?" check used by store.get().
 package objstore
 
 import (
@@ -12,8 +30,20 @@ import (
 )
 
 const (
-	maxDeltaChainDepth = 50       // Git default protection
-	windowBudget       = 32 << 20 // 32 MiB
+	// maxDeltaChainDepth is the maximum number of delta hops allowed when
+	// resolving a deltified packfile object. This matches the Git default
+	// (pack.depth = 50). Exceeding this limit returns an error rather than
+	// risking stack overflow or excessive CPU consumption from
+	// pathologically deep delta chains (which may indicate pack corruption).
+	maxDeltaChainDepth = 50
+
+	// windowBudget (32 MiB) is the memory budget for the refCountedDeltaWindow.
+	// This value matches Git's default pack.windowMemory setting. 32 MiB is
+	// large enough to hold several dozen typical delta bases concurrently,
+	// which is sufficient to resolve most delta chains without eviction
+	// pressure, while remaining small enough to avoid significant RSS impact
+	// when multiple HistoryScanners coexist in a process.
+	windowBudget = 32 << 20
 )
 
 // ErrWindowFull is returned when the delta window cannot accommodate new
@@ -48,6 +78,13 @@ type refCountedEntry struct {
 // intrusiveList is a doubly-linked list with sentinel nodes that avoids
 // per-element heap allocation. All entry nodes embed prev/next pointers
 // directly, keeping LRU traversal cache-friendly.
+//
+// Sentinel node invariant: head and tail are non-nil dummy entries that are
+// NEVER removed or evicted. They exist solely to eliminate nil checks in the
+// insert/remove paths. When the list is empty, head.next == tail and
+// tail.prev == head. Data entries always satisfy entry != head && entry !=
+// tail. All list mutation methods (pushFront, remove, moveToFront) guard
+// against being called with a sentinel.
 type intrusiveList struct {
 	// head.next is the most recently used entry.
 	// tail.prev is the least recently used entry.
@@ -150,6 +187,22 @@ func (l *intrusiveList) back() *refCountedEntry {
 //
 // The cache uses an intrusive doubly-linked list for LRU ordering, keeping all
 // entry metadata contiguous and avoiding per-element heap allocations.
+//
+// Thread safety: all public methods (acquire, add) are protected by mu. The
+// evictable counter uses atomic operations for fast-path reads (e.g.
+// checking whether any entry can be evicted before acquiring the lock), but
+// mutations to evictable are always performed while mu is held to maintain
+// the invariant:
+//
+//	evictable == (number of entries in the LRU with refCnt == 0)
+//
+// Relationship to arcCache: refCountedDeltaWindow lives inside the delta
+// resolution hot path and caches *intermediate* base objects needed to apply
+// OFS_DELTA / REF_DELTA instructions. The arcCache, by contrast, caches
+// *fully resolved* objects at the store.get() level. A single object may
+// appear in both caches simultaneously (the delta window retains the base,
+// while the ARC cache retains the final result). The two caches have
+// independent eviction policies and memory budgets.
 type refCountedDeltaWindow struct {
 	mu sync.Mutex
 
@@ -161,7 +214,10 @@ type refCountedDeltaWindow struct {
 
 	lru *intrusiveList
 
-	// evictable counts entries with refCnt == 0.
+	// evictable counts entries with refCnt == 0. It is kept in sync with the
+	// actual count of zero-refCnt entries in the LRU under mu. The atomic
+	// type allows fast reads outside the lock (e.g. in add's pre-check) but
+	// writes always happen under mu to prevent drift.
 	evictable atomic.Int32
 
 	handlePool sync.Pool
@@ -202,6 +258,14 @@ func (h *Handle) Type() ObjectType {
 
 // Release decrements the reference count for this handle's entry and
 // marks the handle as invalid for further use.
+//
+// Idempotency: Release is safe to call multiple times. After the first call,
+// h.entry and h.w are set to nil, so subsequent calls are no-ops. This makes
+// it safe to defer Release() and also call it explicitly in error paths
+// without risk of double-decrementing the reference count.
+//
+// After Release returns, the Handle is returned to the sync.Pool for reuse.
+// The caller MUST NOT access h.Data() after calling Release.
 func (h *Handle) Release() {
 	if h.entry == nil || h.w == nil {
 		return
@@ -224,6 +288,11 @@ func (h *Handle) Release() {
 }
 
 // Data returns the cached object data associated with this handle.
+//
+// Lifetime: the returned slice is valid only as long as the Handle has not
+// been released. Once Release() is called, the underlying entry may be
+// evicted and its data buffer reused or garbage-collected. Callers that need
+// the data beyond the Handle's lifetime MUST copy the slice before releasing.
 func (h *Handle) Data() []byte { return h.data }
 
 // acquire attempts to return a handle to the cached data for the given
@@ -253,6 +322,32 @@ func (w *refCountedDeltaWindow) acquire(oid Hash) (*Handle, bool) {
 }
 
 // add inserts or updates the cached entry for the given object hash.
+//
+// If the OID already exists in the window, the entry's data, size, and type
+// are updated in-place without changing the reference count or creating a new
+// entry node. The memory accounting (w.used) is adjusted by the size delta,
+// and the entry is promoted to MRU position. This in-place update avoids
+// dangling Handle references that would occur if the old entry were evicted
+// and a new one inserted.
+//
+// If the OID is new, the eviction algorithm proceeds as follows:
+//
+//  1. If the new entry fits within the remaining budget (used + len(buf) <=
+//     budget), it is inserted at the MRU position with refCnt 0 (evictable).
+//
+//  2. If the budget would be exceeded, the algorithm walks the LRU list from
+//     the tail (least recently used) toward the head, evicting entries whose
+//     refCnt is 0. Entries with refCnt > 0 are skipped because they are
+//     actively borrowed via Handles -- evicting them would corrupt in-flight
+//     delta resolution.
+//
+//  3. The walk continues until either enough space has been freed or no more
+//     evictable entries remain. If the budget is still exceeded and no
+//     evictable entries exist, ErrWindowFull is returned so the caller can
+//     fall back to an uncached code path.
+//
+// Objects larger than the entire budget are rejected immediately with
+// ErrObjectTooLarge to avoid evicting every other entry for a single object.
 func (w *refCountedDeltaWindow) add(oid Hash, buf []byte, objType ObjectType) error {
 	if len(buf) > w.budget {
 		return ErrObjectTooLarge

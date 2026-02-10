@@ -1,3 +1,8 @@
+// delta_test.go tests the delta decompression subsystem, including variable-
+// integer decoding, delta cycle detection, ping-pong buffer management during
+// multi-level delta chain resolution, buffer boundary conditions, arena pooling,
+// and large-object delta application.
+
 package objstore
 
 import (
@@ -11,6 +16,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestReadVarIntFromReader validates the Git-style variable-length integer
+// decoder, covering single-byte values, multi-byte continuation sequences,
+// and the empty-input error case.
+// NOTE: consider adding a "name" field to each test case for clearer subtest output.
 func TestReadVarIntFromReader(t *testing.T) {
 	tests := []struct {
 		data        []byte
@@ -40,6 +49,9 @@ func TestReadVarIntFromReader(t *testing.T) {
 	}
 }
 
+// TestDeltaCycleDetection verifies that the deltaContext correctly detects
+// circular REF_DELTA references (same hash seen twice) and rejects chains
+// that exceed the maximum allowed depth.
 func TestDeltaCycleDetection(t *testing.T) {
 	ctx := newDeltaContext(10)
 
@@ -546,7 +558,7 @@ func TestApplyDeltaStackWithLargeObjects(t *testing.T) {
 		stack        []testDelta
 		expectedSize int
 		description  string
-		shouldCache  bool
+		shouldCache  bool // Currently unused; documents intent for future cache-eligibility assertions.
 	}{
 		{
 			name: "large_base_small_delta",

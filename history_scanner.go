@@ -227,17 +227,35 @@ func (h *HunkAddition) Path() string { return h.path }
 // IsBinary returns whether this hunk contains binary data.
 func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 
-// DiffHistoryHunks streams every added hunk from all commits.
+// DiffHistoryHunks streams every added hunk from all commits, diffing each
+// commit against its first parent only (i.e. merge commits are treated as a
+// single diff against the first parent, matching `git log --first-parent`
+// semantics). This keeps output deterministic and avoids duplicate hunks from
+// merge base reconstruction.
 //
 // It returns two buffered channels: one for HunkAddition values and one for a
-// single error.
-// The function never blocks the caller; all writes to the channels are
-// non‑blocking.
+// single error. The function never blocks the caller; all writes to the
+// channels are non-blocking.
 //
-// A nil error sent on errC signals a graceful end‑of‑stream.
+// Goroutine ownership: DiffHistoryHunks spawns a background goroutine that
+// owns the returned channels and closes them when the walk completes. The
+// caller MUST drain the HunkAddition channel to completion (or read until the
+// errC channel delivers a value) to avoid leaking goroutines. Failing to
+// drain will block the internal worker pool indefinitely.
+//
+// The HunkAddition channel is buffered to runtime.NumCPU() to allow workers
+// to make progress without waiting for the consumer on every hunk. The errC
+// channel is buffered to 1 so the producer goroutine can always send its
+// final error without blocking.
+//
+// A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
 	numWorkers := runtime.NumCPU()
 
+	// Buffer the output channel to numWorkers so that each worker can deposit
+	// at least one hunk without blocking, reducing contention during bursts.
+	// The errC channel is buffered to 1 so the goroutine can always complete
+	// its send even if the caller has not started reading yet.
 	out := make(chan HunkAddition, numWorkers)
 	errC := make(chan error, 1)
 
@@ -330,7 +348,16 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 var errScanAborted = errors.New("scan aborted")
 
 // firstParentTree resolves the tree OID for a commit's first parent.
-// Missing or non-commit parents are treated as an empty tree.
+//
+// When the commit has no parents (i.e. it is a root commit), the zero Hash{}
+// is returned. The caller interprets the zero hash as the empty tree, so
+// diffing against it produces additions for every file in the root commit's
+// tree. This avoids special-casing root commits in the diff pipeline.
+//
+// When the first parent cannot be found (ErrObjectNotFound) or is not a
+// commit object (ErrObjectNotCommit), the zero hash is returned silently.
+// This gracefully handles shallow clones and truncated history where parent
+// objects may be absent.
 func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
 	if len(c.ParentOIDs) == 0 {
 		return Hash{}, nil
@@ -368,17 +395,29 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, p
 		for _, hunk := range hunks {
 			if hunk.IsBinary { // Don't fuse binary hunks
 				// Binary files are always sent as a single hunk.
+				// Convention: for binary hunks, startLine == endLine to signal
+				// that line-based range semantics do not apply. The value
+				// comes from hunk.StartLine and is repeated for endLine to
+				// communicate "this is a single indivisible blob" rather than
+				// a contiguous line range.
 				out <- HunkAddition{
 					commit:    c.OID,
 					path:      filepath.ToSlash(path),
 					startLine: int(hunk.StartLine),
-					endLine:   int(hunk.StartLine), // Binary files are one "line"
+					endLine:   int(hunk.StartLine),
 					lines:     hunk.Lines,
 					isBinary:  true,
 				}
 				continue
 			}
 
+			// fuseHunks merges adjacent hunks that are separated by fewer
+			// than `contextBefore` + `contextAfter` lines. The values 3, 3
+			// match the default context size used by `git diff` (3 lines of
+			// leading and 3 lines of trailing context). This keeps hunk
+			// boundaries consistent with what developers expect from
+			// standard unified-diff output and avoids splitting logically
+			// related changes into separate HunkAddition values.
 			fusedHunks := fuseHunks([]AddedHunk{hunk}, 3, 3)
 			for _, fused := range fusedHunks {
 				out <- HunkAddition{
@@ -395,7 +434,10 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, p
 	})
 }
 
-// get returns the fully materialized object identified by oid plus its type.
+// get returns the fully materialized (i.e. delta-resolved, decompressed)
+// object identified by oid plus its type. "Materialized" means that all
+// delta chains have been walked and applied, producing the final byte content
+// as if `git cat-file -p <oid>` were invoked.
 func (hs *HistoryScanner) get(oid Hash) ([]byte, ObjectType, error) {
 	return hs.store.get(oid)
 }
@@ -435,6 +477,16 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 
 // loadAllCommits is an internal helper used by package tests. Production scan
 // paths should use streaming traversal.
+//
+// The method uses sync.Once to ensure the expensive commit enumeration is
+// performed at most once, even under concurrent calls. After the first
+// successful load, subsequent calls return a fresh copy of the cached slice.
+//
+// Copy semantics: the returned []commitInfo is a shallow copy of the internal
+// cache. This prevents callers from mutating the scanner's cached state (e.g.
+// reordering or truncating the slice). The commitInfo values themselves are
+// safe to share because their mutable parts (the ParentOIDs slice) are never
+// modified after construction.
 func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
 	hs.commitsOnce.Do(func() {
 		if hs.graphData != nil {

@@ -1,3 +1,15 @@
+// midx_in_memory.go
+//
+// Synthesized in-memory multi-pack index for Git repositories that lack an
+// on-disk MIDX file. When no "multi-pack-index" file is present in the
+// objects/pack directory, the store builds this structure from the individual
+// *.idx files so that all object lookups go through a single unified index.
+//
+// The resulting inMemoryMidx is immutable after construction and safe for
+// concurrent reads without additional synchronization. It mirrors the
+// lookup behaviour of midxFile (see midx.go) but is backed by Go slices
+// instead of a memory-mapped file.
+
 package objstore
 
 import (
@@ -23,12 +35,34 @@ type inMemoryMidx struct {
 	entries  []inMemoryMidxEntry
 }
 
+// inMemoryMidxRecord is a temporary intermediate used only during
+// buildInMemoryMidx construction. It pairs an object ID with the pack's
+// ordinal position so that the sort-then-dedup pass can break ties
+// deterministically (lowest pack order wins).
 type inMemoryMidxRecord struct {
 	oid       Hash
 	packOrder int
 	entry     inMemoryMidxEntry
 }
 
+// buildInMemoryMidx merges the object tables from all provided idxFile
+// instances into a single sorted, deduplicated index.
+//
+// The algorithm:
+//  1. Collect every (oid, pack, offset) triple from each idx.
+//  2. Sort by (oid ASC, packOrder ASC, offset ASC). The secondary sort on
+//     packOrder ensures that when duplicate OIDs exist across packs, the
+//     copy in the lowest-numbered pack is retained -- matching Git's own
+//     "first pack wins" deduplication semantics.
+//  3. Deduplicate by skipping consecutive records with the same OID.
+//  4. Build a cumulative fanout table from the first byte of each OID.
+//
+// INVARIANT: after construction, objectID and entries are parallel slices
+// of identical length, sorted in ascending OID order with no duplicates.
+// The fanout table is cumulative: fanout[b] == number of objects whose
+// first byte is <= b.
+//
+// Returns nil if no valid objects are found across all packs.
 func buildInMemoryMidx(packs []*idxFile) *inMemoryMidx {
 	total := 0
 	for _, pf := range packs {
@@ -123,6 +157,9 @@ func buildInMemoryMidx(packs []*idxFile) *inMemoryMidx {
 	}
 }
 
+// findObject looks up an object by its hash and returns the mmap reader for
+// the pack that contains it together with the byte offset within that pack.
+// It delegates to findEntry and unpacks the result.
 func (m *inMemoryMidx) findObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 	entry, ok := m.findEntry(oid)
 	if !ok {
@@ -131,6 +168,12 @@ func (m *inMemoryMidx) findObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 	return entry.pack, entry.offset, true
 }
 
+// findEntry performs a two-stage lookup identical to the on-disk midxFile:
+//  1. Use the fanout table to narrow the search to all objects sharing the
+//     same first byte as oid.
+//  2. Binary search within that range for an exact match.
+//
+// Returns the entry and true on hit, or a zero-value entry and false on miss.
 func (m *inMemoryMidx) findEntry(oid Hash) (inMemoryMidxEntry, bool) {
 	first := oid[0]
 	start := uint32(0)

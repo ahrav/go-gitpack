@@ -40,10 +40,27 @@ const (
 	chunkCDAT = 0x43444154 // CDAT
 	chunkEDGE = 0x45444745 // EDGE
 
+	// graphParentNone is the sentinel value stored in the p1 or p2raw fields
+	// of a CDAT record when a commit has no parent in that slot. The value
+	// 0x70000000 is defined by the Git commit-graph format specification and
+	// must not be confused with a valid object index.
 	graphParentNone = 0x70000000
-	graphLastEdge   = 0x80000000
+
+	// graphLastEdge is a flag bit (MSB) set on the last entry in the EDGE
+	// (extra-edge) list for an octopus merge. When p2raw has this bit set,
+	// the remaining 31 bits form an index into the edge table. Within the
+	// edge table itself, the entry with this bit set marks the final parent
+	// for that commit.
+	graphLastEdge = 0x80000000
 )
 
+// cdatRecordSize is the byte width of a single record in the CDAT (commit
+// data) chunk. Each record is laid out as:
+//
+//	[ root-tree OID (20 bytes) | parent1 (4) | parent2 (4) | gen+time (8) ]
+//	  <------- hashSize ------>  <------------ 16 bytes ----------------->
+//
+// The total is hashSize + 16 = 36 bytes per commit.
 const cdatRecordSize = hashSize + 16
 
 // Parents maps each commit OID to the OIDs of its immediate parents.
@@ -106,6 +123,15 @@ func (g *commitGraphData) parentsOf(idx int) []Hash {
 	return parents
 }
 
+// buildCommitGraphFromCommits synthesizes a commitGraphData from an
+// already-collected slice of commitInfo values (typically obtained via the
+// ref-walk fallback in commit_fallback.go).
+//
+// This constructor exists so that both the commit-graph file reader and the
+// fallback ref-walker produce the same data structure, allowing the rest of
+// the codebase to be agnostic to the source. The resulting commitGraphData
+// owns all of its slices (no aliasing with the input) and is safe for
+// concurrent reads.
 func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 	n := len(commits)
 	parents := make(Parents, n)
@@ -312,11 +338,22 @@ type parsedGraph struct {
 	edge []uint32
 }
 
-// resolveParentsInto converts parent indices from this graph file into actual OIDs,
-// storing the result in dst. It handles split commit-graph chains by applying the
-// given offset and respects layer precedence (newer layers override older ones).
-// This optimized version pre-scans commits to estimate parent counts and pre-allocates
-// slices accordingly to reduce memory allocations and improve performance.
+// resolveParentsInto converts parent indices from this graph file into actual
+// OIDs, storing the result in dst. It handles split commit-graph chains by
+// applying the given offset and respects layer precedence (newer layers
+// override older ones).
+//
+// Layer precedence reasoning: in a split commit-graph chain, newer graph
+// layers are parsed first (they appear earlier in the chain file). When the
+// same commit OID appears in multiple layers (e.g. after a repack), only the
+// entry from the newest layer should be used, because that layer reflects the
+// most recent state of the repository. The "if _, seen := dst[oid]; seen"
+// guard at the top of the per-commit loop enforces this: once a commit has
+// been recorded by a newer layer, older layers skip it.
+//
+// This optimized version pre-scans commits to estimate parent counts and
+// pre-allocates slices accordingly to reduce memory allocations and improve
+// performance.
 func (g parsedGraph) resolveParentsInto(dst Parents, all []Hash, offset int) error {
 	// Pre-scan to estimate parent counts for each commit.
 	// Benchmarks show this additional step is worth it.
@@ -456,15 +493,24 @@ func discoverGraphFiles(objectsDir string) ([]string, error) {
 	return nil, nil
 }
 
-// parseGraphFile reads and validates a commit-graph file, returning the parsed data.
-// The returned parsedGraph keeps the memory mapping open for the caller to close.
+// parseGraphFile reads and validates a commit-graph file, returning the parsed
+// data. The returned parsedGraph keeps the memory mapping open; the caller is
+// responsible for calling result.mr.Close() once the data has been consumed.
+//
+// Defer cleanup pattern: the function declares `result` as a named variable
+// and uses a deferred closure that checks `result.mr == nil`. On the success
+// path, result.mr is set to the open mmap handle, so the defer becomes a
+// no-op. On any error path, result.mr remains nil and the defer closes the
+// mmap to prevent a resource leak. This pattern avoids scattering Close()
+// calls on every individual error return while still guaranteeing cleanup.
 func parseGraphFile(path string) (parsedGraph, error) {
 	mr, err := mmap.Open(path)
 	if err != nil {
 		return parsedGraph{}, err
 	}
 
-	// Ensure cleanup on all error paths.
+	// Ensure cleanup on all error paths. See the function doc comment for
+	// an explanation of the result.mr == nil guard.
 	var result parsedGraph
 	defer func() {
 		if result.mr == nil && mr != nil {
@@ -593,6 +639,15 @@ func parseGraphFile(path string) (parsedGraph, error) {
 			copy(trees[i][:], buf[:hashSize])
 			p1[i] = binary.BigEndian.Uint32(buf[hashSize:])
 			p2[i] = binary.BigEndian.Uint32(buf[hashSize+4:])
+			// The 8-byte gen+time field packs two values:
+			//   - upper 30 bits: generation number (used for reachability queries)
+			//   - lower 34 bits: commit timestamp in seconds since Unix epoch
+			//
+			// The mask 0x3FFFFFFFF isolates the lower 34 bits (2^34 - 1 =
+			// 17,179,869,183), which can represent dates up to the year 2514.
+			// This exceeds the traditional 32-bit Unix timestamp limit of 2038
+			// and matches the extended timestamp width introduced in Git's
+			// commit-graph format version 2.
 			genTime := binary.BigEndian.Uint64(buf[hashSize+8:])
 			times[i] = int64(genTime & 0x3FFFFFFFF)
 		}

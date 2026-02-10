@@ -1,3 +1,20 @@
+// commit_fallback.go
+//
+// Fallback commit-history discovery for repositories that lack a commit-graph
+// file.  When no *.graph / commit-graph-chain is present, the HistoryScanner
+// falls back to this code path, which reconstructs the same commitInfo list
+// by walking reachable commits from refs.
+//
+// The entry point is loadFromRefs, which:
+//  1. Collects all ref tips (HEAD, refs/*, packed-refs).
+//  2. Performs a depth-first, stack-based walk over the commit DAG.
+//  3. Resolves annotated tags to their target commits.
+//  4. Returns commits in parent-first topological order.
+//
+// Because every commit must be individually inflated from a packfile (or
+// loose object), this path is significantly slower than the commit-graph
+// reader and should only be used when the commit-graph is unavailable.
+
 package objstore
 
 import (
@@ -13,6 +30,11 @@ import (
 	"strings"
 )
 
+// loadFromRefs is the entry point for the commit-graph fallback path.
+// It discovers all ref tips, walks the reachable commit DAG, and returns
+// commits ordered parent-first (i.e. every parent appears before its
+// children) so that downstream consumers can process them in a single
+// forward pass.
 func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 	out := make([]commitInfo, 0, 256)
 	if err := hs.walkCommitsFromRefs(func(info commitInfo) error {
@@ -95,6 +117,16 @@ func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) erro
 	return nil
 }
 
+// resolveTagTarget attempts to peel an annotated tag object to find its
+// ultimate target commit OID.
+//
+// Return semantics:
+//   - (target, true, nil)  -- oid is a tag whose "object" header points at a
+//     commit or another tag (which will be resolved on the next walk iteration).
+//   - (zero, false, nil)   -- oid is a tag that points at a non-commit/non-tag
+//     object (e.g. a tree or blob), or has no "object" header at all. The
+//     caller should skip it silently.
+//   - (zero, false, err)   -- an I/O or parse error occurred.
 func (hs *HistoryScanner) resolveTagTarget(oid Hash) (Hash, bool, error) {
 	data, typ, err := hs.store.getMaterialized(oid)
 	if err != nil {
@@ -140,6 +172,17 @@ func (hs *HistoryScanner) resolveTagTarget(oid Hash) (Hash, bool, error) {
 	return targetOID, true, nil
 }
 
+// collectRefTips discovers all unique commit-ish OIDs reachable from the
+// repository's refs. The search proceeds in the following order:
+//
+//  1. HEAD          -- resolved through its symref (if any) or as a detached hash.
+//  2. refs/**       -- every loose ref file under .git/refs/ is read.
+//  3. packed-refs   -- the packed-refs file is scanned for both regular lines
+//     and peeled "^" lines (which record the peeled tag target).
+//
+// Duplicates are suppressed via a seen-set so each OID appears at most once in
+// the returned slice. The output is sorted by hash for deterministic ordering
+// in downstream consumers.
 func collectRefTips(gitDir string) ([]Hash, error) {
 	seen := make(map[Hash]struct{}, 128)
 	out := make([]Hash, 0, 128)
@@ -257,6 +300,16 @@ func readRefHash(gitDir, refName string) (Hash, bool) {
 	return Hash{}, false
 }
 
+// parseCommitInfoFromHeader extracts structured metadata from the raw header
+// bytes of a commit object.
+//
+// Required fields: the header MUST contain at least one "tree" line and one
+// "committer" line. If either is missing, the function returns an error.
+// "parent" lines are optional (root commits have none); zero or more may be
+// present and are collected in order.
+//
+// The function stops scanning at the first blank line (the separator between
+// header and body in the Git commit format), so the body is never inspected.
 func parseCommitInfoFromHeader(oid Hash, hdr []byte) (commitInfo, error) {
 	info := commitInfo{
 		OID:        oid,
@@ -308,6 +361,13 @@ func parseCommitInfoFromHeader(oid Hash, hdr []byte) (commitInfo, error) {
 	return info, nil
 }
 
+// parseHeaderTimestamp extracts the Unix epoch timestamp from a "committer"
+// (or "author") header line.
+//
+// The Git format is: "committer <name> <<email>> <timestamp> <tz>", where
+// fields are whitespace-separated. The timestamp is always the second-to-last
+// field (len(fields)-2), and the timezone is the last. Indexing from the end
+// avoids having to handle names or emails that contain spaces.
 func parseHeaderTimestamp(line []byte) (int64, error) {
 	fields := bytes.Fields(line)
 	if len(fields) < 3 {
@@ -322,6 +382,16 @@ func parseHeaderTimestamp(line []byte) (int64, error) {
 	return ts, nil
 }
 
+// parseHashToken extracts a SHA-1 hash from the beginning of text.
+//
+// The function trims leading/trailing whitespace, then considers only the
+// first 40 characters. Any trailing content (e.g. a ref name after a space
+// in packed-refs, or a newline) is silently ignored -- the truncation to
+// exactly 40 hex characters is intentional so that lines like
+// "abc123... refs/heads/main" are handled without an explicit split.
+//
+// Returns the parsed hash and true on success, or (zero, false) if text is
+// shorter than 40 characters or is not valid hex.
 func parseHashToken(text string) (Hash, bool) {
 	text = strings.TrimSpace(text)
 	if len(text) < 40 {

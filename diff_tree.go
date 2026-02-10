@@ -1,3 +1,18 @@
+// diff_tree.go implements a streaming, memory-efficient tree-to-tree diff for
+// Git object trees.
+//
+// The algorithm performs a merge-join over the sorted entries of two trees,
+// emitting per-file change callbacks without materialising the full trees in
+// memory. This design supports arbitrarily large repositories because only
+// one tree level is traversed at a time.
+//
+// PRECONDITION: Git tree entries are stored in Git tree sort order, which is
+// *not* plain lexicographic order. Directories are compared as if their name
+// had a trailing '/' appended (e.g. "foo" < "foo-bar" < "foo.c" < "foo/"
+// when "foo" is a tree). The TreeIter returned by store.treeIter MUST yield
+// entries in this canonical order for the merge-join comparisons (oln < nln,
+// oln == nln) to be correct. Violating this precondition will produce
+// incorrect diffs silently.
 package objstore
 
 import (
@@ -6,9 +21,16 @@ import (
 	"io"
 )
 
-// joinPath builds a Git-style forward-slash path without allocating through
-// filepath.Join + filepath.ToSlash. Since Git tree entries always use
-// forward slashes, we can concatenate directly.
+// joinPath builds a Git-style forward-slash path by simple string
+// concatenation. This is intentionally used instead of filepath.Join +
+// filepath.ToSlash because:
+//
+//  1. filepath.Join allocates an intermediate slice via filepath.Clean and
+//     then filepath.ToSlash allocates again for the slash conversion. In a
+//     large repository diff this function is called millions of times, so the
+//     double allocation is measurable.
+//  2. Git tree entries already use forward slashes, so no OS-specific path
+//     normalisation is needed.
 func joinPath(prefix, name string) string {
 	if prefix == "" {
 		return name
@@ -83,6 +105,8 @@ func walkDiff(
 	if err != nil {
 		return err
 	}
+	defer putTreeIter(oldIter)
+	defer putTreeIter(newIter)
 
 	// State of the "current" entry of each iterator.
 	var (
@@ -161,7 +185,15 @@ func walkDiff(
 					return err
 				}
 			default:
-				// File replaced or mode changed.
+				// Type transition or mode change. This covers cases such as:
+				//   - A regular file replaced by a symlink (mode change).
+				//   - A file replaced by a directory, or vice versa. When a
+				//     file is replaced by a directory (or the reverse), the
+				//     entry name is the same on both sides but the modes
+				//     differ in their type bits. We report this as a single
+				//     callback with both old and new OIDs rather than a
+				//     delete + add pair, letting the caller decide how to
+				//     interpret the transition.
 				if err := fn(
 					joinPath(prefix, nln),
 					oidOld,

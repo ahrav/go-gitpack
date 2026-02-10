@@ -18,6 +18,9 @@ import (
 	objstore "github.com/ahrav/go-gitpack"
 )
 
+// findGitDir walks up the directory tree from startDir looking for a ".git"
+// directory. It returns the full path to the first ".git" directory found, or
+// an empty string if the filesystem root is reached without finding one.
 func findGitDir(startDir string) string {
 	dir := startDir
 	for {
@@ -76,6 +79,10 @@ func main() {
 	}
 
 	// Create scanner with profiling configuration.
+	// WithProfiling accepts a ProfilingConfig that controls the HTTP pprof
+	// server and Go execution tracing. When EnableProfiling is true the
+	// scanner starts an HTTP server on ProfileAddr exposing /debug/pprof/.
+	// When Trace is true a runtime/trace file is written to TraceOutputPath.
 	scanner, err := objstore.NewHistoryScanner(*gitDir,
 		objstore.WithProfiling(&objstore.ProfilingConfig{
 			EnableProfiling: *enableProf,
@@ -96,6 +103,9 @@ func main() {
 
 	fmt.Println("\n🚀 Starting scan...")
 
+	// DiffHistoryHunks returns two channels: a stream of hunk additions and an
+	// error channel. Hunks are sent as each commit is diffed; the error channel
+	// receives at most one value when the walk completes or fails.
 	hunkAdditions, errors := scanner.DiffHistoryHunks()
 
 	done := make(chan bool)

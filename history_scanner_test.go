@@ -1,3 +1,8 @@
+// history_scanner_test.go tests the HistoryScanner's commit loading and
+// diff-hunk streaming against pre-generated test repositories of varying
+// sizes (empty, linear, merge, 100/1k/10k commits). It also validates
+// the fallback commit-walker path used when no commit-graph file is present,
+// and benchmarks both commit loading and hunk streaming throughput.
 package objstore
 
 import (
@@ -12,12 +17,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// init panics early if the testdata/repos directory is missing, rather than
+// letting every test in the file fail with cryptic "no such file" errors.
+// The test repositories are created by running ./generate_testdata.sh, which
+// is a prerequisite for this test file.
 func init() {
 	if _, err := os.Stat("testdata/repos"); os.IsNotExist(err) {
 		panic("Test data not found. Run ./generate_testdata.sh first")
 	}
 }
 
+// TestLoadAllCommits_EmptyRepository confirms that loading commits from a
+// repository with no commits returns an empty slice and no error.
 func TestLoadAllCommits_EmptyRepository(t *testing.T) {
 	scanner := createScannerForRepo(t, "empty-repo")
 	defer scanner.Close()
@@ -27,6 +38,9 @@ func TestLoadAllCommits_EmptyRepository(t *testing.T) {
 	assert.Empty(t, commits)
 }
 
+// TestLoadAllCommits_LinearHistory verifies that a three-commit linear
+// repository produces exactly three commits, each with a non-zero OID,
+// TreeOID, and positive timestamp.
 func TestLoadAllCommits_LinearHistory(t *testing.T) {
 	scanner := createScannerForRepo(t, "simple-linear")
 	defer scanner.Close()
@@ -42,6 +56,8 @@ func TestLoadAllCommits_LinearHistory(t *testing.T) {
 	}
 }
 
+// TestLoadAllCommits_WithMergeCommits loads a repository that includes a
+// merge commit and checks that exactly one commit has two parents.
 func TestLoadAllCommits_WithMergeCommits(t *testing.T) {
 	scanner := createScannerForRepo(t, "with-merges")
 	defer scanner.Close()
@@ -70,6 +86,8 @@ func TestLoadAllCommits_WithMergeCommits(t *testing.T) {
 	assert.True(t, hasMerge, "Expected to find merge commits")
 }
 
+// TestLoadAllCommits_WithCommitGraph uses a repository that ships with a
+// commit-graph file and verifies that the same number of commits is loaded.
 func TestLoadAllCommits_WithCommitGraph(t *testing.T) {
 	scanner := createScannerForRepo(t, "simple-linear") // This repo has commit-graph
 	defer scanner.Close()
@@ -79,6 +97,9 @@ func TestLoadAllCommits_WithCommitGraph(t *testing.T) {
 	assert.Len(t, commits, 3)
 }
 
+// TestNewHistoryScanner_IgnoresDiskCommitGraph ensures that the scanner
+// defers commit-graph construction to loadAllCommits time rather than
+// loading the on-disk commit-graph eagerly at creation.
 func TestNewHistoryScanner_IgnoresDiskCommitGraph(t *testing.T) {
 	scanner := createScannerForRepo(t, "simple-linear") // This repo has commit-graph
 	defer scanner.Close()
@@ -91,6 +112,9 @@ func TestNewHistoryScanner_IgnoresDiskCommitGraph(t *testing.T) {
 	require.NotNil(t, scanner.graphData)
 }
 
+// TestLoadAllCommits_LargeRepo loads a 100-commit repository and validates
+// that every commit has valid fields and that all parent references point
+// to commits that exist in the loaded set.
 func TestLoadAllCommits_LargeRepo(t *testing.T) {
 	scanner := createScannerForRepo(t, "large-repo")
 	defer scanner.Close()
@@ -131,6 +155,8 @@ func TestLoadAllCommits_LargeRepo(t *testing.T) {
 	}
 }
 
+// TestLoadAllCommits_WithoutCommitGraph exercises the fallback commit walker
+// that discovers commits by walking pack objects when no commit-graph exists.
 func TestLoadAllCommits_WithoutCommitGraph(t *testing.T) {
 	scanner := createScannerForRepo(t, "no-commit-graph")
 	defer scanner.Close()
@@ -140,6 +166,10 @@ func TestLoadAllCommits_WithoutCommitGraph(t *testing.T) {
 	assert.NotEmpty(t, commits)
 }
 
+// TestLoadAllCommits_BuildsGraphWhenMissing confirms that when no on-disk
+// commit-graph is present, loadAllCommits builds an equivalent in-memory
+// graph whose OrderedOIDs, TreeOIDs, Timestamps, and Parents all match the
+// returned commit slice.
 func TestLoadAllCommits_BuildsGraphWhenMissing(t *testing.T) {
 	scanner := createScannerForRepo(t, "no-commit-graph")
 	defer scanner.Close()
@@ -159,6 +189,8 @@ func TestLoadAllCommits_BuildsGraphWhenMissing(t *testing.T) {
 	}
 }
 
+// TestDiffHistoryHunks_WithoutCommitGraph verifies that the streaming hunk
+// pipeline still produces output when the fallback commit walker is active.
 func TestDiffHistoryHunks_WithoutCommitGraph(t *testing.T) {
 	scanner := createScannerForRepo(t, "no-commit-graph")
 	defer scanner.Close()
@@ -172,6 +204,10 @@ func TestDiffHistoryHunks_WithoutCommitGraph(t *testing.T) {
 	assert.Greater(t, count, 0, "fallback commit walker should still produce hunks")
 }
 
+// TestDiffHistoryHunks is a table-driven test that streams hunks from the
+// "simple-linear" and "with-merges" repositories, asserting that every
+// expected file appears, hunk counts fall within the given bounds, and each
+// hunk's StartLine/EndLine/Lines fields are internally consistent.
 func TestDiffHistoryHunks(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -242,6 +278,9 @@ func TestDiffHistoryHunks(t *testing.T) {
 	}
 }
 
+// TestLoadAllCommits_MixedPackedAndLooseCommits creates a real Git
+// repository where the first commit is repacked and the second remains as
+// a loose object, then confirms that both commits are discovered.
 func TestLoadAllCommits_MixedPackedAndLooseCommits(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git executable not found in PATH")
@@ -288,6 +327,10 @@ func TestLoadAllCommits_MixedPackedAndLooseCommits(t *testing.T) {
 	assert.Len(t, commits, 2)
 }
 
+// createScannerForRepo is a test helper that opens the pre-generated test
+// repository at testdata/repos/<repoName> and returns a ready-to-use
+// HistoryScanner. It fails the calling test immediately if the repository
+// cannot be opened.
 func createScannerForRepo(t testing.TB, repoName string) *HistoryScanner {
 	repoPath := filepath.Join("testdata", "repos", repoName)
 	scanner, err := NewHistoryScanner(repoPath)
@@ -295,11 +338,17 @@ func createScannerForRepo(t testing.TB, repoName string) *HistoryScanner {
 	return scanner
 }
 
+// createScannerForRepoWithError is like createScannerForRepo but returns the
+// error instead of failing the test, allowing callers to assert specific
+// error conditions. It is currently unused but retained for future negative
+// test cases that need to inspect scanner-creation failures.
 func createScannerForRepoWithError(t testing.TB, repoName string) (*HistoryScanner, error) {
 	repoPath := filepath.Join("testdata", "repos", repoName)
 	return NewHistoryScanner(repoPath)
 }
 
+// BenchmarkLoadAllCommits measures commit loading throughput across
+// repositories of increasing size (3 to 10,000 commits).
 func BenchmarkLoadAllCommits(b *testing.B) {
 	tests := []struct {
 		name     string
@@ -327,6 +376,9 @@ func BenchmarkLoadAllCommits(b *testing.B) {
 	}
 }
 
+// BenchmarkDiffHistoryHunks measures hunk streaming throughput, including
+// commit walking, tree diffing, and hunk grouping, across repositories of
+// increasing size.
 func BenchmarkDiffHistoryHunks(b *testing.B) {
 	tests := []struct {
 		name     string
@@ -362,6 +414,9 @@ func BenchmarkDiffHistoryHunks(b *testing.B) {
 	}
 }
 
+// TestDiffHistoryHunks_LargeRepo streams hunks from a 100-commit repository
+// and validates that all 100 files are found, hunk counts are reasonable
+// (grouped consecutive lines reduce total hunks), and timing is logged.
 func TestDiffHistoryHunks_LargeRepo(t *testing.T) {
 	scanner := createScannerForRepo(t, "large-repo")
 	defer scanner.Close()
@@ -410,6 +465,8 @@ func TestDiffHistoryHunks_LargeRepo(t *testing.T) {
 		hunkCount, totalLines, float64(totalLines)/float64(hunkCount))
 }
 
+// TestDiffHistoryHunks_VeryLargeRepo streams hunks from a 1,000-commit
+// repository. Skipped in short mode to keep CI fast.
 func TestDiffHistoryHunks_VeryLargeRepo(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping very large repo test in short mode")
@@ -458,6 +515,8 @@ func TestDiffHistoryHunks_VeryLargeRepo(t *testing.T) {
 		hunkCount, totalLines, float64(totalLines)/float64(hunkCount))
 }
 
+// TestDiffHistoryHunks_SuperLargeRepo streams hunks from a 10,000-commit
+// repository. Skipped in short mode to keep CI fast.
 func TestDiffHistoryHunks_SuperLargeRepo(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping super large repo test in short mode")
@@ -500,6 +559,8 @@ func TestDiffHistoryHunks_SuperLargeRepo(t *testing.T) {
 		hunkCount, totalLines, float64(totalLines)/float64(hunkCount))
 }
 
+// TestLoadAllCommits_VeryLargeRepo loads 1,000 commits and checks basic
+// invariants (valid OIDs, single root). Skipped in short mode.
 func TestLoadAllCommits_VeryLargeRepo(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping very large repo test in short mode")
@@ -531,6 +592,8 @@ func TestLoadAllCommits_VeryLargeRepo(t *testing.T) {
 	assert.Equal(t, 1, rootCommitCount, "Should have exactly one root commit")
 }
 
+// TestLoadAllCommits_SuperLargeRepo loads 10,000 commits and checks basic
+// invariants (valid OIDs, single root). Skipped in short mode.
 func TestLoadAllCommits_SuperLargeRepo(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping super large repo test in short mode")

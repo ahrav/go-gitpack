@@ -1,3 +1,24 @@
+// packer.go
+//
+// Lowest-level pack reader: inflates a single Git object from a memory-mapped
+// packfile given its byte offset.
+//
+// This file sits below the delta-resolution layer (delta.go) and above the
+// memory-mapped I/O layer (mmap). Its sole exported entry point is
+// readRawObject, which:
+//
+//  1. Parses the variable-length object header at the given offset.
+//  2. For ref-delta and ofs-delta objects, reads the base-reference prefix
+//     (20-byte OID or variable-length backward offset) and prepends it to
+//     the inflated delta instructions in a single combined allocation.
+//  3. For regular objects (blob, tree, commit, tag), inflates the
+//     zlib-compressed content directly.
+//
+// The function does NOT resolve delta chains; it returns the raw delta
+// instructions with their prefix intact. The caller (typically
+// inflateDeltaChainStreaming in delta.go) is responsible for walking the
+// chain and applying deltas.
+
 package objstore
 
 import (
@@ -8,7 +29,14 @@ import (
 )
 
 var (
-	ErrEmptyObject            = errors.New("empty object")
+	ErrEmptyObject = errors.New("empty object")
+
+	// ErrOfsDeltaBaseRefTooLong is returned when the variable-length backward
+	// offset of an ofs-delta object cannot be decoded within 12 continuation
+	// bytes. Git's encoding uses 7 payload bits per byte with an MSB
+	// continuation flag, so 12 bytes encode at most 84 bits -- far more than
+	// needed for any valid pack offset. Exceeding this limit indicates a
+	// corrupted or maliciously crafted packfile.
 	ErrOfsDeltaBaseRefTooLong = errors.New("ofs-delta base-ref too long")
 )
 
@@ -63,7 +91,17 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	}
 
 	if prefixLen > 0 {
-		// Allocate a single buffer for prefix + inflated data to avoid concatenation.
+		// Combined buffer allocation strategy: the prefix (base reference)
+		// and the inflated delta instructions are laid out contiguously in
+		// a single allocation:
+		//
+		//   [  prefix (OID or var-int offset)  |  inflated delta body  ]
+		//   <------------ prefixLen ----------->|<------- size -------->
+		//
+		// The prefix is read via ReadAt; the body is inflated via zlib.
+		// This avoids a second allocation + append/copy to concatenate
+		// the two pieces, which matters on hot paths during delta-chain
+		// resolution where thousands of objects may be inflated per scan.
 		combined := make([]byte, prefixLen+int(size))
 
 		// Read prefix directly into the buffer.
@@ -73,6 +111,11 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 		pos += int64(prefixLen)
 
 		// Inflate the zlib-compressed delta instructions into the remainder.
+		// The SectionReader length is set to 1<<63-1 (math.MaxInt64) because
+		// the exact compressed size is unknown at this point. The zlib
+		// decompressor will stop at its own internal EOF marker, so the
+		// oversized limit is harmless -- it simply tells the SectionReader
+		// "do not impose an artificial byte cap."
 		src := io.NewSectionReader(r, pos, 1<<63-1)
 		zr, err := getZlibReader(src)
 		if err != nil {
@@ -87,6 +130,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	}
 
 	// Regular (non-delta) object: inflate directly.
+	// See the delta branch above for why the SectionReader length is 1<<63-1.
 	src := io.NewSectionReader(r, pos, 1<<63-1)
 	zr, err := getZlibReader(src)
 	if err != nil {

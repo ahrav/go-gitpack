@@ -1,3 +1,13 @@
+// commit_attribution.go
+//
+// Efficient extraction and caching of Git commit author metadata.
+//
+// Every secret finding needs to be attributed to a commit author (name, email,
+// timestamp). Parsing the raw commit header each time is expensive, so this
+// file provides metaCache -- a concurrency-safe, read-through cache that
+// stores AuthorInfo keyed by commit OID. When a commit-graph file is
+// available, timestamps are served from the precomputed graph slice instead
+// of re-parsing the header.
 package objstore
 
 import (
@@ -60,7 +70,11 @@ type metaCache struct {
 	m map[Hash]AuthorInfo
 }
 
-// newMetaCache is called once from NewHistoryScanner.
+// newMetaCache constructs a metaCache with the given commit graph (may be nil)
+// and commit header reader. It is called once during NewHistoryScanner
+// initialization. The initial map capacity (1024) is a heuristic that avoids
+// early rehashing for typical repository sizes without over-allocating for
+// very small repos.
 func newMetaCache(g *commitGraphData, s commitHeaderReader) *metaCache {
 	const cacheSize = 1024
 	var ts []int64
@@ -76,6 +90,10 @@ func newMetaCache(g *commitGraphData, s commitHeaderReader) *metaCache {
 	}
 }
 
+// attachGraph replaces the current commit-graph reference. This is used when
+// the scanner discovers a commit-graph file after initial construction, or
+// when the graph is invalidated. Passing nil clears both the graph and the
+// timestamp slice so subsequent lookups fall back to header parsing.
 func (c *metaCache) attachGraph(g *commitGraphData) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -89,6 +107,20 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 	c.ts = g.Timestamps
 }
 
+// get returns the CommitMetadata for the given OID, using the cache when
+// possible and falling back to header parsing on a miss.
+//
+// Concurrency protocol:
+//  1. Acquire RLock, probe the map. (fast path -- no allocation)
+//  2. On miss: release RLock, parse header (potentially expensive I/O),
+//     acquire write Lock, insert into map, release Lock.
+//  3. Read graph pointer and timestamp slice under RLock, then look up
+//     the precomputed timestamp.
+//
+// This two-phase locking pattern means the same OID may be parsed twice if
+// two goroutines miss concurrently, but that is safe because AuthorInfo is
+// an immutable value type and the second write simply overwrites with an
+// identical value.
 func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 	// Fast read-only path for author info.
 	c.mu.RLock()
@@ -96,7 +128,7 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 	c.mu.RUnlock()
 
 	if !ok {
-		// Slow path – inflate header once.
+		// Slow path -- inflate and parse the commit header once.
 		hdr, err := c.store.readCommitHeader(oid)
 		if err != nil {
 			return CommitMetadata{}, err
@@ -112,7 +144,8 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 		c.mu.Unlock()
 	}
 
-	// Timestamp from commit-graph is faster if available.
+	// Prefer the commit-graph timestamp when available because it avoids
+	// reparsing the header and is authoritative for the committer date.
 	var ts int64
 	c.mu.RLock()
 	graph := c.graph
@@ -123,6 +156,11 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 			ts = tsSlice[idx]
 		}
 	}
+	// Fallback: ts == 0 can mean the commit is not in the graph, or the
+	// graph timestamp is genuinely the Unix epoch (1970-01-01T00:00:00Z).
+	// The epoch case is astronomically unlikely for real commits, so we
+	// treat 0 as "not available" and fall back to the parsed author
+	// timestamp.
 	if ts == 0 {
 		ts = ai.When.Unix()
 	}
@@ -145,8 +183,16 @@ var (
 //
 // The function scans the input line-by-line looking for the first "author "
 // header. If no author line exists it falls back to the first "committer "
-// line.  It does zero-allocation substring slicing wherever possible and
-// returns a descriptive error when the header is missing or malformed.
+// line, because some tooling (e.g. filter-branch, BFG) can produce commits
+// where the author line is stripped but the committer line survives.
+//
+// It does zero-allocation substring slicing wherever possible and returns a
+// descriptive error when the header is missing or malformed.
+//
+// Lifetime note: the returned AuthorInfo.Name and AuthorInfo.Email are
+// produced via btostr and therefore alias the backing array of hdr. If the
+// caller's hdr slice is pooled or reused, the strings must be copied before
+// the slice is returned to the pool.
 func parseAuthorHeader(hdr []byte) (AuthorInfo, error) {
 	authorStart := -1
 	authorEnd := -1

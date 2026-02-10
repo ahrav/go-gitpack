@@ -131,7 +131,21 @@ func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
 	return f.entries[absIdx].offset, true
 }
 
-// crcAtOffset resolves the CRC-32 checksum for an object at the given pack offset.
+// crcAtOffset resolves the CRC-32 checksum for an object at the given pack
+// byte offset.
+//
+// The method first binary-searches sortedOffsets (ascending) to find the
+// position i of off, then uses the reverse index (ridx) to map that position
+// to the corresponding index in the entries slice. The ridx is stored in
+// *descending*-offset order (largest offset first), so the conversion is:
+//
+//	desc = len(sortedOffsets) - 1 - i   // ascending → descending
+//	idxPos = ridx[desc]                 // → entries[idxPos].crc
+//
+// When the ridx is absent or malformed (e.g. a third-party RIDX generator
+// produced an incompatible file), the method falls back to a linear scan
+// over entries. This is O(n) but still correct; the slow path is acceptable
+// because CRC verification is opt-in and runs infrequently.
 func (f *idxFile) crcAtOffset(off uint64) (uint32, bool) {
 	if f == nil || len(f.sortedOffsets) == 0 {
 		return 0, false
@@ -150,7 +164,9 @@ func (f *idxFile) crcAtOffset(off uint64) (uint32, bool) {
 		}
 	}
 
-	// Fallback for malformed/absent ridx.
+	// Fallback: linear scan over all entries when ridx is absent, incomplete,
+	// or yields an out-of-range index. This is O(n) but still correct and is
+	// only reached in degenerate cases.
 	for _, e := range f.entries {
 		if e.offset == off {
 			return e.crc, true
@@ -231,7 +247,13 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, err
 	}
 
-	// Use unsafe casting to avoid allocating and copying 1024 bytes.
+	// Use unsafe casting to reinterpret the byte slice as a [256]uint32 array
+	// in place, avoiding a 1024-byte copy. This is safe because:
+	//   1. fanoutData was allocated by make([]byte, 1024), which the Go runtime
+	//      guarantees to be at least 4-byte aligned on all supported platforms.
+	//   2. The slice length exactly matches the array size (256 * 4 = 1024).
+	//   3. The resulting array is immediately copied into a stack-local value
+	//      (fanout) below, so the pointer does not escape or alias mutable data.
 	fanoutPtr := (*[fanoutEntries]uint32)(unsafe.Pointer(&fanoutData[0]))
 	fanout := *fanoutPtr
 
@@ -284,6 +306,13 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 
 	entries := make([]idxEntry, objCount)
+	// tableChunk controls how many CRC / offset entries are read per I/O call.
+	// 65,536 entries (~256 KiB for 4-byte tables) balances two concerns:
+	//   - Small enough to keep the temporary read buffer (crcBuf / offsetBuf)
+	//     out of the large-object heap, reducing GC pressure.
+	//   - Large enough to amortize the per-ReadAt syscall overhead so that
+	//     even multi-million-object packs are parsed in a modest number of
+	//     iterations.
 	const tableChunk = 1 << 16 // 65,536 entries (~256 KiB for 4-byte tables)
 
 	// Parse CRC table in chunks to keep peak allocations bounded.
@@ -405,8 +434,18 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}, nil
 }
 
-// resolveIdxPos converts a bit‑index from a bitmap (offset order) to its
-// position in the *.idx oid table.  A panic indicates application misuse.
+// resolveIdxPos converts a bit-index from a bitmap (which is ordered by pack
+// offset) to the corresponding position in the *.idx oid/entries tables.
+//
+// The method deliberately panics instead of returning an error because a
+// bad bit value signals a programming error in the caller (e.g. iterating
+// past the end of a bitmap), not recoverable runtime data corruption. The
+// panic makes such bugs immediately visible during development rather than
+// silently returning an invalid index that could corrupt downstream state.
+//
+// Preconditions (caller must guarantee):
+//   - pf.ridx is non-nil (a reverse index was loaded for this pack).
+//   - 0 <= bit < len(pf.ridx).
 func (pf *idxFile) resolveIdxPos(bit int) uint32 {
 	if pf.ridx == nil || bit < 0 || bit >= len(pf.ridx) {
 		panic("idxFile.resolveIdxPos: out‑of‑range")

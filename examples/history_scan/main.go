@@ -1,3 +1,7 @@
+// Package main demonstrates streaming commit-history hunk additions from a
+// Git repository using the go-gitpack library. It opens the nearest .git
+// directory, calls DiffHistoryHunks to stream per-commit file additions, and
+// prints each hunk with its commit, path, line range, and a content preview.
 package main
 
 import (
@@ -39,10 +43,15 @@ func main() {
 	hunkAdditions, errors := scanner.DiffHistoryHunks()
 
 	hunkCount := 0
-	// const maxHunks = 50 // Limit output for demo purposes.
-	const maxHunks = math.MaxInt // Limit output for demo purposes.
+	// maxHunks controls how many hunks to process before stopping.
+	// Set to a small value (e.g. 50) for demo/testing purposes, or
+	// math.MaxInt to process the entire history.
+	const maxHunks = math.MaxInt
 
-	// Launch a goroutine to process hunk additions from the stream.
+	// A separate goroutine drains the hunk channel so that the main goroutine
+	// can simultaneously wait on the error channel. This is necessary because
+	// DiffHistoryHunks sends hunks and the final error on separate channels;
+	// blocking on one without draining the other would deadlock.
 	done := make(chan bool)
 	go func() {
 		defer close(done)

@@ -55,9 +55,16 @@ func objectNotFoundError(oid Hash) error {
 }
 
 func init() {
-	// On Windows an mmapped file cannot be closed while any outstanding
-	// slices are still referenced. A finalizer makes sure users who forget
-	// to call (*store).Close() do not trigger ERROR_LOCK_VIOLATION.
+	// On Windows, memory-mapped files hold an OS-level lock that prevents the
+	// file from being deleted, renamed, or opened exclusively by another
+	// process. If a store is garbage-collected without an explicit Close(),
+	// those locks remain until the process exits, causing ERROR_LOCK_VIOLATION
+	// for other Git operations. A runtime finalizer provides a safety net by
+	// closing the mappings when the GC reclaims the store.
+	//
+	// This is Windows-only because Unix mmap does not hold a file lock; an
+	// unlinked file with outstanding mappings is silently reclaimed by the
+	// kernel when the last mapping is unmapped or the process exits.
 	if runtime.GOOS == "windows" {
 		runtime.SetFinalizer(&store{}, func(s *store) { _ = s.Close() })
 	}
@@ -118,6 +125,27 @@ type ObjectCache interface {
 // The store memory-maps packfiles and their indices, maintains an in-memory index
 // for fast object lookups, and handles delta chain resolution transparently.
 // All operations are safe for concurrent use.
+//
+// Two-tier caching strategy:
+//
+// Objects pass through two cache layers before reaching the caller:
+//
+//  1. Delta window (dw) -- a small, sharded, write-through window that holds
+//     recently inflated objects. It is optimized for the access pattern of
+//     delta-chain resolution, where the same base object is often needed by
+//     multiple child deltas in quick succession. Objects are inserted here on
+//     first inflation.
+//
+//  2. ARC cache (cache) -- a larger Adaptive Replacement Cache that balances
+//     recency and frequency. Objects are promoted from the delta window to
+//     the ARC on their *second* access (i.e. when get() finds a delta-window
+//     hit). This two-step promotion avoids polluting the ARC with one-shot
+//     objects during bulk scans and reduces lock contention on the ARC's
+//     internal mutexes during high-throughput inflation.
+//
+// Together, the two layers ensure that hot delta bases remain resident (via
+// the delta window) while frequently accessed non-delta objects benefit from
+// the ARC's superior eviction policy.
 type store struct {
 	// packs contains one idxFile per memory-mapped packfile.
 	// Each entry provides object offset lookups and CRC validation.
@@ -340,7 +368,7 @@ func (s *store) treeIter(oid Hash) (*TreeIter, error) {
 	if len(raw) > 0 && raw[0] == 0 {
 		return nil, fmt.Errorf("tree %s starts with null byte (likely corrupted)", oid)
 	}
-	return newTreeIter(raw), nil
+	return getTreeIter(raw), nil
 }
 
 // get retrieves the specified Git object and returns its data and type.
@@ -491,9 +519,17 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 	return nil, ObjBad, err
 }
 
-// getWithContextSkipCache is like getWithContext but skips the delta-window and
-// ARC cache checks. Used by callers that have already verified both caches are
-// misses, eliminating two redundant lookups per miss.
+// getWithContextSkipCache is like getWithContext but skips the delta-window
+// and ARC cache checks.
+//
+// Duplication rationale: getWithContext and getWithContextSkipCache share
+// nearly identical pack-lookup and loose-object-fallback logic. The
+// duplication is intentional -- the public get() method already checks both
+// cache tiers before calling into this code path. Re-checking them here
+// would add two lock-guarded map lookups per cache-miss object, which is
+// measurable during bulk scans that inflate millions of objects. Keeping a
+// separate "skip cache" variant avoids that overhead at the cost of a small
+// amount of code duplication that is straightforward to maintain.
 func (s *store) getWithContextSkipCache(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	if s.memoryMidx != nil {
 		if p, off, ok := s.memoryMidx.findObject(oid); ok {
@@ -544,6 +580,21 @@ func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, err
 	return s.inflateFromPackWithOptions(params, true, true)
 }
 
+// inflateFromPackWithOptions reads and materializes an object from a packfile
+// with fine-grained control over the commit fast-path and caching behavior.
+//
+// Parameters:
+//   - allowCommitFastPath: when true and the object at params.off is a plain
+//     (non-delta) commit, the method returns (nil, ObjCommit, nil) immediately
+//     without inflating the body. The nil data signals to the caller that
+//     commit metadata should be obtained from the commit-graph instead. This
+//     optimization avoids zlib decompression for commits whose headers are
+//     already available in the graph. Callers that need the full commit body
+//     (e.g. getMaterialized) must pass false.
+//   - cacheResult: when true the inflated object is written to the delta
+//     window (and potentially promoted to the ARC cache on later access).
+//     Callers that will not re-read the object should pass false to avoid
+//     evicting useful entries.
 func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFastPath, cacheResult bool) ([]byte, ObjectType, error) {
 	// Perform a cheap header peek to avoid full inflation for commits
 	// that are already covered by the commit-graph.
@@ -666,15 +717,30 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	return trimCommitHeader(full)
 }
 
+// readCommitHeaderFromStream incrementally reads lines from a zlib stream
+// until it encounters the "committer" line, then returns all bytes read up
+// to and including that line.
+//
+// This allows the caller to obtain tree, parent, author, and committer
+// metadata without decompressing the entire commit object (which may include
+// a large message body). The returned slice is a heap-allocated copy that
+// does not alias the pooled buffer.
+//
+// The zlib reader is wrapped in a pooled bufio.Reader so that reads go
+// through an 8 KiB buffer instead of issuing one-byte reads against the
+// decompressor. ReadBytes('\n') replaces the former readUntilLF loop,
+// cutting per-line allocations from ~6 append-growths to 1.
 func readCommitHeaderFromStream(r io.Reader) ([]byte, error) {
+	br := getBR(r)
+	defer putBR(br)
+
 	buf := GetBuf()
 	defer PutBuf(buf)
 
 	for len(*buf) < MaxHdr {
-		line, err := readUntilLF(r)
+		line, err := br.ReadBytes('\n')
 		*buf = append(*buf, line...)
 		if bytes.HasPrefix(line, []byte("committer ")) {
-			// Return after committer line so tree/parents/author are present.
 			return append([]byte(nil), *buf...), nil
 		}
 		if err != nil {
@@ -685,6 +751,10 @@ func readCommitHeaderFromStream(r io.Reader) ([]byte, error) {
 	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
 }
 
+// trimCommitHeader extracts the header portion of a fully materialized commit
+// object (up to and including the "committer" line). Unlike
+// readCommitHeaderFromStream, this operates on an already-inflated byte slice
+// rather than a streaming reader. The returned slice is a fresh copy.
 func trimCommitHeader(full []byte) ([]byte, error) {
 	end := 0
 	for end < len(full) && end < MaxHdr {
@@ -703,25 +773,6 @@ func trimCommitHeader(full []byte) ([]byte, error) {
 	}
 
 	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
-}
-
-// readUntilLF reads a complete line including the terminating newline.
-// The function returns the line with '\n' included or any partial line if EOF is encountered.
-func readUntilLF(r io.Reader) ([]byte, error) {
-	var line []byte
-	var b [1]byte
-	for {
-		n, err := r.Read(b[:])
-		if n == 1 {
-			line = append(line, b[0])
-			if b[0] == '\n' { // A newline indicates the end of the line.
-				return line, nil
-			}
-		}
-		if err != nil {
-			return line, err
-		}
-	}
 }
 
 // findCRCForObject returns the CRC-32 checksum for the specified object.

@@ -1,3 +1,8 @@
+// diff_blob_test.go tests the core addedHunksWithPos diff algorithm and the
+// fuseHunks hunk-merging logic. It covers basic additions, multiple hunks,
+// replacements, edge cases (unicode, whitespace, CRLF), the EndLine invariant,
+// and fuzz testing for state invariant validation.
+
 package objstore
 
 import (
@@ -10,6 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TODO: TestMetaCacheConcurrency is misplaced in this file; it tests the
+// commit attribution metaCache, not the diff/blob subsystem. Consider moving
+// it to commit_attribution_test.go.
 func TestMetaCacheConcurrency(t *testing.T) {
 	var h Hash
 	g := &commitGraphData{Timestamps: []int64{123}, OrderedOIDs: []Hash{h},
@@ -37,6 +45,10 @@ func TestMetaCacheConcurrency(t *testing.T) {
 	}
 }
 
+// TestAddedHunks is the primary table-driven test for addedHunksWithPos. It
+// covers empty inputs, identical content, additions at the beginning/middle/end,
+// multiple hunks, full replacements, special characters (plus signs, unicode,
+// CRLF), and whitespace-only lines. Each subtest also validates EndLine().
 func TestAddedHunks(t *testing.T) {
 	tests := []struct {
 		name     string
@@ -292,6 +304,12 @@ func BenchmarkAddedHunks(b *testing.B) {
 	}
 }
 
+// FuzzAddedHunks performs fuzz testing on addedHunksWithPos. For every pair of
+// arbitrary byte slices the fuzzer generates, it asserts the following invariants:
+//   - StartLine is always > 0 (1-based).
+//   - EndLine >= StartLine.
+//   - Lines is never nil within a hunk.
+//   - Identical inputs always produce nil (no hunks).
 func FuzzAddedHunks(f *testing.F) {
 	f.Add([]byte(""), []byte(""))
 	f.Add([]byte("hello"), []byte("world"))
@@ -315,17 +333,27 @@ func FuzzAddedHunks(f *testing.F) {
 	})
 }
 
+// TestFuseHunks validates the fuseHunks function which merges adjacent hunks
+// whose inter-hunk gap is small enough. The merging threshold is determined by
+// the ctx (context lines) and inter (inter-hunk gap allowance) parameters:
+// hunks are merged when the gap between them is <= 2*ctx + inter.
+// Each subtest also validates the monotone, non-overlapping invariant on the
+// resulting hunk list.
 func TestFuseHunks(t *testing.T) {
 	type args struct {
 		hunks []AddedHunk
 		ctx   int
 		inter int
 	}
+	// makeH is a helper that constructs an AddedHunk for table-driven tests.
+	// NOTE: The variable b below computes total byte length but is unused;
+	// it appears to be a leftover from when AddedHunk tracked byte size.
 	makeH := func(start uint32, lines ...string) AddedHunk {
 		b := 0
 		for _, l := range lines {
 			b += len(l)
 		}
+		_ = b // silence unused-variable linter; see note above.
 		return AddedHunk{StartLine: start, Lines: lines}
 	}
 

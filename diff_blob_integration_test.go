@@ -1,3 +1,9 @@
+// diff_blob_integration_test.go contains oracle-based integration tests for the
+// addedHunksWithPos diff implementation. It uses gotextdiff (Myers algorithm) as
+// a reference oracle to generate unified diffs, then verifies that
+// addedHunksWithPos produces matching results. This cross-validation ensures
+// that the custom diff implementation agrees with a well-known algorithm.
+
 package objstore
 
 import (
@@ -11,6 +17,11 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestAddedHunksIntegration cross-validates addedHunksWithPos against a
+// gotextdiff-generated unified diff for each test case. It checks that:
+//   - The expected strings appear in the unified diff output (oracle sanity).
+//   - addedHunksWithPos returns the expected hunk structure.
+//   - EndLine calculations are consistent with StartLine + len(Lines) - 1.
 func TestAddedHunksIntegration(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -116,6 +127,9 @@ func TestAddedHunksIntegration(t *testing.T) {
 	}
 }
 
+// TestAddedHunksEdgeCases validates addedHunksWithPos on boundary conditions:
+// identical content (returns nil), single-line additions, empty-to-content
+// transitions, content-to-empty transitions, and interspersed insertions.
 func TestAddedHunksEdgeCases(t *testing.T) {
 	tests := []struct {
 		name     string

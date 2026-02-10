@@ -1,9 +1,13 @@
-// crc_test.go - Simplified version that should work with existing helpers
+// crc_test.go contains tests for CRC-32 verification of individual pack
+// objects, SHA-1 pack trailer validation, and MIDX v2 CRC chunk parsing.
+// Each test constructs minimal pack files in a temporary directory, writes
+// the correct (or deliberately incorrect) checksums, and asserts the expected
+// error sentinels from the verification routines.
 package objstore
 
 import (
 	"bytes"
-	"compress/zlib"
+	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
@@ -19,6 +23,9 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
+// TestVerifyCRC32_ValidObject writes a pack containing a single zlib-compressed
+// blob, creates a matching index, opens the store with CRC verification
+// enabled, and confirms that retrieval succeeds without error.
 func TestVerifyCRC32_ValidObject(t *testing.T) {
 	dir := t.TempDir()
 
@@ -61,6 +68,9 @@ func TestVerifyCRC32_ValidObject(t *testing.T) {
 	assert.Equal(t, blob, data)
 }
 
+// TestVerifyCRC32_ObjectExceedsPackBounds constructs an idxFile whose second
+// object offset falls past the pack trailer boundary and verifies that
+// verifyCRC32 returns ErrObjectExceedsPackBounds.
 func TestVerifyCRC32_ObjectExceedsPackBounds(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -96,6 +106,9 @@ func TestVerifyCRC32_ObjectExceedsPackBounds(t *testing.T) {
 	assert.ErrorIs(t, err, ErrObjectExceedsPackBounds)
 }
 
+// TestVerifyCRC32_NonMonotonicOffsets creates a sorted-offset slice with two
+// identical entries and asserts that verifyCRC32 detects the non-strictly-
+// increasing sequence via ErrNonMonotonicOffsets.
 func TestVerifyCRC32_NonMonotonicOffsets(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -123,6 +136,11 @@ func TestVerifyCRC32_NonMonotonicOffsets(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNonMonotonicOffsets)
 }
 
+// TestVerifyCRC32_MismatchedCRC writes a pack object whose on-disk bytes are
+// raw zlib data (0x78 0x9c header followed by an empty stored block) so that
+// the IEEE CRC-32 of those bytes is known. It then calls verifyCRC32 with an
+// intentionally wrong expected CRC (0xDEADBEEF) and checks that the returned
+// error message includes both the expected and actual CRC values.
 func TestVerifyCRC32_MismatchedCRC(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -160,6 +178,9 @@ func TestVerifyCRC32_MismatchedCRC(t *testing.T) {
 	assert.Contains(t, err.Error(), fmt.Sprintf("%08x", actualCRC))
 }
 
+// TestVerifyPackTrailer_Valid builds a pack whose trailing 20 bytes are the
+// correct SHA-1 of the preceding content and confirms that verifyPackTrailer
+// returns no error.
 func TestVerifyPackTrailer_Valid(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -183,6 +204,9 @@ func TestVerifyPackTrailer_Valid(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestVerifyPackTrailer_Corrupt writes a pack with 20 zero bytes as the
+// trailer instead of a valid SHA-1 checksum and asserts that verifyPackTrailer
+// returns ErrPackTrailerCorrupt.
 func TestVerifyPackTrailer_Corrupt(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -204,6 +228,8 @@ func TestVerifyPackTrailer_Corrupt(t *testing.T) {
 	assert.ErrorIs(t, err, ErrPackTrailerCorrupt)
 }
 
+// TestStore_VerifyPackTrailers opens a store containing one valid and one
+// corrupt pack and confirms that the corrupt trailer is detected.
 func TestStore_VerifyPackTrailers(t *testing.T) {
 	dir := t.TempDir()
 
@@ -226,6 +252,9 @@ func TestStore_VerifyPackTrailers(t *testing.T) {
 	assert.True(t, foundCorrupt, "Should find corrupt pack")
 }
 
+// createValidPackWithTrailer writes a minimal pack file (header + payload)
+// with a correct SHA-1 trailer and a companion empty index file. The pack
+// contains zero objects; it is used solely to test trailer verification.
 func createValidPackWithTrailer(t *testing.T, packPath string) {
 	var packBuf bytes.Buffer
 	packBuf.Write([]byte("PACK"))
@@ -242,6 +271,9 @@ func createValidPackWithTrailer(t *testing.T, packPath string) {
 	require.NoError(t, createV2IndexFile(idxPath, []Hash{}, []uint64{}))
 }
 
+// createCorruptPackWithTrailer writes a pack file whose trailing 20 bytes are
+// all 0xFF instead of the correct SHA-1. A companion empty index is also
+// created so that the store can open the pack for trailer verification.
 func createCorruptPackWithTrailer(t *testing.T, packPath string) {
 	var packBuf bytes.Buffer
 	packBuf.Write([]byte("PACK"))
@@ -256,6 +288,10 @@ func createCorruptPackWithTrailer(t *testing.T, packPath string) {
 	require.NoError(t, createV2IndexFile(idxPath, []Hash{}, []uint64{}))
 }
 
+// TestMidxV2CRCParsing is a forward-looking test for MIDX v2 CRC chunk
+// parsing. It is currently skipped because parseMidx does not yet support
+// version 2. When v2 support lands, this test validates that CRC values
+// embedded in the CRCS chunk are correctly associated with each object.
 func TestMidxV2CRCParsing(t *testing.T) {
 	// NOTE: This test will fail until MIDX v2 support is implemented in parseMidx.
 	t.Skip("MIDX v2 parsing not yet implemented")

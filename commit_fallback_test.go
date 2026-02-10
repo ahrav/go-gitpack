@@ -1,3 +1,7 @@
+// commit_fallback_test.go tests the graceful fallback behaviour when a
+// repository's HEAD or branch refs point to objects that do not exist in any
+// pack file. The scanner should return zero commits rather than an error,
+// allowing callers to handle repositories with dangling references.
 package objstore
 
 import (
@@ -6,6 +10,11 @@ import (
 	"testing"
 )
 
+// TestLoadAllCommits_SkipsMissingRefObjects simulates a repository whose HEAD
+// resolves to refs/heads/main, which in turn contains a 40-hex OID that does
+// not correspond to any object in the pack directory. The expected behaviour
+// is that loadAllCommits returns an empty commit slice (not an error), because
+// missing ref targets are silently skipped during the commit walk.
 func TestLoadAllCommits_SkipsMissingRefObjects(t *testing.T) {
 	gitDir := t.TempDir()
 

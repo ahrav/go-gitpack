@@ -1,3 +1,8 @@
+// store_test.go contains unit tests, benchmarks, and examples for the object
+// store layer. It exercises opening pack directories, parsing v2 index files,
+// object retrieval (including delta resolution), LRU cache behaviour, and
+// in-memory multi-pack-index synthesis. The benchmarks measure cold-cache
+// versus warm-cache object retrieval and pack-directory open latency.
 package objstore
 
 import (
@@ -16,13 +21,18 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
-// packObjectsInfo represents objects from a single pack file for midx creation
+// packObjectsInfo aggregates the object hashes and their corresponding byte
+// offsets from a single pack file. It is used as input when constructing a
+// multi-pack index that spans multiple packs.
 type packObjectsInfo struct {
 	name    string
 	hashes  []Hash
 	offsets []uint64
 }
 
+// TestOpen verifies that OpenForTesting correctly handles empty directories,
+// missing or invalid index files, single and multiple pack files, and
+// automatic in-memory midx construction when no on-disk midx exists.
 func TestOpen(t *testing.T) {
 	t.Run("empty directory returns empty store", func(t *testing.T) {
 		emptyDir := t.TempDir()
@@ -137,6 +147,9 @@ func TestOpen(t *testing.T) {
 	})
 }
 
+// TestParseIdx validates the v2 pack-index parser against invalid magic bytes,
+// unsupported versions, minimal valid indices, large-offset handling,
+// multi-object sorted order, and truncated files.
 func TestParseIdx(t *testing.T) {
 	t.Run("invalid magic bytes", func(t *testing.T) {
 		data := make([]byte, 8)
@@ -259,6 +272,9 @@ func TestParseIdx(t *testing.T) {
 	})
 }
 
+// TestStoreBasic performs a round-trip test: open a pack directory containing
+// both a base blob and a delta blob, then retrieve each by hash and confirm
+// that the returned type and data match the originals.
 func TestStoreBasic(t *testing.T) {
 	packPath, _, cleanup := createTestPackWithDelta(t)
 	defer cleanup()
@@ -287,6 +303,9 @@ func TestStoreBasic(t *testing.T) {
 	assert.Equal(t, blob2Data, data)
 }
 
+// TestCacheEviction exercises the object cache by retrieving two distinct blobs
+// and then re-retrieving the first, ensuring the cache stores and returns
+// objects correctly across multiple accesses.
 func TestCacheEviction(t *testing.T) {
 	packPath, _, cleanup := createTestPackWithDelta(t)
 	defer cleanup()
@@ -317,6 +336,10 @@ func TestCacheEviction(t *testing.T) {
 	assert.Equal(t, blob1Data, data1Again)
 }
 
+// ExampleHistoryScanner demonstrates the basic workflow for opening a Git
+// repository, creating a HistoryScanner, and retrieving a raw object by its
+// SHA-1 hash. This is the lowest-level API exposed by the library for
+// direct object access.
 func ExampleHistoryScanner() {
 	scanner, err := NewHistoryScanner("/path/to/repo/.git")
 	if err != nil {
@@ -336,6 +359,10 @@ func ExampleHistoryScanner() {
 	fmt.Printf("Object size: %d bytes\n", len(data))
 }
 
+// setupBenchmarkRepo creates a temporary Git repository with five top-level
+// files and three nested files, initialises it with "git init", commits the
+// files, and repacks them into a single pack file. It returns the path to
+// the "objects/pack" directory suitable for passing to OpenForTesting.
 func setupBenchmarkRepo(b *testing.B) string {
 	tempDir := b.TempDir()
 
@@ -360,6 +387,9 @@ func setupBenchmarkRepo(b *testing.B) string {
 	return packDir
 }
 
+// packObjects initialises a Git repository in repoDir, stages all files, creates
+// an initial commit, and repacks the resulting objects into packDir. It requires
+// the "git" executable to be available in PATH and fails the benchmark otherwise.
 func packObjects(b *testing.B, repoDir, packDir string) {
 	cmd := exec.Command("git", "-C", repoDir, "init")
 	require.NoError(b, cmd.Run(), "git init failed - ensure git is installed")
@@ -377,6 +407,9 @@ func packObjects(b *testing.B, repoDir, packDir string) {
 	require.NoError(b, cmd.Run(), "git repack failed")
 }
 
+// benchmarkGet is the shared implementation for cold-cache and warm-cache
+// object retrieval benchmarks. When cacheWarm is true it performs one
+// pre-benchmark lookup to prime the LRU cache before the timed loop.
 func benchmarkGet(b *testing.B, cacheWarm bool) {
 	packDir := setupBenchmarkRepo(b)
 
@@ -399,9 +432,16 @@ func benchmarkGet(b *testing.B, cacheWarm bool) {
 	}
 }
 
+// BenchmarkGetCold measures object retrieval latency with an empty (cold) cache.
 func BenchmarkGetCold(b *testing.B) { benchmarkGet(b, false) }
+
+// BenchmarkGetWarm measures object retrieval latency when the target is already
+// resident in the LRU cache.
 func BenchmarkGetWarm(b *testing.B) { benchmarkGet(b, true) }
 
+// BenchmarkReadVarIntFromReader measures the throughput of reading a
+// multi-byte variable-length integer (three bytes, maximum value) from a
+// buffered reader.
 func BenchmarkReadVarIntFromReader(b *testing.B) {
 	buf := []byte{0xff, 0xff, 0x7f}
 	reader := bufio.NewReader(bytes.NewReader(buf))
@@ -413,6 +453,8 @@ func BenchmarkReadVarIntFromReader(b *testing.B) {
 	}
 }
 
+// BenchmarkOpen measures the cost of opening and closing a pack directory,
+// including mmap setup, index parsing, and optional midx synthesis.
 func BenchmarkOpen(b *testing.B) {
 	packDir := setupBenchmarkRepo(b)
 
@@ -424,6 +466,10 @@ func BenchmarkOpen(b *testing.B) {
 	}
 }
 
+// TestFindObject verifies binary search through the sorted OID table of a
+// parsed index file, covering successful lookups for existing objects,
+// not-found results for absent hashes, and a check that the table is properly
+// sorted to enable efficient binary search.
 func TestFindObject(t *testing.T) {
 	// Create test hashes that will be in different fanout ranges.
 	hash1, _ := ParseHash("0123456789abcdef0123456789abcdef01234567") // starts with 0x01
@@ -478,6 +524,8 @@ func TestFindObject(t *testing.T) {
 	})
 }
 
+// TestTinyRepoHappyPath creates a single-object pack with a companion index
+// and confirms that the store can open it and retrieve the blob.
 func TestTinyRepoHappyPath(t *testing.T) {
 	dir := t.TempDir()
 
@@ -502,6 +550,9 @@ func TestTinyRepoHappyPath(t *testing.T) {
 	assert.Equal(t, payload, data)
 }
 
+// TestLargePack_LoffHandling verifies that parseIdx correctly promotes offsets
+// larger than 2 GiB into the large-offset (LOFF) table, as required by the
+// v2 index format when the MSB of the 32-bit offset field is set.
 func TestLargePack_LoffHandling(t *testing.T) {
 	dir := t.TempDir()
 	pack := filepath.Join(dir, "big.pack")
@@ -529,6 +580,8 @@ func TestLargePack_LoffHandling(t *testing.T) {
 	assert.Len(t, idx.largeOffsets, 1)
 }
 
+// TestParseIdx_TruncatedTrailer ensures that parseIdx returns ErrBadIdxChecksum
+// when the trailing 40 bytes (pack-SHA + idx-SHA) are missing.
 func TestParseIdx_TruncatedTrailer(t *testing.T) {
 	// Start with minimal valid index.
 	h, _ := ParseHash("1234567890abcdef1234567890abcdef12345678")
@@ -546,6 +599,9 @@ func TestParseIdx_TruncatedTrailer(t *testing.T) {
 	assert.ErrorIs(t, err, ErrBadIdxChecksum)
 }
 
+// TestParseIdx_CorruptFanout corrupts the fanout table so that an entry is
+// smaller than the preceding one and verifies that parseIdx returns
+// ErrNonMonotonicFanout.
 func TestParseIdx_CorruptFanout(t *testing.T) {
 	h, _ := ParseHash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	data := createValidIdxData(t, []Hash{h}, []uint64{12})
@@ -565,6 +621,9 @@ func TestParseIdx_CorruptFanout(t *testing.T) {
 	assert.ErrorIs(t, err, ErrNonMonotonicFanout)
 }
 
+// TestStore_DeltaObjectRetrieval confirms that delta objects (both OFS_DELTA
+// and REF_DELTA) are transparently resolved to their final base type and data
+// during retrieval, and that no spurious zlib errors leak to the caller.
 func TestStore_DeltaObjectRetrieval(t *testing.T) {
 	t.Run("delta objects should not cause zlib errors", func(t *testing.T) {
 		packPath, _, cleanup := createTestPackWithDelta(t)

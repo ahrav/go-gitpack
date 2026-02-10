@@ -1,3 +1,7 @@
+// Package main demonstrates simple streaming consumption of commit-history
+// hunks using the go-gitpack library. It locates the nearest .git directory,
+// opens a HistoryScanner, and prints a rolling summary of added hunks as
+// they are streamed from DiffHistoryHunks.
 package main
 
 import (
@@ -54,6 +58,11 @@ func main() {
 
 	hunkAdditions, errors := scanner.DiffHistoryHunks()
 
+	// The select/channel pattern below multiplexes the hunk data stream
+	// and the error channel. We read from hunkAdditions until it is closed
+	// (indicating the walk is complete), and check the error channel for
+	// any fatal errors that may arrive concurrently. When hunkAdditions is
+	// closed, ok becomes false and we exit.
 	count := 0
 	totalLines := 0
 	for {

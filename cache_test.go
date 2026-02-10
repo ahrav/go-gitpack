@@ -1,3 +1,15 @@
+// cache_test.go tests the reference-counted delta window cache
+// (refCountedDeltaWindow) used to hold recently decompressed Git objects in
+// memory while delta chains are being resolved. Tests cover the core
+// add/acquire/release lifecycle, reference-count accounting, LRU eviction
+// (including pinned-entry protection), data updates, zero-sized and nil
+// data, error conditions (oversized objects, budget exhaustion), and
+// concurrent mixed workloads under the race detector.
+//
+// A comprehensive benchmark suite compares the refCountedDeltaWindow against
+// a plain hashicorp/golang-lru cache across five realistic access-pattern
+// scenarios: hot base objects, tree walking, concurrent delta chains, pack
+// traversal, and full delta-chain resolution.
 package objstore
 
 import (
@@ -15,12 +27,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// makeHash creates a Hash by copying the bytes of s into the first
+// positions, leaving the rest zeroed. It is a deterministic test helper
+// for generating unique, human-readable object identifiers.
 func makeHash(s string) Hash {
 	var h Hash
 	copy(h[:], []byte(s))
 	return h
 }
 
+// TestRefCountedDeltaWindow is the top-level test that groups all
+// refCountedDeltaWindow sub-tests by concern area.
 func TestRefCountedDeltaWindow(t *testing.T) {
 	t.Run("Core Functionality", testCoreFunctionality)
 	t.Run("Reference Counting", testReferenceCounting)
@@ -357,12 +374,20 @@ const (
 	largeInflate  = 1 * time.Millisecond
 )
 
-// Pre-generated access patterns to ensure reproducible benchmarks.
+// The following types define pre-generated, deterministic access patterns for
+// the cache benchmarks. Seeded PRNGs build the pattern arrays before the
+// benchmark timer starts so that benchmark iterations measure only cache
+// throughput, not random-number generation overhead.
+
+// accessStep describes one iteration of the "hot bases" benchmark: which
+// delta chain to walk and how many objects deep to go.
 type accessStep struct {
 	chainIdx int
 	walkLen  int
 }
 
+// treeWalkStep describes one iteration of the "tree walk" benchmark:
+// how many subtrees to descend into and which files to touch in each.
 type treeWalkStep struct {
 	numSubtrees int
 	subtreeIdx  []int
@@ -370,16 +395,23 @@ type treeWalkStep struct {
 	fileIdx     [][]int
 }
 
+// chainStep describes one iteration of the "concurrent chains" benchmark:
+// which chain to resolve and which intermediate handles to release early.
 type chainStep struct {
 	chainIdx    int
 	releaseProb []bool // Pre-computed release decisions.
 }
 
+// packStep describes one iteration of the "pack traversal" benchmark:
+// a pattern type (sequential, random, or locality-based) and the object
+// indices to access.
 type packStep struct {
 	pattern int // 0=sequential, 1=random, 2=locality.
 	indices []int
 }
 
+// generateHotBasesPattern builds a reproducible sequence of delta-chain walk
+// steps for the hot-bases benchmark scenario.
 func generateHotBasesPattern(numSteps int) []accessStep {
 	rng := rand.New(rand.NewPCG(12345, 67890))
 	steps := make([]accessStep, numSteps)
@@ -396,6 +428,9 @@ func generateHotBasesPattern(numSteps int) []accessStep {
 	return steps
 }
 
+// generateTreeWalkPattern builds a reproducible tree-walk access sequence
+// where each step descends into 1-3 subtrees and touches 1-5 files per
+// subtree.
 func generateTreeWalkPattern(numSteps int) []treeWalkStep {
 	rng := rand.New(rand.NewPCG(12345, 67890))
 	steps := make([]treeWalkStep, numSteps)
@@ -422,6 +457,9 @@ func generateTreeWalkPattern(numSteps int) []treeWalkStep {
 	return steps
 }
 
+// generateConcurrentChainsPattern builds a reproducible sequence of
+// overlapping delta-chain resolution steps with pre-computed handle release
+// decisions.
 func generateConcurrentChainsPattern(numSteps int) []chainStep {
 	rng := rand.New(rand.NewPCG(12345, 67890))
 	steps := make([]chainStep, numSteps)
@@ -443,6 +481,8 @@ func generateConcurrentChainsPattern(numSteps int) []chainStep {
 	return steps
 }
 
+// generatePackTraversalPattern builds a reproducible mix of sequential,
+// random, and locality-based access patterns over a 1,000-object pack.
 func generatePackTraversalPattern(numSteps int) []packStep {
 	rng := rand.New(rand.NewPCG(12345, 67890))
 	steps := make([]packStep, numSteps)
@@ -481,22 +521,32 @@ func generatePackTraversalPattern(numSteps int) []packStep {
 	return steps
 }
 
-// Cache interface for benchmarking different implementations.
+// benchCache is the interface satisfied by both the refCountedDeltaWindow
+// and the plain LRU wrapper, allowing the benchmark suite to run the same
+// workload against both implementations and compare hit rates, miss rates,
+// inflation counts, and contention metrics.
 type benchCache interface {
 	add(Hash, []byte, ObjectType) error
 	acquire(Hash) (*Handle, bool)
 }
 
+// newRefCache returns a refCountedDeltaWindow wrapped as a benchCache with
+// the given memory budget in bytes.
 func newRefCache(budget int) benchCache {
 	w := newRefCountedDeltaWindow()
 	w.budget = budget
 	return w
 }
 
+// lruWrap adapts hashicorp/golang-lru into the benchCache interface.
+// It does not perform reference counting, serving as a baseline comparison
+// for the refCountedDeltaWindow.
 type lruWrap struct {
 	*lru.Cache[string, []byte]
 }
 
+// newLRUCache creates a plain LRU cache with entry capacity derived from
+// budget / avgObjSize.
 func newLRUCache(budget, avgObjSize int) benchCache {
 	capEntries := budget / avgObjSize
 	if capEntries == 0 {
@@ -518,7 +568,9 @@ func (l *lruWrap) acquire(h Hash) (*Handle, bool) {
 	return nil, false
 }
 
-// Benchmark metrics collection.
+// metrics collects per-benchmark statistics that are reported via
+// b.ReportMetric at the end of each scenario. The atomic fields are safe
+// for concurrent updates from parallel benchmark goroutines.
 type metrics struct {
 	hits      atomic.Uint64
 	misses    atomic.Uint64
@@ -535,13 +587,18 @@ func (m *metrics) report(b *testing.B) {
 	b.ReportMetric(float64(m.conflicts.Load())/float64(b.N), "conflict/op")
 }
 
-// Object generation with simulated decompression costs.
+// object bundles a cache key (oid), payload (data), and a simulated
+// decompression cost (cost) derived from the payload size. The cost models
+// real-world zlib inflation latency so that benchmarks measure cache hit
+// rates under realistic contention.
 type object struct {
 	oid  Hash
 	data []byte
 	cost time.Duration
 }
 
+// makeObject creates a test object with random data and an inflation cost
+// proportional to the size tier (tiny/small/medium/large).
 func makeObject(name string, size int) object {
 	data := make([]byte, size)
 	cryptorand.Read(data)
@@ -1147,7 +1204,9 @@ func benchmarkDeltaChainResolution(b *testing.B, newCache func() benchCache) {
 	b.ReportMetric(float64(maxHandles.Load()), "max_handles")
 }
 
-// Main benchmark runner.
+// BenchmarkDeltaCache is the top-level benchmark entry point that runs every
+// scenario against both cache implementations (RefCount and LRU) and reports
+// per-scenario hit rates, miss rates, inflation counts, and contention.
 func BenchmarkDeltaCache(b *testing.B) {
 	scenarios := []struct {
 		name    string

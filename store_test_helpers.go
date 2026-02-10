@@ -8,7 +8,7 @@ package objstore
 
 import (
 	"bytes"
-	"compress/zlib"
+	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
@@ -141,6 +141,10 @@ func createValidIdxData(t testing.TB, hashes []Hash, offsets []uint64) []byte {
 	return buf.Bytes()
 }
 
+// createMinimalPack writes a valid Git packfile containing a single zlib-
+// compressed blob object. The pack header uses version 2 with an object count
+// of 1. This is the simplest possible packfile and is used throughout the test
+// suite whenever a syntactically valid .pack file is required.
 func createMinimalPack(path string, content []byte) error {
 	file, err := os.Create(path)
 	if err != nil {
@@ -167,6 +171,9 @@ func createMinimalPack(path string, content []byte) error {
 	return nil
 }
 
+// calculateHash computes the SHA-1 object ID for a Git object of the given
+// type and content. The hash is computed over the canonical Git object header
+// ("<type> <size>\0") followed by the raw data bytes.
 func calculateHash(objType ObjectType, data []byte) Hash {
 	h := sha1.New()
 	header := fmt.Sprintf("%s %d\x00", objType.String(), len(data))
@@ -235,6 +242,11 @@ func createTestPackWithDelta(t *testing.T) (packPath, idxPath string, cleanup fu
 	return packPath, idxPath, cleanup
 }
 
+// createDelta builds a minimal Git delta instruction stream that transforms
+// base into target. Rather than computing an optimal delta, it emits a simple
+// insert instruction containing the entire target content. This is sufficient
+// for tests that need a structurally valid delta without requiring optimal
+// compression.
 func createDelta(base, target []byte) []byte {
 	var delta bytes.Buffer
 
@@ -248,6 +260,9 @@ func createDelta(base, target []byte) []byte {
 	return delta.Bytes()
 }
 
+// writeVarInt encodes a uint64 as a Git-style variable-length integer and
+// writes it to w. Each byte stores 7 data bits with the MSB set on all bytes
+// except the last.
 func writeVarInt(w io.Writer, v uint64) {
 	for {
 		b := byte(v & 0x7f)
@@ -262,6 +277,15 @@ func writeVarInt(w io.Writer, v uint64) {
 	}
 }
 
+// createV2IndexFile writes a complete Git pack index v2 file to path.
+//
+// This function and createValidIdxData both produce v2 index content. The
+// difference is that createValidIdxData returns raw bytes (useful when the
+// caller needs to manipulate the data before writing), while createV2IndexFile
+// writes directly to a file on disk and additionally computes real CRC32
+// checksums from the companion .pack file when it exists. Tests that need an
+// index backed by an actual pack file should prefer createV2IndexFile;
+// tests that only need well-formed index bytes can use createValidIdxData.
 func createV2IndexFile(path string, hashes []Hash, offsets []uint64) error {
 	var buf bytes.Buffer
 

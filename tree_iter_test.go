@@ -1,3 +1,21 @@
+// tree_iter_test.go tests treeIter, a zero-allocation iterator over raw Git
+// tree object data. Each tree entry is encoded as "<octal-mode> <name>\0<20-byte-hash>"
+// and the iterator parses them sequentially without copying the underlying buffer.
+//
+// The tests cover:
+//   - Empty trees, single entries, and multi-entry trees.
+//   - All standard Git entry modes (regular, executable, directory, symlink, gitlink).
+//   - Unicode and special-character filenames.
+//   - Malformed entries: invalid mode digits, missing space, missing null, truncated SHA.
+//   - Iterator invariants: non-mutation of the backing buffer, independent concurrent iterators.
+//   - Benchmarks for typical (~20 entries) and large (~2000 entries) trees.
+//
+// Note: this file defines a local octStr helper that is functionally identical
+// to diffTestOctStr in diff_tree_test.go. Both convert a uint32 to its octal
+// string representation. They are kept separate because each test file may be
+// compiled independently and the helper is trivial enough that sharing it via
+// a common file would add unnecessary coupling.
+
 package objstore
 
 import (
@@ -545,7 +563,9 @@ func BenchmarkTreeIter_Large(b *testing.B) {
 	}
 }
 
-// octStr converts a uint32 to an octal string.
+// octStr converts a uint32 to an octal string without a leading "0o" prefix.
+// This is the same algorithm as diffTestOctStr in diff_tree_test.go; see the
+// file-level comment for why the two copies exist.
 func octStr(n uint32) string {
 	if n == 0 {
 		return "0"

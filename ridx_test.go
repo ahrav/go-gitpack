@@ -1,3 +1,21 @@
+// ridx_test.go tests the reverse index (.ridx / .rev) loader and the
+// in-memory builder that derives a reverse index from sorted pack offsets.
+//
+// A reverse index maps positions in offset-descending order back to the
+// corresponding index positions in the .idx file. This is used for efficient
+// pack traversal in offset order without scanning the entire index.
+//
+// The tests cover:
+//   - Loading a .ridx file from disk (TestLoadReverseIndex_FromFile).
+//   - Falling back to building the reverse index from offsets when no .ridx
+//     file is present (TestLoadReverseIndex_BuildFromOffsets).
+//   - Backward compatibility with the older .rev extension
+//     (TestLoadReverseIndex_OldRevExtension).
+//   - Validation of magic bytes, version, object counts, fanout, and trailer
+//     checksums (TestLoadReverseIndex_InvalidFiles, _TrailerVerification).
+//   - Edge cases such as nil packfile handles and midx-only packs.
+//   - Benchmarks for building the reverse index and resolving index positions.
+
 package objstore
 
 import (
@@ -56,6 +74,11 @@ func createValidRidxFile(
 	return os.WriteFile(ridxPath, buf.Bytes(), 0644)
 }
 
+// TestLoadReverseIndex_FromFile verifies that loadReverseIndex correctly reads
+// a .ridx file from disk and returns the expected mapping. The test creates a
+// minimal pack with a single blob object, writes a corresponding .ridx file,
+// and asserts that the returned reverse index has one entry mapping to idx
+// position 0.
 func TestLoadReverseIndex_FromFile(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -86,6 +109,12 @@ func TestLoadReverseIndex_FromFile(t *testing.T) {
 	assert.Equal(t, uint32(0), ridx[0])
 }
 
+// TestLoadReverseIndex_BuildFromOffsets verifies the fallback path where no
+// .ridx file exists on disk. In this case loadReverseIndex builds the reverse
+// index in memory from the sorted offsets in the parsed index file. The test
+// creates three objects at offsets [12, 50, 100] and confirms the reverse
+// mapping sorts them in descending offset order: offset 100 -> idx 2,
+// offset 50 -> idx 1, offset 12 -> idx 0.
 func TestLoadReverseIndex_BuildFromOffsets(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -517,8 +546,11 @@ func TestLoadReverseIndex_MidxOnlyPack(t *testing.T) {
 	assert.Len(t, ridx, 1)
 }
 
+// BenchmarkBuildReverseFromOffsets measures the time to build a reverse index
+// from 10,000 sorted offsets. This simulates a moderately-sized packfile and
+// exercises the sort-based construction path.
 func BenchmarkBuildReverseFromOffsets(b *testing.B) {
-	// Create a realistic set of offsets.
+	// Create a realistic set of offsets (10,000 objects spaced 100 bytes apart).
 	numObjects := 10000
 	offsets := make([]uint64, numObjects)
 	for i := range numObjects {
@@ -531,6 +563,9 @@ func BenchmarkBuildReverseFromOffsets(b *testing.B) {
 	}
 }
 
+// BenchmarkLoadReverseIndex_FromFile measures the time to load and parse a
+// .ridx file containing 1,000 objects. This covers the mmap + binary parse
+// hot path used when a pre-built reverse index is available.
 func BenchmarkLoadReverseIndex_FromFile(b *testing.B) {
 	dir := b.TempDir()
 	packPath := filepath.Join(dir, "bench.pack")
@@ -555,6 +590,10 @@ func BenchmarkLoadReverseIndex_FromFile(b *testing.B) {
 	}
 }
 
+// BenchmarkResolveIdxPos measures the cost of resolving bit positions through
+// the reverse index. It tests three positions (first, middle, last) per
+// iteration across a 10,000-entry index to capture any position-dependent
+// performance differences.
 func BenchmarkResolveIdxPos(b *testing.B) {
 	numObjects := 10000
 	ridx := make([]uint32, numObjects)

@@ -1,8 +1,13 @@
+// midx_test.go tests the multi-pack-index (midx) parser and the store's
+// ability to locate and retrieve objects through an midx. It covers single-
+// and multi-pack midx construction, invalid file rejection, cross-pack delta
+// resolution via REF_DELTA, CRC verification with a real Git repository, and
+// comparative benchmarks of midx-based versus per-idx object lookup.
 package objstore
 
 import (
 	"bytes"
-	"compress/zlib"
+	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
@@ -129,6 +134,8 @@ func createValidMidxFile(
 	return midxPath
 }
 
+// TestParseMidx creates a single-pack midx file and verifies that parseMidx
+// correctly populates the fanout table, object ID list, and findObject lookup.
 func TestParseMidx(t *testing.T) {
 	dir := t.TempDir()
 
@@ -166,6 +173,9 @@ func TestParseMidx(t *testing.T) {
 	assert.NotNil(t, p)
 }
 
+// TestStoreWithMidx confirms that a single-pack store ignores the on-disk midx
+// and skips in-memory midx synthesis (because there is only one pack), while
+// still being able to retrieve objects.
 func TestStoreWithMidx(t *testing.T) {
 	dir := t.TempDir()
 
@@ -198,6 +208,8 @@ func TestStoreWithMidx(t *testing.T) {
 	assert.Equal(t, content, data)
 }
 
+// TestParseMidx_InvalidFiles writes a file with invalid magic bytes and
+// confirms that parseMidx rejects it with an error.
 func TestParseMidx_InvalidFiles(t *testing.T) {
 	dir := t.TempDir()
 
@@ -411,9 +423,18 @@ func createManualMidx(tb testing.TB, packDir string) {
 	require.NoError(tb, err, "Failed to create multi-pack-index")
 }
 
-// createManualMidxFileMultiPack constructs a complete multi-pack index file
-// following Git's midx format specification. This function handles multiple
-// createManualMidxFileMultiPack creates a multi-pack index file that properly handles multiple packs
+// createManualMidxFileMultiPack constructs a complete multi-pack index v1
+// file following Git's midx format specification. It merges objects from
+// all supplied packs into a single sorted object-ID list, builds the OIDF
+// fanout, OIDL, OOFF, and PNAM chunks, and writes the assembled file to
+// "multi-pack-index" inside packDir.
+//
+// NOTE on OOFF field order: the OOFF chunk in this helper writes
+// (offset, pack-id) per entry. This matches the parser in parseMidx which
+// reads (offset, pack-id). The single-pack helper createValidMidxFile writes
+// (pack-id, offset) because its companion parser path always uses pack-id 0
+// and reads the second uint32 as the offset. Both orderings are tested by
+// their respective callers; future refactors should unify the layout.
 func createManualMidxFileMultiPack(
 	tb testing.TB,
 	packDir string,
@@ -753,6 +774,9 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 	})
 }
 
+// TestStore_MidxOnly_NoIdx verifies that the store refuses to open when the
+// companion .idx file has been deleted, even if a midx file is present,
+// because the current implementation requires per-pack idx files.
 func TestStore_MidxOnly_NoIdx(t *testing.T) {
 	dir := t.TempDir()
 
@@ -773,6 +797,10 @@ func TestStore_MidxOnly_NoIdx(t *testing.T) {
 	assert.Contains(t, err.Error(), "mmap idx")
 }
 
+// TestCRCVerification creates a real Git repository via the git CLI, repacks
+// it, and retrieves an object with CRC verification enabled. This is an
+// integration-level test that validates the full CRC path against objects
+// produced by the official Git toolchain.
 func TestCRCVerification(t *testing.T) {
 	// Skip when Git is not available (e.g. unusual CI images).
 	if _, err := exec.LookPath("git"); err != nil {
@@ -823,6 +851,9 @@ func TestCRCVerification(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// TestMidxFanoutAcrossPacks opens a three-pack store with an in-memory midx
+// and retrieves an object that lives in the third pack, proving that the
+// fanout table correctly routes lookups across pack boundaries.
 func TestMidxFanoutAcrossPacks(t *testing.T) {
 	packDir := setupBenchmarkRepoWithMidx(t)
 
@@ -854,6 +885,10 @@ func TestMidxFanoutAcrossPacks(t *testing.T) {
 	require.NoError(t, err, "midx fan‑out should locate object across packs")
 }
 
+// TestThinPackCrossPackViaMidx creates two packs where Pack A holds a base
+// blob and Pack B holds a REF_DELTA referencing that base. A two-pack midx
+// indexes both objects, and the test verifies that the store can resolve the
+// cross-pack delta to produce the correct final blob content.
 func TestThinPackCrossPackViaMidx(t *testing.T) {
 	dir := t.TempDir()
 

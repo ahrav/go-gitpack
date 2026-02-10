@@ -1,4 +1,8 @@
-// commit_graph_test.go
+// commit_graph_test.go tests the commit-graph file parser including single-file
+// and chained graphs, chunk validation, parent resolution (including octopus
+// merges via the EDGE chunk), fanout integrity, and various edge cases around
+// corrupt or malformed data.
+
 package objstore
 
 import (
@@ -20,9 +24,14 @@ import (
 /* ------------------------------------------------------------------------- */
 
 const (
-	noParent     = 0x70000000
+	// noParent is the sentinel value stored in CDAT parent slots to indicate
+	// that the commit has no parent at that position (matches graphParentNone).
+	noParent = 0x70000000
+	// lastEdgeMask is the high bit set on the final entry in an EDGE list to
+	// signal that no more extra parents follow.
 	lastEdgeMask = 0x80000000
-	hashLen      = 20
+	// hashLen is the length in bytes of a SHA-1 hash (20 bytes / 160 bits).
+	hashLen = 20
 )
 
 type cgCommit struct {
@@ -184,6 +193,10 @@ func btoi(b bool) int {
 	return 0
 }
 
+// setChunkOffset finds the entry in tbl with the given chunk id and sets its
+// offset to off. If no matching id is found, the table is returned unchanged.
+// It is used during test graph file construction to back-patch chunk offsets
+// after the chunk data has been written.
 func setChunkOffset(tbl []struct {
 	id  uint32
 	off uint64
@@ -599,8 +612,9 @@ func TestCommitGraphOverlappingChunks(t *testing.T) {
 /*                    Edge Cases for Parent Resolution                       */
 /* ------------------------------------------------------------------------- */
 
-// TestCommitGraphCircularEdgeRefs tests error handling when edge references
-// form a circular pattern.
+// TestCommitGraphCircularEdgeRefs tests that the parser handles edge references
+// that form a circular pattern without entering an infinite loop, and correctly
+// collects all parents until the terminator bit is encountered.
 func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -664,8 +678,9 @@ func TestCommitGraphCircularEdgeRefs(t *testing.T) {
 	}
 }
 
-// TestCommitGraphManyParents tests error handling when a commit has a very long
-// parent list.
+// TestCommitGraphManyParents tests that an octopus merge with 100 parents is
+// parsed correctly, verifying that the EDGE chunk can hold arbitrarily long
+// parent lists.
 func TestCommitGraphManyParents(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -708,8 +723,9 @@ func TestCommitGraphManyParents(t *testing.T) {
 	assert.Len(t, parents, 100, "expected 100 parents, got %d", len(parents))
 }
 
-// TestCommitGraphEdgeNoTerminator tests error handling when edge list
-// does not end with a terminator.
+// TestCommitGraphEdgeNoTerminator tests that when an EDGE list lacks the
+// lastEdgeMask terminator, the parser reads all remaining entries until the
+// end of the EDGE chunk and correctly resolves parent OIDs.
 func TestCommitGraphEdgeNoTerminator(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -937,7 +953,8 @@ func TestCommitGraphChainDuplicates(t *testing.T) {
 	}
 }
 
-// TestCommitGraphLongChain tests error handling when a commit graph file is very long.
+// TestCommitGraphLongChain tests that a 50-file chain of commit graphs loads
+// within 100ms and produces the expected total of 50 commits.
 func TestCommitGraphLongChain(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping long chain test")
@@ -979,7 +996,8 @@ func TestCommitGraphLongChain(t *testing.T) {
 /*                         Data Extraction Tests                             */
 /* ------------------------------------------------------------------------- */
 
-// TestCommitGraphTreeOIDs tests error handling when tree OIDs are not populated correctly.
+// TestCommitGraphTreeOIDs verifies that tree OIDs extracted from the CDAT chunk
+// are correctly populated in the resulting commitGraphData.
 func TestCommitGraphTreeOIDs(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1007,7 +1025,10 @@ func TestCommitGraphTreeOIDs(t *testing.T) {
 	assert.Equal(t, treeC, graphData.TreeOIDs[2], "tree 2: got %v, want %v", graphData.TreeOIDs[2], treeC)
 }
 
-// TestCommitGraphTimestamps tests error handling when timestamps are not populated correctly.
+// TODO: TestCommitGraphTimestamps is disabled because it references an older
+// LoadCommitGraph API and has incomplete assertion logic. Re-enable once the
+// timestamp extraction from CDAT (34-bit encoding) is finalized and the API
+// is updated.
 // func TestCommitGraphTimestamps(t *testing.T) {
 // 	tmp := t.TempDir()
 
@@ -1100,8 +1121,9 @@ func TestCommitGraphTreeOIDs(t *testing.T) {
 // 	// }
 // }
 
-// TestCommitGraphOIDIndexMap tests error handling when OID to index mapping
-// is not populated correctly.
+// TestCommitGraphOIDIndexMap verifies that the OIDToIndex mapping is correctly
+// built during parsing, mapping each commit OID to its positional index, and
+// that lookups for non-existent OIDs return false.
 func TestCommitGraphOIDIndexMap(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1146,8 +1168,9 @@ func TestCommitGraphOIDIndexMap(t *testing.T) {
 /*                         Error Recovery Tests                              */
 /* ------------------------------------------------------------------------- */
 
-// TestCommitGraphCleanupOnError tests error handling when a commit graph file
-// is corrupted and cannot be parsed.
+// TestCommitGraphCleanupOnError tests that when a chain references both a valid
+// and a truncated/corrupt graph file, loadCommitGraph returns an error and does
+// not panic or leak resources.
 func TestCommitGraphCleanupOnError(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1231,7 +1254,9 @@ func TestCommitGraphCorruptHeaders(t *testing.T) {
 /*                              Stress Tests                                 */
 /* ------------------------------------------------------------------------- */
 
-// TestCommitGraphLargeFile tests error handling when a commit graph file is very large.
+// TestCommitGraphLargeFile tests that a commit graph with 10,000 commits loads
+// correctly and within a reasonable time bound (500ms), verifying scalability
+// of the parser.
 func TestCommitGraphLargeFile(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping large file test")
@@ -1274,8 +1299,9 @@ func TestCommitGraphLargeFile(t *testing.T) {
 	assert.Less(t, loadTime, 500*time.Millisecond, "loading 10k commits took too long: %v", loadTime)
 }
 
-// TestCommitGraphComplexMerges tests error handling when complex merge commits
-// are not handled correctly.
+// TestCommitGraphComplexMerges tests that the parser correctly handles multiple
+// merge commits with varying parent counts (3-way, 5-way, and 11-way octopus
+// merges) using a combination of CDAT and EDGE parent encoding.
 func TestCommitGraphComplexMerges(t *testing.T) {
 	tmp := t.TempDir()
 	// Create base commits
@@ -1365,7 +1391,8 @@ func TestCommitGraphComplexMerges(t *testing.T) {
 /*                            Special Patterns                               */
 /* ------------------------------------------------------------------------- */
 
-// TestCommitGraphAllRoots tests error handling when all commits are roots.
+// TestCommitGraphAllRoots tests that a graph where every commit is a root
+// (no parents) is parsed correctly and all parent lists are empty.
 func TestCommitGraphAllRoots(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1392,8 +1419,9 @@ func TestCommitGraphAllRoots(t *testing.T) {
 	}
 }
 
-// TestCommitGraphLinearHistory tests error handling when a commit graph
-// represents a linear history.
+// TestCommitGraphLinearHistory tests that a 1000-commit linear chain is parsed
+// correctly with each commit having exactly one parent pointing to its
+// predecessor.
 func TestCommitGraphLinearHistory(t *testing.T) {
 	tmp := t.TempDir()
 
@@ -1436,8 +1464,9 @@ func TestCommitGraphLinearHistory(t *testing.T) {
 	t.Logf("Linear history (1000): build=%v, load=%v", buildTime, loadTime)
 }
 
-// TestCommitGraphBinaryTree tests error handling when a commit graph
-// represents a binary tree pattern.
+// TestCommitGraphBinaryTree tests that a commit graph shaped as a binary tree
+// (5 levels, 31 total commits) is parsed correctly, with each non-root commit
+// having 1 or 2 parents drawn from the previous level.
 func TestCommitGraphBinaryTree(t *testing.T) {
 	tmp := t.TempDir()
 	// Create commits in binary tree pattern
@@ -1744,6 +1773,8 @@ func generateTestGraphChain(t testing.TB, dir string, layers []int) []string {
 /*                              Benchmarks                                   */
 /* ------------------------------------------------------------------------- */
 
+// BenchmarkLoadCommitGraph measures end-to-end loadCommitGraph performance for
+// single-file and chained graphs at sizes from 1K to 1M commits.
 func BenchmarkLoadCommitGraph(b *testing.B) {
 	sizes := []int{1_000, 10_000, 100_000, 1_000_000}
 
@@ -1786,6 +1817,8 @@ func BenchmarkLoadCommitGraph(b *testing.B) {
 	}
 }
 
+// BenchmarkParseGraphFile measures the cost of parsing a single graph file
+// (header, chunk table, mmap) at various sizes, both with and without EDGE data.
 func BenchmarkParseGraphFile(b *testing.B) {
 	sizes := []int{1_000, 10_000, 100_000, 1_000_000}
 
@@ -1826,6 +1859,8 @@ func BenchmarkParseGraphFile(b *testing.B) {
 	}
 }
 
+// BenchmarkResolveParents measures the cost of resolving all parent relationships
+// from a parsed graph file into a Parents map, across various commit counts.
 func BenchmarkResolveParents(b *testing.B) {
 	sizes := []int{1_000, 10_000, 50_000, 100_000, 500_000}
 
@@ -1858,6 +1893,8 @@ func BenchmarkResolveParents(b *testing.B) {
 	}
 }
 
+// BenchmarkDiscoverGraphFiles measures the filesystem discovery cost of locating
+// commit-graph files (single, chained, and absent) within a git object directory.
 func BenchmarkDiscoverGraphFiles(b *testing.B) {
 	b.Run("single", func(b *testing.B) {
 		dir := b.TempDir()
