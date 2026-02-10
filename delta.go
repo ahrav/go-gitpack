@@ -20,7 +20,6 @@ package objstore
 
 import (
 	"bufio"
-	"compress/zlib"
 	"errors"
 	"fmt"
 	"io"
@@ -132,6 +131,17 @@ func getDeltaArena() *deltaArena { return deltaArenaPool.Get().(*deltaArena) }
 func putDeltaArena(arena *deltaArena) {
 	arena.data = arena.data[:cap(arena.data)]
 	deltaArenaPool.Put(arena)
+}
+
+// errDeltaOutputTooSmall reports that the caller-provided output buffer cannot
+// hold the decoded target.
+type errDeltaOutputTooSmall struct {
+	need uint64
+	have int
+}
+
+func (e *errDeltaOutputTooSmall) Error() string {
+	return fmt.Sprintf("output buffer too small: need %d, have %d", e.need, e.have)
 }
 
 // inflationParams bundles the inputs required by inflateDeltaChainStreaming to
@@ -320,14 +330,15 @@ func applyDeltaStack(
 	arena := getDeltaArena()
 	defer putDeltaArena(arena)
 
-	maxTarget := peekLargestTarget(stack)
-	if bs := uint64(len(baseData)); bs > maxTarget {
-		maxTarget = bs
+	maxTarget := uint64(len(baseData))
+	poolHalf := uint64(cap(arena.data) / 2)
+	if poolHalf > maxTarget && (maxObjectSize == 0 || poolHalf <= maxObjectSize) {
+		maxTarget = poolHalf
 	}
 	if maxObjectSize > 0 && maxTarget > maxObjectSize {
 		return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, maxTarget, maxObjectSize)
 	}
-	if maxTarget > uint64(len(arena.data)/2) {
+	if maxTarget > uint64(cap(arena.data)/2) {
 		arena.data = make([]byte, maxTarget*2)
 	}
 
@@ -345,22 +356,46 @@ func applyDeltaStack(
 	for i := len(stack) - 1; i >= 0; i-- {
 		d := stack[i]
 
-		// Choose output buffer (the one we're NOT currently using).
-		var out []byte
-		if usingA {
-			out = bufB[:0]
-		} else {
-			out = bufA[:0]
-		}
+		for {
+			// Choose output buffer (the one we're NOT currently using).
+			var out []byte
+			if usingA {
+				out = bufB[:0]
+			} else {
+				out = bufA[:0]
+			}
 
-		result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out)
-		if err != nil {
-			return nil, ObjBad, err
-		}
+			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out)
+			if err != nil {
+				var tooSmall *errDeltaOutputTooSmall
+				if errors.As(err, &tooSmall) {
+					if maxObjectSize > 0 && tooSmall.need > maxObjectSize {
+						return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
+					}
+					if tooSmall.need <= maxTarget {
+						return nil, ObjBad, err
+					}
 
-		// The result is now in 'out' buffer, make it the current for next iteration.
-		current = result
-		usingA = !usingA // Switch which buffer we're using
+					maxTarget = tooSmall.need
+					arena.data = make([]byte, maxTarget*2)
+					bufA = arena.data[:maxTarget]
+					bufB = arena.data[maxTarget : maxTarget*2]
+
+					// Re-anchor current into the new arena and retry this delta.
+					rebased := bufA[:len(current)]
+					copy(rebased, current)
+					current = rebased
+					usingA = true
+					continue
+				}
+				return nil, ObjBad, err
+			}
+
+			// The result is now in 'out' buffer, make it the current for next iteration.
+			current = result
+			usingA = !usingA // Switch which buffer we're using
+			break
+		}
 	}
 
 	// Copy final result.
@@ -420,80 +455,6 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) uint64 {
 	return offset
 }
 
-// peekLargestTarget calculates the maximum target size needed for delta application.
-// This allows pre-allocating buffers of the correct size to avoid reallocation
-// during delta chain resolution.
-func peekLargestTarget(deltaStack deltaStack) uint64 {
-	maxSize := uint64(0)
-
-	for _, delta := range deltaStack {
-		// Peek at the delta header to determine the size of the resulting object.
-		targetSize, err := peekDeltaTargetSize(delta.pack, delta.offset, delta.typ)
-		if err != nil {
-			// If peeking fails, fall back to a conservative, large buffer size.
-			return uint64(16 << 20) // 16MB fallback
-		}
-		if targetSize > maxSize {
-			maxSize = targetSize
-		}
-	}
-
-	return maxSize
-}
-
-// peekDeltaTargetSize reads the target size from a delta header without full decompression.
-// This optimization allows proper buffer sizing before applying deltas.
-func peekDeltaTargetSize(
-	pack *mmap.ReaderAt,
-	offset uint64,
-	deltaType ObjectType,
-) (uint64, error) {
-	// Skip to delta instructions.
-	_, hdrLen, err := peekObjectType(pack, offset)
-	if err != nil {
-		return 0, err
-	}
-	pos := int64(offset) + int64(hdrLen)
-
-	// Skip the delta reference.
-	switch deltaType {
-	case ObjRefDelta:
-		pos += 20
-	case ObjOfsDelta:
-		// Skip the variable offset.
-		for {
-			var b [1]byte
-			if _, err := pack.ReadAt(b[:], pos); err != nil {
-				return 0, err
-			}
-			pos++
-			if b[0]&0x80 == 0 {
-				break
-			}
-		}
-	}
-
-	// Open a zlib stream just to read the header.
-	src := io.NewSectionReader(pack, pos, 1<<63-1)
-	zr, err := getZlibReader(src)
-	if err != nil {
-		return 0, err
-	}
-	defer putZlibReader(zr)
-
-	bufRdr := getBR(zr)
-	defer putBR(bufRdr)
-
-	// Skip the base size.
-	if _, _, err = readVarIntFromReader(bufRdr); err != nil {
-		return 0, err
-	}
-
-	// Read the target size.
-	targetSize, _, err := readVarIntFromReader(bufRdr)
-	return targetSize, err
-}
-
 // applyDeltaStreaming applies delta instructions to reconstruct an object.
 // The method uses pre-allocated buffers and streaming decompression to minimize memory usage.
 //
@@ -535,14 +496,15 @@ func applyDeltaStreaming(
 
 	// Open a zlib stream to decompress the delta instructions.
 	src := io.NewSectionReader(pack, pos, 1<<63-1)
-	zr, err := zlib.NewReader(src)
+	zr, err := getZlibReader(src)
 	if err != nil {
 		return nil, err
 	}
-	defer zr.Close()
+	defer putZlibReader(zr)
 
-	// Use a pooled buffered reader for efficient byte-level operations.
-	br := bufio.NewReader(zr)
+	// Reuse buffered readers to avoid allocating one per delta application.
+	br := getBR(zr)
+	defer putBR(br)
 
 	// Read the delta header, which specifies the base and target object sizes.
 	baseSize, _, err := readVarIntFromReader(br)
@@ -557,7 +519,7 @@ func applyDeltaStreaming(
 
 	// Verify that the output buffer is large enough for the target object.
 	if uint64(cap(out)) < targetSize {
-		return nil, fmt.Errorf("output buffer too small: need %d, have %d", targetSize, cap(out))
+		return nil, &errDeltaOutputTooSmall{need: targetSize, have: cap(out)}
 	}
 
 	// Initialize a zero-length slice to ensure no undefined content is present.

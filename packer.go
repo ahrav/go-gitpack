@@ -1,7 +1,6 @@
 package objstore
 
 import (
-	"compress/zlib"
 	"errors"
 	"io"
 
@@ -73,11 +72,11 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	// The compressed length is unknown, so provide SectionReader
 	// with a virtually infinite length; it will stop at EOF.
 	src := io.NewSectionReader(r, pos, 1<<63-1)
-	zr, err := zlib.NewReader(src)
+	zr, err := getZlibReader(src)
 	if err != nil {
 		return ObjBad, nil, err
 	}
-	defer zr.Close()
+	defer putZlibReader(zr)
 
 	out := make([]byte, size)
 	if _, err := io.ReadFull(zr, out); err != nil {
