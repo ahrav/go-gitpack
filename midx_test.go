@@ -184,13 +184,13 @@ func TestStoreWithMidx(t *testing.T) {
 	// Create multi‑pack‑index pointing at that single pack.
 	createValidMidxFile(t, dir, filepath.Base(packPath), []Hash{oid}, []uint64{12})
 
-	// Open() should ignore on-disk MIDX and build the in-memory merged index.
+	// Open() should ignore on-disk MIDX. With a single pack, a synthesized
+	// in-memory MIDX is unnecessary and should be omitted to save memory.
 	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 
-	assert.NotNil(t, store.memoryMidx, "Store should contain synthesized in-memory midx")
-	assert.True(t, len(store.memoryMidx.objectID) > 0, "in-memory midx should index at least one object")
+	assert.Nil(t, store.memoryMidx, "single-pack stores should skip in-memory midx synthesis")
 
 	data, typ, err := store.get(oid)
 	require.NoError(t, err)

@@ -54,7 +54,7 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 
 	switch hs.scanMode {
 	case ScanModeBlob:
-		return hs.ScanPlannedBlobs(seen, scanner)
+		return hs.scanBlobsStreaming(seen, scanner)
 	case ScanModeHunks:
 		return hs.scanHunks(scanner)
 	default:

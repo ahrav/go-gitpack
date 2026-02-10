@@ -58,7 +58,7 @@ import (
 //
 // Only OID, tree, parents, and committer timestamp are retained, which keeps
 // allocation pressure low during repository‑wide walks.
-// The struct is produced by HistoryScanner.LoadAllCommits and can be processed
+// The struct is produced by internal commit-walk helpers and can be processed
 // concurrently.
 //
 // NOTE: commitInfo is unexported because it is an implementation detail; the
@@ -250,78 +250,106 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
 		}
 
-		commits, err := hs.LoadAllCommits()
-		if err != nil {
-			errC <- err
-			return
-		}
-		if len(commits) == 0 {
-			errC <- nil
-			return
-		}
-
 		type workItem struct {
 			commit     commitInfo
 			parentTree Hash
 		}
 
-		workChan := make(chan workItem, numWorkers)
-		errorChan := make(chan error, numWorkers)
-
-		var wg sync.WaitGroup
+		workChan := make(chan workItem, numWorkers*2)
+		stopCh := make(chan struct{})
+		var (
+			stopOnce sync.Once
+			wg       sync.WaitGroup
+			firstErr error
+		)
+		setError := func(err error) {
+			if err == nil {
+				return
+			}
+			stopOnce.Do(func() {
+				firstErr = err
+				close(stopCh)
+			})
+		}
 
 		for range numWorkers {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for work := range workChan {
-					if err := hs.processCommitStreamingHunks(hs.store, work.commit, work.parentTree, out); err != nil {
-						c := work.commit
-						errorChan <- fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err)
+				for {
+					select {
+					case <-stopCh:
 						return
+					case work, ok := <-workChan:
+						if !ok {
+							return
+						}
+						if err := hs.processCommitStreamingHunks(hs.store, work.commit, work.parentTree, out); err != nil {
+							c := work.commit
+							setError(fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err))
+							return
+						}
 					}
 				}
 			}()
 		}
 
-		go func() {
-			wg.Wait()
-			close(errorChan)
-		}()
-
-		treeByCommit := make(map[Hash]Hash, len(commits))
-		for _, c := range commits {
-			treeByCommit[c.OID] = c.TreeOID
-		}
-
-		// Feed commits to the workers in parent-before-child order.
-		go func() {
-			defer close(workChan)
-			for _, c := range commits {
-				parentTree := Hash{}
-				if len(c.ParentOIDs) > 0 {
-					if t, ok := treeByCommit[c.ParentOIDs[0]]; ok {
-						parentTree = t
-					}
-				}
-				workChan <- workItem{
-					commit:     c,
-					parentTree: parentTree,
-				}
+		walkErr := hs.walkCommitsFromRefs(func(c commitInfo) error {
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
 			}
-		}()
 
-		var firstErr error
-		for err := range errorChan {
-			if err != nil && firstErr == nil {
-				firstErr = err
+			parentTree, err := hs.firstParentTree(c)
+			if err != nil {
+				return fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err)
 			}
+
+			select {
+			case <-stopCh:
+				return errScanAborted
+			case workChan <- workItem{commit: c, parentTree: parentTree}:
+				return nil
+			}
+		})
+		close(workChan)
+		wg.Wait()
+
+		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
+			setError(walkErr)
 		}
 
 		errC <- firstErr
 	}()
 
 	return out, errC
+}
+
+// errScanAborted marks an internal early-stop condition used to unwind commit walks.
+var errScanAborted = errors.New("scan aborted")
+
+// firstParentTree resolves the tree OID for a commit's first parent.
+// Missing or non-commit parents are treated as an empty tree.
+func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
+	if len(c.ParentOIDs) == 0 {
+		return Hash{}, nil
+	}
+
+	parentOID := c.ParentOIDs[0]
+	hdr, err := hs.store.readCommitHeader(parentOID)
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) || errors.Is(err, ErrObjectNotCommit) {
+			return Hash{}, nil
+		}
+		return Hash{}, fmt.Errorf("read parent header %s: %w", parentOID, err)
+	}
+
+	parentInfo, err := parseCommitInfoFromHeader(parentOID, hdr)
+	if err != nil {
+		return Hash{}, err
+	}
+	return parentInfo.TreeOID, nil
 }
 
 // processCommitStreamingHunks diffs a single commit against its first parent
@@ -405,9 +433,9 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
-// LoadAllCommits returns all commits in a deterministic parent-before-child order.
-// The slice is never nil; it may be empty when the repository contains no commits.
-func (hs *HistoryScanner) LoadAllCommits() ([]commitInfo, error) {
+// loadAllCommits is an internal helper used by package tests. Production scan
+// paths should use streaming traversal.
+func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
 	hs.commitsOnce.Do(func() {
 		if hs.graphData != nil {
 			hs.commits = hs.loadFromGraph()

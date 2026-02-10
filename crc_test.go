@@ -90,9 +90,6 @@ func TestVerifyCRC32_ObjectExceedsPackBounds(t *testing.T) {
 	idx := &idxFile{
 		pack:          packRA,
 		sortedOffsets: []uint64{obj1Offset, obj2Offset},
-		entriesByOff: map[uint64]idxEntry{
-			obj1Offset: {offset: obj1Offset, crc: 0x12345678},
-		},
 	}
 
 	err = verifyCRC32(idx, obj1Offset, 0x12345678)
@@ -120,9 +117,6 @@ func TestVerifyCRC32_NonMonotonicOffsets(t *testing.T) {
 	idx := &idxFile{
 		pack:          packRA,
 		sortedOffsets: []uint64{50, 50},
-		entriesByOff: map[uint64]idxEntry{
-			50: {offset: 50, crc: 0x12345678},
-		},
 	}
 
 	err = verifyCRC32(idx, 50, 0x12345678)
@@ -157,9 +151,6 @@ func TestVerifyCRC32_MismatchedCRC(t *testing.T) {
 	idx := &idxFile{
 		pack:          packRA,
 		sortedOffsets: []uint64{objOffset},
-		entriesByOff: map[uint64]idxEntry{
-			objOffset: {offset: objOffset, crc: wrongCRC},
-		},
 	}
 
 	err = verifyCRC32(idx, objOffset, wrongCRC)

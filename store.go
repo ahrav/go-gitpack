@@ -267,7 +267,9 @@ func open(dir string) (*store, error) {
 			}
 		}
 	}
-	store.memoryMidx = buildInMemoryMidx(store.packs)
+	if len(store.packs) > 1 {
+		store.memoryMidx = buildInMemoryMidx(store.packs)
+	}
 
 	return store, nil
 }
@@ -393,7 +395,22 @@ func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
 		oid:           oid,
 		ctx:           newDeltaContext(s.maxDeltaDepth),
 		maxObjectSize: s.maxDeltaObjectSize,
-	}, false)
+	}, false, true)
+}
+
+// getNoCache retrieves the specified Git object without touching cache layers.
+func (s *store) getNoCache(oid Hash) ([]byte, ObjectType, error) {
+	p, off, ok := s.findPackedObject(oid)
+	if !ok {
+		return s.readLooseObject(oid)
+	}
+	return s.inflateFromPackWithOptions(inflationParams{
+		p:             p,
+		off:           off,
+		oid:           oid,
+		ctx:           newDeltaContext(s.maxDeltaDepth),
+		maxObjectSize: s.maxDeltaObjectSize,
+	}, true, false)
 }
 
 // getWithContext retrieves an object while tracking delta chain depth.
@@ -456,10 +473,10 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 // inflateFromPack returns the inflated object data, its type, and any error encountered.
 // The returned data is a fresh allocation safe for modification.
 func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, error) {
-	return s.inflateFromPackWithOptions(params, true)
+	return s.inflateFromPackWithOptions(params, true, true)
 }
 
-func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFastPath bool) ([]byte, ObjectType, error) {
+func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFastPath, cacheResult bool) ([]byte, ObjectType, error) {
 	// Perform a cheap header peek to avoid full inflation for commits
 	// that are already covered by the commit-graph.
 	objType, _, err := peekObjectType(params.p, params.off)
@@ -477,7 +494,7 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 			return nil, ObjBad, err
 		}
 		// Add the fully resolved object to both the delta window and the ARC cache.
-		if len(full) <= maxCacheableSize {
+		if cacheResult && len(full) <= maxCacheableSize {
 			s.dw.add(params.oid, full, baseType)
 			s.cache.Add(params.oid, cachedObj{data: full, typ: baseType})
 		}
@@ -499,7 +516,7 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 		}
 	}
 
-	if len(data) <= maxCacheableSize {
+	if cacheResult && len(data) <= maxCacheableSize {
 		s.dw.add(params.oid, data, objType)
 		s.cache.Add(params.oid, cachedObj{data: data, typ: objType})
 	}
@@ -638,9 +655,9 @@ func readUntilLF(r io.Reader) ([]byte, error) {
 // findCRCForObject is read-only and safe for concurrent use.
 func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32, bool) {
 	for _, pf := range s.packs {
-		if pf.pack == p && pf.entriesByOff != nil {
-			if entry, ok := pf.entriesByOff[off]; ok {
-				return entry.crc, true
+		if pf.pack == p {
+			if crc, ok := pf.crcAtOffset(off); ok {
+				return crc, true
 			}
 		}
 	}

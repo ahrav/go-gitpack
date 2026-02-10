@@ -64,15 +64,14 @@ Found .git directory at: /path/to/go-gitpack/.git
 
 ### 2. Full History Scan (`history_scan/`)
 
-A comprehensive example demonstrating various `HistoryScanner` capabilities, including streaming diff history, loading all commits, and retrieving commit timestamps.
+A comprehensive example demonstrating `HistoryScanner` streaming capabilities, including streaming diff history and blob scanning.
 
 **Functionality:**
 
 -   Automatically locates the Git repository by traversing up the directory tree.
 -   Streams diff history with detailed output for each addition.
 -   Limits output to 100 additions for demonstration purposes.
--   Demonstrates additional scanner capabilities like `LoadAllCommits()` and `Timestamp()`.
--   Displays repository statistics, including the total number of commits and the first 5 commit details.
+-   Demonstrates streaming hunk output and streaming blob scan behavior.
 
 **Execution:**
 
@@ -264,38 +263,29 @@ for {
 
 This snippet showcases the `DiffHistory()` function, which streams commit additions and errors. The `select` statement concurrently processes additions and errors from the respective channels. Each addition provides details about the commit, line number, and file path where the change occurred.
 
-#### Loading All Commits
+#### Streaming Blob Scan
 
 ```go
-commits, err := scanner.LoadAllCommits()
-if err != nil {
-    log.Printf("Failed to load commits: %v", err)
-} else {
-    fmt.Printf("Total commits: %d\n", len(commits))
-    for _, commit := range commits {
-        fmt.Printf("Commit: %s, Tree: %s, Parents: %d\n",
-            commit.OID, commit.TreeOID, len(commit.ParentOIDs))
+type counter struct {
+    blobs int
+}
+
+func (c *counter) ScanBlob(r io.Reader, meta objstore.ScanMeta) error {
+    _, err := io.Copy(io.Discard, r)
+    if err == nil {
+        c.blobs++
     }
+    return err
 }
+
+c := &counter{}
+if err := scanner.Scan(nil, c); err != nil {
+    log.Fatalf("streaming blob scan failed: %v", err)
+}
+fmt.Printf("Scanned %d blobs\n", c.blobs)
 ```
 
-The `LoadAllCommits()` function loads all commits in the repository. This function is useful for analyzing the entire commit history. The code iterates through the commits and prints details such as the commit OID, tree OID, and the number of parent commits.
-
-#### Getting Metadata
-
-```go
-// Get commit timestamp
-if timestamp, hasTimestamp := scanner.Timestamp(commitOID); hasTimestamp {
-    fmt.Printf("Commit time: %d\n", timestamp)
-}
-
-// Get author information
-if author, err := scanner.Author(commitOID); err == nil {
-    fmt.Printf("Author: %s <%s>\n", author.Name, author.Email)
-}
-```
-
-This example demonstrates how to retrieve commit metadata, such as the timestamp and author information. The `Timestamp()` function retrieves the commit timestamp, and the `Author()` function retrieves the author's name and email.
+This snippet demonstrates streaming blob scan mode. Blob data is delivered to `ScanBlob` one object at a time.
 
 #### Enabling Profiling
 

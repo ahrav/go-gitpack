@@ -27,7 +27,7 @@ func TestCommitAttributionIntegration(t *testing.T) {
 			defer scanner.Close()
 
 			// Load all commits from the repository
-			commits, err := scanner.LoadAllCommits()
+			commits, err := scanner.loadAllCommits()
 			require.NoError(t, err)
 			require.NotEmpty(t, commits, "Repository should have commits")
 
@@ -88,7 +88,7 @@ func TestCommitAttributionWithoutCommitGraph(t *testing.T) {
 	require.NoError(t, err)
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.NotEmpty(t, commits, "Fallback loader should discover commits without commit-graph")
 }
@@ -100,7 +100,7 @@ func TestCommitAttributionEmptyRepo(t *testing.T) {
 	require.NoError(t, err)
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.Empty(t, commits)
 }

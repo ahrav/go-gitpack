@@ -32,7 +32,7 @@ func TestLoadAllCommits_SkipsMissingRefObjects(t *testing.T) {
 	}
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	if err != nil {
 		t.Fatalf("LoadAllCommits: %v", err)
 	}

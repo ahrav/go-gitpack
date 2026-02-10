@@ -14,16 +14,32 @@ import (
 )
 
 func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
-	tips, err := collectRefTips(hs.gitDir)
-	if err != nil {
+	out := make([]commitInfo, 0, 256)
+	if err := hs.walkCommitsFromRefs(func(info commitInfo) error {
+		out = append(out, info)
+		return nil
+	}); err != nil {
 		return nil, err
 	}
+	return orderCommitsParentFirst(out), nil
+}
+
+// walkCommitsFromRefs performs a ref-based reachable commit walk and calls visit
+// once per commit.
+func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) error {
+	if visit == nil {
+		return nil
+	}
+
+	tips, err := collectRefTips(hs.gitDir)
+	if err != nil {
+		return err
+	}
 	if len(tips) == 0 {
-		return []commitInfo{}, nil
+		return nil
 	}
 
 	seen := make(map[Hash]struct{}, len(tips)*4)
-	commits := make(map[Hash]commitInfo, len(tips)*4)
 	stack := append([]Hash(nil), tips...)
 
 	for len(stack) > 0 {
@@ -44,7 +60,7 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 				continue
 			}
 			if !errors.Is(err, ErrObjectNotCommit) {
-				return nil, fmt.Errorf("read commit header %s: %w", oid, err)
+				return fmt.Errorf("read commit header %s: %w", oid, err)
 			}
 			// Non-commit refs (tags, trees, etc.) are allowed.
 			target, ok, tagErr := hs.resolveTagTarget(oid)
@@ -52,7 +68,7 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 				if errors.Is(tagErr, ErrObjectNotFound) {
 					continue
 				}
-				return nil, tagErr
+				return tagErr
 			}
 			if ok {
 				stack = append(stack, target)
@@ -62,9 +78,11 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 
 		info, err := parseCommitInfoFromHeader(oid, hdr)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		commits[oid] = info
+		if err := visit(info); err != nil {
+			return err
+		}
 
 		for _, p := range info.ParentOIDs {
 			if _, ok := seen[p]; ok {
@@ -74,11 +92,7 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 		}
 	}
 
-	out := make([]commitInfo, 0, len(commits))
-	for _, c := range commits {
-		out = append(out, c)
-	}
-	return orderCommitsParentFirst(out), nil
+	return nil
 }
 
 func (hs *HistoryScanner) resolveTagTarget(oid Hash) (Hash, bool, error) {

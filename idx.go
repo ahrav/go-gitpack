@@ -76,17 +76,12 @@ type idxFile struct {
 	// the pack and the CRC-32 checksum of each object.
 	entries []idxEntry
 
-	// crcByOffset maps pack file offset to CRC-32 checksum for O(1) lookup
-	// during CRC verification.
-	crcByOffset map[uint64]uint32
-
 	// largeOffsets stores 64-bit offsets for objects located beyond the
 	// 2 GiB boundary. The slice is nil when the pack is smaller than that.
 	largeOffsets []uint64
 
-	// fast look‑ups for CRC verification.
-	entriesByOff  map[uint64]idxEntry // exact offset → entry (constant‑time)
-	sortedOffsets []uint64            // monotonically ascending list of offsets
+	// sortedOffsets holds all pack offsets in ascending order.
+	sortedOffsets []uint64
 
 	// ridx is the reverse‑index table that maps pack file byte offsets back
 	// to zero‑based object indices within the sorted oidTable. When present,
@@ -134,6 +129,34 @@ func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
 	}
 	absIdx := int(start) + relIdx
 	return f.entries[absIdx].offset, true
+}
+
+// crcAtOffset resolves the CRC-32 checksum for an object at the given pack offset.
+func (f *idxFile) crcAtOffset(off uint64) (uint32, bool) {
+	if f == nil || len(f.sortedOffsets) == 0 {
+		return 0, false
+	}
+	i, ok := slices.BinarySearch(f.sortedOffsets, off)
+	if !ok {
+		return 0, false
+	}
+
+	// ridx maps descending-offset order to idx-entry order.
+	if len(f.ridx) == len(f.sortedOffsets) {
+		desc := len(f.sortedOffsets) - 1 - i
+		idxPos := int(f.ridx[desc])
+		if idxPos >= 0 && idxPos < len(f.entries) {
+			return f.entries[idxPos].crc, true
+		}
+	}
+
+	// Fallback for malformed/absent ridx.
+	for _, e := range f.entries {
+		if e.offset == off {
+			return e.crc, true
+		}
+	}
+	return 0, false
 }
 
 // largeOffsetEntry relates an object index to its entry in the large-offset
@@ -251,63 +274,70 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	crcBase := oidBase + int64(objCount*hashSize)
 	offBase := crcBase + int64(objCount*crcSize)
 
-	// Read all fixed-size data in a single syscall to reduce I/O overhead.
-	allDataSize := objCount*hashSize + objCount*crcSize + objCount*offsetSize
-	allData := make([]byte, allDataSize)
-
-	if _, err := ix.ReadAt(allData, oidBase); err != nil {
-		return nil, err
-	}
-
-	oidData := allData[:objCount*hashSize]
-	crcData := allData[objCount*hashSize : objCount*hashSize+objCount*crcSize]
-	offsetData := allData[objCount*hashSize+objCount*crcSize:]
-
-	// Convert raw bytes to Hash structs using unsafe operations to avoid parsing overhead.
+	// Read object IDs directly into the destination slice to avoid extra copies.
 	oids := make([]Hash, objCount)
 	if len(oids) > 0 {
-		copy(unsafe.Slice((*byte)(unsafe.Pointer(&oids[0])), len(oids)*hashSize), oidData)
-	}
-
-	crcs := make([]uint32, objCount)
-	if len(crcs) > 0 {
-		if littleEndian {
-			for i := range objCount {
-				crcs[i] = binary.BigEndian.Uint32(crcData[i*4:])
-			}
-		} else {
-			srcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&crcData[0]))
-			crcPtr := (*[1 << 28]uint32)(unsafe.Pointer(&crcs[0]))
-			copy(crcPtr[:objCount], srcPtr[:objCount])
+		oidBytes := unsafe.Slice((*byte)(unsafe.Pointer(&oids[0])), len(oids)*hashSize)
+		if _, err := ix.ReadAt(oidBytes, oidBase); err != nil {
+			return nil, err
 		}
 	}
 
 	entries := make([]idxEntry, objCount)
-	offsetPtr := (*[1 << 28]uint32)(unsafe.Pointer(&offsetData[0]))
+	const tableChunk = 1 << 16 // 65,536 entries (~256 KiB for 4-byte tables)
+
+	// Parse CRC table in chunks to keep peak allocations bounded.
+	crcBuf := make([]byte, tableChunk*crcSize)
+	for base := uint32(0); base < objCount; {
+		n := tableChunk
+		remaining := int(objCount - base)
+		if remaining < n {
+			n = remaining
+		}
+		chunk := crcBuf[:n*crcSize]
+		if _, err := ix.ReadAt(chunk, crcBase+int64(base)*crcSize); err != nil {
+			return nil, err
+		}
+		for i := range n {
+			entries[int(base)+i].crc = binary.BigEndian.Uint32(chunk[i*crcSize:])
+		}
+		base += uint32(n)
+	}
 
 	// Track objects that reference the large offset table (for packs > 2GB).
 	largeOffsetList := make([]largeOffsetEntry, 0, objCount/1000)
 	maxLargeIdx := uint32(0)
 
-	for i := range objCount {
-		offset := offsetPtr[i]
-		if littleEndian {
-			offset = binary.BigEndian.Uint32(offsetData[i*4:])
+	// Parse offset table in chunks.
+	offsetBuf := make([]byte, tableChunk*offsetSize)
+	for base := uint32(0); base < objCount; {
+		n := tableChunk
+		remaining := int(objCount - base)
+		if remaining < n {
+			n = remaining
+		}
+		chunk := offsetBuf[:n*offsetSize]
+		if _, err := ix.ReadAt(chunk, offBase+int64(base)*offsetSize); err != nil {
+			return nil, err
 		}
 
-		entries[i].crc = crcs[i]
+		for i := range n {
+			offset := binary.BigEndian.Uint32(chunk[i*offsetSize:])
+			objIdx := uint32(int(base) + i)
 
-		// If MSB is 0, it's a direct 31-bit offset.
-		// If MSB is 1, it's an index into the large offset table.
-		if offset&0x80000000 == 0 {
-			entries[i].offset = uint64(offset)
-		} else {
-			largeIdx := offset & 0x7fffffff
-			largeOffsetList = append(largeOffsetList, largeOffsetEntry{i, largeIdx})
-			if largeIdx > maxLargeIdx {
-				maxLargeIdx = largeIdx
+			// If MSB is 0, it's a direct 31-bit offset.
+			// If MSB is 1, it's an index into the large offset table.
+			if offset&0x80000000 == 0 {
+				entries[int(objIdx)].offset = uint64(offset)
+			} else {
+				largeIdx := offset & 0x7fffffff
+				largeOffsetList = append(largeOffsetList, largeOffsetEntry{objIdx, largeIdx})
+				if largeIdx > maxLargeIdx {
+					maxLargeIdx = largeIdx
+				}
 			}
 		}
+		base += uint32(n)
 	}
 
 	// Handle large offsets if any objects require them.
@@ -343,15 +373,8 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 	}
 
-	crcByOffset := make(map[uint64]uint32, objCount)
-	for i := range objCount {
-		crcByOffset[entries[i].offset] = entries[i].crc
-	}
-
-	byOff := make(map[uint64]idxEntry, objCount)
 	offs := make([]uint64, objCount)
 	for i, e := range entries {
-		byOff[e.offset] = e
 		offs[i] = e.offset
 	}
 	slices.Sort(offs)
@@ -377,9 +400,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		fanout:        fanout,
 		entries:       entries,
 		oidTable:      oids,
-		crcByOffset:   crcByOffset,
 		largeOffsets:  largeOffsets,
-		entriesByOff:  byOff,
 		sortedOffsets: offs,
 	}, nil
 }

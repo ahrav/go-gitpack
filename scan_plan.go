@@ -38,94 +38,98 @@ type BlobScanner interface {
 	ScanBlob(r io.Reader, meta ScanMeta) error
 }
 
-// ScanPlannedBlobs executes blob-centric scans planned by PlanScanJobs.
-//
-// The current implementation materializes each blob via store.get and passes a
-// bytes.Reader to scanner. This wires the planner into production usage while a
-// future streaming object path is introduced.
-func (hs *HistoryScanner) ScanPlannedBlobs(seen SeenSet, scanner BlobScanner) error {
+// scanBlobsStreaming executes blob-centric scans in streaming mode.
+func (hs *HistoryScanner) scanBlobsStreaming(seen SeenSet, scanner BlobScanner) error {
 	if scanner == nil {
 		return fmt.Errorf("scanner is nil")
 	}
 
-	jobsByPack, err := hs.PlanScanJobs(seen)
-	if err != nil {
-		return err
+	var dedupe map[Hash]struct{}
+	if seen == nil {
+		dedupe = make(map[Hash]struct{}, 1024)
 	}
 
-	packs := make([]*mmap.ReaderAt, 0, len(jobsByPack))
-	for p := range jobsByPack {
-		packs = append(packs, p)
-	}
-
-	// Deterministic pack order for reproducible scans.
-	sort.Slice(packs, func(i, j int) bool {
-		ai := jobsByPack[packs[i]]
-		aj := jobsByPack[packs[j]]
-		if len(ai) == 0 || len(aj) == 0 {
-			return len(ai) < len(aj)
+	return hs.walkCommitsFromRefs(func(c commitInfo) error {
+		parentTree, err := hs.firstParentTree(c)
+		if err != nil {
+			return err
 		}
-		if ai[0].Offset != aj[0].Offset {
-			return ai[0].Offset < aj[0].Offset
-		}
-		return ai[0].Blob.String() < aj[0].Blob.String()
+		return hs.scanCommitBlobs(c, parentTree, seen, dedupe, scanner)
 	})
-
-	for _, p := range packs {
-		for _, job := range jobsByPack[p] {
-			data, objType, err := hs.store.get(job.Blob)
-			if err != nil {
-				return fmt.Errorf("load blob %s for %s:%s: %w", job.Blob, job.Commit, job.Path, err)
-			}
-			if objType != ObjBlob {
-				// Planner should only schedule blob-like paths; tolerate unexpected
-				// objects to keep scans moving.
-				continue
-			}
-
-			meta := ScanMeta{
-				Blob:   job.Blob,
-				Commit: job.Commit,
-				Path:   job.Path,
-			}
-			if err := scanner.ScanBlob(bytes.NewReader(data), meta); err != nil {
-				return fmt.Errorf("scan blob %s for %s:%s: %w", job.Blob, job.Commit, job.Path, err)
-			}
-			if seen != nil {
-				if err := seen.Put(job.Blob); err != nil {
-					return fmt.Errorf("mark seen %s: %w", job.Blob, err)
-				}
-			}
-		}
-	}
-
-	return nil
 }
 
-// PlanScanJobs builds pack-sorted blob scan jobs with per-run OID dedupe.
-func (hs *HistoryScanner) PlanScanJobs(seen SeenSet) (map[*mmap.ReaderAt][]ScanJob, error) {
-	commits, err := hs.LoadAllCommits()
-	if err != nil {
-		return nil, err
-	}
+func (hs *HistoryScanner) scanCommitBlobs(
+	c commitInfo,
+	parentTree Hash,
+	seen SeenSet,
+	dedupe map[Hash]struct{},
+	scanner BlobScanner,
+) error {
+	return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, oldOID, newOID Hash, mode uint32) error {
+		if !isBlobMode(mode) {
+			return nil
+		}
+		if newOID.IsZero() || newOID == oldOID {
+			return nil
+		}
 
-	treeByCommit := make(map[Hash]Hash, len(commits))
-	for _, c := range commits {
-		treeByCommit[c.OID] = c.TreeOID
-	}
+		if dedupe != nil {
+			if _, ok := dedupe[newOID]; ok {
+				return nil
+			}
+		}
+		if seen != nil {
+			ok, err := seen.Has(newOID)
+			if err != nil {
+				return err
+			}
+			if ok {
+				return nil
+			}
+		}
 
+		data, objType, err := hs.store.getNoCache(newOID)
+		if err != nil {
+			return fmt.Errorf("load blob %s for %s:%s: %w", newOID, c.OID, path, err)
+		}
+		if objType != ObjBlob {
+			// Tree diffs can surface mode changes; only blobs are scannable.
+			return nil
+		}
+
+		meta := ScanMeta{
+			Blob:   newOID,
+			Commit: c.OID,
+			Path:   filepath.ToSlash(path),
+		}
+		if err := scanner.ScanBlob(bytes.NewReader(data), meta); err != nil {
+			return fmt.Errorf("scan blob %s for %s:%s: %w", newOID, c.OID, path, err)
+		}
+
+		if seen != nil {
+			if err := seen.Put(newOID); err != nil {
+				return fmt.Errorf("mark seen %s: %w", newOID, err)
+			}
+		}
+		if dedupe != nil {
+			dedupe[newOID] = struct{}{}
+		}
+		return nil
+	})
+}
+
+// planScanJobs builds pack-sorted blob scan jobs with per-run OID dedupe.
+// It is internal and only used by package tests/benchmarks.
+func (hs *HistoryScanner) planScanJobs(seen SeenSet) (map[*mmap.ReaderAt][]ScanJob, error) {
 	jobsByPack := make(map[*mmap.ReaderAt][]ScanJob, 16)
 	scheduled := make(map[Hash]struct{}, 1024)
 
-	for _, c := range commits {
-		parentTree := Hash{}
-		if len(c.ParentOIDs) > 0 {
-			if t, ok := treeByCommit[c.ParentOIDs[0]]; ok {
-				parentTree = t
-			}
+	err := hs.walkCommitsFromRefs(func(c commitInfo) error {
+		parentTree, err := hs.firstParentTree(c)
+		if err != nil {
+			return err
 		}
-
-		err := walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, oldOID, newOID Hash, mode uint32) error {
+		return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, oldOID, newOID Hash, mode uint32) error {
 			if !isBlobMode(mode) {
 				return nil
 			}
@@ -160,9 +164,9 @@ func (hs *HistoryScanner) PlanScanJobs(seen SeenSet) (map[*mmap.ReaderAt][]ScanJ
 			})
 			return nil
 		})
-		if err != nil {
-			return nil, err
-		}
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	for p, jobs := range jobsByPack {

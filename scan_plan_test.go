@@ -3,6 +3,9 @@ package objstore
 import (
 	"errors"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 
 	"golang.org/x/exp/mmap"
@@ -64,7 +67,7 @@ func TestPlanScanJobs_DedupWithinRun(t *testing.T) {
 	defer scanner.Close()
 
 	seen := &memSeenSet{m: make(map[Hash]struct{})}
-	jobsByPack, err := scanner.PlanScanJobs(seen)
+	jobsByPack, err := scanner.planScanJobs(seen)
 	if err != nil {
 		t.Fatalf("PlanScanJobs: %v", err)
 	}
@@ -98,7 +101,7 @@ func TestPlanScanJobs_RespectsSeenSet(t *testing.T) {
 
 	seen := &memSeenSet{m: make(map[Hash]struct{})}
 
-	first, err := scanner.PlanScanJobs(seen)
+	first, err := scanner.planScanJobs(seen)
 	if err != nil {
 		t.Fatalf("first PlanScanJobs: %v", err)
 	}
@@ -112,7 +115,7 @@ func TestPlanScanJobs_RespectsSeenSet(t *testing.T) {
 		t.Fatalf("put seen: %v", err)
 	}
 
-	second, err := scanner.PlanScanJobs(seen)
+	second, err := scanner.planScanJobs(seen)
 	if err != nil {
 		t.Fatalf("second PlanScanJobs: %v", err)
 	}
@@ -129,7 +132,7 @@ func TestScanPlannedBlobs_ScansAndMarksSeen(t *testing.T) {
 
 	seen := &memSeenSet{m: make(map[Hash]struct{})}
 	first := &recordingBlobScanner{}
-	if err := scanner.ScanPlannedBlobs(seen, first); err != nil {
+	if err := scanner.scanBlobsStreaming(seen, first); err != nil {
 		t.Fatalf("ScanPlannedBlobs first pass: %v", err)
 	}
 	if len(first.metas) == 0 {
@@ -157,7 +160,7 @@ func TestScanPlannedBlobs_ScansAndMarksSeen(t *testing.T) {
 	}
 
 	second := &recordingBlobScanner{}
-	if err := scanner.ScanPlannedBlobs(seen, second); err != nil {
+	if err := scanner.scanBlobsStreaming(seen, second); err != nil {
 		t.Fatalf("ScanPlannedBlobs second pass: %v", err)
 	}
 	if got := len(second.metas); got != 0 {
@@ -169,7 +172,7 @@ func TestScanPlannedBlobs_NilScanner(t *testing.T) {
 	scanner := createScannerForRepo(t, "simple-linear")
 	defer scanner.Close()
 
-	err := scanner.ScanPlannedBlobs(nil, nil)
+	err := scanner.scanBlobsStreaming(nil, nil)
 	if err == nil || err.Error() != "scanner is nil" {
 		t.Fatalf("expected scanner is nil error, got %v", err)
 	}
@@ -180,7 +183,7 @@ func TestScanPlannedBlobs_AllowsNilSeenSet(t *testing.T) {
 	defer scanner.Close()
 
 	rec := &recordingBlobScanner{}
-	if err := scanner.ScanPlannedBlobs(nil, rec); err != nil {
+	if err := scanner.scanBlobsStreaming(nil, rec); err != nil {
 		t.Fatalf("ScanPlannedBlobs with nil seen set: %v", err)
 	}
 	if len(rec.metas) == 0 {
@@ -194,7 +197,7 @@ func TestScanPlannedBlobs_PropagatesScannerError(t *testing.T) {
 
 	want := errors.New("scan failed")
 	seen := &memSeenSet{m: make(map[Hash]struct{})}
-	err := scanner.ScanPlannedBlobs(seen, &recordingBlobScanner{alwaysErr: want})
+	err := scanner.scanBlobsStreaming(seen, &recordingBlobScanner{alwaysErr: want})
 	if !errors.Is(err, want) {
 		t.Fatalf("expected scanner error %v, got %v", want, err)
 	}
@@ -213,7 +216,7 @@ func TestScanPlannedBlobs_SeenSetErrors(t *testing.T) {
 			m:      make(map[Hash]struct{}),
 			hasErr: want,
 		}
-		err := scanner.ScanPlannedBlobs(seen, &recordingBlobScanner{})
+		err := scanner.scanBlobsStreaming(seen, &recordingBlobScanner{})
 		if !errors.Is(err, want) {
 			t.Fatalf("expected seen.Has error %v, got %v", want, err)
 		}
@@ -228,9 +231,86 @@ func TestScanPlannedBlobs_SeenSetErrors(t *testing.T) {
 			m:      make(map[Hash]struct{}),
 			putErr: want,
 		}
-		err := scanner.ScanPlannedBlobs(seen, &recordingBlobScanner{})
+		err := scanner.scanBlobsStreaming(seen, &recordingBlobScanner{})
 		if !errors.Is(err, want) {
 			t.Fatalf("expected seen.Put error %v, got %v", want, err)
 		}
 	})
+}
+
+func TestScanPlannedBlobs_MixedPackedAndLooseCommits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repo := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t",
+			"GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t",
+			"GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v failed: %s", args, string(out))
+		}
+	}
+
+	run("init", "--quiet")
+	write := func(name, content string) {
+		path := filepath.Join(repo, name)
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	write("file.txt", "first\n")
+	run("add", "file.txt")
+	run("commit", "-m", "first", "--quiet")
+	run("repack", "-adq")
+
+	write("file.txt", "first\nsecond\n")
+	run("add", "file.txt")
+	run("commit", "-m", "second", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	if err != nil {
+		t.Fatalf("NewHistoryScanner: %v", err)
+	}
+	defer scanner.Close()
+
+	seen := &memSeenSet{m: make(map[Hash]struct{})}
+	rec := &recordingBlobScanner{}
+	if err := scanner.scanBlobsStreaming(seen, rec); err != nil {
+		t.Fatalf("ScanPlannedBlobs: %v", err)
+	}
+
+	if len(rec.metas) != 2 {
+		t.Fatalf("expected 2 scanned blobs, got %d", len(rec.metas))
+	}
+	if len(seen.m) != 2 {
+		t.Fatalf("expected 2 seen blobs, got %d", len(seen.m))
+	}
+
+	looseFound := false
+	for _, meta := range rec.metas {
+		if meta.Blob.IsZero() {
+			t.Fatalf("scan meta has zero blob OID")
+		}
+		if meta.Commit.IsZero() {
+			t.Fatalf("scan meta has zero commit OID")
+		}
+		if meta.Path == "" {
+			t.Fatalf("scan meta has empty path")
+		}
+		if _, _, ok := scanner.store.findPackedObject(meta.Blob); !ok {
+			looseFound = true
+		}
+	}
+	if !looseFound {
+		t.Fatalf("expected at least one scanned blob to be loose")
+	}
 }

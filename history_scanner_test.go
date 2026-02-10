@@ -22,7 +22,7 @@ func TestLoadAllCommits_EmptyRepository(t *testing.T) {
 	scanner := createScannerForRepo(t, "empty-repo")
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.Empty(t, commits)
 }
@@ -31,7 +31,7 @@ func TestLoadAllCommits_LinearHistory(t *testing.T) {
 	scanner := createScannerForRepo(t, "simple-linear")
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.Len(t, commits, 3)
 
@@ -46,7 +46,7 @@ func TestLoadAllCommits_WithMergeCommits(t *testing.T) {
 	scanner := createScannerForRepo(t, "with-merges")
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.Len(t, commits, 5)
 
@@ -74,7 +74,7 @@ func TestLoadAllCommits_WithCommitGraph(t *testing.T) {
 	scanner := createScannerForRepo(t, "simple-linear") // This repo has commit-graph
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.Len(t, commits, 3)
 }
@@ -85,7 +85,7 @@ func TestNewHistoryScanner_IgnoresDiskCommitGraph(t *testing.T) {
 
 	assert.Nil(t, scanner.graphData, "scanner should defer to in-memory commit graph build")
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	require.NotEmpty(t, commits)
 	require.NotNil(t, scanner.graphData)
@@ -95,7 +95,7 @@ func TestLoadAllCommits_LargeRepo(t *testing.T) {
 	scanner := createScannerForRepo(t, "large-repo")
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 
 	assert.Len(t, commits, 100)
@@ -135,7 +135,7 @@ func TestLoadAllCommits_WithoutCommitGraph(t *testing.T) {
 	scanner := createScannerForRepo(t, "no-commit-graph")
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.NotEmpty(t, commits)
 }
@@ -144,7 +144,7 @@ func TestLoadAllCommits_BuildsGraphWhenMissing(t *testing.T) {
 	scanner := createScannerForRepo(t, "no-commit-graph")
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	require.NotEmpty(t, commits)
 	require.NotNil(t, scanner.graphData)
@@ -283,7 +283,7 @@ func TestLoadAllCommits_MixedPackedAndLooseCommits(t *testing.T) {
 	require.NoError(t, err)
 	defer scanner.Close()
 
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.Len(t, commits, 2)
 }
@@ -319,7 +319,7 @@ func BenchmarkLoadAllCommits(b *testing.B) {
 			defer scanner.Close()
 
 			for b.Loop() {
-				commits, err := scanner.LoadAllCommits()
+				commits, err := scanner.loadAllCommits()
 				require.NoError(b, err)
 				require.Len(b, commits, tt.expected)
 			}
@@ -509,7 +509,7 @@ func TestLoadAllCommits_VeryLargeRepo(t *testing.T) {
 	defer scanner.Close()
 
 	startTime := time.Now()
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	duration := time.Since(startTime)
 
 	require.NoError(t, err)
@@ -540,7 +540,7 @@ func TestLoadAllCommits_SuperLargeRepo(t *testing.T) {
 	defer scanner.Close()
 
 	startTime := time.Now()
-	commits, err := scanner.LoadAllCommits()
+	commits, err := scanner.loadAllCommits()
 	duration := time.Since(startTime)
 
 	require.NoError(t, err)

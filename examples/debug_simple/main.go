@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -75,10 +76,21 @@ func main() {
 
 	fmt.Println("✅ Scanner created successfully!")
 
-	commits, err := scanner.LoadAllCommits()
-	if err != nil {
-		log.Fatalf("Failed to load commits: %v", err)
+	counter := &countingBlobScanner{}
+	if err := scanner.Scan(nil, counter); err != nil {
+		log.Fatalf("Failed to stream scan blobs: %v", err)
 	}
+	fmt.Printf("✅ Successfully streamed %d blobs\n", counter.count)
+}
 
-	fmt.Printf("✅ Successfully loaded %d commits\n", len(commits))
+type countingBlobScanner struct {
+	count int
+}
+
+func (c *countingBlobScanner) ScanBlob(r io.Reader, _ objstore.ScanMeta) error {
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		return err
+	}
+	c.count++
+	return nil
 }

@@ -91,30 +91,6 @@ func main() {
 	case <-done:
 		fmt.Printf("✅ Processed %d hunks\n", hunkCount)
 	}
-
-	fmt.Println("\n--- Additional Scanner Capabilities ---")
-
-	// LoadAllCommits demonstrates loading all commits.
-	commits, err := scanner.LoadAllCommits()
-	if err != nil {
-		log.Printf("Failed to load commits: %v", err)
-	} else {
-		fmt.Printf("📊 Total commits in repository: %d\n", len(commits))
-
-		showCount := min(5, len(commits))
-		fmt.Printf("📝 First %d commits:\n", showCount)
-		for i := range showCount {
-			commit := commits[i]
-			metadata, err := scanner.GetCommitMetadata(commit.OID)
-			if err != nil {
-				log.Printf("Failed to get commit metadata: %v", err)
-				continue
-			}
-
-			fmt.Printf("  %s (tree: %s, parents: %d, time: %d)\n",
-				commit.OID, commit.TreeOID, len(commit.ParentOIDs), metadata.Timestamp)
-		}
-	}
 }
 
 // findGitDir walks up the directory tree to find a .git directory.
