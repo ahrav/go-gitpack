@@ -127,6 +127,25 @@ func TestLoadAllCommits_WithoutCommitGraph(t *testing.T) {
 	assert.NotEmpty(t, commits)
 }
 
+func TestLoadAllCommits_BuildsGraphWhenMissing(t *testing.T) {
+	scanner := createScannerForRepo(t, "no-commit-graph")
+	defer scanner.Close()
+
+	commits, err := scanner.LoadAllCommits()
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+	require.NotNil(t, scanner.graphData)
+	assert.Equal(t, len(commits), len(scanner.graphData.OrderedOIDs))
+	assert.Equal(t, len(commits), len(scanner.graphData.TreeOIDs))
+
+	for i, c := range commits {
+		assert.Equal(t, c.OID, scanner.graphData.OrderedOIDs[i])
+		assert.Equal(t, c.TreeOID, scanner.graphData.TreeOIDs[i])
+		assert.Equal(t, scanner.graphData.Timestamps[i], c.Timestamp)
+		assert.Len(t, scanner.graphData.Parents[c.OID], len(c.ParentOIDs))
+	}
+}
+
 func TestDiffHistoryHunks_WithoutCommitGraph(t *testing.T) {
 	scanner := createScannerForRepo(t, "no-commit-graph")
 	defer scanner.Close()

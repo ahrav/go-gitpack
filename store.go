@@ -128,6 +128,10 @@ type store struct {
 	// When non-nil, it provides unified access across multiple packfiles.
 	midx *midxFile
 
+	// memoryMidx is synthesized from individual *.idx files when no on-disk
+	// multi-pack-index exists.
+	memoryMidx *inMemoryMidx
+
 	// packMap prevents duplicate memory mappings of the same packfile.
 	// Keys are absolute file paths, values are mmap handles.
 	packMap map[string]*mmap.ReaderAt
@@ -253,8 +257,14 @@ func open(dir string) (*store, error) {
 		return nil, fmt.Errorf("failed to create ARC cache: %w", err)
 	}
 
-	// Build idxFile instances, reusing the existing mmap handles.
-	for path, handle := range packCache {
+	// Build idxFile instances in deterministic path order, reusing existing mmap handles.
+	packPaths := make([]string, 0, len(packCache))
+	for path := range packCache {
+		packPaths = append(packPaths, path)
+	}
+	slices.Sort(packPaths)
+	for _, path := range packPaths {
+		handle := packCache[path]
 		idxPath := strings.TrimSuffix(path, ".pack") + ".idx"
 		ix, err := mmap.Open(idxPath)
 		if errors.Is(err, os.ErrNotExist) && midx != nil {
@@ -280,6 +290,10 @@ func open(dir string) (*store, error) {
 				return nil, fmt.Errorf("load ridx: %w", err)
 			}
 		}
+	}
+
+	if store.midx == nil {
+		store.memoryMidx = buildInMemoryMidx(store.packs)
 	}
 
 	return store, nil
@@ -434,6 +448,17 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 			})
 		}
 	}
+	if s.memoryMidx != nil {
+		if p, off, ok := s.memoryMidx.findObject(oid); ok {
+			return s.inflateFromPack(inflationParams{
+				p:             p,
+				off:           off,
+				oid:           oid,
+				ctx:           ctx,
+				maxObjectSize: s.maxDeltaObjectSize,
+			})
+		}
+	}
 
 	for _, pf := range s.packs {
 		offset, found := pf.findObject(oid)
@@ -521,6 +546,11 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 	if s.midx != nil {
 		if p, off, ok := s.midx.findObject(oid); ok {
+			return p, off, true
+		}
+	}
+	if s.memoryMidx != nil {
+		if p, off, ok := s.memoryMidx.findObject(oid); ok {
 			return p, off, true
 		}
 	}
@@ -665,6 +695,14 @@ func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32
 			if entry.crc != 0 {
 				return entry.crc, true
 			}
+		}
+	}
+	if s.memoryMidx != nil {
+		if entry, ok := s.memoryMidx.findEntry(oid); ok &&
+			entry.pack == p &&
+			entry.offset == off &&
+			entry.crc != 0 {
+			return entry.crc, true
 		}
 	}
 

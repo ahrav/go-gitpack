@@ -76,6 +76,19 @@ func newMetaCache(g *commitGraphData, s commitHeaderReader) *metaCache {
 	}
 }
 
+func (c *metaCache) attachGraph(g *commitGraphData) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if g == nil {
+		c.graph = nil
+		c.ts = nil
+		return
+	}
+	c.graph = g
+	c.ts = g.Timestamps
+}
+
 func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 	// Fast read-only path for author info.
 	c.mu.RLock()
@@ -101,9 +114,13 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 
 	// Timestamp from commit-graph is faster if available.
 	var ts int64
-	if c.graph != nil {
-		if idx, ok := c.graph.OIDToIndex[oid]; ok && idx < len(c.ts) {
-			ts = c.ts[idx]
+	c.mu.RLock()
+	graph := c.graph
+	tsSlice := c.ts
+	c.mu.RUnlock()
+	if graph != nil {
+		if idx, ok := graph.OIDToIndex[oid]; ok && idx < len(tsSlice) {
+			ts = tsSlice[idx]
 		}
 	}
 	if ts == 0 {

@@ -83,6 +83,35 @@ type commitGraphData struct {
 	OIDToIndex map[Hash]int
 }
 
+func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
+	n := len(commits)
+	parents := make(Parents, n)
+	ordered := make([]Hash, n)
+	trees := make([]Hash, n)
+	times := make([]int64, n)
+	oidToIdx := make(map[Hash]int, n)
+
+	for i, c := range commits {
+		ordered[i] = c.OID
+		trees[i] = c.TreeOID
+		times[i] = c.Timestamp
+		if len(c.ParentOIDs) > 0 {
+			parents[c.OID] = append([]Hash(nil), c.ParentOIDs...)
+		} else {
+			parents[c.OID] = nil
+		}
+		oidToIdx[c.OID] = i
+	}
+
+	return &commitGraphData{
+		Parents:     parents,
+		OrderedOIDs: ordered,
+		TreeOIDs:    trees,
+		Timestamps:  times,
+		OIDToIndex:  oidToIdx,
+	}
+}
+
 // loadCommitGraph parses the commit-graph files that belong to the Git
 // repository located at objectsDir and returns an in-memory
 // CommitGraphData.

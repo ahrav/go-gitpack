@@ -99,6 +99,43 @@ func TestOpen(t *testing.T) {
 		}
 		assert.Equal(t, 2, totalObjects)
 	})
+
+	t.Run("builds in-memory midx when file is missing", func(t *testing.T) {
+		dir := t.TempDir()
+
+		var target Hash
+		for i := range 2 {
+			packPath := filepath.Join(dir, fmt.Sprintf("pack%d.pack", i))
+			idxPath := filepath.Join(dir, fmt.Sprintf("pack%d.idx", i))
+
+			payload := []byte(fmt.Sprintf("content %d", i))
+			hash := calculateHash(ObjBlob, payload)
+			if i == 1 {
+				target = hash
+			}
+
+			require.NoError(t, createMinimalPack(packPath, payload))
+			require.NoError(t, createV2IndexFile(idxPath, []Hash{hash}, []uint64{12}))
+		}
+
+		store, err := OpenForTesting(dir)
+		require.NoError(t, err)
+		defer store.Close()
+
+		require.Nil(t, store.midx)
+		require.NotNil(t, store.memoryMidx)
+		assert.Equal(t, uint32(2), store.memoryMidx.fanout[255])
+
+		p, off, ok := store.memoryMidx.findObject(target)
+		require.True(t, ok)
+		require.NotNil(t, p)
+		assert.Equal(t, uint64(12), off)
+
+		data, typ, err := store.get(target)
+		require.NoError(t, err)
+		assert.Equal(t, ObjBlob, typ)
+		assert.Equal(t, []byte("content 1"), data)
+	})
 }
 
 func TestParseIdx(t *testing.T) {

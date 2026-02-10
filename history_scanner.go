@@ -420,6 +420,13 @@ func (hs *HistoryScanner) LoadAllCommits() ([]commitInfo, error) {
 			return
 		}
 		hs.commits, hs.commitsErr = hs.loadFromRefs()
+		if hs.commitsErr != nil {
+			return
+		}
+		hs.graphData = buildCommitGraphFromCommits(hs.commits)
+		if hs.meta != nil {
+			hs.meta.attachGraph(hs.graphData)
+		}
 	})
 
 	if hs.commitsErr != nil {
