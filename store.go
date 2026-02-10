@@ -126,6 +126,9 @@ type store struct {
 	// memoryMidx is synthesized from individual *.idx files.
 	memoryMidx *inMemoryMidx
 
+	// objectsDir points to ".git/objects" and is used for loose-object fallback.
+	objectsDir string
+
 	// packMap prevents duplicate memory mappings of the same packfile.
 	// Keys are absolute file paths, values are mmap handles.
 	packMap map[string]*mmap.ReaderAt
@@ -162,8 +165,10 @@ type store struct {
 // The directory should contain matched pairs of *.pack and *.idx files.
 // For bare repositories, pass ".git/objects/pack" as the directory.
 //
-// The function returns an error if no packfiles are found or if any index file is
-// missing or malformed.
+// If no packfiles are found, a valid store is still returned and loose-object
+// fallback remains available.
+//
+// The function returns an error if any discovered index file is missing or malformed.
 // All I/O uses memory mapping for zero-copy access.
 //
 // The returned store is safe for concurrent use without additional
@@ -173,6 +178,7 @@ func open(dir string) (*store, error) {
 	if err != nil {
 		return nil, err
 	}
+	objectsDir := filepath.Dir(absDir)
 
 	packCache := make(map[string]*mmap.ReaderAt)
 
@@ -188,6 +194,7 @@ func open(dir string) (*store, error) {
 			maxDeltaDepth:      defaultMaxDeltaDepth,
 			maxDeltaObjectSize: defaultMaxDeltaObjectSize,
 			packs:              []*idxFile{}, // Use an empty slice instead of nil for consistency.
+			objectsDir:         objectsDir,
 			packMap:            make(map[string]*mmap.ReaderAt),
 			dw:                 newShardedDeltaWindow(64, windowBudget),
 		}
@@ -217,6 +224,7 @@ func open(dir string) (*store, error) {
 	store := &store{
 		maxDeltaDepth:      defaultMaxDeltaDepth,
 		maxDeltaObjectSize: defaultMaxDeltaObjectSize,
+		objectsDir:         objectsDir,
 		packMap:            packCache,
 		dw:                 newShardedDeltaWindow(64, windowBudget),
 	}
@@ -376,7 +384,7 @@ func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
 
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		return nil, ObjBad, objectNotFoundError(oid)
+		return s.readLooseObject(oid)
 	}
 
 	return s.inflateFromPackWithOptions(inflationParams{
@@ -427,8 +435,15 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 			maxObjectSize: s.maxDeltaObjectSize,
 		})
 	}
-
-	return nil, ObjBad, objectNotFoundError(oid)
+	data, typ, err := s.readLooseObject(oid)
+	if err == nil {
+		if len(data) <= maxCacheableSize {
+			s.dw.add(oid, data, typ)
+			s.cache.Add(oid, cachedObj{data: data, typ: typ})
+		}
+		return data, typ, nil
+	}
+	return nil, ObjBad, err
 }
 
 // inflateFromPack reads and materializes an object from a packfile.
@@ -518,7 +533,14 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	// Locate the commit object and skip past its generic object header.
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		return nil, objectNotFoundError(oid)
+		full, typ, err := s.readLooseObject(oid)
+		if err != nil {
+			return nil, err
+		}
+		if typ != ObjCommit {
+			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+		}
+		return trimCommitHeader(full)
 	}
 	typ, hdrLen, err := peekObjectType(p, off)
 	if err != nil {

@@ -3,6 +3,7 @@ package objstore
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -239,6 +240,52 @@ func TestDiffHistoryHunks(t *testing.T) {
 			t.Logf("Found %d hunks with %d total lines", hunkCount, totalLines)
 		})
 	}
+}
+
+func TestLoadAllCommits_MixedPackedAndLooseCommits(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repo := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t",
+			"GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t",
+			"GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "git %v failed: %s", args, string(out))
+	}
+
+	run("init", "--quiet")
+
+	write := func(name, content string) {
+		path := filepath.Join(repo, name)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	}
+
+	write("file.txt", "first\n")
+	run("add", "file.txt")
+	run("commit", "-m", "first", "--quiet")
+
+	// Pack the first commit so later history includes both packed and loose objects.
+	run("repack", "-adq")
+
+	write("file.txt", "first\nsecond\n")
+	run("add", "file.txt")
+	run("commit", "-m", "second", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	commits, err := scanner.LoadAllCommits()
+	require.NoError(t, err)
+	assert.Len(t, commits, 2)
 }
 
 func createScannerForRepo(t testing.TB, repoName string) *HistoryScanner {
