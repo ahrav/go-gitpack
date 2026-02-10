@@ -10,10 +10,30 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
+	"sync"
 
 	"golang.org/x/exp/mmap"
 )
+
+// bytesReaderPool reuses bytes.Reader instances to avoid per-blob allocations.
+var bytesReaderPool = sync.Pool{
+	New: func() any { return new(bytes.Reader) },
+}
+
+// getBytesReader returns a pooled bytes.Reader reset to the given data.
+func getBytesReader(data []byte) *bytes.Reader {
+	r := bytesReaderPool.Get().(*bytes.Reader)
+	r.Reset(data)
+	return r
+}
+
+// putBytesReader returns a bytes.Reader to the pool.
+func putBytesReader(r *bytes.Reader) {
+	r.Reset(nil) // release reference to data
+	bytesReaderPool.Put(r)
+}
 
 // SeenSet tracks globally scanned blobs.
 type SeenSet interface {
@@ -51,6 +71,9 @@ const (
 	scanFastPathMaxBlobs  = 2_000_000
 	scanPackFlushRecords  = 4096
 	scanPackFlushBytes    = 8 << 20
+	scanPackDecodeMinRecs = 32
+	scanPackDecodeWorkers = 24
+	scanPackDecodeBatchN  = 2
 
 	blobRecordHeaderBytes   = 20 + 20 + 4
 	packedRecordHeaderBytes = 8 + blobRecordHeaderBytes
@@ -224,6 +247,151 @@ func readPackedBlobRecord(r io.Reader) (packedBlobRecord, error) {
 
 func packedRecordApproxBytes(rec packedBlobRecord) int {
 	return packedRecordHeaderBytes + len(rec.Path)
+}
+
+type packedDecodeResult struct {
+	data []byte
+	typ  ObjectType
+	err  error
+}
+
+func scanPackDecodeWorkerCount(recordCount int) int {
+	if recordCount < scanPackDecodeMinRecs {
+		return 1
+	}
+	workers := runtime.GOMAXPROCS(0)
+	if workers < 1 {
+		workers = 1
+	}
+	if workers > scanPackDecodeWorkers {
+		workers = scanPackDecodeWorkers
+	}
+	if workers > recordCount {
+		workers = recordCount
+	}
+	if workers < 2 {
+		return 1
+	}
+	return workers
+}
+
+func scanPackDecodeBatchSize(workers int) int {
+	if workers <= 1 {
+		return 1
+	}
+	batch := workers * scanPackDecodeBatchN
+	if batch < scanPackDecodeMinRecs {
+		return scanPackDecodeMinRecs
+	}
+	return batch
+}
+
+func decodePackedBatchParallel(
+	store *store,
+	packID int,
+	pack *mmap.ReaderAt,
+	recs []packedBlobRecord,
+	workers int,
+) []packedDecodeResult {
+	results := make([]packedDecodeResult, len(recs))
+	if len(recs) == 0 {
+		return results
+	}
+	if workers <= 1 {
+		for i := range recs {
+			rec := recs[i]
+			data, typ, err := store.getPackedObjectNoCache(pack, rec.Offset, rec.Blob)
+			if err != nil {
+				err = fmt.Errorf("scan pack %d offset %d blob %s: %w", packID, rec.Offset, rec.Blob, err)
+			}
+			results[i] = packedDecodeResult{
+				data: data,
+				typ:  typ,
+				err:  err,
+			}
+		}
+		return results
+	}
+
+	if workers > len(recs) {
+		workers = len(recs)
+	}
+
+	jobs := make(chan int, len(recs))
+	for i := range recs {
+		jobs <- i
+	}
+	close(jobs)
+
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			for idx := range jobs {
+				rec := recs[idx]
+				data, typ, err := store.getPackedObjectNoCache(pack, rec.Offset, rec.Blob)
+				if err != nil {
+					err = fmt.Errorf("scan pack %d offset %d blob %s: %w", packID, rec.Offset, rec.Blob, err)
+				}
+				results[idx] = packedDecodeResult{
+					data: data,
+					typ:  typ,
+					err:  err,
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	return results
+}
+
+func scanPackedRecordsOrdered(
+	store *store,
+	packID int,
+	pack *mmap.ReaderAt,
+	recs []packedBlobRecord,
+	emit func(rec packedBlobRecord, data []byte, typ ObjectType) error,
+) error {
+	if len(recs) == 0 {
+		return nil
+	}
+	if emit == nil {
+		return fmt.Errorf("packed emit callback is nil")
+	}
+
+	workers := scanPackDecodeWorkerCount(len(recs))
+	if workers <= 1 {
+		results := decodePackedBatchParallel(store, packID, pack, recs, 1)
+		for i := range recs {
+			if results[i].err != nil {
+				return results[i].err
+			}
+			if err := emit(recs[i], results[i].data, results[i].typ); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	batchSize := scanPackDecodeBatchSize(workers)
+	for start := 0; start < len(recs); start += batchSize {
+		end := start + batchSize
+		if end > len(recs) {
+			end = len(recs)
+		}
+		batch := recs[start:end]
+		results := decodePackedBatchParallel(store, packID, pack, batch, workers)
+		for i := range batch {
+			if results[i].err != nil {
+				return results[i].err
+			}
+			if err := emit(batch[i], results[i].data, results[i].typ); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type scanPlanner struct {
@@ -682,27 +850,46 @@ func (p *scanPlanner) scanSortedPackChunks(
 	}
 	heap.Init(&h)
 
-	for h.Len() > 0 {
-		item := heap.Pop(&h).(packedMergeItem)
-		rec := item.record
-
-		data, typ, err := p.store.getPackedObjectNoCache(pack, rec.Offset, rec.Blob)
-		if err != nil {
-			return fmt.Errorf("scan pack %d offset %d blob %s: %w", packID, rec.Offset, rec.Blob, err)
+	batchSize := scanPackDecodeBatchSize(scanPackDecodeWorkerCount(scanPackFlushRecords))
+	if batchSize < scanPackFlushRecords {
+		batchSize = scanPackFlushRecords
+	}
+	batch := make([]packedBlobRecord, 0, batchSize)
+	flushBatch := func() error {
+		if len(batch) == 0 {
+			return nil
 		}
-		if typ == ObjBlob {
+		err := scanPackedRecordsOrdered(p.store, packID, pack, batch, func(rec packedBlobRecord, data []byte, typ ObjectType) error {
+			if typ != ObjBlob {
+				return nil
+			}
 			meta := ScanMeta{
 				Blob:   rec.Blob,
 				Commit: rec.Commit,
 				Path:   rec.Path,
 			}
-			if err := scanner.ScanBlob(bytes.NewReader(data), meta); err != nil {
+			if err := func() error { r := getBytesReader(data); err := scanner.ScanBlob(r, meta); putBytesReader(r); return err }(); err != nil {
 				return fmt.Errorf("scan blob %s for %s:%s: %w", rec.Blob, rec.Commit, rec.Path, err)
 			}
 			if p.seen != nil {
 				if err := p.seen.Put(rec.Blob); err != nil {
 					return fmt.Errorf("mark seen %s: %w", rec.Blob, err)
 				}
+			}
+			return nil
+		})
+		batch = batch[:0]
+		return err
+	}
+
+	for h.Len() > 0 {
+		item := heap.Pop(&h).(packedMergeItem)
+		rec := item.record
+
+		batch = append(batch, rec)
+		if len(batch) >= batchSize {
+			if err := flushBatch(); err != nil {
+				return err
 			}
 		}
 
@@ -714,6 +901,10 @@ func (p *scanPlanner) scanSortedPackChunks(
 			return err
 		}
 		heap.Push(&h, packedMergeItem{record: next, chunkIdx: item.chunkIdx})
+	}
+
+	if err := flushBatch(); err != nil {
+		return err
 	}
 
 	return nil
@@ -749,7 +940,7 @@ func (p *scanPlanner) executeLooseFile(path string, scanner BlobScanner) error {
 			Commit: rec.Commit,
 			Path:   rec.Path,
 		}
-		if err := scanner.ScanBlob(bytes.NewReader(data), meta); err != nil {
+		if err := func() error { r := getBytesReader(data); err := scanner.ScanBlob(r, meta); putBytesReader(r); return err }(); err != nil {
 			return fmt.Errorf("scan loose blob %s for %s:%s: %w", rec.Blob, rec.Commit, rec.Path, err)
 		}
 		if p.seen != nil {
@@ -864,10 +1055,29 @@ func (e *streamingPackExecutor) flushPack(packID int) error {
 		return a.Path < b.Path
 	})
 
-	for i := range recs {
-		if err := e.scanPacked(packID, pf.pack, recs[i]); err != nil {
-			return err
+	if err := scanPackedRecordsOrdered(e.hs.store, packID, pf.pack, recs, func(rec packedBlobRecord, data []byte, typ ObjectType) error {
+		if typ != ObjBlob {
+			return nil
 		}
+		meta := ScanMeta{
+			Blob:   rec.Blob,
+			Commit: rec.Commit,
+			Path:   rec.Path,
+		}
+		r := getBytesReader(data)
+		if err := e.scanner.ScanBlob(r, meta); err != nil {
+			putBytesReader(r)
+			return fmt.Errorf("scan blob %s for %s:%s: %w", rec.Blob, rec.Commit, rec.Path, err)
+		}
+		putBytesReader(r)
+		if e.seen != nil {
+			if err := e.seen.Put(rec.Blob); err != nil {
+				return fmt.Errorf("mark seen %s: %w", rec.Blob, err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 
 	e.packBuffers[packID] = recs[:0]
@@ -914,9 +1124,12 @@ func (e *streamingPackExecutor) scanLoose(rec blobRecord) error {
 		Commit: rec.Commit,
 		Path:   rec.Path,
 	}
-	if err := e.scanner.ScanBlob(bytes.NewReader(data), meta); err != nil {
+	r := getBytesReader(data)
+	if err := e.scanner.ScanBlob(r, meta); err != nil {
+		putBytesReader(r)
 		return fmt.Errorf("scan loose blob %s for %s:%s: %w", rec.Blob, rec.Commit, rec.Path, err)
 	}
+	putBytesReader(r)
 	if e.seen != nil {
 		if err := e.seen.Put(rec.Blob); err != nil {
 			return fmt.Errorf("mark seen %s: %w", rec.Blob, err)
@@ -1056,22 +1269,16 @@ func (hs *HistoryScanner) executeInMemoryScanPlan(plan *inMemoryScanPlan, seen S
 		})
 		plan.packedByID[packID] = recs
 
-		for i := range recs {
-			rec := recs[i]
-			data, typ, err := hs.store.getPackedObjectNoCache(pf.pack, rec.Offset, rec.Blob)
-			if err != nil {
-				return fmt.Errorf("scan pack %d offset %d blob %s: %w", packID, rec.Offset, rec.Blob, err)
-			}
+		if err := scanPackedRecordsOrdered(hs.store, packID, pf.pack, recs, func(rec packedBlobRecord, data []byte, typ ObjectType) error {
 			if typ != ObjBlob {
-				continue
+				return nil
 			}
-
 			meta := ScanMeta{
 				Blob:   rec.Blob,
 				Commit: rec.Commit,
 				Path:   rec.Path,
 			}
-			if err := scanner.ScanBlob(bytes.NewReader(data), meta); err != nil {
+			if err := func() error { r := getBytesReader(data); err := scanner.ScanBlob(r, meta); putBytesReader(r); return err }(); err != nil {
 				return fmt.Errorf("scan blob %s for %s:%s: %w", rec.Blob, rec.Commit, rec.Path, err)
 			}
 			if seen != nil {
@@ -1079,6 +1286,9 @@ func (hs *HistoryScanner) executeInMemoryScanPlan(plan *inMemoryScanPlan, seen S
 					return fmt.Errorf("mark seen %s: %w", rec.Blob, err)
 				}
 			}
+			return nil
+		}); err != nil {
+			return err
 		}
 	}
 
@@ -1097,7 +1307,7 @@ func (hs *HistoryScanner) executeInMemoryScanPlan(plan *inMemoryScanPlan, seen S
 			Commit: rec.Commit,
 			Path:   rec.Path,
 		}
-		if err := scanner.ScanBlob(bytes.NewReader(data), meta); err != nil {
+		if err := func() error { r := getBytesReader(data); err := scanner.ScanBlob(r, meta); putBytesReader(r); return err }(); err != nil {
 			return fmt.Errorf("scan loose blob %s for %s:%s: %w", rec.Blob, rec.Commit, rec.Path, err)
 		}
 		if seen != nil {

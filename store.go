@@ -358,6 +358,10 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// that are likely to be bases for upcoming delta resolutions.
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
+		// Promote to ARC cache on second access (delta window hit).
+		if len(d) <= maxCacheableSize {
+			s.cache.Add(oid, cachedObj{data: d, typ: t})
+		}
 		b.Release()
 		return d, t, nil
 	}
@@ -368,8 +372,11 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	}
 
 	// On a cache miss, inflate the object from a packfile, tracking delta depth
-	// to prevent cycles and excessive recursion.
-	return s.getWithContext(oid, newDeltaContext(s.maxDeltaDepth))
+	// to prevent cycles and excessive recursion. Skip cache checks since we
+	// already verified both caches above.
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
+	return s.getWithContextSkipCache(oid, ctx)
 }
 
 // getMaterialized retrieves the fully materialized object, including commit bodies.
@@ -389,11 +396,13 @@ func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
 		return s.readLooseObject(oid)
 	}
 
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
 	return s.inflateFromPackWithOptions(inflationParams{
 		p:             p,
 		off:           off,
 		oid:           oid,
-		ctx:           newDeltaContext(s.maxDeltaDepth),
+		ctx:           ctx,
 		maxObjectSize: s.maxDeltaObjectSize,
 	}, false, true)
 }
@@ -404,11 +413,13 @@ func (s *store) getNoCache(oid Hash) ([]byte, ObjectType, error) {
 	if !ok {
 		return s.readLooseObject(oid)
 	}
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
 	return s.inflateFromPackWithOptions(inflationParams{
 		p:             p,
 		off:           off,
 		oid:           oid,
-		ctx:           newDeltaContext(s.maxDeltaDepth),
+		ctx:           ctx,
 		maxObjectSize: s.maxDeltaObjectSize,
 	}, true, false)
 }
@@ -419,11 +430,13 @@ func (s *store) getPackedObjectNoCache(p *mmap.ReaderAt, off uint64, oid Hash) (
 	if p == nil {
 		return nil, ObjBad, fmt.Errorf("pack handle is nil")
 	}
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
 	return s.inflateFromPackWithOptions(inflationParams{
 		p:             p,
 		off:           off,
 		oid:           oid,
-		ctx:           newDeltaContext(s.maxDeltaDepth),
+		ctx:           ctx,
 		maxObjectSize: s.maxDeltaObjectSize,
 	}, false, false)
 }
@@ -442,6 +455,46 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		return b.data, b.typ, nil
 	}
 
+	if s.memoryMidx != nil {
+		if p, off, ok := s.memoryMidx.findObject(oid); ok {
+			return s.inflateFromPack(inflationParams{
+				p:             p,
+				off:           off,
+				oid:           oid,
+				ctx:           ctx,
+				maxObjectSize: s.maxDeltaObjectSize,
+			})
+		}
+	}
+
+	for _, pf := range s.packs {
+		offset, found := pf.findObject(oid)
+		if !found {
+			continue
+		}
+		return s.inflateFromPack(inflationParams{
+			p:             pf.pack,
+			off:           offset,
+			oid:           oid,
+			ctx:           ctx,
+			maxObjectSize: s.maxDeltaObjectSize,
+		})
+	}
+	data, typ, err := s.readLooseObject(oid)
+	if err == nil {
+		if len(data) <= maxCacheableSize {
+			s.dw.add(oid, data, typ)
+			s.cache.Add(oid, cachedObj{data: data, typ: typ})
+		}
+		return data, typ, nil
+	}
+	return nil, ObjBad, err
+}
+
+// getWithContextSkipCache is like getWithContext but skips the delta-window and
+// ARC cache checks. Used by callers that have already verified both caches are
+// misses, eliminating two redundant lookups per miss.
+func (s *store) getWithContextSkipCache(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	if s.memoryMidx != nil {
 		if p, off, ok := s.memoryMidx.findObject(oid); ok {
 			return s.inflateFromPack(inflationParams{
@@ -504,14 +557,23 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 
 	// For delta objects, resolve the entire chain iteratively.
 	if objType == ObjOfsDelta || objType == ObjRefDelta {
-		full, baseType, err := inflateDeltaChainStreaming(s, params)
+		var full []byte
+		var baseType ObjectType
+		var err error
+		if cacheResult {
+			full, baseType, err = inflateDeltaChainStreaming(s, params)
+		} else {
+			// Borrowed path: skip final copy for consume-and-discard callers.
+			full, baseType, err = inflateDeltaChainBorrowed(s, params)
+		}
 		if err != nil {
 			return nil, ObjBad, err
 		}
-		// Add the fully resolved object to both the delta window and the ARC cache.
+		// Write only to the delta window on first inflation. Objects are
+		// promoted to the ARC cache on second access (via get()'s cache-hit
+		// path), reducing lock contention on the ARC during bulk inflation.
 		if cacheResult && len(full) <= maxCacheableSize {
 			s.dw.add(params.oid, full, baseType)
-			s.cache.Add(params.oid, cachedObj{data: full, typ: baseType})
 		}
 		return full, baseType, nil
 	}
@@ -533,7 +595,6 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 
 	if cacheResult && len(data) <= maxCacheableSize {
 		s.dw.add(params.oid, data, objType)
-		s.cache.Add(params.oid, cachedObj{data: data, typ: objType})
 	}
 	return data, objType, nil
 }

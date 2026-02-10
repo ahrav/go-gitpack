@@ -81,19 +81,19 @@ func testReferenceCounting(t *testing.T) {
 		oid := makeHash("ref-counting")
 		w.add(oid, []byte("data"), ObjBlob)
 
-		assert.Equal(t, 1, w.evictable, "evictable should be 1 after add")
+		assert.Equal(t, 1, int(w.evictable.Load()), "evictable should be 1 after add")
 
 		h1, _ := w.acquire(oid)
-		assert.Equal(t, 0, w.evictable, "evictable should be 0 after first acquire")
+		assert.Equal(t, 0, int(w.evictable.Load()), "evictable should be 0 after first acquire")
 
 		h2, _ := w.acquire(oid)
-		assert.Equal(t, 0, w.evictable, "evictable should be 0 after second acquire")
+		assert.Equal(t, 0, int(w.evictable.Load()), "evictable should be 0 after second acquire")
 
 		h1.Release()
-		assert.Equal(t, 0, w.evictable, "evictable should be 0 when one handle is still outstanding")
+		assert.Equal(t, 0, int(w.evictable.Load()), "evictable should be 0 when one handle is still outstanding")
 
 		h2.Release()
-		assert.Equal(t, 1, w.evictable, "evictable should be 1 after all handles are released")
+		assert.Equal(t, 1, int(w.evictable.Load()), "evictable should be 1 after all handles are released")
 	})
 
 	t.Run("Double Release is Idempotent", func(t *testing.T) {
@@ -103,10 +103,10 @@ func testReferenceCounting(t *testing.T) {
 		h, _ := w.acquire(oid)
 
 		h.Release()
-		assert.Equal(t, 1, w.evictable, "evictable count should be 1 after first release")
+		assert.Equal(t, 1, int(w.evictable.Load()), "evictable count should be 1 after first release")
 
 		h.Release()
-		assert.Equal(t, 1, w.evictable, "evictable count should remain 1 after second release")
+		assert.Equal(t, 1, int(w.evictable.Load()), "evictable count should remain 1 after second release")
 	})
 }
 
@@ -230,15 +230,15 @@ func testErrorsAndEdgeCases(t *testing.T) {
 
 		err := w.add(makeHash("A"), make([]byte, 80), ObjBlob)
 		require.NoError(t, err, "should be able to add A")
-		t.Logf("After adding A: used=%d, evictable=%d", w.used, w.evictable)
+		t.Logf("After adding A: used=%d, evictable=%d", w.used, int(w.evictable.Load()))
 
 		h, _ := w.acquire(makeHash("A")) // Pin the entry.
-		t.Logf("After acquiring A: used=%d, evictable=%d", w.used, w.evictable)
+		t.Logf("After acquiring A: used=%d, evictable=%d", w.used, int(w.evictable.Load()))
 		defer h.Release()
 
 		// This should exceed budget and fail.
 		err = w.add(makeHash("B"), make([]byte, 80), ObjBlob)
-		t.Logf("After attempting to add B: used=%d, evictable=%d, err=%v", w.used, w.evictable, err)
+		t.Logf("After attempting to add B: used=%d, evictable=%d, err=%v", w.used, int(w.evictable.Load()), err)
 		assert.ErrorIs(t, err, ErrWindowFull, "should get ErrWindowFull")
 	})
 
@@ -332,8 +332,7 @@ func testConcurrency(t *testing.T) {
 		// Final check: ensure all reference counts are zero after the test.
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		for _, elem := range w.index {
-			entry := elem.Value.(*refCountedEntry)
+		for _, entry := range w.index {
 			cnt := entry.refCnt.Load()
 			assert.Equal(t, int32(0), cnt, "no leaked reference counts should remain")
 		}

@@ -469,8 +469,8 @@ func (hs *HistoryScanner) loadFromGraph() []commitInfo {
 		out[i] = commitInfo{
 			OID:        oid,
 			TreeOID:    hs.graphData.TreeOIDs[i],
-			ParentOIDs: hs.graphData.Parents[oid],
-			Timestamp:  hs.graphData.Timestamps[i], // if available
+			ParentOIDs: hs.graphData.parentsOf(i),
+			Timestamp:  hs.graphData.Timestamps[i],
 		}
 	}
 	return orderCommitsParentFirst(out)

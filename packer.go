@@ -39,38 +39,54 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 
 	pos := int64(off) + int64(hdrLen) // Position of the first byte after the generic header.
 
-	// For delta objects, read and store the prefix, which contains the base reference.
-	var prefix []byte
+	// For delta objects, determine the prefix length and read it.
+	var prefixLen int
 	switch objType {
 	case ObjRefDelta:
-		prefix = make([]byte, 20)
-		if _, err := r.ReadAt(prefix, pos); err != nil {
-			return ObjBad, nil, err
-		}
-		pos += 20
-
+		prefixLen = 20
 	case ObjOfsDelta:
-		// The offset is a variable-length negative value.
-		for {
-			var b [1]byte
-			if _, err := r.ReadAt(b[:], pos+int64(len(prefix))); err != nil {
-				return ObjBad, nil, err
-			}
-			prefix = append(prefix, b[0])
-			if b[0]&0x80 == 0 { // The MSB is clear, indicating the last byte of the offset.
-				pos += int64(len(prefix))
+		// Read up to 13 bytes to find the end of the variable-length offset.
+		var pfxBuf [13]byte
+		pn, _ := r.ReadAt(pfxBuf[:], pos)
+		for i := 0; i < pn; i++ {
+			if pfxBuf[i]&0x80 == 0 {
+				prefixLen = i + 1
 				break
 			}
-			if len(prefix) > 12 { // A sanity check to prevent parsing excessively long offsets.
+		}
+		if prefixLen == 0 {
+			if pn > 12 {
 				return ObjBad, nil, ErrOfsDeltaBaseRefTooLong
 			}
+			return ObjBad, nil, ErrOfsDeltaBaseRefTooLong
 		}
 	}
 
-	// Inflate the zlib-compressed data stream that follows the header and prefix.
-	//
-	// The compressed length is unknown, so provide SectionReader
-	// with a virtually infinite length; it will stop at EOF.
+	if prefixLen > 0 {
+		// Allocate a single buffer for prefix + inflated data to avoid concatenation.
+		combined := make([]byte, prefixLen+int(size))
+
+		// Read prefix directly into the buffer.
+		if _, err := r.ReadAt(combined[:prefixLen], pos); err != nil {
+			return ObjBad, nil, err
+		}
+		pos += int64(prefixLen)
+
+		// Inflate the zlib-compressed delta instructions into the remainder.
+		src := io.NewSectionReader(r, pos, 1<<63-1)
+		zr, err := getZlibReader(src)
+		if err != nil {
+			return ObjBad, nil, err
+		}
+		defer putZlibReader(zr)
+
+		if _, err := io.ReadFull(zr, combined[prefixLen:]); err != nil {
+			return ObjBad, nil, err
+		}
+		return objType, combined, nil
+	}
+
+	// Regular (non-delta) object: inflate directly.
 	src := io.NewSectionReader(r, pos, 1<<63-1)
 	zr, err := getZlibReader(src)
 	if err != nil {
@@ -81,12 +97,6 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	out := make([]byte, size)
 	if _, err := io.ReadFull(zr, out); err != nil {
 		return ObjBad, nil, err
-	}
-
-	// For deltas, return the concatenated prefix and inflated data;
-	// otherwise, return just the inflated data.
-	if len(prefix) != 0 {
-		return objType, append(prefix, out...), nil
 	}
 	return objType, out, nil
 }

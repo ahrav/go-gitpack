@@ -42,6 +42,10 @@ type deltaInfo struct {
 
 	// typ indicates whether this is an ofs-delta or ref-delta object.
 	typ ObjectType
+
+	// hdrLen caches the parsed object header length so downstream consumers
+	// (applyDeltaStreaming) can skip re-parsing the header.
+	hdrLen int
 }
 
 // deltaStack is a stack of deltaInfo objects, used to iteratively
@@ -76,15 +80,43 @@ type deltaContext struct {
 	maxDepth int
 }
 
+// deltaContextPool reuses deltaContext values across lookups.
+// Maps are cleared (Go 1.21+) rather than reallocated, preserving their
+// backing storage for subsequent resolutions.
+var deltaContextPool = sync.Pool{
+	New: func() any {
+		return &deltaContext{
+			visited: make(map[Hash]bool),
+			offsets: make(map[uint64]bool),
+		}
+	},
+}
+
+// getDeltaContext retrieves a pooled deltaContext configured with maxDepth.
+func getDeltaContext(maxDepth int) *deltaContext {
+	ctx := deltaContextPool.Get().(*deltaContext)
+	ctx.maxDepth = maxDepth
+	return ctx
+}
+
+// putDeltaContext returns ctx to the pool after clearing its per-lookup state.
+func putDeltaContext(ctx *deltaContext) {
+	ctx.reset()
+	deltaContextPool.Put(ctx)
+}
+
+// reset clears per-lookup state so the context can be reused from a pool.
+func (ctx *deltaContext) reset() {
+	clear(ctx.visited)
+	clear(ctx.offsets)
+	ctx.depth = 0
+	ctx.maxDepth = 0
+}
+
 // newDeltaContext allocates and initializes a deltaContext that enforces the
 // supplied maximum delta‑chain depth.
 func newDeltaContext(maxDepth int) *deltaContext {
-	return &deltaContext{
-		visited:  make(map[Hash]bool),
-		offsets:  make(map[uint64]bool),
-		depth:    0,
-		maxDepth: maxDepth,
-	}
+	return getDeltaContext(maxDepth)
 }
 
 // checkRefDelta validates that following a ref‑delta will neither exceed the
@@ -230,12 +262,25 @@ type inflationParams struct {
 // resolution is complete.  applyDeltaStack treats the slice as read-only and
 // does not retain it after the call returns.
 func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, ObjectType, error) {
-	var stack deltaStack // will be mutated in-place
+	stack := make(deltaStack, 0, 16) // pre-size for typical chain depths
 	base, baseType, err := walkUpDeltaChain(s, params, &stack)
 	if err != nil {
 		return nil, ObjBad, err
 	}
-	return applyDeltaStack(stack, base, baseType, params.maxObjectSize)
+	return applyDeltaStack(stack, base, baseType, params.maxObjectSize, false)
+}
+
+// inflateDeltaChainBorrowed is like inflateDeltaChainStreaming but skips the
+// final copy from the arena. The returned data is only valid until the next
+// delta resolution on the same goroutine. Callers must finish consuming the
+// data before calling any other delta-resolution functions.
+func inflateDeltaChainBorrowed(s *store, params inflationParams) ([]byte, ObjectType, error) {
+	stack := make(deltaStack, 0, 16)
+	base, baseType, err := walkUpDeltaChain(s, params, &stack)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+	return applyDeltaStack(stack, base, baseType, params.maxObjectSize, true)
 }
 
 // walkUpDeltaChain climbs the delta chain starting at (pack, off) until a
@@ -264,7 +309,7 @@ func walkUpDeltaChain(
 
 	currPack, currOff := params.p, params.off
 	for depth := 0; depth < params.ctx.maxDepth; depth++ {
-		typ, _, err := peekObjectType(currPack, currOff)
+		typ, hdrLen, err := peekObjectType(currPack, currOff)
 		if err != nil {
 			return nil, ObjBad, err
 		}
@@ -277,12 +322,12 @@ func walkUpDeltaChain(
 			return baseData, typ, nil
 		}
 
-		*stack = append(*stack, deltaInfo{currPack, currOff, typ})
+		*stack = append(*stack, deltaInfo{currPack, currOff, typ, hdrLen})
 
 		if typ == ObjRefDelta {
 			var baseOID Hash
-			_, _, baseOID, err = readRefDeltaHeader(currPack, currOff)
-			if err != nil {
+			pos := int64(currOff) + int64(hdrLen)
+			if _, err := currPack.ReadAt(baseOID[:], pos); err != nil {
 				return nil, ObjBad, err
 			}
 			if err = params.ctx.checkRefDelta(baseOID); err != nil { // Cycle detection check.
@@ -298,12 +343,9 @@ func walkUpDeltaChain(
 			continue
 		}
 
-		// ofs-delta.
-		var back uint64
-		_, _, back, err = readOfsDeltaHeader(currPack, currOff)
-		if err != nil {
-			return nil, ObjBad, err
-		}
+		// ofs-delta: read the variable-length backward offset directly.
+		pos := int64(currOff) + int64(hdrLen)
+		back := readOfsDeltaOffset(currPack, pos)
 		currOff -= back
 	}
 
@@ -319,8 +361,12 @@ func applyDeltaStack(
 	baseData []byte,
 	baseType ObjectType,
 	maxObjectSize uint64,
+	borrowed bool, // when true, skip the final copy (caller must consume before next resolution)
 ) ([]byte, ObjectType, error) {
 	if len(stack) == 0 {
+		if borrowed {
+			return baseData, baseType, nil
+		}
 		// Fast-path: no deltas at all.
 		result := make([]byte, len(baseData))
 		copy(result, baseData)
@@ -365,7 +411,7 @@ func applyDeltaStack(
 				out = bufA[:0]
 			}
 
-			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out)
+			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, current, out)
 			if err != nil {
 				var tooSmall *errDeltaOutputTooSmall
 				if errors.As(err, &tooSmall) {
@@ -398,58 +444,35 @@ func applyDeltaStack(
 		}
 	}
 
-	// Copy final result.
-	in := current
+	if borrowed {
+		// Return arena-backed data directly. The caller must consume the data
+		// before any subsequent delta resolution on this goroutine.
+		return current, baseType, nil
+	}
 
-	final := make([]byte, len(in))
-	copy(final, in)
+	// Copy final result out of the arena so the arena can be recycled.
+	final := make([]byte, len(current))
+	copy(final, current)
 	return final, baseType, nil
-}
-
-// readRefDeltaHeader reads the header of a ref-delta object.
-// The method returns the object type, header length, and base object hash.
-func readRefDeltaHeader(p *mmap.ReaderAt, off uint64) (ObjectType, int, Hash, error) {
-	typ, hdrLen, err := peekObjectType(p, off)
-	if err != nil {
-		return ObjBad, 0, Hash{}, err
-	}
-
-	var baseOid Hash
-	pos := int64(off) + int64(hdrLen)
-	if _, err := p.ReadAt(baseOid[:], pos); err != nil {
-		return ObjBad, 0, Hash{}, err
-	}
-	return typ, hdrLen, baseOid, nil
-}
-
-// readOfsDeltaHeader reads the header of an ofs-delta object.
-// The method returns the object type, header length, and negative offset to base.
-func readOfsDeltaHeader(p *mmap.ReaderAt, off uint64) (ObjectType, int, uint64, error) {
-	typ, hdrLen, err := peekObjectType(p, off)
-	if err != nil {
-		return ObjBad, 0, 0, err
-	}
-
-	pos := int64(off) + int64(hdrLen)
-	offsetValue := readOfsDeltaOffset(p, pos)
-
-	return typ, hdrLen, offsetValue, nil
 }
 
 // readOfsDeltaOffset reads a variable-length offset from an ofs-delta object.
 // The offset encoding uses the MSB as a continuation bit.
+// Up to 9 bytes are read in a single ReadAt to avoid per-byte kernel crossings.
 func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) uint64 {
-	var offset uint64
-	var b [1]byte
+	var buf [9]byte
+	n, _ := pack.ReadAt(buf[:], pos)
+	if n == 0 {
+		return 0
+	}
 
-	// Read the variable-length negative offset from the pack data.
-	pack.ReadAt(b[:], pos)
-	offset = uint64(b[0] & 0x7f)
-	for b[0]&0x80 != 0 {
-		pos++
+	offset := uint64(buf[0] & 0x7f)
+	for i := 1; i < n; i++ {
+		if buf[i-1]&0x80 == 0 {
+			return offset
+		}
 		offset++
-		pack.ReadAt(b[:], pos)
-		offset = (offset << 7) | uint64(b[0]&0x7f)
+		offset = (offset << 7) | uint64(buf[i]&0x7f)
 	}
 
 	return offset
@@ -466,13 +489,17 @@ func applyDeltaStreaming(
 	pack *mmap.ReaderAt,
 	offset uint64,
 	deltaType ObjectType,
+	cachedHdrLen int, // pre-parsed header length from walkUpDeltaChain; 0 means re-parse
 	base []byte,
 	out []byte, // Pre-allocated output buffer
 ) ([]byte, error) {
-	// Skip the object header to get to the delta instructions.
-	_, hdrLen, err := peekObjectType(pack, offset)
-	if err != nil {
-		return nil, err
+	hdrLen := cachedHdrLen
+	if hdrLen <= 0 {
+		var err error
+		_, hdrLen, err = peekObjectType(pack, offset)
+		if err != nil {
+			return nil, err
+		}
 	}
 	pos := int64(offset) + int64(hdrLen)
 
@@ -579,55 +606,47 @@ func applyDeltaStreaming(
 // If size is encoded as zero the function substitutes 0x10000, mirroring Git's
 // behavior.
 func decodeCopyCommand(cmd byte, br *bufio.Reader) (offset, size int, err error) {
-	if cmd&0x01 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset = int(b)
-	}
-	if cmd&0x02 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 8
-	}
-	if cmd&0x04 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 16
-	}
-	if cmd&0x08 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 24
+	// Count the operand bytes indicated by the lower 7 bits of cmd.
+	bits := cmd & 0x7f
+	count := popcount7(bits)
+	if count == 0 {
+		return 0, 0x10000, nil
 	}
 
-	if cmd&0x10 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size = int(b)
+	var buf [7]byte
+	if _, err := io.ReadFull(br, buf[:count]); err != nil {
+		return 0, 0, err
 	}
-	if cmd&0x20 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 8
+
+	// Unpack operand bytes in order. The shift table maps each bit position
+	// to the corresponding shift amount for offset (bits 0-3) and size (bits 4-6).
+	idx := 0
+	if bits&0x01 != 0 {
+		offset = int(buf[idx])
+		idx++
 	}
-	if cmd&0x40 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 16
+	if bits&0x02 != 0 {
+		offset |= int(buf[idx]) << 8
+		idx++
+	}
+	if bits&0x04 != 0 {
+		offset |= int(buf[idx]) << 16
+		idx++
+	}
+	if bits&0x08 != 0 {
+		offset |= int(buf[idx]) << 24
+		idx++
+	}
+	if bits&0x10 != 0 {
+		size = int(buf[idx])
+		idx++
+	}
+	if bits&0x20 != 0 {
+		size |= int(buf[idx]) << 8
+		idx++
+	}
+	if bits&0x40 != 0 {
+		size |= int(buf[idx]) << 16
 	}
 
 	if size == 0 {
@@ -635,6 +654,14 @@ func decodeCopyCommand(cmd byte, br *bufio.Reader) (offset, size int, err error)
 	}
 
 	return offset, size, nil
+}
+
+// popcount7 returns the number of set bits in the lower 7 bits of b.
+func popcount7(b byte) int {
+	b = b & 0x7f
+	b = (b & 0x55) + ((b >> 1) & 0x55)
+	b = (b & 0x33) + ((b >> 2) & 0x33)
+	return int((b + (b >> 4)) & 0x0f)
 }
 
 // readVarIntFromReader reads a base‑128 varint from br and returns its value

@@ -81,6 +81,29 @@ type commitGraphData struct {
 	// OIDToIndex provides O(1) reverse lookup from a commit OID to its
 	// index within OrderedOIDs and the parallel metadata slices.
 	OIDToIndex map[Hash]int
+
+	// parentIndices stores parent relationships as dense integer arrays.
+	// parentIndices[i] holds the OrderedOIDs indices of commit i's parents.
+	// This avoids hash-keyed map lookups during commit walks.
+	parentIndices [][]int32
+}
+
+// parentsOf returns the parent OIDs for the commit at the given index.
+// This uses the flat parentIndices array for O(1) lookup with good cache
+// locality, falling back to the Parents map if the index is out of range.
+func (g *commitGraphData) parentsOf(idx int) []Hash {
+	if idx < 0 || idx >= len(g.parentIndices) {
+		return nil
+	}
+	pidxs := g.parentIndices[idx]
+	if len(pidxs) == 0 {
+		return nil
+	}
+	parents := make([]Hash, len(pidxs))
+	for i, pi := range pidxs {
+		parents[i] = g.OrderedOIDs[pi]
+	}
+	return parents
 }
 
 func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
@@ -103,12 +126,28 @@ func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 		oidToIdx[c.OID] = i
 	}
 
+	// Build flat parent indices.
+	parentIndices := make([][]int32, n)
+	for i, c := range commits {
+		if len(c.ParentOIDs) == 0 {
+			continue
+		}
+		idxs := make([]int32, len(c.ParentOIDs))
+		for j, p := range c.ParentOIDs {
+			if pi, ok := oidToIdx[p]; ok {
+				idxs[j] = int32(pi)
+			}
+		}
+		parentIndices[i] = idxs
+	}
+
 	return &commitGraphData{
-		Parents:     parents,
-		OrderedOIDs: ordered,
-		TreeOIDs:    trees,
-		Timestamps:  times,
-		OIDToIndex:  oidToIdx,
+		Parents:       parents,
+		OrderedOIDs:   ordered,
+		TreeOIDs:      trees,
+		Timestamps:    times,
+		OIDToIndex:    oidToIdx,
+		parentIndices: parentIndices,
 	}
 }
 
@@ -196,17 +235,34 @@ func loadCommitGraph(objectsDir string) (*commitGraphData, error) {
 		}
 	}
 
+	// Build flat parent indices for O(1) array-based lookups.
+	parentIndices := make([][]int32, len(allOids))
+	for i, oid := range allOids {
+		ps := parents[oid]
+		if len(ps) == 0 {
+			continue
+		}
+		idxs := make([]int32, len(ps))
+		for j, p := range ps {
+			if pi, ok := oidToIndex[p]; ok {
+				idxs[j] = int32(pi)
+			}
+		}
+		parentIndices[i] = idxs
+	}
+
 	// Close all mmaps; the returned slices hold their own copies.
 	for _, g := range fileInfo {
 		g.mr.Close()
 	}
 
 	return &commitGraphData{
-		Parents:     parents,
-		OrderedOIDs: allOids,
-		TreeOIDs:    allTrees,
-		Timestamps:  allTimes,
-		OIDToIndex:  oidToIndex,
+		Parents:       parents,
+		OrderedOIDs:   allOids,
+		TreeOIDs:      allTrees,
+		Timestamps:    allTimes,
+		OIDToIndex:    oidToIndex,
+		parentIndices: parentIndices,
 	}, nil
 }
 

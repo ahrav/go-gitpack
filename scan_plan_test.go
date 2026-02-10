@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"golang.org/x/exp/mmap"
@@ -379,7 +380,10 @@ func TestPackedBlobRecord_RoundTrip(t *testing.T) {
 }
 
 func TestScanBlobsStreaming_PackedOffsetsMonotonicPerPack(t *testing.T) {
-	scanner := createScannerForRepo(t, "simple-linear")
+	prevProcs := runtime.GOMAXPROCS(4)
+	defer runtime.GOMAXPROCS(prevProcs)
+
+	scanner := createScannerForRepo(t, "large-repo")
 	defer scanner.Close()
 
 	rec := &recordingBlobScanner{}
@@ -400,5 +404,36 @@ func TestScanBlobsStreaming_PackedOffsetsMonotonicPerPack(t *testing.T) {
 			t.Fatalf("offset regression for pack: got %d after %d", off, prev)
 		}
 		lastOffset[pack] = off
+	}
+}
+
+func TestScanBlobsStreaming_ParallelDecodeMatchesSerialOrder(t *testing.T) {
+	run := func(procs int) []ScanMeta {
+		prev := runtime.GOMAXPROCS(procs)
+		defer runtime.GOMAXPROCS(prev)
+
+		scanner := createScannerForRepo(t, "large-repo")
+		defer scanner.Close()
+
+		rec := &recordingBlobScanner{}
+		if err := scanner.scanBlobsStreaming(nil, rec); err != nil {
+			t.Fatalf("scanBlobsStreaming (GOMAXPROCS=%d): %v", procs, err)
+		}
+
+		out := make([]ScanMeta, len(rec.metas))
+		copy(out, rec.metas)
+		return out
+	}
+
+	serial := run(1)
+	parallel := run(4)
+
+	if len(serial) != len(parallel) {
+		t.Fatalf("scan count mismatch: serial=%d parallel=%d", len(serial), len(parallel))
+	}
+	for i := range serial {
+		if serial[i] != parallel[i] {
+			t.Fatalf("scan order mismatch at %d: serial=%+v parallel=%+v", i, serial[i], parallel[i])
+		}
 	}
 }

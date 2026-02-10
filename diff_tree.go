@@ -4,8 +4,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 )
+
+// joinPath builds a Git-style forward-slash path without allocating through
+// filepath.Join + filepath.ToSlash. Since Git tree entries always use
+// forward slashes, we can concatenate directly.
+func joinPath(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	// Avoid double slash when prefix already ends with '/'.
+	if prefix[len(prefix)-1] == '/' {
+		return prefix + name
+	}
+	return prefix + "/" + name
+}
 
 // walkDiff streams the differences between two Git trees.
 //
@@ -142,7 +155,7 @@ func walkDiff(
 					tc,
 					oidOld,
 					oidNew,
-					filepath.Join(prefix, nln),
+					joinPath(prefix, nln),
 					fn,
 				); err != nil {
 					return err
@@ -150,7 +163,7 @@ func walkDiff(
 			default:
 				// File replaced or mode changed.
 				if err := fn(
-					filepath.ToSlash(filepath.Join(prefix, nln)),
+					joinPath(prefix, nln),
 					oidOld,
 					oidNew,
 					modeNew,
@@ -199,9 +212,9 @@ func handleAdd(
 	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
 	if isTreeMode(mode) { // directory
-		return walkDiff(tc, Hash{}, oid, filepath.Join(prefix, name), fn)
+		return walkDiff(tc, Hash{}, oid, joinPath(prefix, name), fn)
 	}
-	return fn(filepath.ToSlash(filepath.Join(prefix, name)), Hash{}, oid, mode)
+	return fn(joinPath(prefix, name), Hash{}, oid, mode)
 }
 
 // handleDel reports a deleted entry discovered by walkDiff.
@@ -218,7 +231,7 @@ func handleDel(
 	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
 	if isTreeMode(mode) { // directory
-		return walkDiff(tc, oid, Hash{}, filepath.Join(prefix, name), fn)
+		return walkDiff(tc, oid, Hash{}, joinPath(prefix, name), fn)
 	}
-	return fn(filepath.ToSlash(filepath.Join(prefix, name)), oid, Hash{}, mode)
+	return fn(joinPath(prefix, name), oid, Hash{}, mode)
 }
