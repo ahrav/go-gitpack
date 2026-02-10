@@ -1,6 +1,7 @@
 package objstore
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"os"
@@ -312,5 +313,92 @@ func TestScanPlannedBlobs_MixedPackedAndLooseCommits(t *testing.T) {
 	}
 	if !looseFound {
 		t.Fatalf("expected at least one scanned blob to be loose")
+	}
+}
+
+func TestBlobRecord_RoundTrip(t *testing.T) {
+	blob := newHash("blob")
+	commit := newHash("commit")
+	want := blobRecord{
+		Blob:   blob,
+		Commit: commit,
+		Path:   "path/to/file.txt",
+	}
+
+	var buf bytes.Buffer
+	if err := writeBlobRecord(&buf, want); err != nil {
+		t.Fatalf("writeBlobRecord: %v", err)
+	}
+
+	got, err := readBlobRecord(&buf)
+	if err != nil {
+		t.Fatalf("readBlobRecord: %v", err)
+	}
+	if got.Blob != want.Blob {
+		t.Fatalf("blob = %s, want %s", got.Blob, want.Blob)
+	}
+	if got.Commit != want.Commit {
+		t.Fatalf("commit = %s, want %s", got.Commit, want.Commit)
+	}
+	if got.Path != want.Path {
+		t.Fatalf("path = %q, want %q", got.Path, want.Path)
+	}
+}
+
+func TestPackedBlobRecord_RoundTrip(t *testing.T) {
+	blob := newHash("blob")
+	commit := newHash("commit")
+	want := packedBlobRecord{
+		Offset: 12345,
+		Blob:   blob,
+		Commit: commit,
+		Path:   "path/to/file.txt",
+	}
+
+	var buf bytes.Buffer
+	if err := writePackedBlobRecord(&buf, want); err != nil {
+		t.Fatalf("writePackedBlobRecord: %v", err)
+	}
+
+	got, err := readPackedBlobRecord(&buf)
+	if err != nil {
+		t.Fatalf("readPackedBlobRecord: %v", err)
+	}
+	if got.Offset != want.Offset {
+		t.Fatalf("offset = %d, want %d", got.Offset, want.Offset)
+	}
+	if got.Blob != want.Blob {
+		t.Fatalf("blob = %s, want %s", got.Blob, want.Blob)
+	}
+	if got.Commit != want.Commit {
+		t.Fatalf("commit = %s, want %s", got.Commit, want.Commit)
+	}
+	if got.Path != want.Path {
+		t.Fatalf("path = %q, want %q", got.Path, want.Path)
+	}
+}
+
+func TestScanBlobsStreaming_PackedOffsetsMonotonicPerPack(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+	defer scanner.Close()
+
+	rec := &recordingBlobScanner{}
+	if err := scanner.scanBlobsStreaming(nil, rec); err != nil {
+		t.Fatalf("scanBlobsStreaming: %v", err)
+	}
+	if len(rec.metas) == 0 {
+		t.Fatalf("expected at least one scanned blob")
+	}
+
+	lastOffset := make(map[*mmap.ReaderAt]uint64)
+	for _, meta := range rec.metas {
+		pack, off, ok := scanner.store.findPackedObject(meta.Blob)
+		if !ok {
+			continue
+		}
+		if prev, exists := lastOffset[pack]; exists && off < prev {
+			t.Fatalf("offset regression for pack: got %d after %d", off, prev)
+		}
+		lastOffset[pack] = off
 	}
 }

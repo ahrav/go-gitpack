@@ -413,6 +413,21 @@ func (s *store) getNoCache(oid Hash) ([]byte, ObjectType, error) {
 	}, true, false)
 }
 
+// getPackedObjectNoCache materializes the object at a known pack offset
+// without consulting in-memory caches or performing an OID lookup.
+func (s *store) getPackedObjectNoCache(p *mmap.ReaderAt, off uint64, oid Hash) ([]byte, ObjectType, error) {
+	if p == nil {
+		return nil, ObjBad, fmt.Errorf("pack handle is nil")
+	}
+	return s.inflateFromPackWithOptions(inflationParams{
+		p:             p,
+		off:           off,
+		oid:           oid,
+		ctx:           newDeltaContext(s.maxDeltaDepth),
+		maxObjectSize: s.maxDeltaObjectSize,
+	}, false, false)
+}
+
 // getWithContext retrieves an object while tracking delta chain depth.
 // This internal method prevents infinite recursion and detects cycles
 // in malformed delta chains.
