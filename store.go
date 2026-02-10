@@ -46,6 +46,8 @@ var hostLittle = func() bool {
 	return *(*byte)(unsafe.Pointer(&i)) == 1
 }()
 
+var ErrObjectNotCommit = errors.New("object is not a commit")
+
 func init() {
 	// On Windows an mmapped file cannot be closed while any outstanding
 	// slices are still referenced. A finalizer makes sure users who forget
@@ -74,6 +76,11 @@ const (
 
 	// defaultMaxDeltaDepth is the default maximum depth for resolving delta chains.
 	defaultMaxDeltaDepth = 100
+
+	// defaultMaxDeltaObjectSize bounds delta materialization to prevent runaway
+	// allocations on very large delta chains.
+	defaultMaxDeltaObjectSize = 512 << 20 // 512 MiB
+
 	// maxCacheableSize is the maximum size of an object that will be stored in the cache.
 	maxCacheableSize = 4 << 20 // 4 MiB
 )
@@ -128,11 +135,15 @@ type store struct {
 
 	// dw maintains a small window of recently materialized objects.
 	// Objects likely to be delta bases are kept here for fast access.
-	dw *refCountedDeltaWindow
+	dw deltaWindow
 
 	// maxDeltaDepth limits delta chain traversal depth.
 	// The default value matches Git's own limit of 50.
 	maxDeltaDepth int
+
+	// maxDeltaObjectSize bounds delta target materialization.
+	// Zero disables the bound.
+	maxDeltaObjectSize uint64
 
 	// VerifyCRC enables CRC-32 validation for each object read.
 	// When false (default), it prioritizes speed over integrity checks.
@@ -190,10 +201,11 @@ func open(dir string) (*store, error) {
 	if len(packs) == 0 && midx == nil {
 		// If no packs are found, return a valid but empty store for an empty repository.
 		store := &store{
-			maxDeltaDepth: defaultMaxDeltaDepth,
-			packs:         []*idxFile{}, // Use an empty slice instead of nil for consistency.
-			packMap:       make(map[string]*mmap.ReaderAt),
-			dw:            newRefCountedDeltaWindow(),
+			maxDeltaDepth:      defaultMaxDeltaDepth,
+			maxDeltaObjectSize: defaultMaxDeltaObjectSize,
+			packs:              []*idxFile{}, // Use an empty slice instead of nil for consistency.
+			packMap:            make(map[string]*mmap.ReaderAt),
+			dw:                 newShardedDeltaWindow(64, windowBudget),
 		}
 
 		const defaultCacheSize = 1 << 14 // 16K entries, approximately 96MiB.
@@ -219,10 +231,11 @@ func open(dir string) (*store, error) {
 	}
 
 	store := &store{
-		maxDeltaDepth: defaultMaxDeltaDepth,
-		midx:          midx,
-		packMap:       packCache,
-		dw:            newRefCountedDeltaWindow(),
+		maxDeltaDepth:      defaultMaxDeltaDepth,
+		maxDeltaObjectSize: defaultMaxDeltaObjectSize,
+		midx:               midx,
+		packMap:            packCache,
+		dw:                 newShardedDeltaWindow(64, windowBudget),
 	}
 
 	const defaultCacheSize = 1 << 14 // 16K entries, approximately 96MiB.
@@ -276,6 +289,14 @@ func (s *store) SetMaxDeltaDepth(depth int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.maxDeltaDepth = depth
+}
+
+// SetMaxDeltaObjectSize configures the maximum reconstructed delta size in bytes.
+// Values greater than zero prevent excessive allocations for huge delta chains.
+func (s *store) SetMaxDeltaObjectSize(maxBytes uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxDeltaObjectSize = maxBytes
 }
 
 // Close releases all memory-mapped files associated with the store.
@@ -355,6 +376,32 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	return s.getWithContext(oid, newDeltaContext(s.maxDeltaDepth))
 }
 
+// getMaterialized retrieves the fully materialized object, including commit bodies.
+func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
+	if b, ok := s.dw.acquire(oid); ok {
+		d, t := b.Data(), b.Type()
+		b.Release()
+		return d, t, nil
+	}
+
+	if b, ok := s.cache.Get(oid); ok {
+		return b.data, b.typ, nil
+	}
+
+	p, off, ok := s.findPackedObject(oid)
+	if !ok {
+		return nil, ObjBad, fmt.Errorf("object %x not found", oid)
+	}
+
+	return s.inflateFromPackWithOptions(inflationParams{
+		p:             p,
+		off:           off,
+		oid:           oid,
+		ctx:           newDeltaContext(s.maxDeltaDepth),
+		maxObjectSize: s.maxDeltaObjectSize,
+	}, false)
+}
+
 // getWithContext retrieves an object while tracking delta chain depth.
 // This internal method prevents infinite recursion and detects cycles
 // in malformed delta chains.
@@ -372,10 +419,11 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 	if s.midx != nil {
 		if p, off, ok := s.midx.findObject(oid); ok {
 			return s.inflateFromPack(inflationParams{
-				p:   p,
-				off: off,
-				oid: oid,
-				ctx: ctx,
+				p:             p,
+				off:           off,
+				oid:           oid,
+				ctx:           ctx,
+				maxObjectSize: s.maxDeltaObjectSize,
 			})
 		}
 	}
@@ -386,10 +434,11 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 			continue
 		}
 		return s.inflateFromPack(inflationParams{
-			p:   pf.pack,
-			off: offset,
-			oid: oid,
-			ctx: ctx,
+			p:             pf.pack,
+			off:           offset,
+			oid:           oid,
+			ctx:           ctx,
+			maxObjectSize: s.maxDeltaObjectSize,
 		})
 	}
 
@@ -406,13 +455,17 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 // inflateFromPack returns the inflated object data, its type, and any error encountered.
 // The returned data is a fresh allocation safe for modification.
 func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, error) {
+	return s.inflateFromPackWithOptions(params, true)
+}
+
+func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFastPath bool) ([]byte, ObjectType, error) {
 	// Perform a cheap header peek to avoid full inflation for commits
 	// that are already covered by the commit-graph.
 	objType, _, err := peekObjectType(params.p, params.off)
 	if err != nil {
 		return nil, ObjBad, err
 	}
-	if objType == ObjCommit {
+	if allowCommitFastPath && objType == ObjCommit {
 		return nil, ObjCommit, nil
 	}
 
@@ -487,35 +540,70 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	if typ != ObjCommit {
-		return nil, fmt.Errorf("%x is not a commit", oid)
-	}
-	off += uint64(hdrLen)
+	if typ == ObjCommit {
+		off += uint64(hdrLen)
 
-	// Decompress only the beginning of the object, typically less than 512 bytes.
-	zr, err := getZlibReader(io.NewSectionReader(p, int64(off), 1<<63-1))
+		// Decompress only the beginning of the object, typically less than 512 bytes.
+		zr, err := getZlibReader(io.NewSectionReader(p, int64(off), 1<<63-1))
+		if err != nil {
+			return nil, err
+		}
+		defer putZlibReader(zr)
+
+		return readCommitHeaderFromStream(zr)
+	}
+
+	if typ != ObjOfsDelta && typ != ObjRefDelta {
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
+
+	full, resolvedType, err := s.getMaterialized(oid)
 	if err != nil {
 		return nil, err
 	}
-	defer putZlibReader(zr)
+	if resolvedType != ObjCommit {
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
+	return trimCommitHeader(full)
+}
 
+func readCommitHeaderFromStream(r io.Reader) ([]byte, error) {
 	buf := GetBuf()
 	defer PutBuf(buf)
 
 	for len(*buf) < MaxHdr {
-		line, err := readUntilLF(zr)
+		line, err := readUntilLF(r)
 		*buf = append(*buf, line...)
-		if bytes.HasPrefix(line, []byte("author ")) ||
-			bytes.HasPrefix(line, []byte("committer ")) {
-			// The desired line has been found; copy it to a new slice and return.
+		if bytes.HasPrefix(line, []byte("committer ")) {
+			// Return after committer line so tree/parents/author are present.
 			return append([]byte(nil), *buf...), nil
 		}
-		if err != nil { // This indicates an EOF before the author/committer line was found.
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	return nil, fmt.Errorf("commit header exceeds %d bytes without author line", MaxHdr)
+	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
+}
+
+func trimCommitHeader(full []byte) ([]byte, error) {
+	end := 0
+	for end < len(full) && end < MaxHdr {
+		nl := bytes.IndexByte(full[end:], '\n')
+		if nl < 0 {
+			break
+		}
+		lineEnd := end + nl + 1
+		line := full[end:lineEnd]
+		if bytes.HasPrefix(line, []byte("committer ")) {
+			out := make([]byte, lineEnd)
+			copy(out, full[:lineEnd])
+			return out, nil
+		}
+		end = lineEnd
+	}
+
+	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
 }
 
 // readUntilLF reads a complete line including the terminating newline.

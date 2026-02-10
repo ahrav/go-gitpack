@@ -84,18 +84,23 @@ func TestCommitAttributionIntegration(t *testing.T) {
 func TestCommitAttributionWithoutCommitGraph(t *testing.T) {
 	repoPath := filepath.Join("testdata", "repos", "no-commit-graph")
 
-	// This should fail since HistoryScanner requires commit-graph
 	scanner, err := NewHistoryScanner(repoPath)
-	assert.Error(t, err, "Should fail to open repository without commit-graph")
-	assert.ErrorIs(t, err, ErrCommitGraphRequired, "Should return ErrCommitGraphRequired")
-	assert.Nil(t, scanner, "Scanner should be nil on error")
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	commits, err := scanner.LoadAllCommits()
+	require.NoError(t, err)
+	assert.NotEmpty(t, commits, "Fallback loader should discover commits without commit-graph")
 }
 
 func TestCommitAttributionEmptyRepo(t *testing.T) {
 	repoPath := filepath.Join("testdata", "repos", "empty-repo")
 
-	// Empty repo should also fail since there's no commit-graph
 	scanner, err := NewHistoryScanner(repoPath)
-	assert.Error(t, err, "Should fail to open empty repository")
-	assert.Nil(t, scanner, "Scanner should be nil on error")
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	commits, err := scanner.LoadAllCommits()
+	require.NoError(t, err)
+	assert.Empty(t, commits)
 }

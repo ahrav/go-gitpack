@@ -63,10 +63,15 @@ type metaCache struct {
 // newMetaCache is called once from NewHistoryScanner.
 func newMetaCache(g *commitGraphData, s commitHeaderReader) *metaCache {
 	const cacheSize = 1024
+	var ts []int64
+	if g != nil {
+		ts = g.Timestamps
+	}
+
 	return &metaCache{
 		graph: g,
 		store: s,
-		ts:    g.Timestamps,
+		ts:    ts,
 		m:     make(map[Hash]AuthorInfo, cacheSize),
 	}
 }
@@ -96,10 +101,12 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 
 	// Timestamp from commit-graph is faster if available.
 	var ts int64
-	if idx, ok := c.graph.OIDToIndex[oid]; ok && idx < len(c.ts) {
-		ts = c.ts[idx]
-	} else {
-		// Fallback to timestamp from parsed header.
+	if c.graph != nil {
+		if idx, ok := c.graph.OIDToIndex[oid]; ok && idx < len(c.ts) {
+			ts = c.ts[idx]
+		}
+	}
+	if ts == 0 {
 		ts = ai.When.Unix()
 	}
 

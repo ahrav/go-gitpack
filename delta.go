@@ -29,6 +29,8 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
+var ErrDeltaTargetTooLarge = errors.New("delta target exceeds configured maximum")
+
 // deltaInfo represents a single delta object in a delta chain.
 // The struct is used during chain traversal to track the sequence of deltas
 // that must be applied to reconstruct the final object.
@@ -154,6 +156,9 @@ type inflationParams struct {
 	// ctx carries per-call state such as recursion depth and visited nodes.
 	// Obtain it via newDeltaContext before invoking the inflation routine.
 	ctx *deltaContext
+
+	// maxObjectSize bounds reconstructed delta objects. Zero disables the bound.
+	maxObjectSize uint64
 }
 
 // inflateDeltaChainStreaming reconstructs an object that is stored as a
@@ -220,7 +225,7 @@ func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, Objec
 	if err != nil {
 		return nil, ObjBad, err
 	}
-	return applyDeltaStack(stack, base, baseType)
+	return applyDeltaStack(stack, base, baseType, params.maxObjectSize)
 }
 
 // walkUpDeltaChain climbs the delta chain starting at (pack, off) until a
@@ -303,6 +308,7 @@ func applyDeltaStack(
 	stack deltaStack,
 	baseData []byte,
 	baseType ObjectType,
+	maxObjectSize uint64,
 ) ([]byte, ObjectType, error) {
 	if len(stack) == 0 {
 		// Fast-path: no deltas at all.
@@ -317,6 +323,9 @@ func applyDeltaStack(
 	maxTarget := peekLargestTarget(stack)
 	if bs := uint64(len(baseData)); bs > maxTarget {
 		maxTarget = bs
+	}
+	if maxObjectSize > 0 && maxTarget > maxObjectSize {
+		return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, maxTarget, maxObjectSize)
 	}
 	if maxTarget > uint64(len(arena.data)/2) {
 		arena.data = make([]byte, maxTarget*2)

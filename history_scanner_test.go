@@ -18,8 +18,12 @@ func init() {
 }
 
 func TestLoadAllCommits_EmptyRepository(t *testing.T) {
-	_, err := createScannerForRepoWithError(t, "empty-repo")
-	assert.Error(t, err, "Empty repositories don't have commit graphs")
+	scanner := createScannerForRepo(t, "empty-repo")
+	defer scanner.Close()
+
+	commits, err := scanner.LoadAllCommits()
+	require.NoError(t, err)
+	assert.Empty(t, commits)
 }
 
 func TestLoadAllCommits_LinearHistory(t *testing.T) {
@@ -114,9 +118,26 @@ func TestLoadAllCommits_LargeRepo(t *testing.T) {
 	}
 }
 
-func TestLoadAllCommits_WithoutCommitGraph_ShouldFail(t *testing.T) {
-	_, err := createScannerForRepoWithError(t, "no-commit-graph")
-	assert.Error(t, err, "Should fail when commit-graph is not available")
+func TestLoadAllCommits_WithoutCommitGraph(t *testing.T) {
+	scanner := createScannerForRepo(t, "no-commit-graph")
+	defer scanner.Close()
+
+	commits, err := scanner.LoadAllCommits()
+	require.NoError(t, err)
+	assert.NotEmpty(t, commits)
+}
+
+func TestDiffHistoryHunks_WithoutCommitGraph(t *testing.T) {
+	scanner := createScannerForRepo(t, "no-commit-graph")
+	defer scanner.Close()
+
+	hunks, errC := scanner.DiffHistoryHunks()
+	count := 0
+	for range hunks {
+		count++
+	}
+	require.NoError(t, <-errC)
+	assert.Greater(t, count, 0, "fallback commit walker should still produce hunks")
 }
 
 func TestDiffHistoryHunks(t *testing.T) {

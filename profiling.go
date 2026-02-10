@@ -8,7 +8,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof" // Register pprof handlers
+	pprof "net/http/pprof"
 	"os"
 	"runtime/trace"
 	"time"

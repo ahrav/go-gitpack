@@ -169,7 +169,7 @@ func TestTreeIter_InvalidMode(t *testing.T) {
 
 			_, _, _, ok, err := iter.Next()
 			assert.False(t, ok, "expected ok=false for invalid mode")
-			assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+			assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 		})
 	}
 
@@ -213,7 +213,7 @@ func TestTreeIter_MissingSpace(t *testing.T) {
 
 	_, _, _, ok, err := iter.Next()
 	assert.False(t, ok, "expected ok=false for missing space")
-	assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+	assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 }
 
 func TestTreeIter_MissingNull(t *testing.T) {
@@ -224,7 +224,7 @@ func TestTreeIter_MissingNull(t *testing.T) {
 
 	_, _, _, ok, err := iter.Next()
 	assert.False(t, ok, "expected ok=false for missing null")
-	assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+	assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 }
 
 func TestTreeIter_TruncatedSHA(t *testing.T) {
@@ -240,7 +240,7 @@ func TestTreeIter_TruncatedSHA(t *testing.T) {
 
 			_, _, _, ok, err := iter.Next()
 			assert.False(t, ok, "expected ok=false for truncated SHA")
-			assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+			assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 		})
 	}
 }
@@ -259,7 +259,7 @@ func TestTreeIter_PartialEntry(t *testing.T) {
 
 			_, _, _, ok, err := iter.Next()
 			assert.False(t, ok, "expected ok=false for partial entry")
-			assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+			assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 		})
 	}
 }

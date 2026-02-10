@@ -136,7 +136,7 @@ func walkDiff(
 			switch {
 			case oidOld == oidNew && modeOld == modeNew:
 				// Identical entry → skip.
-			case modeOld&040000 != 0 && modeNew&040000 != 0:
+			case isTreeMode(modeOld) && isTreeMode(modeNew):
 				// Directory exists on both sides → recurse.
 				if err := walkDiff(
 					tc,
@@ -198,7 +198,7 @@ func handleAdd(
 	mode uint32,
 	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
-	if mode&040000 != 0 { // directory
+	if isTreeMode(mode) { // directory
 		return walkDiff(tc, Hash{}, oid, filepath.Join(prefix, name), fn)
 	}
 	return fn(filepath.ToSlash(filepath.Join(prefix, name)), Hash{}, oid, mode)
@@ -217,7 +217,7 @@ func handleDel(
 	mode uint32,
 	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
-	if mode&040000 != 0 { // directory
+	if isTreeMode(mode) { // directory
 		return walkDiff(tc, oid, Hash{}, filepath.Join(prefix, name), fn)
 	}
 	return fn(filepath.ToSlash(filepath.Join(prefix, name)), oid, Hash{}, mode)

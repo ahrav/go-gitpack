@@ -186,6 +186,38 @@ func TestWalkDiff_ModeOnlyChange(t *testing.T) {
 	assert.True(t, equalChanges(got, want), "mode change not reported: %+v", got)
 }
 
+func TestWalkDiff_GitlinkNotRecursed(t *testing.T) {
+	oldSub := newHash("sub-old")
+	newSub := newHash("sub-new")
+	parentOID := newHash("parent-sub")
+	childOID := newHash("child-sub")
+
+	tc := buildTestStore(map[Hash][]byte{
+		parentOID: createRawTreeData(
+			struct {
+				mode uint32
+				name string
+				hash Hash
+			}{0160000, "vendor", oldSub},
+		),
+		childOID: createRawTreeData(
+			struct {
+				mode uint32
+				name string
+				hash Hash
+			}{0160000, "vendor", newSub},
+		),
+	})
+
+	got, err := collect(tc, parentOID, childOID, "")
+	assert.NoError(t, err)
+
+	want := []change{
+		{"vendor", oldSub, newSub, 0160000},
+	}
+	assert.True(t, equalChanges(got, want), "gitlink change should be reported as a file replacement")
+}
+
 func TestWalkDiff_RecursiveAndPrefix(t *testing.T) {
 	subParent := newHash("sp")
 	subChild := newHash("sc")
