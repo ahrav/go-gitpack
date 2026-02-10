@@ -122,7 +122,6 @@ func TestOpen(t *testing.T) {
 		require.NoError(t, err)
 		defer store.Close()
 
-		require.Nil(t, store.midx)
 		require.NotNil(t, store.memoryMidx)
 		assert.Equal(t, uint32(2), store.memoryMidx.fanout[255])
 

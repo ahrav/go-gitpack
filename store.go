@@ -10,9 +10,9 @@
 //
 // The store memory-maps one or more *.pack / *.idx pairs, builds an in-memory map
 // from SHA-1 object IDs to their pack offsets, and inflates objects on demand.
-// It coordinates between pack-index (IDX), multi-pack-index (MIDX), and
-// reverse-index (RIDX) files, providing unified access across multiple packfiles
-// with transparent delta chain resolution and caching.
+// It coordinates between pack-index (IDX) and reverse-index (RIDX) data,
+// and builds a unified in-memory lookup across packfiles with transparent
+// delta chain resolution and caching.
 //
 // All packfiles are memory-mapped for zero-copy access, with an adaptive
 // replacement cache (ARC) and delta window for hot objects. Delta chains are
@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -124,12 +123,7 @@ type store struct {
 	// Each entry provides object offset lookups and CRC validation.
 	packs []*idxFile
 
-	// midx references the multi-pack-index file if present.
-	// When non-nil, it provides unified access across multiple packfiles.
-	midx *midxFile
-
-	// memoryMidx is synthesized from individual *.idx files when no on-disk
-	// multi-pack-index exists.
+	// memoryMidx is synthesized from individual *.idx files.
 	memoryMidx *inMemoryMidx
 
 	// packMap prevents duplicate memory mappings of the same packfile.
@@ -182,34 +176,13 @@ func open(dir string) (*store, error) {
 
 	packCache := make(map[string]*mmap.ReaderAt)
 
-	// Attempt to mmap a multi-pack-index, which is named exactly
-	// "…/objects/pack/multi-pack-index".
-	midxPath := filepath.Join(absDir, "multi-pack-index")
-	var midx *midxFile
-	if st, err := os.Stat(midxPath); err == nil && !st.IsDir() {
-		mr, err := mmap.Open(midxPath)
-		if err != nil {
-			return nil, fmt.Errorf("mmap midx: %w", err)
-		}
-		defer func() {
-			if midx == nil {
-				_ = mr.Close()
-			}
-		}()
-		midx, err = parseMidx(absDir, mr, packCache)
-		if err != nil {
-			_ = mr.Close()
-			return nil, fmt.Errorf("parse midx: %w", err)
-		}
-	}
-
 	// Enumerate standard pack and index files.
 	pattern := filepath.Join(absDir, "*.pack")
 	packs, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, err
 	}
-	if len(packs) == 0 && midx == nil {
+	if len(packs) == 0 {
 		// If no packs are found, return a valid but empty store for an empty repository.
 		store := &store{
 			maxDeltaDepth:      defaultMaxDeltaDepth,
@@ -229,7 +202,7 @@ func open(dir string) (*store, error) {
 		return store, nil
 	}
 
-	// Map any remaining *.pack files not already covered by the multi-pack-index.
+	// Map all pack files in the directory.
 	for _, pack := range packs {
 		if _, ok := packCache[pack]; ok {
 			continue
@@ -244,7 +217,6 @@ func open(dir string) (*store, error) {
 	store := &store{
 		maxDeltaDepth:      defaultMaxDeltaDepth,
 		maxDeltaObjectSize: defaultMaxDeltaObjectSize,
-		midx:               midx,
 		packMap:            packCache,
 		dw:                 newShardedDeltaWindow(64, windowBudget),
 	}
@@ -267,11 +239,7 @@ func open(dir string) (*store, error) {
 		handle := packCache[path]
 		idxPath := strings.TrimSuffix(path, ".pack") + ".idx"
 		ix, err := mmap.Open(idxPath)
-		if errors.Is(err, os.ErrNotExist) && midx != nil {
-			// If a pack is referenced only by the multi-pack-index, its CRC will be sourced from the MIDX v2 later.
-			store.packs = append(store.packs, &idxFile{pack: handle}) // Create a minimal stub for now.
-			continue
-		} else if err != nil {
+		if err != nil {
 			return nil, fmt.Errorf("mmap idx: %w", err)
 		}
 		f, err := parseIdx(ix)
@@ -291,10 +259,7 @@ func open(dir string) (*store, error) {
 			}
 		}
 	}
-
-	if store.midx == nil {
-		store.memoryMidx = buildInMemoryMidx(store.packs)
-	}
+	store.memoryMidx = buildInMemoryMidx(store.packs)
 
 	return store, nil
 }
@@ -437,17 +402,6 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		return b.data, b.typ, nil
 	}
 
-	if s.midx != nil {
-		if p, off, ok := s.midx.findObject(oid); ok {
-			return s.inflateFromPack(inflationParams{
-				p:             p,
-				off:           off,
-				oid:           oid,
-				ctx:           ctx,
-				maxObjectSize: s.maxDeltaObjectSize,
-			})
-		}
-	}
 	if s.memoryMidx != nil {
 		if p, off, ok := s.memoryMidx.findObject(oid); ok {
 			return s.inflateFromPack(inflationParams{
@@ -527,8 +481,6 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 			if err := s.verifyCRCForPackObject(params.p, params.off, crc); err != nil {
 				return nil, ObjBad, err
 			}
-		} else if s.midx != nil && s.midx.version >= 2 {
-			return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", params.oid)
 		}
 	}
 
@@ -540,15 +492,10 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 }
 
 // findPackedObject locates an object in any mapped packfile.
-// The method checks the multi-pack-index first if available, then searches individual packs.
+// The method consults the in-memory merged index first, then individual packs.
 //
 // findPackedObject returns the pack handle, byte offset, and true if found.
 func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
-	if s.midx != nil {
-		if p, off, ok := s.midx.findObject(oid); ok {
-			return p, off, true
-		}
-	}
 	if s.memoryMidx != nil {
 		if p, off, ok := s.memoryMidx.findObject(oid); ok {
 			return p, off, true
@@ -663,7 +610,7 @@ func readUntilLF(r io.Reader) ([]byte, error) {
 }
 
 // findCRCForObject returns the CRC-32 checksum for the specified object.
-// The method searches pack index files first, then falls back to multi-pack-index v2 if available.
+// The method searches pack index files first, then falls back to the in-memory merged index.
 //
 // The second return value indicates whether a CRC was found.
 // findCRCForObject is read-only and safe for concurrent use.
@@ -676,27 +623,6 @@ func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32
 		}
 	}
 
-	if s.midx != nil && s.midx.version >= 2 {
-		first := oid[0]
-		start := uint32(0)
-		if first > 0 {
-			start = s.midx.fanout[first-1]
-		}
-		end := s.midx.fanout[first]
-
-		rel, hit := slices.BinarySearchFunc(
-			s.midx.objectIDs[start:end],
-			oid,
-			func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
-		)
-		if hit {
-			abs := int(start) + rel
-			entry := s.midx.entries[abs]
-			if entry.crc != 0 {
-				return entry.crc, true
-			}
-		}
-	}
 	if s.memoryMidx != nil {
 		if entry, ok := s.memoryMidx.findEntry(oid); ok &&
 			entry.pack == p &&
@@ -710,21 +636,10 @@ func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32
 }
 
 // verifyCRCForPackObject validates the CRC-32 checksum of a pack object.
-// The method creates a minimal index structure for packs referenced only through MIDX
-// to enable CRC verification.
-//
 // verifyCRCForPackObject returns an error if the pack cannot be located or checksum verification fails.
 func (s *store) verifyCRCForPackObject(p *mmap.ReaderAt, off uint64, crc uint32) error {
 	for _, pf := range s.packs {
 		if pf.pack == p {
-			if pf.sortedOffsets == nil {
-				// This is a stub idxFile created from the multi-pack-index.
-				// Minimal structures must be built to perform CRC verification.
-				pf.sortedOffsets = []uint64{off}
-				pf.entriesByOff = map[uint64]idxEntry{
-					off: {offset: off, crc: crc},
-				}
-			}
 			return verifyCRC32(pf, off, crc)
 		}
 	}

@@ -78,6 +78,18 @@ func TestLoadAllCommits_WithCommitGraph(t *testing.T) {
 	assert.Len(t, commits, 3)
 }
 
+func TestNewHistoryScanner_IgnoresDiskCommitGraph(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear") // This repo has commit-graph
+	defer scanner.Close()
+
+	assert.Nil(t, scanner.graphData, "scanner should defer to in-memory commit graph build")
+
+	commits, err := scanner.LoadAllCommits()
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+	require.NotNil(t, scanner.graphData)
+}
+
 func TestLoadAllCommits_LargeRepo(t *testing.T) {
 	scanner := createScannerForRepo(t, "large-repo")
 	defer scanner.Close()

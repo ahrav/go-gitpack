@@ -184,13 +184,13 @@ func TestStoreWithMidx(t *testing.T) {
 	// Create multi‑pack‑index pointing at that single pack.
 	createValidMidxFile(t, dir, filepath.Base(packPath), []Hash{oid}, []uint64{12})
 
-	// Open() must pick the .midx automatically.
+	// Open() should ignore on-disk MIDX and build the in-memory merged index.
 	store, err := OpenForTesting(dir)
 	require.NoError(t, err)
 	defer store.Close()
 
-	assert.NotNil(t, store.midx, "Store should contain parsed midx")
-	assert.True(t, len(store.midx.objectIDs) > 0, "midx should index at least one object")
+	assert.NotNil(t, store.memoryMidx, "Store should contain synthesized in-memory midx")
+	assert.True(t, len(store.memoryMidx.objectID) > 0, "in-memory midx should index at least one object")
 
 	data, typ, err := store.get(oid)
 	require.NoError(t, err)
@@ -596,8 +596,8 @@ func BenchmarkOpenWithMidx(b *testing.B) {
 		store, err := OpenForTesting(packDir)
 		require.NoError(b, err)
 
-		// Verify that the midx was successfully loaded and utilized.
-		require.NotNil(b, store.midx, "Store should have loaded midx")
+		// Verify that the in-memory merged index was successfully built.
+		require.NotNil(b, store.memoryMidx, "Store should have loaded in-memory midx")
 
 		store.Close()
 	}
@@ -613,15 +613,15 @@ func BenchmarkGetMidxCold(b *testing.B) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	if store.midx == nil {
-		b.Skip("No midx loaded")
+	if store.memoryMidx == nil {
+		b.Skip("No in-memory midx loaded")
 	}
 
-	if len(store.midx.objectIDs) == 0 {
-		b.Skip("No objects in midx")
+	if len(store.memoryMidx.objectID) == 0 {
+		b.Skip("No objects in in-memory midx")
 	}
 
-	someHash := store.midx.objectIDs[0]
+	someHash := store.memoryMidx.objectID[0]
 
 	b.ResetTimer()
 	for b.Loop() {
@@ -642,15 +642,15 @@ func BenchmarkGetMidxWarm(b *testing.B) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	if store.midx == nil {
-		b.Skip("No midx loaded")
+	if store.memoryMidx == nil {
+		b.Skip("No in-memory midx loaded")
 	}
 
-	if len(store.midx.objectIDs) == 0 {
-		b.Skip("No objects in midx")
+	if len(store.memoryMidx.objectID) == 0 {
+		b.Skip("No objects in in-memory midx")
 	}
 
-	someHash := store.midx.objectIDs[0]
+	someHash := store.memoryMidx.objectID[0]
 
 	// Warm the cache with an initial lookup.
 	_, _, err = store.get(someHash)
@@ -673,14 +673,14 @@ func BenchmarkFindObject_MidxVsIdx(b *testing.B) {
 	require.NoError(b, err)
 	defer store.Close()
 
-	if store.midx == nil || len(store.packs) == 0 {
-		b.Skip("Need both midx and regular packs for comparison")
+	if store.memoryMidx == nil || len(store.packs) == 0 {
+		b.Skip("Need both in-memory midx and regular packs for comparison")
 	}
 
 	// Select a test object that exists in both lookup mechanisms.
 	var testHash Hash
-	if len(store.midx.objectIDs) > 0 {
-		testHash = store.midx.objectIDs[0]
+	if len(store.memoryMidx.objectID) > 0 {
+		testHash = store.memoryMidx.objectID[0]
 	} else if len(store.packs) > 0 && len(store.packs[0].oidTable) > 0 {
 		testHash = store.packs[0].oidTable[0]
 	} else {
@@ -689,8 +689,8 @@ func BenchmarkFindObject_MidxVsIdx(b *testing.B) {
 
 	b.Run("midx", func(b *testing.B) {
 		for b.Loop() {
-			_, _, found := store.midx.findObject(testHash)
-			require.True(b, found, "Object should be found in midx")
+			_, _, found := store.memoryMidx.findObject(testHash)
+			require.True(b, found, "Object should be found in in-memory midx")
 		}
 	})
 
@@ -722,8 +722,8 @@ func BenchmarkMemoryUsage_MidxVsMultipleIdx(b *testing.B) {
 			require.NoError(b, err)
 
 			// Exercise the data structures to ensure realistic allocation patterns.
-			if store.midx != nil && len(store.midx.objectIDs) > 0 {
-				hash := store.midx.objectIDs[0]
+			if store.memoryMidx != nil && len(store.memoryMidx.objectID) > 0 {
+				hash := store.memoryMidx.objectID[0]
 				store.get(hash)
 			}
 
@@ -768,16 +768,9 @@ func TestStore_MidxOnly_NoIdx(t *testing.T) {
 	createValidMidxFile(t, dir, filepath.Base(pack), []Hash{oid}, []uint64{12})
 	require.NoError(t, os.Remove(idxPath)) // simulate "only midx"
 
-	store, err := OpenForTesting(dir)
-	require.NoError(t, err)
-	defer store.Close()
-
-	assert.Nil(t, store.packs[0].idx, "Store should tolerate missing .idx when midx present")
-
-	data, typ, err := store.get(oid)
-	require.NoError(t, err)
-	assert.Equal(t, ObjBlob, typ)
-	assert.Equal(t, blob, data)
+	_, err := OpenForTesting(dir)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mmap idx")
 }
 
 func TestCRCVerification(t *testing.T) {
@@ -838,18 +831,18 @@ func TestMidxFanoutAcrossPacks(t *testing.T) {
 	defer store.Close()
 
 	require.Greater(t, len(store.packs), 2, "need >2 packs")
-	require.NotNil(t, store.midx)
+	require.NotNil(t, store.memoryMidx)
 
-	packCounts := make(map[uint32]int)
-	for _, entry := range store.midx.entries {
-		packCounts[entry.packID]++
+	packOrder := make(map[*mmap.ReaderAt]int, len(store.packs))
+	for i, pf := range store.packs {
+		packOrder[pf.pack] = i
 	}
 
 	// Choose an object from the *third* pack to prove fan‑out works.
 	var target Hash
-	for i, entry := range store.midx.entries {
-		if entry.packID == 2 { // third pack (0‑based)
-			target = store.midx.objectIDs[i]
+	for i, entry := range store.memoryMidx.entries {
+		if packOrder[entry.pack] == 2 { // third pack (0‑based)
+			target = store.memoryMidx.objectID[i]
 			break
 		}
 	}

@@ -139,14 +139,14 @@ func (e *ScanError) Error() string {
 }
 
 // ErrCommitGraphRequired is kept for backward compatibility.
-// NewHistoryScanner now falls back to a ref walk when no commit-graph exists.
+// HistoryScanner now always builds commit metadata in memory from ref walks.
 var ErrCommitGraphRequired = errors.New("commit‑graph required but not found")
 
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
 //
-// The scanner prefers commit-graph data when available. If commit-graph data
-// is missing, it falls back to walking commits from refs.
+// The scanner always builds an in-memory commit graph from a ref walk and does
+// not consume on-disk commit-graph files.
 //
 // Options can be provided to configure scanner behavior, such as enabling
 // profiling with WithProfiling.
@@ -160,19 +160,13 @@ func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, e
 		return nil, fmt.Errorf("open object store: %w", err)
 	}
 
-	graphDir := filepath.Join(gitDir, "objects")
-	graph, err := loadCommitGraph(graphDir)
-	if err != nil {
-		graph = nil
-	}
-
-	mc := newMetaCache(graph, store)
+	mc := newMetaCache(nil, store)
 
 	hs := &HistoryScanner{
 		gitDir:    gitDir,
 		scanMode:  ScanModeBlob,
 		store:     store,
-		graphData: graph,
+		graphData: nil,
 		meta:      mc,
 	}
 
