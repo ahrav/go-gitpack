@@ -686,3 +686,28 @@ func TestStore_DeltaObjectRetrieval(t *testing.T) {
 		}
 	})
 }
+
+// TestReadRawObject_OfsDeltaReadError verifies that readRawObject propagates
+// I/O errors (e.g., reading beyond EOF) from the ofs-delta prefix read instead
+// of masking them as ErrOfsDeltaBaseRefTooLong.
+func TestReadRawObject_OfsDeltaReadError(t *testing.T) {
+	// Build a minimal pack file with a valid object header indicating an
+	// ofs-delta object, but truncate the file so the prefix read fails.
+	//
+	// Object header for ofs-delta: type=6 (bits 6,5,4 = 110), size=1.
+	// Encoding: 0110_0001 = 0x61. After this byte the file is truncated.
+	data := []byte{0x61}
+
+	path := filepath.Join(t.TempDir(), "truncated.pack")
+	require.NoError(t, os.WriteFile(path, data, 0o644))
+	pack, err := mmap.Open(path)
+	require.NoError(t, err)
+	defer pack.Close()
+
+	_, _, err = readRawObject(pack, 0)
+	require.Error(t, err)
+	// The error should NOT be ErrOfsDeltaBaseRefTooLong — it should be the
+	// actual I/O error from the failed ReadAt.
+	assert.NotErrorIs(t, err, ErrOfsDeltaBaseRefTooLong,
+		"expected I/O error, not ErrOfsDeltaBaseRefTooLong; got: %v", err)
+}

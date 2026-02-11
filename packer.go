@@ -23,6 +23,7 @@ package objstore
 
 import (
 	"errors"
+	"fmt"
 	"io"
 
 	"golang.org/x/exp/mmap"
@@ -75,7 +76,7 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	case ObjOfsDelta:
 		// Read up to 13 bytes to find the end of the variable-length offset.
 		var pfxBuf [13]byte
-		pn, _ := r.ReadAt(pfxBuf[:], pos)
+		pn, readErr := r.ReadAt(pfxBuf[:], pos)
 		for i := 0; i < pn; i++ {
 			if pfxBuf[i]&0x80 == 0 {
 				prefixLen = i + 1
@@ -83,8 +84,8 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 			}
 		}
 		if prefixLen == 0 {
-			if pn > 12 {
-				return ObjBad, nil, ErrOfsDeltaBaseRefTooLong
+			if pn == 0 && readErr != nil {
+				return ObjBad, nil, fmt.Errorf("read ofs-delta prefix: %w", readErr)
 			}
 			return ObjBad, nil, ErrOfsDeltaBaseRefTooLong
 		}

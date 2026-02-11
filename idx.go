@@ -90,6 +90,11 @@ type idxFile struct {
 	// traversal and delta resolution. The slice is nil when no reverse
 	// index is available and has length equal to the object count when loaded.
 	ridx []uint32
+
+	// ridxCRCTrusted reports whether ridx was loaded from an on-disk .ridx/.rev
+	// file (true) versus synthesized from sortedOffsets (false). Only trusted
+	// reverse indexes can map offset order back to idx-entry order for CRC lookups.
+	ridxCRCTrusted bool
 }
 
 // findObject looks up hash in the tables that belong to a single
@@ -142,10 +147,10 @@ func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
 //	desc = len(sortedOffsets) - 1 - i   // ascending → descending
 //	idxPos = ridx[desc]                 // → entries[idxPos].crc
 //
-// When the ridx is absent or malformed (e.g. a third-party RIDX generator
-// produced an incompatible file), the method falls back to a linear scan
-// over entries. This is O(n) but still correct; the slow path is acceptable
-// because CRC verification is opt-in and runs infrequently.
+// When ridx is absent, synthesized from sortedOffsets, or malformed, the method
+// falls back to a linear scan over entries. This is O(n) but still correct; the
+// slow path is acceptable because CRC verification is opt-in and runs
+// infrequently.
 func (f *idxFile) crcAtOffset(off uint64) (uint32, bool) {
 	if f == nil || len(f.sortedOffsets) == 0 {
 		return 0, false
@@ -155,8 +160,9 @@ func (f *idxFile) crcAtOffset(off uint64) (uint32, bool) {
 		return 0, false
 	}
 
-	// ridx maps descending-offset order to idx-entry order.
-	if len(f.ridx) == len(f.sortedOffsets) {
+	// Only trust on-disk ridx mappings for CRC lookups. Synthetic fallback
+	// tables encode descending rank, not offset->entries index mapping.
+	if f.ridxCRCTrusted && len(f.ridx) == len(f.sortedOffsets) {
 		desc := len(f.sortedOffsets) - 1 - i
 		idxPos := int(f.ridx[desc])
 		if idxPos >= 0 && idxPos < len(f.entries) {

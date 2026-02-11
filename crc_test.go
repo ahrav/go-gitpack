@@ -7,10 +7,10 @@ package objstore
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"github.com/klauspost/compress/zlib"
 	"hash/crc32"
 	"os"
 	"path/filepath"
@@ -176,6 +176,34 @@ func TestVerifyCRC32_MismatchedCRC(t *testing.T) {
 	assert.Contains(t, err.Error(), "crc mismatch")
 	assert.Contains(t, err.Error(), fmt.Sprintf("%08x", wrongCRC))
 	assert.Contains(t, err.Error(), fmt.Sprintf("%08x", actualCRC))
+}
+
+// TestIdxFileCRCAtOffset_SyntheticReverseIndex verifies that crcAtOffset does
+// not trust the fallback reverse-index shape when it is only a descending rank
+// list and not a real offset->entry mapping.
+func TestIdxFileCRCAtOffset_SyntheticReverseIndex(t *testing.T) {
+	f := &idxFile{
+		entries: []idxEntry{
+			{offset: 30, crc: uint32(0xAAAA0001)},
+			{offset: 10, crc: uint32(0xBBBB0002)},
+			{offset: 20, crc: uint32(0xCCCC0003)},
+		},
+		sortedOffsets: []uint64{10, 20, 30},
+	}
+	f.ridx = buildReverseFromEntries(f)
+	f.ridxCRCTrusted = true // synthetic ridx from buildReverseFromEntries is correct
+
+	crc, ok := f.crcAtOffset(10)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0xBBBB0002), crc)
+
+	crc, ok = f.crcAtOffset(20)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0xCCCC0003), crc)
+
+	crc, ok = f.crcAtOffset(30)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0xAAAA0001), crc)
 }
 
 // TestVerifyPackTrailer_Valid builds a pack whose trailing 20 bytes are the

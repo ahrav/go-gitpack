@@ -13,9 +13,9 @@
 // delta step can decode from one half of the buffer while writing into the
 // other, avoiding heap allocations.
 //
-// No delta‑specific names are exported.
-// All symbols below this comment are package‑private in order to keep the
-// public surface minimal and stable.
+// ErrDeltaTargetTooLarge is the only exported symbol.
+// All other symbols below this comment are package‑private in order to keep
+// the public surface minimal and stable.
 package objstore
 
 import (
@@ -71,13 +71,8 @@ type deltaContext struct {
 	// resolution so that the resolver can detect ref‑delta cycles.
 	visited map[Hash]bool
 
-	// offsets marks every packfile offset reached during ofs‑delta resolution
-	// so that the resolver can detect cycles that revisit a previous object
-	// offset in the same pack.
-	offsets map[uint64]bool
-
 	// depth is the current recursion depth.
-	// It is incremented on entry to a child delta and decremented on exit.
+	// Cleared to zero when the context is returned to the pool via reset().
 	depth int
 
 	// maxDepth is the caller‑provided recursion limit.
@@ -92,7 +87,6 @@ var deltaContextPool = sync.Pool{
 	New: func() any {
 		return &deltaContext{
 			visited: make(map[Hash]bool),
-			offsets: make(map[uint64]bool),
 		}
 	},
 }
@@ -113,7 +107,6 @@ func putDeltaContext(ctx *deltaContext) {
 // reset clears per-lookup state so the context can be reused from a pool.
 func (ctx *deltaContext) reset() {
 	clear(ctx.visited)
-	clear(ctx.offsets)
 	ctx.depth = 0
 	ctx.maxDepth = 0
 }
@@ -150,13 +143,16 @@ func (ctx *deltaContext) enterRefDelta(hash Hash) {
 // between *source* and *destination* buffers while walking a delta chain.
 type deltaArena struct{ data []byte }
 
+// defaultDeltaArenaSize is the standard allocation for pooled ping-pong arenas:
+// two 16 MiB halves = 32 MiB total.
+const defaultDeltaArenaSize = 2 * 16 << 20
+
 // deltaArenaPool loans arenas large enough to hold two complete objects of up
 // to 16 MiB each (32 MiB total).
 var deltaArenaPool = sync.Pool{
 	New: func() any {
-		const maxObjectSize = 16 << 20 // 16 MiB
 		return &deltaArena{
-			data: make([]byte, 2*maxObjectSize),
+			data: make([]byte, defaultDeltaArenaSize),
 		}
 	},
 }
@@ -165,7 +161,13 @@ var deltaArenaPool = sync.Pool{
 func getDeltaArena() *deltaArena { return deltaArenaPool.Get().(*deltaArena) }
 
 // putDeltaArena returns arena to the pool and resets its slice length.
+// Arenas that were grown beyond the default pool size during dynamic resizing
+// are discarded rather than returned, preventing pool pollution with oversized
+// allocations.
 func putDeltaArena(arena *deltaArena) {
+	if cap(arena.data) > defaultDeltaArenaSize {
+		return
+	}
 	arena.data = arena.data[:cap(arena.data)]
 	deltaArenaPool.Put(arena)
 }
@@ -275,21 +277,10 @@ func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, Objec
 	return applyDeltaStack(stack, base, baseType, params.maxObjectSize, false)
 }
 
-// inflateDeltaChainBorrowed is like inflateDeltaChainStreaming but skips the
-// final copy from the arena, returning a slice that is backed by a pooled
-// deltaArena buffer.
-//
-// Lifetime / invalidation contract:
-// The returned []byte is valid ONLY until ANY of the following events occurs:
-//   - The caller invokes any other delta-resolution function on the same
-//     goroutine (inflateDeltaChainStreaming, inflateDeltaChainBorrowed,
-//     applyDeltaStack, or any store method that inflates a delta).
-//   - The deltaArena is returned to deltaArenaPool (which happens at the end
-//     of applyDeltaStack via the deferred putDeltaArena call).
-//   - The goroutine exits (the runtime may reclaim pooled objects at any GC).
-//
-// In practice, callers must copy or fully consume the returned data
-// synchronously before performing any further object inflation.
+// inflateDeltaChainBorrowed keeps a distinct entry point for callers that
+// intentionally skip cache writes. For correctness, the returned bytes are
+// detached from pooled arena storage before return (same lifetime guarantees
+// as inflateDeltaChainStreaming).
 func inflateDeltaChainBorrowed(s *store, params inflationParams) ([]byte, ObjectType, error) {
 	stack := make(deltaStack, 0, 16)
 	base, baseType, err := walkUpDeltaChain(s, params, &stack)
@@ -370,7 +361,10 @@ func walkUpDeltaChain(
 		// structural property makes explicit cycle detection unnecessary for
 		// ofs-delta chains (though the depth limit still applies).
 		pos := int64(currOff) + int64(hdrLen)
-		back := readOfsDeltaOffset(currPack, pos)
+		back, err := readOfsDeltaOffset(currPack, pos)
+		if err != nil {
+			return nil, ObjBad, fmt.Errorf("read ofs-delta offset: %w", err)
+		}
 		currOff -= back
 	}
 
@@ -382,10 +376,9 @@ func walkUpDeltaChain(
 // performed after the walk-up phase has completed. The function then resolves
 // the chain using the established ping-pong arena strategy.
 //
-// When borrowed is true, the returned []byte is backed by the arena and
-// must be consumed before the next delta resolution (see the lifetime
-// contract documented on inflateDeltaChainBorrowed). When borrowed is false,
-// a fresh heap allocation is returned that the caller may retain indefinitely.
+// borrowed preserves the historical call-site intent for consume-and-discard
+// paths. For correctness, the final bytes are always detached from the pooled
+// arena before the function returns.
 //
 // Ordering invariant: the stack is iterated from len(stack)-1 down to 0.
 // walkUpDeltaChain pushes deltas in walk-up order (child first, base last),
@@ -397,7 +390,7 @@ func applyDeltaStack(
 	baseData []byte,
 	baseType ObjectType,
 	maxObjectSize uint64,
-	borrowed bool, // when true, skip the final copy (caller must consume before next resolution)
+	borrowed bool, // retained for call-site intent; final bytes are always detached
 ) ([]byte, ObjectType, error) {
 	if len(stack) == 0 {
 		if borrowed {
@@ -480,15 +473,11 @@ func applyDeltaStack(
 		}
 	}
 
-	if borrowed {
-		// Return arena-backed data directly. The caller must consume the data
-		// before any subsequent delta resolution on this goroutine.
-		return current, baseType, nil
-	}
-
-	// Copy final result out of the arena so the arena can be recycled.
+	// Always copy final result out of the arena so the arena can be safely
+	// recycled without invalidating returned bytes.
 	final := make([]byte, len(current))
 	copy(final, current)
+	_ = borrowed // call-site signal is currently informational only.
 	return final, baseType, nil
 }
 
@@ -513,23 +502,26 @@ func applyDeltaStack(
 //
 // Up to 9 bytes are read in a single ReadAt to avoid per-byte syscall
 // overhead on the memory-mapped file.
-func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) uint64 {
+func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
 	var buf [9]byte
-	n, _ := pack.ReadAt(buf[:], pos)
+	n, err := pack.ReadAt(buf[:], pos)
 	if n == 0 {
-		return 0
+		if err != nil {
+			return 0, fmt.Errorf("read ofs-delta offset: %w", err)
+		}
+		return 0, fmt.Errorf("read ofs-delta offset: no bytes read")
 	}
 
 	offset := uint64(buf[0] & 0x7f)
 	for i := 1; i < n; i++ {
 		if buf[i-1]&0x80 == 0 {
-			return offset
+			return offset, nil
 		}
 		offset++
 		offset = (offset << 7) | uint64(buf[i]&0x7f)
 	}
 
-	return offset
+	return offset, nil
 }
 
 // applyDeltaStreaming applies delta instructions to reconstruct an object.
@@ -589,8 +581,11 @@ func applyDeltaStreaming(
 
 	// Read the delta header, which specifies the base and target object sizes.
 	baseSize, _, err := readVarIntFromReader(br)
-	if err != nil || baseSize != uint64(len(base)) {
-		return nil, errors.New("delta base size mismatch")
+	if err != nil {
+		return nil, fmt.Errorf("read delta base size: %w", err)
+	}
+	if baseSize != uint64(len(base)) {
+		return nil, fmt.Errorf("delta base size mismatch: header=%d actual=%d", baseSize, len(base))
 	}
 
 	targetSize, _, err := readVarIntFromReader(br)
