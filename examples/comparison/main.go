@@ -59,102 +59,73 @@ func main() {
 }
 
 func printReport(results []result) {
+	line := strings.Repeat("─", 68)
+	dblLine := strings.Repeat("═", 68)
+
 	fmt.Println()
-	fmt.Println("# go-gitpack Scan vs git log (gitleaks / trufflehog)")
+	fmt.Println(dblLine)
+	fmt.Println("  go-gitpack vs git log  ·  Full-History Scan Comparison")
+	fmt.Println(dblLine)
 	fmt.Println()
 	printMachineInfo()
 	fmt.Println()
-
-	fmt.Println("## What each method does")
-	fmt.Println()
-	fmt.Println("| Method | Work performed |")
-	fmt.Println("|--------|---------------|")
-	fmt.Println("| gitleaks `git log` | Walk commits, diff trees, compute unified patches (`-U0`), emit changed lines only |")
-	fmt.Println("| trufflehog `git log` | Walk commits, diff trees, compute full unified patches, emit changed lines + context |")
-	fmt.Println("| gitpack `Scan` | Walk commits, collect unique blob OIDs, decompress + delta-resolve **every full blob** |")
-	fmt.Println()
-	fmt.Println("gitpack reads significantly more data because it materializes full file contents,")
-	fmt.Println("not just diff hunks. Despite this, it is consistently faster due to mmap'd packfile")
-	fmt.Println("access, parallel decode workers, and zero process-spawning overhead.")
-	fmt.Println()
-
-	fmt.Println("## Results")
-	fmt.Println()
-	fmt.Printf("| %-25s | %8s | %10s | %10s | %10s | %10s | %10s | %10s | %10s |\n",
-		"Repository", "Commits",
-		"gitleaks", "gl output",
-		"trufflehog", "th output",
-		"gitpack", "gp data",
-		"gp blobs")
-	fmt.Printf("|%s|%s|%s|%s|%s|%s|%s|%s|%s|\n",
-		strings.Repeat("-", 27),
-		strings.Repeat("-", 10),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12))
+	fmt.Println("  How each method works:")
+	fmt.Println("    gitleaks    git log -p -U0  → diff hunks (changed lines only)")
+	fmt.Println("    trufflehog  git log -p      → diff patches (changes + context)")
+	fmt.Println("    go-gitpack  HistoryScanner  → every unique full blob via mmap")
 
 	for _, r := range results {
+		fmt.Println()
+		fmt.Println(line)
+		fmt.Printf("  %s", r.name)
+		if r.commits > 0 {
+			fmt.Printf("  (%s commits)", fmtCount(r.commits))
+		}
+		fmt.Println()
+		fmt.Println(line)
+
 		if r.gpErr != nil {
-			fmt.Printf("| %-25s | %8d | ERROR: %v\n", r.name, r.commits, r.gpErr)
+			fmt.Printf("\n  ERROR: %v\n", r.gpErr)
 			continue
 		}
-		fmt.Printf("| %-25s | %8d | %10s | %10s | %10s | %10s | %10s | %10s | %10d |\n",
-			r.name, r.commits,
-			fmtDur(r.git[0].dur), fmtBytes(r.git[0].bytes),
-			fmtDur(r.git[1].dur), fmtBytes(r.git[1].bytes),
-			fmtDur(r.gpDur), fmtBytes(r.gpBytes),
-			r.gpBlobs)
-	}
 
-	fmt.Println()
-	fmt.Println("## Speedup")
-	fmt.Println()
-	fmt.Printf("| %-25s | %8s | %10s | %10s | %6s | %10s | %10s | %6s |\n",
-		"Repository", "Commits",
-		"gitleaks", "gitpack", "ratio",
-		"trufflehog", "gitpack", "ratio")
-	fmt.Printf("|%s|%s|%s|%s|%s|%s|%s|%s|\n",
-		strings.Repeat("-", 27),
-		strings.Repeat("-", 10),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 8),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 12),
-		strings.Repeat("-", 8))
+		fmt.Println()
 
-	for _, r := range results {
-		if r.gpErr != nil {
-			continue
-		}
-		glRatio := "—"
-		thRatio := "—"
+		// Timing + data table.
+		fmt.Printf("  %-22s %10s    %10s streamed\n",
+			"gitleaks git log", fmtDur(r.git[0].dur), fmtBytes(r.git[0].bytes))
+		fmt.Printf("  %-22s %10s    %10s streamed\n",
+			"trufflehog git log", fmtDur(r.git[1].dur), fmtBytes(r.git[1].bytes))
+		fmt.Printf("  %-22s %10s    %10s scanned  (%s blobs)\n",
+			"go-gitpack", fmtDur(r.gpDur), fmtBytes(r.gpBytes), fmtCount(int(r.gpBlobs)))
+
+		// Speedup summary.
+		fmt.Println()
 		if r.git[0].dur > 0 {
-			glRatio = fmt.Sprintf("%.2fx", float64(r.gpDur)/float64(r.git[0].dur))
+			glSpeedup := float64(r.git[0].dur) / float64(r.gpDur)
+			fmt.Printf("  → %.1fx faster than gitleaks\n", glSpeedup)
 		}
 		if r.git[1].dur > 0 {
-			thRatio = fmt.Sprintf("%.2fx", float64(r.gpDur)/float64(r.git[1].dur))
+			thSpeedup := float64(r.git[1].dur) / float64(r.gpDur)
+			fmt.Printf("  → %.1fx faster than trufflehog\n", thSpeedup)
 		}
-		fmt.Printf("| %-25s | %8d | %10s | %10s | %6s | %10s | %10s | %6s |\n",
-			r.name, r.commits,
-			fmtDur(r.git[0].dur), fmtDur(r.gpDur), glRatio,
-			fmtDur(r.git[1].dur), fmtDur(r.gpDur), thRatio)
+
+		// Data comparison (only if git commands produced output to compare against).
+		if r.git[0].bytes > 0 && r.gpBytes > r.git[0].bytes {
+			dataRatio := float64(r.gpBytes) / float64(r.git[0].bytes)
+			fmt.Printf("\n  Note: go-gitpack read %.1fx MORE data (full blobs vs diff hunks)\n", dataRatio)
+			fmt.Println("  yet still finished faster.")
+		}
+
+		// Throughput.
+		if r.gpDur > 0 && r.gpBytes > 0 {
+			throughput := float64(r.gpBytes) / r.gpDur.Seconds()
+			fmt.Printf("\n  Throughput: %s/s\n", fmtBytes(int64(throughput)))
+		}
 	}
 
 	fmt.Println()
-	fmt.Println("Ratio = gitpack / git (lower = gitpack is faster).")
-	fmt.Println()
-	fmt.Println("## Legend")
-	fmt.Println()
-	fmt.Println("| Label | Command |")
-	fmt.Println("|-------|---------|")
-	fmt.Println("| gitleaks | `git log -p -U0 --full-history --all --diff-filter=tuxdb` |")
-	fmt.Println("| trufflehog | `git log -p --full-history --all --date=iso-strict --pretty=fuller --notes` |")
-	fmt.Println("| gitpack | `HistoryScanner.Scan()` — mmap packfiles, parallel decode, stream every unique blob |")
+	fmt.Println(dblLine)
 }
 
 func printMachineInfo() {
@@ -334,6 +305,17 @@ func fmtDur(d time.Duration) string {
 		return fmt.Sprintf("%.1fms", float64(d.Milliseconds()))
 	default:
 		return fmt.Sprintf("%.2fs", d.Seconds())
+	}
+}
+
+func fmtCount(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%dk", n/1_000)
+	default:
+		return fmt.Sprintf("%d", n)
 	}
 }
 
