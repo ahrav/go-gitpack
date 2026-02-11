@@ -622,7 +622,7 @@ func makeObject(name string, size int) object {
 	}
 }
 
-// Scenario 1: Hot Base Objects
+// Hot Base Objects
 // Simulates multiple delta chains sharing common base objects.
 // This is typical when many files share similar content.
 func benchmarkHotBases(b *testing.B, newCache func() benchCache) {
@@ -710,7 +710,7 @@ func benchmarkHotBases(b *testing.B, newCache func() benchCache) {
 	m.report(b)
 }
 
-// Scenario 2: Tree Walking
+// Tree Walking
 // Simulates walking git trees where parent directories are frequently reused.
 func benchmarkTreeWalk(b *testing.B, newCache func() benchCache) {
 	cache := newCache()
@@ -803,7 +803,7 @@ func benchmarkTreeWalk(b *testing.B, newCache func() benchCache) {
 	m.report(b)
 }
 
-// Scenario 3: Concurrent Resolution
+// Concurrent Resolution
 // Simulates multiple goroutines resolving overlapping delta chains.
 // This tests the value of reference counting.
 func benchmarkConcurrentChains(b *testing.B, newCache func() benchCache) {
@@ -913,7 +913,7 @@ func benchmarkConcurrentChains(b *testing.B, newCache func() benchCache) {
 	b.ReportMetric(float64(holding.Load()), "holding_final")
 }
 
-// Scenario 4: Pack Traversal
+// Pack Traversal
 // Simulates scanning a packfile with mixed object types and sizes.
 func benchmarkPackTraversal(b *testing.B, newCache func() benchCache) {
 	cache := newCache()
@@ -991,7 +991,7 @@ func benchmarkPackTraversal(b *testing.B, newCache func() benchCache) {
 	m.report(b)
 }
 
-// Scenario 5: Delta Chain Resolution
+// Delta Chain Resolution
 // Simulates resolving full delta chains where all objects in the chain
 // must be held in memory simultaneously until the final object is reconstructed.
 // This is the core operation when Git needs to reconstruct a file from a packfile.
