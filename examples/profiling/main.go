@@ -93,7 +93,8 @@ func main() {
 	startTime := time.Now()
 	fmt.Println("\nStarting blob scan...")
 
-	if err := <-errs; err != nil {
+	s := &profilingScanner{startTime: startTime}
+	if err := scanner.Scan(nil, s); err != nil {
 		log.Printf("Error during scan: %v", err)
 	}
 
