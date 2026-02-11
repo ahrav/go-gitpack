@@ -10,26 +10,10 @@ Note: This is very much experimental and a learning repo.
 
 ## Usage
 
-### Stream added hunks
+### Scan every unique blob (recommended)
 
-```go
-scanner, err := objstore.NewHistoryScanner("/path/to/.git")
-if err != nil {
-    log.Fatal(err)
-}
-defer scanner.Close()
-
-hunks, errs := scanner.DiffHistoryHunks()
-for h := range hunks {
-    fmt.Printf("%s %s (lines %d-%d)\n",
-        h.Commit().String()[:8], h.Path(), h.StartLine(), h.EndLine())
-}
-if err := <-errs; err != nil {
-    log.Fatal(err)
-}
-```
-
-### Scan every unique blob
+Blob mode visits every unique blob exactly once in pack-offset order — no diff
+computation, sequential I/O, and each blob is seen only once via deduplication.
 
 ```go
 type myScanner struct{}
@@ -50,3 +34,4 @@ if err := scanner.Scan(nil, &myScanner{}); err != nil {
     log.Fatal(err)
 }
 ```
+
