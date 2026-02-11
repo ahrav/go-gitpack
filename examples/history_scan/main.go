@@ -39,8 +39,11 @@ func main() {
 	fmt.Println("Starting to stream commit history hunks...")
 	fmt.Println("Press Ctrl+C to stop")
 
-	// DiffHistoryHunks returns streaming channels for additions and errors.
-	hunkAdditions, errors := scanner.DiffHistoryHunks()
+	// DiffHistoryHunks returns two channels: a stream of hunk additions and
+	// an error channel. Drain hunks completely in a goroutine, then check the
+	// error channel. This avoids a select race where the error channel becomes
+	// readable before the hunk channel is closed.
+	hunks, errs := scanner.DiffHistoryHunks()
 
 	hunkCount := 0
 	// maxHunks controls how many hunks to process before stopping.
@@ -48,14 +51,8 @@ func main() {
 	// math.MaxInt to process the entire history.
 	const maxHunks = math.MaxInt
 
-	// A separate goroutine drains the hunk channel so that the main goroutine
-	// can simultaneously wait on the error channel. This is necessary because
-	// DiffHistoryHunks sends hunks and the final error on separate channels;
-	// blocking on one without draining the other would deadlock.
-	done := make(chan bool)
 	go func() {
-		defer close(done)
-		for hunkAddition := range hunkAdditions {
+		for hunkAddition := range hunks {
 			if hunkCount >= maxHunks {
 				fmt.Printf("... (stopping after %d hunks for demo purposes)\n", maxHunks)
 				return
@@ -73,7 +70,7 @@ func main() {
 			showLines := min(3, len(lines))
 			fmt.Printf("  Content (first %d lines):\n", showLines)
 			for i := range showLines {
-				content := string(lines[i])
+				content := lines[i]
 				if len(content) > 80 {
 					content = content[:77] + "..."
 				}
@@ -90,16 +87,10 @@ func main() {
 		}
 	}()
 
-	// Wait for either the completion of hunk processing or an error.
-	select {
-	case err := <-errors:
-		if err != nil {
-			log.Fatalf("Error during history scan: %v", err)
-		}
-		fmt.Println("✅ History scan completed successfully!")
-	case <-done:
-		fmt.Printf("✅ Processed %d hunks\n", hunkCount)
+	if err := <-errs; err != nil {
+		log.Fatalf("Error during history scan: %v", err)
 	}
+	fmt.Printf("Processed %d hunks\n", hunkCount)
 }
 
 // findGitDir walks up the directory tree to find a .git directory.

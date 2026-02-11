@@ -30,13 +30,6 @@ import (
 )
 
 const (
-	// maxDeltaChainDepth is the maximum number of delta hops allowed when
-	// resolving a deltified packfile object. This matches the Git default
-	// (pack.depth = 50). Exceeding this limit returns an error rather than
-	// risking stack overflow or excessive CPU consumption from
-	// pathologically deep delta chains (which may indicate pack corruption).
-	maxDeltaChainDepth = 50
-
 	// windowBudget (32 MiB) is the memory budget for the refCountedDeltaWindow.
 	// This value matches Git's default pack.windowMemory setting. 32 MiB is
 	// large enough to hold several dozen typical delta bases concurrently,

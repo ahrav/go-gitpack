@@ -91,7 +91,7 @@ type commitGraphData struct {
 	// TreeOIDs records the root tree OID for each commit in OrderedOIDs.
 	TreeOIDs []Hash
 
-	// Timestamps records the author timestamp, in seconds since the Unix epoch,
+	// Timestamps records the committer timestamp, in seconds since the Unix epoch,
 	// for each commit in OrderedOIDs.
 	Timestamps []int64
 
@@ -320,7 +320,7 @@ type parsedGraph struct {
 	// trees stores the root tree object ID for each commit in oids.
 	trees []Hash
 
-	// times records the author timestamp, in seconds since the Unix epoch,
+	// times records the committer timestamp, in seconds since the Unix epoch,
 	// for each commit in oids.
 	times []int64
 

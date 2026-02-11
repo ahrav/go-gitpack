@@ -174,7 +174,7 @@ type store struct {
 	dw deltaWindow
 
 	// maxDeltaDepth limits delta chain traversal depth.
-	// The default value matches Git's own limit of 50.
+	// The default value is 100 (see defaultMaxDeltaDepth).
 	maxDeltaDepth int
 
 	// maxDeltaObjectSize bounds delta target materialization.
@@ -303,7 +303,7 @@ func open(dir string) (*store, error) {
 }
 
 // SetMaxDeltaDepth configures the maximum number of delta hops allowed.
-// The default value of 50 matches Git's own limit.
+// The default value is 100 (see defaultMaxDeltaDepth).
 //
 // Lower values reduce CPU usage but may reject valid deeply-chained objects.
 // Higher values risk stack overflow with maliciously crafted repositories.
@@ -325,8 +325,8 @@ func (s *store) SetMaxDeltaObjectSize(maxBytes uint64) {
 
 // Close releases all memory-mapped files associated with the store.
 // After Close returns, the store must not be used.
-//
-// Multiple calls to Close are safe and return the first error encountered.
+// Close must be called exactly once; calling it multiple times may
+// attempt to close already-closed handles.
 func (s *store) Close() error {
 	if s == nil {
 		return nil
@@ -363,7 +363,7 @@ func (s *store) treeIter(oid Hash) (*TreeIter, error) {
 		return nil, fmt.Errorf("failed to get tree %s: %w", oid, err)
 	}
 	if typ != ObjTree {
-		return nil, fmt.Errorf("expected tree type for %s, got %v", oid, typ)
+		return nil, fmt.Errorf("%w: expected tree type for %s, got %v", ErrTypeMismatch, oid, typ)
 	}
 	if len(raw) > 0 && raw[0] == 0 {
 		return nil, fmt.Errorf("tree %s starts with null byte (likely corrupted)", oid)

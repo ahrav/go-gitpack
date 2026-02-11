@@ -71,10 +71,6 @@ func main() {
 		fmt.Printf("Failed to create scanner: %v\n", err)
 		fmt.Printf("Error type: %T\n", err)
 
-		if err == objstore.ErrCommitGraphRequired {
-			fmt.Println("Error is ErrCommitGraphRequired")
-		}
-
 		log.Fatalf("Cannot proceed: %v", err)
 	}
 	defer scanner.Close()

@@ -103,15 +103,16 @@ func main() {
 
 	fmt.Println("\n🚀 Starting scan...")
 
-	// DiffHistoryHunks returns two channels: a stream of hunk additions and an
-	// error channel. Hunks are sent as each commit is diffed; the error channel
-	// receives at most one value when the walk completes or fails.
-	hunkAdditions, errors := scanner.DiffHistoryHunks()
+	// DiffHistoryHunks returns two channels: hunks and a single error.
+	// Drain hunks completely in a goroutine, then check the error channel.
+	// This avoids a select race where the error channel becomes readable
+	// before the hunk channel is closed (due to defer ordering inside
+	// DiffHistoryHunks), which would cause a data race on the shared
+	// counters and potentially incomplete statistics.
+	hunks, errs := scanner.DiffHistoryHunks()
 
-	done := make(chan bool)
 	go func() {
-		defer close(done)
-		for hunkAddition := range hunkAdditions {
+		for hunkAddition := range hunks {
 			hunkCount++
 			totalLines += len(hunkAddition.Lines())
 			commitSet[hunkAddition.Commit()] = struct{}{}
@@ -130,44 +131,17 @@ func main() {
 		}
 	}()
 
-	select {
-	case err := <-errors:
-		if err != nil {
-			log.Printf("Error during scan: %v", err)
-		}
-	case <-done:
-		fmt.Println("\n✅ Scan completed successfully!")
+	if err := <-errs; err != nil {
+		log.Printf("Error during scan: %v", err)
 	}
 
 	elapsed := time.Since(startTime)
-	fmt.Printf("\n📊 Scan Statistics:\n")
+	fmt.Printf("\nScan Statistics:\n")
 	fmt.Printf("   Total hunks processed: %d\n", hunkCount)
 	fmt.Printf("   Total lines analyzed: %d\n", totalLines)
 	fmt.Printf("   Unique commits: %d\n", len(commitSet))
 	fmt.Printf("   Time elapsed: %v\n", elapsed)
 	fmt.Printf("   Processing rate: %.1f hunks/sec\n", float64(hunkCount)/elapsed.Seconds())
-
-	if *enableProf {
-		fmt.Printf("\n📈 Profile Analysis:\n")
-		fmt.Println("While the scan is running, capture profiles from another terminal:")
-		fmt.Printf("   # CPU profile (30 seconds):\n")
-		fmt.Printf("   curl http://%s/debug/pprof/profile?seconds=30 > cpu.prof\n", *profileAddr)
-		fmt.Printf("   go tool pprof cpu.prof\n\n")
-
-		fmt.Printf("   # Memory profile:\n")
-		fmt.Printf("   curl http://%s/debug/pprof/heap > heap.prof\n", *profileAddr)
-		fmt.Printf("   go tool pprof heap.prof\n\n")
-
-		fmt.Printf("   # Live profiling:\n")
-		fmt.Printf("   go tool pprof http://%s/debug/pprof/heap\n", *profileAddr)
-		fmt.Printf("   go tool pprof http://%s/debug/pprof/profile?seconds=30\n\n", *profileAddr)
-
-		fmt.Printf("💡 Common pprof commands:\n")
-		fmt.Printf("   top10          - Show top 10 functions by CPU/memory\n")
-		fmt.Printf("   list <func>    - Show source code for a function\n")
-		fmt.Printf("   web            - Open interactive graph in browser\n")
-		fmt.Printf("   png > out.png  - Save graph as image\n")
-	}
 
 	if *trace {
 		fmt.Printf("\n   Execution trace will be saved to: %s\n", *tracePath)

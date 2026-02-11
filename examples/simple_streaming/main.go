@@ -56,23 +56,16 @@ func main() {
 
 	fmt.Println("🚀 Streaming commit hunks from repository history...")
 
-	hunkAdditions, errors := scanner.DiffHistoryHunks()
+	hunks, errs := scanner.DiffHistoryHunks()
 
-	// The select/channel pattern below multiplexes the hunk data stream
-	// and the error channel. We read from hunkAdditions until it is closed
-	// (indicating the walk is complete), and check the error channel for
-	// any fatal errors that may arrive concurrently. When hunkAdditions is
-	// closed, ok becomes false and we exit.
+	// Drain the hunk channel completely in a goroutine, then check the
+	// error channel. This avoids a select race where the error channel
+	// becomes readable before the hunk channel is closed, which could
+	// silently drop trailing buffered hunks.
 	count := 0
 	totalLines := 0
-	for {
-		select {
-		case hunkAddition, ok := <-hunkAdditions:
-			if !ok {
-				fmt.Printf("\n✅ Finished! Processed %d hunks with %d total lines.\n", count, totalLines)
-				return
-			}
-
+	go func() {
+		for hunkAddition := range hunks {
 			count++
 			hunkLineCount := len(hunkAddition.Lines())
 			totalLines += hunkLineCount
@@ -90,7 +83,7 @@ func main() {
 
 					showLines := min(2, len(lines))
 					for i := 0; i < showLines; i++ {
-						content := string(lines[i])
+						content := lines[i]
 						if len(content) > 80 {
 							content = content[:77] + "..."
 						}
@@ -101,13 +94,11 @@ func main() {
 					}
 				}
 			}
-
-		case err := <-errors:
-			if err != nil {
-				log.Fatalf("❌ Error during streaming: %v", err)
-			}
-			fmt.Printf("\n✅ Streaming completed successfully! Total hunks: %d, total lines: %d\n", count, totalLines)
-			return
 		}
+	}()
+
+	if err := <-errs; err != nil {
+		log.Fatalf("Error during streaming: %v", err)
 	}
+	fmt.Printf("\nStreaming completed successfully! Total hunks: %d, total lines: %d\n", count, totalLines)
 }
