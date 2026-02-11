@@ -203,7 +203,11 @@ func collectRefTips(gitDir string) ([]Hash, error) {
 		headLine := strings.TrimSpace(string(headData))
 		if strings.HasPrefix(headLine, "ref: ") {
 			refName := strings.TrimSpace(strings.TrimPrefix(headLine, "ref: "))
-			if h, ok := readRefHash(gitDir, refName); ok {
+			h, ok, err := readRefHash(gitDir, refName)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
 				add(h)
 			}
 		} else if h, ok := parseHashToken(headLine); ok {
@@ -269,16 +273,22 @@ func collectRefTips(gitDir string) ([]Hash, error) {
 	return out, nil
 }
 
-func readRefHash(gitDir, refName string) (Hash, bool) {
+func readRefHash(gitDir, refName string) (Hash, bool, error) {
 	refPath := filepath.Join(gitDir, filepath.FromSlash(refName))
 	if b, err := os.ReadFile(refPath); err == nil {
-		return parseHashToken(strings.TrimSpace(string(b)))
+		h, ok := parseHashToken(strings.TrimSpace(string(b)))
+		return h, ok, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Hash{}, false, err
 	}
 
 	packedRefsPath := filepath.Join(gitDir, "packed-refs")
 	packed, err := os.ReadFile(packedRefsPath)
 	if err != nil {
-		return Hash{}, false
+		if errors.Is(err, os.ErrNotExist) {
+			return Hash{}, false, nil
+		}
+		return Hash{}, false, err
 	}
 
 	sc := bufio.NewScanner(bytes.NewReader(packed))
@@ -295,9 +305,13 @@ func readRefHash(gitDir, refName string) (Hash, bool) {
 		if fields[1] != refName {
 			continue
 		}
-		return parseHashToken(fields[0])
+		h, ok := parseHashToken(fields[0])
+		return h, ok, nil
 	}
-	return Hash{}, false
+	if err := sc.Err(); err != nil {
+		return Hash{}, false, err
+	}
+	return Hash{}, false, nil
 }
 
 // parseCommitInfoFromHeader extracts structured metadata from the raw header

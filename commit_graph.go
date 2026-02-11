@@ -116,9 +116,15 @@ func (g *commitGraphData) parentsOf(idx int) []Hash {
 	if len(pidxs) == 0 {
 		return nil
 	}
-	parents := make([]Hash, len(pidxs))
-	for i, pi := range pidxs {
-		parents[i] = g.OrderedOIDs[pi]
+	parents := make([]Hash, 0, len(pidxs))
+	for _, pi := range pidxs {
+		if pi < 0 || int(pi) >= len(g.OrderedOIDs) {
+			continue // Sentinel or out-of-range: parent not in graph.
+		}
+		parents = append(parents, g.OrderedOIDs[pi])
+	}
+	if len(parents) == 0 {
+		return nil
 	}
 	return parents
 }
@@ -162,6 +168,8 @@ func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 		for j, p := range c.ParentOIDs {
 			if pi, ok := oidToIdx[p]; ok {
 				idxs[j] = int32(pi)
+			} else {
+				idxs[j] = -1 // Sentinel: parent not in graph.
 			}
 		}
 		parentIndices[i] = idxs
@@ -272,6 +280,8 @@ func loadCommitGraph(objectsDir string) (*commitGraphData, error) {
 		for j, p := range ps {
 			if pi, ok := oidToIndex[p]; ok {
 				idxs[j] = int32(pi)
+			} else {
+				idxs[j] = -1 // Sentinel: parent not in graph.
 			}
 		}
 		parentIndices[i] = idxs

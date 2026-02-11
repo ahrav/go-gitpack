@@ -54,6 +54,15 @@ func objectNotFoundError(oid Hash) error {
 	return fmt.Errorf("%w: %x", ErrObjectNotFound, oid)
 }
 
+// copyBytes returns a new byte slice with the same contents as src.
+// It is used by cache-hit paths to ensure callers receive an independent
+// copy that they may safely mutate without corrupting cached data.
+func copyBytes(src []byte) []byte {
+	cp := make([]byte, len(src))
+	copy(cp, src)
+	return cp
+}
+
 func init() {
 	// On Windows, memory-mapped files hold an OS-level lock that prevents the
 	// file from being deleted, renamed, or opened exclusively by another
@@ -386,17 +395,19 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// that are likely to be bases for upcoming delta resolutions.
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
+		cp := copyBytes(d)
 		// Promote to ARC cache on second access (delta window hit).
-		if len(d) <= maxCacheableSize {
-			s.cache.Add(oid, cachedObj{data: d, typ: t})
+		// Store the copy in the ARC cache so it doesn't alias the delta window buffer.
+		if len(cp) <= maxCacheableSize {
+			s.cache.Add(oid, cachedObj{data: cp, typ: t})
 		}
 		b.Release()
-		return d, t, nil
+		return cp, t, nil
 	}
 
 	// If not in the delta window, check the larger ARC cache.
 	if b, ok := s.cache.Get(oid); ok {
-		return b.data, b.typ, nil
+		return copyBytes(b.data), b.typ, nil
 	}
 
 	// On a cache miss, inflate the object from a packfile, tracking delta depth
@@ -411,12 +422,13 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
+		cp := copyBytes(d)
 		b.Release()
-		return d, t, nil
+		return cp, t, nil
 	}
 
 	if b, ok := s.cache.Get(oid); ok {
-		return b.data, b.typ, nil
+		return copyBytes(b.data), b.typ, nil
 	}
 
 	p, off, ok := s.findPackedObject(oid)
@@ -475,12 +487,13 @@ func (s *store) getPackedObjectNoCache(p *mmap.ReaderAt, off uint64, oid Hash) (
 func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
+		cp := copyBytes(d)
 		b.Release()
-		return d, t, nil
+		return cp, t, nil
 	}
 
 	if b, ok := s.cache.Get(oid); ok {
-		return b.data, b.typ, nil
+		return copyBytes(b.data), b.typ, nil
 	}
 
 	if s.memoryMidx != nil {
@@ -514,7 +527,8 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 			s.dw.add(oid, data, typ)
 			s.cache.Add(oid, cachedObj{data: data, typ: typ})
 		}
-		return data, typ, nil
+		// Return a copy so callers cannot corrupt the cached data.
+		return copyBytes(data), typ, nil
 	}
 	return nil, ObjBad, err
 }
@@ -562,7 +576,8 @@ func (s *store) getWithContextSkipCache(oid Hash, ctx *deltaContext) ([]byte, Ob
 			s.dw.add(oid, data, typ)
 			s.cache.Add(oid, cachedObj{data: data, typ: typ})
 		}
-		return data, typ, nil
+		// Return a copy so callers cannot corrupt the cached data.
+		return copyBytes(data), typ, nil
 	}
 	return nil, ObjBad, err
 }
@@ -625,6 +640,8 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 		// path), reducing lock contention on the ARC during bulk inflation.
 		if cacheResult && len(full) <= maxCacheableSize {
 			s.dw.add(params.oid, full, baseType)
+			// Return a copy so the caller cannot corrupt the cached data.
+			return copyBytes(full), baseType, nil
 		}
 		return full, baseType, nil
 	}
@@ -646,6 +663,8 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 
 	if cacheResult && len(data) <= maxCacheableSize {
 		s.dw.add(params.oid, data, objType)
+		// Return a copy so the caller cannot corrupt the cached data.
+		return copyBytes(data), objType, nil
 	}
 	return data, objType, nil
 }

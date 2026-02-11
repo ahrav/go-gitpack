@@ -1773,6 +1773,42 @@ func generateTestGraphChain(t testing.TB, dir string, layers []int) []string {
 /*                              Benchmarks                                   */
 /* ------------------------------------------------------------------------- */
 
+// TestBuildCommitGraphFromCommits_MissingParentDoesNotPointToZero verifies that
+// when a commit references a parent OID that is NOT present in the commits
+// slice, the parent index uses the sentinel value (not 0), so parentsOf()
+// does not silently return the first commit as a parent.
+func TestBuildCommitGraphFromCommits_MissingParentDoesNotPointToZero(t *testing.T) {
+	root := commitInfo{
+		OID:     makeCGHash("aa"),
+		TreeOID: makeCGHash("11"),
+	}
+	// missingParent is an OID that is NOT in the commits slice.
+	missingParent := makeCGHash("deadbeef")
+	child := commitInfo{
+		OID:        makeCGHash("bb"),
+		TreeOID:    makeCGHash("22"),
+		ParentOIDs: []Hash{missingParent},
+	}
+
+	graph := buildCommitGraphFromCommits([]commitInfo{root, child})
+
+	// The child should have 1 parent in the Parents map.
+	childParents := graph.Parents[child.OID]
+	require.Len(t, childParents, 1)
+	assert.Equal(t, missingParent, childParents[0])
+
+	// The parentsOf() function should NOT resolve the missing parent to the
+	// root commit (index 0). Since the parent OID is not in the graph, it
+	// should be treated as absent.
+	childIdx, ok := graph.OIDToIndex[child.OID]
+	require.True(t, ok)
+	resolvedParents := graph.parentsOf(childIdx)
+	for _, p := range resolvedParents {
+		assert.NotEqual(t, root.OID, p,
+			"missing parent should not resolve to index 0 (the root commit)")
+	}
+}
+
 // BenchmarkLoadCommitGraph measures end-to-end loadCommitGraph performance for
 // single-file and chained graphs at sizes from 1K to 1M commits.
 func BenchmarkLoadCommitGraph(b *testing.B) {

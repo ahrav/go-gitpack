@@ -7,7 +7,11 @@ package objstore
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // TestLoadAllCommits_SkipsMissingRefObjects simulates a repository whose HEAD
@@ -48,4 +52,41 @@ func TestLoadAllCommits_SkipsMissingRefObjects(t *testing.T) {
 	if len(commits) != 0 {
 		t.Fatalf("expected zero commits, got %d", len(commits))
 	}
+}
+
+// TestReadRefHash_PropagatesIOErrors verifies that readRefHash returns an error
+// (not just false) when the ref file cannot be read due to a permission error.
+// Before the fix, all errors were swallowed as "not found".
+func TestReadRefHash_PropagatesIOErrors(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("permission-based test not reliable on Windows")
+	}
+
+	gitDir := t.TempDir()
+	refsDir := filepath.Join(gitDir, "refs", "heads")
+	require.NoError(t, os.MkdirAll(refsDir, 0o755))
+
+	refPath := filepath.Join(refsDir, "main")
+	require.NoError(t, os.WriteFile(refPath, []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"), 0o000))
+
+	// Before the fix: readRefHash returns (Hash{}, false, nil), swallowing
+	// the permission error. After the fix: it returns a non-nil error.
+	_, _, err := readRefHash(gitDir, "refs/heads/main")
+	assert.Error(t, err, "permission errors should be propagated, not swallowed")
+}
+
+// TestReadRefHash_ChecksScannerError verifies that readRefHash checks sc.Err()
+// after the scanner loop, so I/O errors from packed-refs are reported.
+func TestReadRefHash_ChecksScannerError(t *testing.T) {
+	gitDir := t.TempDir()
+
+	// Create a packed-refs file with valid content. readRefHash should
+	// return (Hash{}, false, nil) when the ref is simply not in packed-refs.
+	packedRefs := "# pack-refs with: peeled fully-peeled sorted\n" +
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb refs/heads/other\n"
+	require.NoError(t, os.WriteFile(filepath.Join(gitDir, "packed-refs"), []byte(packedRefs), 0o644))
+
+	_, ok, err := readRefHash(gitDir, "refs/heads/nonexistent")
+	require.NoError(t, err)
+	assert.False(t, ok)
 }

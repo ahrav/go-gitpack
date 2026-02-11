@@ -687,6 +687,40 @@ func TestStore_DeltaObjectRetrieval(t *testing.T) {
 	})
 }
 
+// TestGet_ReturnsFreshAllocation verifies that successive calls to get() for
+// the same OID return independent byte slices. Mutating the first result
+// must not affect the second. Before the fix, both calls returned slices
+// backed by the same cache buffer.
+func TestGet_ReturnsFreshAllocation(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	s, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer s.Close()
+
+	blobData := []byte("base content")
+	blobHash := calculateHash(ObjBlob, blobData)
+
+	// First get — populates the caches.
+	data1, typ1, err := s.get(blobHash)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ1)
+	assert.Equal(t, blobData, data1)
+
+	// Mutate the returned slice.
+	for i := range data1 {
+		data1[i] = 0xFF
+	}
+
+	// Second get — should return the original content, not the mutated data.
+	data2, typ2, err := s.get(blobHash)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ2)
+	assert.Equal(t, blobData, data2,
+		"get() must return independent copies; mutating one must not affect later calls")
+}
+
 // TestReadRawObject_OfsDeltaReadError verifies that readRawObject propagates
 // I/O errors (e.g., reading beyond EOF) from the ofs-delta prefix read instead
 // of masking them as ErrOfsDeltaBaseRefTooLong.
