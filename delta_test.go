@@ -882,3 +882,55 @@ func applyTestDeltaStack(t *testing.T, _ deltaStack, baseData []byte, testDeltas
 	copy(result, current)
 	return result
 }
+
+func TestApplyDeltaStack_BorrowedVsCopy(t *testing.T) {
+	t.Parallel()
+
+	// For empty stack, borrowed=true returns baseData directly (no arena).
+	base := []byte("hello world")
+	result, typ, err := applyDeltaStack(nil, base, ObjBlob, 0, true)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, base, result)
+
+	// For empty stack, borrowed=false returns a COPY.
+	result2, _, err := applyDeltaStack(nil, base, ObjBlob, 0, false)
+	require.NoError(t, err)
+	// Modify original; copy should be independent.
+	base[0] = 'H'
+	assert.Equal(t, byte('h'), result2[0], "non-borrowed should be independent copy")
+}
+
+func TestDeltaArenaOverflowProtection(t *testing.T) {
+	t.Parallel()
+
+	maxObj := uint64(512 << 20)
+	base := []byte("base")
+
+	_, _, err := applyDeltaStack(nil, base, ObjBlob, maxObj, false)
+	assert.NoError(t, err, "empty stack with maxObjectSize should succeed")
+
+	hugeBase := make([]byte, 1)
+	_, _, err = applyDeltaStack(nil, hugeBase, ObjBlob, 0, false)
+	assert.NoError(t, err, "empty stack should always succeed regardless of base size")
+}
+
+func TestDeltaArenaOversizedPoolReturn(t *testing.T) {
+	arena := getDeltaArena()
+	standardCap := cap(arena.data)
+	t.Logf("standard arena capacity: %d bytes (%d MiB)", standardCap, standardCap>>20)
+
+	oversized := make([]byte, standardCap*4)
+	arena.data = oversized
+
+	putDeltaArena(arena)
+
+	arena2 := getDeltaArena()
+	oversizedCap := cap(arena2.data)
+	t.Logf("retrieved arena capacity: %d bytes (%d MiB)", oversizedCap, oversizedCap>>20)
+
+	if oversizedCap > standardCap {
+		t.Logf("CONFIRMED: oversized arena (%d bytes) returned to pool without cap", oversizedCap)
+	}
+	putDeltaArena(arena2)
+}

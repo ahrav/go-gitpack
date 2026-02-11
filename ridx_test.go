@@ -687,3 +687,63 @@ func TestLoadReverseIndex_Integration(t *testing.T) {
 	assert.Equal(t, uint32(1), pf.resolveIdxPos(1))
 	assert.Equal(t, uint32(0), pf.resolveIdxPos(2))
 }
+
+func TestSyntheticRidxCRCLookup(t *testing.T) {
+	t.Parallel()
+
+	f := &idxFile{
+		entries: []idxEntry{
+			{offset: 500, crc: 0x1111},
+			{offset: 100, crc: 0x2222},
+			{offset: 300, crc: 0x3333},
+		},
+		sortedOffsets: []uint64{100, 300, 500},
+	}
+
+	f.ridx = buildReverseFromEntries(f)
+	f.ridxCRCTrusted = true
+	t.Logf("synthetic ridx: %v", f.ridx)
+
+	crc, ok := f.crcAtOffset(100)
+	require.True(t, ok, "should find offset 100")
+	assert.Equal(t, uint32(0x2222), crc,
+		"CRC for offset 100 should be BBB's CRC (0x2222), not AAA's (0x1111)")
+
+	crc, ok = f.crcAtOffset(300)
+	require.True(t, ok, "should find offset 300")
+	assert.Equal(t, uint32(0x3333), crc,
+		"CRC for offset 300 should be CCC's CRC (0x3333)")
+
+	crc, ok = f.crcAtOffset(500)
+	require.True(t, ok, "should find offset 500")
+	assert.Equal(t, uint32(0x1111), crc,
+		"CRC for offset 500 should be AAA's CRC (0x1111)")
+}
+
+func TestSyntheticRidxCRCLookupMatchingOrder(t *testing.T) {
+	t.Parallel()
+
+	f := &idxFile{
+		entries: []idxEntry{
+			{offset: 100, crc: 0x1111},
+			{offset: 300, crc: 0x2222},
+			{offset: 500, crc: 0x3333},
+		},
+		sortedOffsets: []uint64{100, 300, 500},
+	}
+
+	f.ridx = buildReverseFromEntries(f)
+	f.ridxCRCTrusted = true
+
+	crc, ok := f.crcAtOffset(100)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0x1111), crc, "should get correct CRC when orders match")
+
+	crc, ok = f.crcAtOffset(300)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0x2222), crc)
+
+	crc, ok = f.crcAtOffset(500)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0x3333), crc)
+}

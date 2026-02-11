@@ -579,3 +579,22 @@ func octStr(n uint32) string {
 	}
 	return string(buf[i:])
 }
+
+func TestTreeIterPoolLifecycle(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte("100644 test\x00" + string(make([]byte, 20)))
+	it := getTreeIter(raw)
+	require.NotNil(t, it)
+	assert.Equal(t, raw, it.rest, "rest should be set to the provided raw data")
+
+	putTreeIter(it)
+	assert.Nil(t, it.rest, "rest should be nil after putTreeIter")
+
+	putTreeIter(nil)
+
+	it2 := getTreeIter(raw)
+	require.NotNil(t, it2)
+	assert.Equal(t, raw, it2.rest)
+	putTreeIter(it2)
+}
