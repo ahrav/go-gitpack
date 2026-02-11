@@ -58,7 +58,7 @@ import (
 //
 // Only OID, tree, parents, and committer timestamp are retained, which keeps
 // allocation pressure low during repository‑wide walks.
-// The struct is produced by HistoryScanner.LoadAllCommits and can be processed
+// The struct is produced by internal commit-walk helpers and can be processed
 // concurrently.
 //
 // NOTE: commitInfo is unexported because it is an implementation detail; the
@@ -90,12 +90,18 @@ type commitInfo struct {
 // compute incremental diffs without materializing full commit objects.
 // The zero value is invalid; use NewHistoryScanner.
 type HistoryScanner struct {
+	// gitDir is the repository .git directory used for ref-based fallbacks.
+	gitDir string
+
+	// scanMode controls which scanning strategy is used by Scan.
+	// Blob mode is the default.
+	scanMode ScanMode
+
 	// store backs object retrieval for the lifetime of the scanner.
 	store *store
 
 	// graphData is the parsed commit‑graph. A nil value signals that the
-	// repository lacks a commit‑graph; packfile fallbacks will eventually be
-	// implemented to cover this case.
+	// repository lacks a commit‑graph and ref-walk fallback is used.
 	graphData *commitGraphData
 
 	// meta caches author/committer lines for cheap GetCommitMetadata calls.
@@ -110,6 +116,11 @@ type HistoryScanner struct {
 
 	// traceFile holds the file handle for execution trace output.
 	traceFile *os.File
+
+	// commitsOnce caches commit enumeration for repeated history walks.
+	commitsOnce sync.Once
+	commits     []commitInfo
+	commitsErr  error
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -127,20 +138,15 @@ func (e *ScanError) Error() string {
 	return fmt.Sprintf("failed to parse %d commits", len(e.FailedCommits))
 }
 
-// ErrCommitGraphRequired is returned by NewHistoryScanner and DiffHistoryHunks
-// when the caller requested an operation that currently depends on
-// commit‑graph files but the repository does not provide one.
+// ErrCommitGraphRequired is kept for backward compatibility.
+// HistoryScanner now always builds commit metadata in memory from ref walks.
 var ErrCommitGraphRequired = errors.New("commit‑graph required but not found")
 
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
 //
-// The current implementation **requires** a commit‑graph under
-//
-//	<gitDir>/objects/commit‑graph
-//
-// If the commit‑graph cannot be loaded the function returns a non‑nil error
-// and any resources acquired by the underlying object store are released.
+// The scanner always builds an in-memory commit graph from a ref walk and does
+// not consume on-disk commit-graph files.
 //
 // Options can be provided to configure scanner behavior, such as enabling
 // profiling with WithProfiling.
@@ -154,22 +160,13 @@ func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, e
 		return nil, fmt.Errorf("open object store: %w", err)
 	}
 
-	// Require commit‑graph (TODO: add fallback to packfile parsing).
-	graphDir := filepath.Join(gitDir, "objects")
-	graph, err := loadCommitGraph(graphDir)
-	if err != nil || graph == nil {
-		store.Close()
-		if err != nil {
-			return nil, fmt.Errorf("commit‑graph required but failed to load: %w", err)
-		}
-		return nil, ErrCommitGraphRequired
-	}
-
-	mc := newMetaCache(graph, store)
+	mc := newMetaCache(nil, store)
 
 	hs := &HistoryScanner{
+		gitDir:    gitDir,
+		scanMode:  ScanModeBlob,
 		store:     store,
-		graphData: graph,
+		graphData: nil,
 		meta:      mc,
 	}
 
@@ -230,17 +227,35 @@ func (h *HunkAddition) Path() string { return h.path }
 // IsBinary returns whether this hunk contains binary data.
 func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 
-// DiffHistoryHunks streams every added hunk from all commits.
+// DiffHistoryHunks streams every added hunk from all commits, diffing each
+// commit against its first parent only (i.e. merge commits are treated as a
+// single diff against the first parent, matching `git log --first-parent`
+// semantics). This keeps output deterministic and avoids duplicate hunks from
+// merge base reconstruction.
 //
 // It returns two buffered channels: one for HunkAddition values and one for a
-// single error.
-// The function never blocks the caller; all writes to the channels are
-// non‑blocking.
+// single error. The function never blocks the caller; all writes to the
+// channels are non-blocking.
 //
-// A nil error sent on errC signals a graceful end‑of‑stream.
+// Goroutine ownership: DiffHistoryHunks spawns a background goroutine that
+// owns the returned channels and closes them when the walk completes. The
+// caller MUST drain the HunkAddition channel to completion (or read until the
+// errC channel delivers a value) to avoid leaking goroutines. Failing to
+// drain will block the internal worker pool indefinitely.
+//
+// The HunkAddition channel is buffered to runtime.NumCPU() to allow workers
+// to make progress without waiting for the consumer on every hunk. The errC
+// channel is buffered to 1 so the producer goroutine can always send its
+// final error without blocking.
+//
+// A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
 	numWorkers := runtime.NumCPU()
 
+	// Buffer the output channel to numWorkers so that each worker can deposit
+	// at least one hunk without blocking, reducing contention during bursts.
+	// The errC channel is buffered to 1 so the goroutine can always complete
+	// its send even if the caller has not started reading yet.
 	out := make(chan HunkAddition, numWorkers)
 	errC := make(chan error, 1)
 
@@ -253,62 +268,74 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 			fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
 		}
 
-		if hs.graphData == nil {
-			errC <- ErrCommitGraphRequired
-			return
-		}
-
 		type workItem struct {
-			oid        Hash
-			treeOID    Hash
-			parentOIDs []Hash
+			commit     commitInfo
+			parentTree Hash
 		}
 
-		workChan := make(chan workItem, numWorkers)
-		errorChan := make(chan error, numWorkers)
-
-		var wg sync.WaitGroup
+		workChan := make(chan workItem, numWorkers*2)
+		stopCh := make(chan struct{})
+		var (
+			stopOnce sync.Once
+			wg       sync.WaitGroup
+			firstErr error
+		)
+		setError := func(err error) {
+			if err == nil {
+				return
+			}
+			stopOnce.Do(func() {
+				firstErr = err
+				close(stopCh)
+			})
+		}
 
 		for range numWorkers {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				for work := range workChan {
-					c := commitInfo{
-						OID:        work.oid,
-						TreeOID:    work.treeOID,
-						ParentOIDs: work.parentOIDs,
-					}
-					if err := hs.processCommitStreamingHunks(hs.store, c, out); err != nil {
-						errorChan <- fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err)
+				for {
+					select {
+					case <-stopCh:
 						return
+					case work, ok := <-workChan:
+						if !ok {
+							return
+						}
+						if err := hs.processCommitStreamingHunks(hs.store, work.commit, work.parentTree, out); err != nil {
+							c := work.commit
+							setError(fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err))
+							return
+						}
 					}
 				}
 			}()
 		}
 
-		go func() {
-			wg.Wait()
-			close(errorChan)
-		}()
-
-		// Feed commits to the workers.
-		go func() {
-			defer close(workChan)
-			for i, oid := range hs.graphData.OrderedOIDs {
-				workChan <- workItem{
-					oid:        oid,
-					treeOID:    hs.graphData.TreeOIDs[i],
-					parentOIDs: hs.graphData.Parents[oid],
-				}
+		walkErr := hs.walkCommitsFromRefs(func(c commitInfo) error {
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
 			}
-		}()
 
-		var firstErr error
-		for err := range errorChan {
-			if err != nil && firstErr == nil {
-				firstErr = err
+			parentTree, err := hs.firstParentTree(c)
+			if err != nil {
+				return fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err)
 			}
+
+			select {
+			case <-stopCh:
+				return errScanAborted
+			case workChan <- workItem{commit: c, parentTree: parentTree}:
+				return nil
+			}
+		})
+		close(workChan)
+		wg.Wait()
+
+		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
+			setError(walkErr)
 		}
 
 		errC <- firstErr
@@ -317,23 +344,46 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 	return out, errC
 }
 
+// errScanAborted marks an internal early-stop condition used to unwind commit walks.
+var errScanAborted = errors.New("scan aborted")
+
+// firstParentTree resolves the tree OID for a commit's first parent.
+//
+// When the commit has no parents (i.e. it is a root commit), the zero Hash{}
+// is returned. The caller interprets the zero hash as the empty tree, so
+// diffing against it produces additions for every file in the root commit's
+// tree. This avoids special-casing root commits in the diff pipeline.
+//
+// When the first parent cannot be found (ErrObjectNotFound) or is not a
+// commit object (ErrObjectNotCommit), the zero hash is returned silently.
+// This gracefully handles shallow clones and truncated history where parent
+// objects may be absent.
+func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
+	if len(c.ParentOIDs) == 0 {
+		return Hash{}, nil
+	}
+
+	parentOID := c.ParentOIDs[0]
+	hdr, err := hs.store.readCommitHeader(parentOID)
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) || errors.Is(err, ErrObjectNotCommit) {
+			return Hash{}, nil
+		}
+		return Hash{}, fmt.Errorf("read parent header %s: %w", parentOID, err)
+	}
+
+	parentInfo, err := parseCommitInfoFromHeader(parentOID, hdr)
+	if err != nil {
+		return Hash{}, err
+	}
+	return parentInfo.TreeOID, nil
+}
+
 // processCommitStreamingHunks diffs a single commit against its first parent
 // (or the empty tree for a root commit) and streams added hunks to out.
-func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, out chan<- HunkAddition) error {
-	parents := c.ParentOIDs
-	if len(parents) == 0 {
-		parents = []Hash{{}} // Root commit: diff against empty tree.
-	}
-
-	pTree := Hash{}
-	if !parents[0].IsZero() && hs.graphData != nil {
-		if idx, ok := hs.graphData.OIDToIndex[parents[0]]; ok {
-			pTree = hs.graphData.TreeOIDs[idx]
-		}
-	}
-
-	return walkDiff(tc, pTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
-		if mode&040000 != 0 { // Skip sub‑trees; we care only about blobs.
+func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, parentTree Hash, out chan<- HunkAddition) error {
+	return walkDiff(tc, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		if !isBlobMode(mode) {
 			return nil
 		}
 
@@ -345,17 +395,29 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 		for _, hunk := range hunks {
 			if hunk.IsBinary { // Don't fuse binary hunks
 				// Binary files are always sent as a single hunk.
+				// Convention: for binary hunks, startLine == endLine to signal
+				// that line-based range semantics do not apply. The value
+				// comes from hunk.StartLine and is repeated for endLine to
+				// communicate "this is a single indivisible blob" rather than
+				// a contiguous line range.
 				out <- HunkAddition{
 					commit:    c.OID,
 					path:      filepath.ToSlash(path),
 					startLine: int(hunk.StartLine),
-					endLine:   int(hunk.StartLine), // Binary files are one "line"
+					endLine:   int(hunk.StartLine),
 					lines:     hunk.Lines,
 					isBinary:  true,
 				}
 				continue
 			}
 
+			// fuseHunks merges adjacent hunks that are separated by fewer
+			// than `contextBefore` + `contextAfter` lines. The values 3, 3
+			// match the default context size used by `git diff` (3 lines of
+			// leading and 3 lines of trailing context). This keeps hunk
+			// boundaries consistent with what developers expect from
+			// standard unified-diff output and avoids splitting logically
+			// related changes into separate HunkAddition values.
 			fusedHunks := fuseHunks([]AddedHunk{hunk}, 3, 3)
 			for _, fused := range fusedHunks {
 				out <- HunkAddition{
@@ -372,9 +434,21 @@ func (hs *HistoryScanner) processCommitStreamingHunks(tc *store, c commitInfo, o
 	})
 }
 
-// get returns the fully materialized object identified by oid plus its type.
+// get returns the fully materialized (i.e. delta-resolved, decompressed)
+// object identified by oid plus its type. "Materialized" means that all
+// delta chains have been walked and applied, producing the final byte content
+// as if `git cat-file -p <oid>` were invoked.
 func (hs *HistoryScanner) get(oid Hash) ([]byte, ObjectType, error) {
 	return hs.store.get(oid)
+}
+
+// SetMaxDeltaDepth sets the maximum number of delta hops while materializing objects.
+func (hs *HistoryScanner) SetMaxDeltaDepth(depth int) { hs.store.SetMaxDeltaDepth(depth) }
+
+// SetMaxDeltaObjectSize bounds reconstructed delta targets in bytes.
+// Passing zero disables the bound.
+func (hs *HistoryScanner) SetMaxDeltaObjectSize(maxBytes uint64) {
+	hs.store.SetMaxDeltaObjectSize(maxBytes)
 }
 
 // SetVerifyCRC enables or disables CRC‑32 verification on all object reads.
@@ -401,11 +475,41 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
-// LoadAllCommits returns all commits in commit‑graph topological order.
-// The slice is never nil; it may be empty when the repository contains no
-// commits.
-func (hs *HistoryScanner) LoadAllCommits() ([]commitInfo, error) {
-	return hs.loadFromGraph(), nil
+// loadAllCommits is an internal helper used by package tests. Production scan
+// paths should use streaming traversal.
+//
+// The method uses sync.Once to ensure the expensive commit enumeration is
+// performed at most once, even under concurrent calls. After the first
+// successful load, subsequent calls return a fresh copy of the cached slice.
+//
+// Copy semantics: the returned []commitInfo is a shallow copy of the internal
+// cache. This prevents callers from mutating the scanner's cached state (e.g.
+// reordering or truncating the slice). The commitInfo values themselves are
+// safe to share because their mutable parts (the ParentOIDs slice) are never
+// modified after construction.
+func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
+	hs.commitsOnce.Do(func() {
+		if hs.graphData != nil {
+			hs.commits = hs.loadFromGraph()
+			return
+		}
+		hs.commits, hs.commitsErr = hs.loadFromRefs()
+		if hs.commitsErr != nil {
+			return
+		}
+		hs.graphData = buildCommitGraphFromCommits(hs.commits)
+		if hs.meta != nil {
+			hs.meta.attachGraph(hs.graphData)
+		}
+	})
+
+	if hs.commitsErr != nil {
+		return nil, hs.commitsErr
+	}
+
+	out := make([]commitInfo, len(hs.commits))
+	copy(out, hs.commits)
+	return out, nil
 }
 
 // loadFromGraph converts commit‑graph rows into commitInfo values.
@@ -417,9 +521,9 @@ func (hs *HistoryScanner) loadFromGraph() []commitInfo {
 		out[i] = commitInfo{
 			OID:        oid,
 			TreeOID:    hs.graphData.TreeOIDs[i],
-			ParentOIDs: hs.graphData.Parents[oid],
-			Timestamp:  hs.graphData.Timestamps[i], // if available
+			ParentOIDs: hs.graphData.parentsOf(i),
+			Timestamp:  hs.graphData.Timestamps[i],
 		}
 	}
-	return out
+	return orderCommitsParentFirst(out)
 }

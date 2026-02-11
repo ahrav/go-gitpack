@@ -13,14 +13,13 @@
 // delta step can decode from one half of the buffer while writing into the
 // other, avoiding heap allocations.
 //
-// No delta‑specific names are exported.
-// All symbols below this comment are package‑private in order to keep the
-// public surface minimal and stable.
+// ErrDeltaTargetTooLarge is the only exported symbol.
+// All other symbols below this comment are package‑private in order to keep
+// the public surface minimal and stable.
 package objstore
 
 import (
 	"bufio"
-	"compress/zlib"
 	"errors"
 	"fmt"
 	"io"
@@ -28,6 +27,8 @@ import (
 
 	"golang.org/x/exp/mmap"
 )
+
+var ErrDeltaTargetTooLarge = errors.New("delta target exceeds configured maximum")
 
 // deltaInfo represents a single delta object in a delta chain.
 // The struct is used during chain traversal to track the sequence of deltas
@@ -41,10 +42,19 @@ type deltaInfo struct {
 
 	// typ indicates whether this is an ofs-delta or ref-delta object.
 	typ ObjectType
+
+	// hdrLen caches the parsed object header length so downstream consumers
+	// (applyDeltaStreaming) can skip re-parsing the header.
+	hdrLen int
 }
 
-// deltaStack is a stack of deltaInfo objects, used to iteratively
-// resolve a delta chain.
+// deltaStack is a stack of deltaInfo objects, used to iteratively resolve a
+// delta chain.
+//
+// Ordering invariant: elements are pushed during the walk-up phase in
+// encounter order (child delta first, base-adjacent delta last). During the
+// apply-down phase the stack is iterated in reverse (from len-1 to 0) so
+// that the delta closest to the base object is applied first.
 type deltaStack []deltaInfo
 
 // deltaContext carries per‑lookup state while resolving a chain of deltas.
@@ -61,13 +71,8 @@ type deltaContext struct {
 	// resolution so that the resolver can detect ref‑delta cycles.
 	visited map[Hash]bool
 
-	// offsets marks every packfile offset reached during ofs‑delta resolution
-	// so that the resolver can detect cycles that revisit a previous object
-	// offset in the same pack.
-	offsets map[uint64]bool
-
 	// depth is the current recursion depth.
-	// It is incremented on entry to a child delta and decremented on exit.
+	// Cleared to zero when the context is returned to the pool via reset().
 	depth int
 
 	// maxDepth is the caller‑provided recursion limit.
@@ -75,15 +80,41 @@ type deltaContext struct {
 	maxDepth int
 }
 
+// deltaContextPool reuses deltaContext values across lookups.
+// Maps are cleared (Go 1.21+) rather than reallocated, preserving their
+// backing storage for subsequent resolutions.
+var deltaContextPool = sync.Pool{
+	New: func() any {
+		return &deltaContext{
+			visited: make(map[Hash]bool),
+		}
+	},
+}
+
+// getDeltaContext retrieves a pooled deltaContext configured with maxDepth.
+func getDeltaContext(maxDepth int) *deltaContext {
+	ctx := deltaContextPool.Get().(*deltaContext)
+	ctx.maxDepth = maxDepth
+	return ctx
+}
+
+// putDeltaContext returns ctx to the pool after clearing its per-lookup state.
+func putDeltaContext(ctx *deltaContext) {
+	ctx.reset()
+	deltaContextPool.Put(ctx)
+}
+
+// reset clears per-lookup state so the context can be reused from a pool.
+func (ctx *deltaContext) reset() {
+	clear(ctx.visited)
+	ctx.depth = 0
+	ctx.maxDepth = 0
+}
+
 // newDeltaContext allocates and initializes a deltaContext that enforces the
 // supplied maximum delta‑chain depth.
 func newDeltaContext(maxDepth int) *deltaContext {
-	return &deltaContext{
-		visited:  make(map[Hash]bool),
-		offsets:  make(map[uint64]bool),
-		depth:    0,
-		maxDepth: maxDepth,
-	}
+	return getDeltaContext(maxDepth)
 }
 
 // checkRefDelta validates that following a ref‑delta will neither exceed the
@@ -112,13 +143,16 @@ func (ctx *deltaContext) enterRefDelta(hash Hash) {
 // between *source* and *destination* buffers while walking a delta chain.
 type deltaArena struct{ data []byte }
 
+// defaultDeltaArenaSize is the standard allocation for pooled ping-pong arenas:
+// two 16 MiB halves = 32 MiB total.
+const defaultDeltaArenaSize = 2 * 16 << 20
+
 // deltaArenaPool loans arenas large enough to hold two complete objects of up
 // to 16 MiB each (32 MiB total).
 var deltaArenaPool = sync.Pool{
 	New: func() any {
-		const maxObjectSize = 16 << 20 // 16 MiB
 		return &deltaArena{
-			data: make([]byte, 2*maxObjectSize),
+			data: make([]byte, defaultDeltaArenaSize),
 		}
 	},
 }
@@ -127,9 +161,26 @@ var deltaArenaPool = sync.Pool{
 func getDeltaArena() *deltaArena { return deltaArenaPool.Get().(*deltaArena) }
 
 // putDeltaArena returns arena to the pool and resets its slice length.
+// Arenas that were grown beyond the default pool size during dynamic resizing
+// are discarded rather than returned, preventing pool pollution with oversized
+// allocations.
 func putDeltaArena(arena *deltaArena) {
+	if cap(arena.data) > defaultDeltaArenaSize {
+		return
+	}
 	arena.data = arena.data[:cap(arena.data)]
 	deltaArenaPool.Put(arena)
+}
+
+// errDeltaOutputTooSmall reports that the caller-provided output buffer cannot
+// hold the decoded target.
+type errDeltaOutputTooSmall struct {
+	need uint64
+	have int
+}
+
+func (e *errDeltaOutputTooSmall) Error() string {
+	return fmt.Sprintf("output buffer too small: need %d, have %d", e.need, e.have)
 }
 
 // inflationParams bundles the inputs required by inflateDeltaChainStreaming to
@@ -154,6 +205,9 @@ type inflationParams struct {
 	// ctx carries per-call state such as recursion depth and visited nodes.
 	// Obtain it via newDeltaContext before invoking the inflation routine.
 	ctx *deltaContext
+
+	// maxObjectSize bounds reconstructed delta objects. Zero disables the bound.
+	maxObjectSize uint64
 }
 
 // inflateDeltaChainStreaming reconstructs an object that is stored as a
@@ -215,12 +269,25 @@ type inflationParams struct {
 // resolution is complete.  applyDeltaStack treats the slice as read-only and
 // does not retain it after the call returns.
 func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, ObjectType, error) {
-	var stack deltaStack // will be mutated in-place
+	stack := make(deltaStack, 0, 16) // pre-size for typical chain depths
 	base, baseType, err := walkUpDeltaChain(s, params, &stack)
 	if err != nil {
 		return nil, ObjBad, err
 	}
-	return applyDeltaStack(stack, base, baseType)
+	return applyDeltaStack(stack, base, baseType, params.maxObjectSize, false)
+}
+
+// inflateDeltaChainBorrowed keeps a distinct entry point for callers that
+// intentionally skip cache writes. For correctness, the returned bytes are
+// detached from pooled arena storage before return (same lifetime guarantees
+// as inflateDeltaChainStreaming).
+func inflateDeltaChainBorrowed(s *store, params inflationParams) ([]byte, ObjectType, error) {
+	stack := make(deltaStack, 0, 16)
+	base, baseType, err := walkUpDeltaChain(s, params, &stack)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+	return applyDeltaStack(stack, base, baseType, params.maxObjectSize, true)
 }
 
 // walkUpDeltaChain climbs the delta chain starting at (pack, off) until a
@@ -249,7 +316,7 @@ func walkUpDeltaChain(
 
 	currPack, currOff := params.p, params.off
 	for depth := 0; depth < params.ctx.maxDepth; depth++ {
-		typ, _, err := peekObjectType(currPack, currOff)
+		typ, hdrLen, err := peekObjectType(currPack, currOff)
 		if err != nil {
 			return nil, ObjBad, err
 		}
@@ -262,12 +329,12 @@ func walkUpDeltaChain(
 			return baseData, typ, nil
 		}
 
-		*stack = append(*stack, deltaInfo{currPack, currOff, typ})
+		*stack = append(*stack, deltaInfo{currPack, currOff, typ, hdrLen})
 
 		if typ == ObjRefDelta {
 			var baseOID Hash
-			_, _, baseOID, err = readRefDeltaHeader(currPack, currOff)
-			if err != nil {
+			pos := int64(currOff) + int64(hdrLen)
+			if _, err := currPack.ReadAt(baseOID[:], pos); err != nil {
 				return nil, ObjBad, err
 			}
 			if err = params.ctx.checkRefDelta(baseOID); err != nil { // Cycle detection check.
@@ -283,11 +350,20 @@ func walkUpDeltaChain(
 			continue
 		}
 
-		// ofs-delta.
-		var back uint64
-		_, _, back, err = readOfsDeltaHeader(currPack, currOff)
+		// ofs-delta: read the variable-length backward offset and subtract
+		// it from the current position to reach the base object.
+		//
+		// Acyclicity reasoning: every ofs-delta stores a strictly positive
+		// backward byte offset within the same packfile, so the base always
+		// sits at a lower file position than the delta that references it.
+		// Because file offsets decrease monotonically on each hop, the walk
+		// must terminate -- it cannot revisit a previously seen offset. This
+		// structural property makes explicit cycle detection unnecessary for
+		// ofs-delta chains (though the depth limit still applies).
+		pos := int64(currOff) + int64(hdrLen)
+		back, err := readOfsDeltaOffset(currPack, pos)
 		if err != nil {
-			return nil, ObjBad, err
+			return nil, ObjBad, fmt.Errorf("read ofs-delta offset: %w", err)
 		}
 		currOff -= back
 	}
@@ -296,15 +372,30 @@ func walkUpDeltaChain(
 }
 
 // applyDeltaStack consumes the *same* deltaStack that was filled by
-// walkUpDeltaChain.  The slice is treated as read-only here; no mutations are
-// performed after the walk-up phase has completed.  The function then resolves
+// walkUpDeltaChain. The slice is treated as read-only here; no mutations are
+// performed after the walk-up phase has completed. The function then resolves
 // the chain using the established ping-pong arena strategy.
+//
+// borrowed preserves the historical call-site intent for consume-and-discard
+// paths. For correctness, the final bytes are always detached from the pooled
+// arena before the function returns.
+//
+// Ordering invariant: the stack is iterated from len(stack)-1 down to 0.
+// walkUpDeltaChain pushes deltas in walk-up order (child first, base last),
+// so iterating in reverse applies the oldest (closest-to-base) delta first
+// and the newest (closest-to-target) delta last, which is the correct
+// application order for reconstructing the final object.
 func applyDeltaStack(
 	stack deltaStack,
 	baseData []byte,
 	baseType ObjectType,
+	maxObjectSize uint64,
+	borrowed bool, // retained for call-site intent; final bytes are always detached
 ) ([]byte, ObjectType, error) {
 	if len(stack) == 0 {
+		if borrowed {
+			return baseData, baseType, nil
+		}
 		// Fast-path: no deltas at all.
 		result := make([]byte, len(baseData))
 		copy(result, baseData)
@@ -314,11 +405,15 @@ func applyDeltaStack(
 	arena := getDeltaArena()
 	defer putDeltaArena(arena)
 
-	maxTarget := peekLargestTarget(stack)
-	if bs := uint64(len(baseData)); bs > maxTarget {
-		maxTarget = bs
+	maxTarget := uint64(len(baseData))
+	poolHalf := uint64(cap(arena.data) / 2)
+	if poolHalf > maxTarget && (maxObjectSize == 0 || poolHalf <= maxObjectSize) {
+		maxTarget = poolHalf
 	}
-	if maxTarget > uint64(len(arena.data)/2) {
+	if maxObjectSize > 0 && maxTarget > maxObjectSize {
+		return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, maxTarget, maxObjectSize)
+	}
+	if maxTarget > uint64(cap(arena.data)/2) {
 		arena.data = make([]byte, maxTarget*2)
 	}
 
@@ -336,153 +431,97 @@ func applyDeltaStack(
 	for i := len(stack) - 1; i >= 0; i-- {
 		d := stack[i]
 
-		// Choose output buffer (the one we're NOT currently using).
-		var out []byte
-		if usingA {
-			out = bufB[:0]
-		} else {
-			out = bufA[:0]
-		}
+		for {
+			// Choose output buffer (the one we're NOT currently using).
+			var out []byte
+			if usingA {
+				out = bufB[:0]
+			} else {
+				out = bufA[:0]
+			}
 
-		result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out)
-		if err != nil {
-			return nil, ObjBad, err
-		}
+			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, current, out)
+			if err != nil {
+				var tooSmall *errDeltaOutputTooSmall
+				if errors.As(err, &tooSmall) {
+					if maxObjectSize > 0 && tooSmall.need > maxObjectSize {
+						return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
+					}
+					if tooSmall.need <= maxTarget {
+						return nil, ObjBad, err
+					}
 
-		// The result is now in 'out' buffer, make it the current for next iteration.
-		current = result
-		usingA = !usingA // Switch which buffer we're using
+					maxTarget = tooSmall.need
+					arena.data = make([]byte, maxTarget*2)
+					bufA = arena.data[:maxTarget]
+					bufB = arena.data[maxTarget : maxTarget*2]
+
+					// Re-anchor current into the new arena and retry this delta.
+					rebased := bufA[:len(current)]
+					copy(rebased, current)
+					current = rebased
+					usingA = true
+					continue
+				}
+				return nil, ObjBad, err
+			}
+
+			// The result is now in 'out' buffer, make it the current for next iteration.
+			current = result
+			usingA = !usingA // Switch which buffer we're using
+			break
+		}
 	}
 
-	// Copy final result.
-	in := current
-
-	final := make([]byte, len(in))
-	copy(final, in)
+	// Always copy final result out of the arena so the arena can be safely
+	// recycled without invalidating returned bytes.
+	final := make([]byte, len(current))
+	copy(final, current)
+	_ = borrowed // call-site signal is currently informational only.
 	return final, baseType, nil
 }
 
-// readRefDeltaHeader reads the header of a ref-delta object.
-// The method returns the object type, header length, and base object hash.
-func readRefDeltaHeader(p *mmap.ReaderAt, off uint64) (ObjectType, int, Hash, error) {
-	typ, hdrLen, err := peekObjectType(p, off)
-	if err != nil {
-		return ObjBad, 0, Hash{}, err
-	}
-
-	var baseOid Hash
-	pos := int64(off) + int64(hdrLen)
-	if _, err := p.ReadAt(baseOid[:], pos); err != nil {
-		return ObjBad, 0, Hash{}, err
-	}
-	return typ, hdrLen, baseOid, nil
-}
-
-// readOfsDeltaHeader reads the header of an ofs-delta object.
-// The method returns the object type, header length, and negative offset to base.
-func readOfsDeltaHeader(p *mmap.ReaderAt, off uint64) (ObjectType, int, uint64, error) {
-	typ, hdrLen, err := peekObjectType(p, off)
-	if err != nil {
-		return ObjBad, 0, 0, err
-	}
-
-	pos := int64(off) + int64(hdrLen)
-	offsetValue := readOfsDeltaOffset(p, pos)
-
-	return typ, hdrLen, offsetValue, nil
-}
-
-// readOfsDeltaOffset reads a variable-length offset from an ofs-delta object.
-// The offset encoding uses the MSB as a continuation bit.
-func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) uint64 {
-	var offset uint64
-	var b [1]byte
-
-	// Read the variable-length negative offset from the pack data.
-	pack.ReadAt(b[:], pos)
-	offset = uint64(b[0] & 0x7f)
-	for b[0]&0x80 != 0 {
-		pos++
-		offset++
-		pack.ReadAt(b[:], pos)
-		offset = (offset << 7) | uint64(b[0]&0x7f)
-	}
-
-	return offset
-}
-
-// peekLargestTarget calculates the maximum target size needed for delta application.
-// This allows pre-allocating buffers of the correct size to avoid reallocation
-// during delta chain resolution.
-func peekLargestTarget(deltaStack deltaStack) uint64 {
-	maxSize := uint64(0)
-
-	for _, delta := range deltaStack {
-		// Peek at the delta header to determine the size of the resulting object.
-		targetSize, err := peekDeltaTargetSize(delta.pack, delta.offset, delta.typ)
+// readOfsDeltaOffset reads a variable-length backward offset from an
+// ofs-delta object header.
+//
+// Encoding algorithm (from the Git pack format spec):
+//
+// The first byte contributes its lower 7 bits directly. Each subsequent
+// byte, if the previous byte had its MSB (continuation bit) set, is
+// folded in as follows:
+//
+//	offset++                                   // +1 bias
+//	offset = (offset << 7) | (byte & 0x7f)    // shift and merge
+//
+// The +1 before each shift is critical: it ensures that the encoding is
+// non-ambiguous. Without it, a leading 0x00 continuation byte would be
+// indistinguishable from "no more bytes", making the encoding
+// non-canonical. The +1 guarantees that every distinct offset has exactly
+// one valid encoding and that the decoder never produces a zero offset
+// from a non-empty continuation sequence.
+//
+// Up to 9 bytes are read in a single ReadAt to avoid per-byte syscall
+// overhead on the memory-mapped file.
+func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
+	var buf [9]byte
+	n, err := pack.ReadAt(buf[:], pos)
+	if n == 0 {
 		if err != nil {
-			// If peeking fails, fall back to a conservative, large buffer size.
-			return uint64(16 << 20) // 16MB fallback
+			return 0, fmt.Errorf("read ofs-delta offset: %w", err)
 		}
-		if targetSize > maxSize {
-			maxSize = targetSize
+		return 0, fmt.Errorf("read ofs-delta offset: no bytes read")
+	}
+
+	offset := uint64(buf[0] & 0x7f)
+	for i := 1; i < n; i++ {
+		if buf[i-1]&0x80 == 0 {
+			return offset, nil
 		}
+		offset++
+		offset = (offset << 7) | uint64(buf[i]&0x7f)
 	}
 
-	return maxSize
-}
-
-// peekDeltaTargetSize reads the target size from a delta header without full decompression.
-// This optimization allows proper buffer sizing before applying deltas.
-func peekDeltaTargetSize(
-	pack *mmap.ReaderAt,
-	offset uint64,
-	deltaType ObjectType,
-) (uint64, error) {
-	// Skip to delta instructions.
-	_, hdrLen, err := peekObjectType(pack, offset)
-	if err != nil {
-		return 0, err
-	}
-	pos := int64(offset) + int64(hdrLen)
-
-	// Skip the delta reference.
-	switch deltaType {
-	case ObjRefDelta:
-		pos += 20
-	case ObjOfsDelta:
-		// Skip the variable offset.
-		for {
-			var b [1]byte
-			if _, err := pack.ReadAt(b[:], pos); err != nil {
-				return 0, err
-			}
-			pos++
-			if b[0]&0x80 == 0 {
-				break
-			}
-		}
-	}
-
-	// Open a zlib stream just to read the header.
-	src := io.NewSectionReader(pack, pos, 1<<63-1)
-	zr, err := getZlibReader(src)
-	if err != nil {
-		return 0, err
-	}
-	defer putZlibReader(zr)
-
-	bufRdr := getBR(zr)
-	defer putBR(bufRdr)
-
-	// Skip the base size.
-	if _, _, err = readVarIntFromReader(bufRdr); err != nil {
-		return 0, err
-	}
-
-	// Read the target size.
-	targetSize, _, err := readVarIntFromReader(bufRdr)
-	return targetSize, err
+	return offset, nil
 }
 
 // applyDeltaStreaming applies delta instructions to reconstruct an object.
@@ -496,13 +535,17 @@ func applyDeltaStreaming(
 	pack *mmap.ReaderAt,
 	offset uint64,
 	deltaType ObjectType,
+	cachedHdrLen int, // pre-parsed header length from walkUpDeltaChain; 0 means re-parse
 	base []byte,
 	out []byte, // Pre-allocated output buffer
 ) ([]byte, error) {
-	// Skip the object header to get to the delta instructions.
-	_, hdrLen, err := peekObjectType(pack, offset)
-	if err != nil {
-		return nil, err
+	hdrLen := cachedHdrLen
+	if hdrLen <= 0 {
+		var err error
+		_, hdrLen, err = peekObjectType(pack, offset)
+		if err != nil {
+			return nil, err
+		}
 	}
 	pos := int64(offset) + int64(hdrLen)
 
@@ -526,19 +569,23 @@ func applyDeltaStreaming(
 
 	// Open a zlib stream to decompress the delta instructions.
 	src := io.NewSectionReader(pack, pos, 1<<63-1)
-	zr, err := zlib.NewReader(src)
+	zr, err := getZlibReader(src)
 	if err != nil {
 		return nil, err
 	}
-	defer zr.Close()
+	defer putZlibReader(zr)
 
-	// Use a pooled buffered reader for efficient byte-level operations.
-	br := bufio.NewReader(zr)
+	// Reuse buffered readers to avoid allocating one per delta application.
+	br := getBR(zr)
+	defer putBR(br)
 
 	// Read the delta header, which specifies the base and target object sizes.
 	baseSize, _, err := readVarIntFromReader(br)
-	if err != nil || baseSize != uint64(len(base)) {
-		return nil, errors.New("delta base size mismatch")
+	if err != nil {
+		return nil, fmt.Errorf("read delta base size: %w", err)
+	}
+	if baseSize != uint64(len(base)) {
+		return nil, fmt.Errorf("delta base size mismatch: header=%d actual=%d", baseSize, len(base))
 	}
 
 	targetSize, _, err := readVarIntFromReader(br)
@@ -548,7 +595,7 @@ func applyDeltaStreaming(
 
 	// Verify that the output buffer is large enough for the target object.
 	if uint64(cap(out)) < targetSize {
-		return nil, fmt.Errorf("output buffer too small: need %d, have %d", targetSize, cap(out))
+		return nil, &errDeltaOutputTooSmall{need: targetSize, have: cap(out)}
 	}
 
 	// Initialize a zero-length slice to ensure no undefined content is present.
@@ -608,55 +655,47 @@ func applyDeltaStreaming(
 // If size is encoded as zero the function substitutes 0x10000, mirroring Git's
 // behavior.
 func decodeCopyCommand(cmd byte, br *bufio.Reader) (offset, size int, err error) {
-	if cmd&0x01 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset = int(b)
-	}
-	if cmd&0x02 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 8
-	}
-	if cmd&0x04 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 16
-	}
-	if cmd&0x08 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 24
+	// Count the operand bytes indicated by the lower 7 bits of cmd.
+	bits := cmd & 0x7f
+	count := popcount7(bits)
+	if count == 0 {
+		return 0, 0x10000, nil
 	}
 
-	if cmd&0x10 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size = int(b)
+	var buf [7]byte
+	if _, err := io.ReadFull(br, buf[:count]); err != nil {
+		return 0, 0, err
 	}
-	if cmd&0x20 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 8
+
+	// Unpack operand bytes in order. The shift table maps each bit position
+	// to the corresponding shift amount for offset (bits 0-3) and size (bits 4-6).
+	idx := 0
+	if bits&0x01 != 0 {
+		offset = int(buf[idx])
+		idx++
 	}
-	if cmd&0x40 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 16
+	if bits&0x02 != 0 {
+		offset |= int(buf[idx]) << 8
+		idx++
+	}
+	if bits&0x04 != 0 {
+		offset |= int(buf[idx]) << 16
+		idx++
+	}
+	if bits&0x08 != 0 {
+		offset |= int(buf[idx]) << 24
+		idx++
+	}
+	if bits&0x10 != 0 {
+		size = int(buf[idx])
+		idx++
+	}
+	if bits&0x20 != 0 {
+		size |= int(buf[idx]) << 8
+		idx++
+	}
+	if bits&0x40 != 0 {
+		size |= int(buf[idx]) << 16
 	}
 
 	if size == 0 {
@@ -664,6 +703,24 @@ func decodeCopyCommand(cmd byte, br *bufio.Reader) (offset, size int, err error)
 	}
 
 	return offset, size, nil
+}
+
+// popcount7 returns the number of set bits in the lower 7 bits of b.
+//
+// Only 7 bits are counted (not 8) because the MSB of a Git delta copy
+// command byte is the copy/insert discriminator flag (0x80), not an
+// operand-presence indicator. The lower 7 bits (bits 0-6) each signal
+// whether a corresponding operand byte follows in the stream:
+//   - bits 0-3: offset bytes (up to 4)
+//   - bits 4-6: size bytes (up to 3)
+//
+// The implementation uses a standard parallel bit-count (SWAR) algorithm
+// restricted to 7 bits.
+func popcount7(b byte) int {
+	b = b & 0x7f
+	b = (b & 0x55) + ((b >> 1) & 0x55)
+	b = (b & 0x33) + ((b >> 2) & 0x33)
+	return int((b + (b >> 4)) & 0x0f)
 }
 
 // readVarIntFromReader reads a base‑128 varint from br and returns its value

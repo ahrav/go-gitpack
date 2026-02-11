@@ -1,3 +1,21 @@
+// tree_iter_test.go tests treeIter, a zero-allocation iterator over raw Git
+// tree object data. Each tree entry is encoded as "<octal-mode> <name>\0<20-byte-hash>"
+// and the iterator parses them sequentially without copying the underlying buffer.
+//
+// The tests cover:
+//   - Empty trees, single entries, and multi-entry trees.
+//   - All standard Git entry modes (regular, executable, directory, symlink, gitlink).
+//   - Unicode and special-character filenames.
+//   - Malformed entries: invalid mode digits, missing space, missing null, truncated SHA.
+//   - Iterator invariants: non-mutation of the backing buffer, independent concurrent iterators.
+//   - Benchmarks for typical (~20 entries) and large (~2000 entries) trees.
+//
+// Note: this file defines a local octStr helper that is functionally identical
+// to diffTestOctStr in diff_tree_test.go. Both convert a uint32 to its octal
+// string representation. They are kept separate because each test file may be
+// compiled independently and the helper is trivial enough that sharing it via
+// a common file would add unnecessary coupling.
+
 package objstore
 
 import (
@@ -169,7 +187,7 @@ func TestTreeIter_InvalidMode(t *testing.T) {
 
 			_, _, _, ok, err := iter.Next()
 			assert.False(t, ok, "expected ok=false for invalid mode")
-			assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+			assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 		})
 	}
 
@@ -213,7 +231,7 @@ func TestTreeIter_MissingSpace(t *testing.T) {
 
 	_, _, _, ok, err := iter.Next()
 	assert.False(t, ok, "expected ok=false for missing space")
-	assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+	assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 }
 
 func TestTreeIter_MissingNull(t *testing.T) {
@@ -224,7 +242,7 @@ func TestTreeIter_MissingNull(t *testing.T) {
 
 	_, _, _, ok, err := iter.Next()
 	assert.False(t, ok, "expected ok=false for missing null")
-	assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+	assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 }
 
 func TestTreeIter_TruncatedSHA(t *testing.T) {
@@ -240,7 +258,7 @@ func TestTreeIter_TruncatedSHA(t *testing.T) {
 
 			_, _, _, ok, err := iter.Next()
 			assert.False(t, ok, "expected ok=false for truncated SHA")
-			assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+			assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 		})
 	}
 }
@@ -259,7 +277,7 @@ func TestTreeIter_PartialEntry(t *testing.T) {
 
 			_, _, _, ok, err := iter.Next()
 			assert.False(t, ok, "expected ok=false for partial entry")
-			assert.Equal(t, ErrCorruptTree, err, "expected ErrCorruptTree")
+			assert.ErrorIs(t, err, ErrCorruptTree, "expected ErrCorruptTree")
 		})
 	}
 }
@@ -545,7 +563,9 @@ func BenchmarkTreeIter_Large(b *testing.B) {
 	}
 }
 
-// octStr converts a uint32 to an octal string.
+// octStr converts a uint32 to an octal string without a leading "0o" prefix.
+// This is the same algorithm as diffTestOctStr in diff_tree_test.go; see the
+// file-level comment for why the two copies exist.
 func octStr(n uint32) string {
 	if n == 0 {
 		return "0"
@@ -558,4 +578,23 @@ func octStr(n uint32) string {
 		n >>= 3
 	}
 	return string(buf[i:])
+}
+
+func TestTreeIterPoolLifecycle(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte("100644 test\x00" + string(make([]byte, 20)))
+	it := getTreeIter(raw)
+	require.NotNil(t, it)
+	assert.Equal(t, raw, it.rest, "rest should be set to the provided raw data")
+
+	putTreeIter(it)
+	assert.Nil(t, it.rest, "rest should be nil after putTreeIter")
+
+	putTreeIter(nil)
+
+	it2 := getTreeIter(raw)
+	require.NotNil(t, it2)
+	assert.Equal(t, raw, it2.rest)
+	putTreeIter(it2)
 }

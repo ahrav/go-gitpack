@@ -1,16 +1,29 @@
+// delta_test.go tests the delta decompression subsystem, including variable-
+// integer decoding, delta cycle detection, ping-pong buffer management during
+// multi-level delta chain resolution, buffer boundary conditions, arena pooling,
+// and large-object delta application.
+
 package objstore
 
 import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"unsafe"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/mmap"
 )
 
+// TestReadVarIntFromReader validates the Git-style variable-length integer
+// decoder, covering single-byte values, multi-byte continuation sequences,
+// and the empty-input error case.
+// NOTE: consider adding a "name" field to each test case for clearer subtest output.
 func TestReadVarIntFromReader(t *testing.T) {
 	tests := []struct {
 		data        []byte
@@ -40,6 +53,9 @@ func TestReadVarIntFromReader(t *testing.T) {
 	}
 }
 
+// TestDeltaCycleDetection verifies that the deltaContext correctly detects
+// circular REF_DELTA references (same hash seen twice) and rejects chains
+// that exceed the maximum allowed depth.
 func TestDeltaCycleDetection(t *testing.T) {
 	ctx := newDeltaContext(10)
 
@@ -528,6 +544,33 @@ func TestDeltaArenaPooling(t *testing.T) {
 	})
 }
 
+// TestDeltaArenaPoolOversizeDiscard verifies that arenas grown beyond the
+// default pool size during dynamic resizing are not returned to the pool.
+// Without the size guard in putDeltaArena, an oversized arena pollutes the
+// pool and subsequent callers receive bloated allocations.
+func TestDeltaArenaPoolOversizeDiscard(t *testing.T) {
+	const defaultArenaSize = 2 * 16 << 20 // 32 MiB — matches deltaArenaPool.New
+
+	// Drain the pool so we get a fresh arena from New.
+	for range 16 {
+		getDeltaArena()
+	}
+
+	arena := getDeltaArena()
+	assert.Equal(t, defaultArenaSize, cap(arena.data), "fresh arena should be 32 MiB")
+
+	// Simulate dynamic resizing: replace the backing slice with a 128 MiB allocation.
+	const oversized = 128 << 20
+	arena.data = make([]byte, oversized)
+	putDeltaArena(arena)
+
+	// The next arena from the pool must NOT be the oversized one.
+	next := getDeltaArena()
+	assert.LessOrEqual(t, cap(next.data), defaultArenaSize,
+		"oversized arena should not pollute the pool; got cap=%d", cap(next.data))
+	putDeltaArena(next)
+}
+
 // TestApplyDeltaStackWithLargeObjects tests delta application with objects that
 // approach or exceed the maximum cacheable size limit.
 func TestApplyDeltaStackWithLargeObjects(t *testing.T) {
@@ -546,7 +589,7 @@ func TestApplyDeltaStackWithLargeObjects(t *testing.T) {
 		stack        []testDelta
 		expectedSize int
 		description  string
-		shouldCache  bool
+		shouldCache  bool // Currently unused; documents intent for future cache-eligibility assertions.
 	}{
 		{
 			name: "large_base_small_delta",
@@ -655,6 +698,128 @@ func TestApplyDeltaStackWithLargeObjects(t *testing.T) {
 	}
 }
 
+// TestApplyDeltaStackBorrowedResultLifetime verifies that data returned in the
+// borrowed mode remains stable long enough for callers to consume it even after
+// subsequent delta decodes.
+func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
+	base := []byte("base content for borrowed lifetime test")
+	targetA := []byte("delta result payload A")
+	targetB := []byte("delta result payload B")
+
+	makeStack := func(name string, target []byte) (deltaStack, func()) {
+		t.Helper()
+
+		baseOID := calculateHash(ObjBlob, base)
+		obj, err := createRefDeltaObject(baseOID, target, base)
+		require.NoError(t, err)
+
+		path := filepath.Join(t.TempDir(), name+".packobj")
+		require.NoError(t, os.WriteFile(path, obj, 0o644))
+
+		pack, err := mmap.Open(path)
+		require.NoError(t, err)
+
+		typ, hdrLen, err := peekObjectType(pack, 0)
+		require.NoError(t, err)
+		require.Equal(t, ObjRefDelta, typ)
+
+		return deltaStack{
+				{
+					pack:   pack,
+					offset: 0,
+					typ:    typ,
+					hdrLen: hdrLen,
+				},
+			}, func() {
+				require.NoError(t, pack.Close())
+			}
+	}
+
+	stackA, closeA := makeStack("a", targetA)
+	defer closeA()
+	stackB, closeB := makeStack("b", targetB)
+	defer closeB()
+
+	first, typ, err := applyDeltaStack(stackA, base, ObjBlob, 0, true)
+	require.NoError(t, err)
+	require.Equal(t, ObjBlob, typ)
+	require.Equal(t, targetA, first)
+
+	second, typ, err := applyDeltaStack(stackB, base, ObjBlob, 0, true)
+	require.NoError(t, err)
+	require.Equal(t, ObjBlob, typ)
+	require.Equal(t, targetB, second)
+
+	assert.Equal(t, targetA, first, "borrowed delta bytes must remain valid for caller consumption")
+}
+
+// TestApplyDeltaStreaming_SizeMismatchIncludesSizes verifies that when the
+// base size in the delta header doesn't match the actual base, the error
+// message includes both sizes for debugging.
+func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
+	// Create a valid ref-delta object with known base/target data.
+	base := []byte("the original base content")
+	target := []byte("the modified target content")
+	baseOID := calculateHash(ObjBlob, base)
+
+	obj, err := createRefDeltaObject(baseOID, target, base)
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "test.packobj")
+	require.NoError(t, os.WriteFile(path, obj, 0o644))
+	pack, err := mmap.Open(path)
+	require.NoError(t, err)
+	defer pack.Close()
+
+	typ, hdrLen, err := peekObjectType(pack, 0)
+	require.NoError(t, err)
+	require.Equal(t, ObjRefDelta, typ)
+
+	// Call with the WRONG base (different length) to trigger size mismatch.
+	wrongBase := []byte("short")
+	out := make([]byte, 0, 4096)
+	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out)
+	require.Error(t, err)
+
+	// After fix: the error message includes both sizes, not just "delta base size mismatch".
+	assert.Contains(t, err.Error(), "mismatch")
+	assert.Contains(t, err.Error(), fmt.Sprintf("header=%d", len(base)))
+	assert.Contains(t, err.Error(), fmt.Sprintf("actual=%d", len(wrongBase)))
+}
+
+// TestReadOfsDeltaOffset_PropagatesReadError verifies that readOfsDeltaOffset
+// returns an error when the underlying ReadAt fails (e.g., reading beyond EOF
+// on a truncated file). Before the fix, the error was silently discarded.
+func TestReadOfsDeltaOffset_PropagatesReadError(t *testing.T) {
+	// Create an empty temp file and mmap it.
+	path := filepath.Join(t.TempDir(), "empty.pack")
+	require.NoError(t, os.WriteFile(path, []byte{}, 0o644))
+
+	pack, err := mmap.Open(path)
+	require.NoError(t, err)
+	defer pack.Close()
+
+	// Reading at any offset beyond the file should return an error.
+	_, err = readOfsDeltaOffset(pack, 100)
+	require.Error(t, err, "expected error when reading beyond EOF, got nil")
+}
+
+// TestReadOfsDeltaOffset_ValidData verifies that readOfsDeltaOffset correctly
+// decodes a valid single-byte offset (no continuation bit set).
+func TestReadOfsDeltaOffset_ValidData(t *testing.T) {
+	// A single byte with value 0x42 (continuation bit not set) should decode to 0x42.
+	path := filepath.Join(t.TempDir(), "valid.pack")
+	require.NoError(t, os.WriteFile(path, []byte{0x42}, 0o644))
+
+	pack, err := mmap.Open(path)
+	require.NoError(t, err)
+	defer pack.Close()
+
+	offset, err := readOfsDeltaOffset(pack, 0)
+	require.NoError(t, err)
+	assert.Equal(t, uint64(0x42), offset)
+}
+
 // testDelta represents delta information for testing.
 type testDelta struct {
 	targetSize int
@@ -716,4 +881,56 @@ func applyTestDeltaStack(t *testing.T, _ deltaStack, baseData []byte, testDeltas
 	result := make([]byte, len(current))
 	copy(result, current)
 	return result
+}
+
+func TestApplyDeltaStack_BorrowedVsCopy(t *testing.T) {
+	t.Parallel()
+
+	// For empty stack, borrowed=true returns baseData directly (no arena).
+	base := []byte("hello world")
+	result, typ, err := applyDeltaStack(nil, base, ObjBlob, 0, true)
+	require.NoError(t, err)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, base, result)
+
+	// For empty stack, borrowed=false returns a COPY.
+	result2, _, err := applyDeltaStack(nil, base, ObjBlob, 0, false)
+	require.NoError(t, err)
+	// Modify original; copy should be independent.
+	base[0] = 'H'
+	assert.Equal(t, byte('h'), result2[0], "non-borrowed should be independent copy")
+}
+
+func TestDeltaArenaOverflowProtection(t *testing.T) {
+	t.Parallel()
+
+	maxObj := uint64(512 << 20)
+	base := []byte("base")
+
+	_, _, err := applyDeltaStack(nil, base, ObjBlob, maxObj, false)
+	assert.NoError(t, err, "empty stack with maxObjectSize should succeed")
+
+	hugeBase := make([]byte, 1)
+	_, _, err = applyDeltaStack(nil, hugeBase, ObjBlob, 0, false)
+	assert.NoError(t, err, "empty stack should always succeed regardless of base size")
+}
+
+func TestDeltaArenaOversizedPoolReturn(t *testing.T) {
+	arena := getDeltaArena()
+	standardCap := cap(arena.data)
+	t.Logf("standard arena capacity: %d bytes (%d MiB)", standardCap, standardCap>>20)
+
+	oversized := make([]byte, standardCap*4)
+	arena.data = oversized
+
+	putDeltaArena(arena)
+
+	arena2 := getDeltaArena()
+	oversizedCap := cap(arena2.data)
+	t.Logf("retrieved arena capacity: %d bytes (%d MiB)", oversizedCap, oversizedCap>>20)
+
+	if oversizedCap > standardCap {
+		t.Logf("CONFIRMED: oversized arena (%d bytes) returned to pool without cap", oversizedCap)
+	}
+	putDeltaArena(arena2)
 }

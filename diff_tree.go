@@ -1,11 +1,46 @@
+// diff_tree.go implements a streaming, memory-efficient tree-to-tree diff for
+// Git object trees.
+//
+// The algorithm performs a merge-join over the sorted entries of two trees,
+// emitting per-file change callbacks without materialising the full trees in
+// memory. This design supports arbitrarily large repositories because only
+// one tree level is traversed at a time.
+//
+// PRECONDITION: Git tree entries are stored in Git tree sort order, which is
+// *not* plain lexicographic order. Directories are compared as if their name
+// had a trailing '/' appended (e.g. "foo" < "foo-bar" < "foo.c" < "foo/"
+// when "foo" is a tree). The TreeIter returned by store.treeIter MUST yield
+// entries in this canonical order for the merge-join comparisons (oln < nln,
+// oln == nln) to be correct. Violating this precondition will produce
+// incorrect diffs silently.
 package objstore
 
 import (
 	"errors"
 	"fmt"
 	"io"
-	"path/filepath"
 )
+
+// joinPath builds a Git-style forward-slash path by simple string
+// concatenation. This is intentionally used instead of filepath.Join +
+// filepath.ToSlash because:
+//
+//  1. filepath.Join allocates an intermediate slice via filepath.Clean and
+//     then filepath.ToSlash allocates again for the slash conversion. In a
+//     large repository diff this function is called millions of times, so the
+//     double allocation is measurable.
+//  2. Git tree entries already use forward slashes, so no OS-specific path
+//     normalisation is needed.
+func joinPath(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	// Avoid double slash when prefix already ends with '/'.
+	if prefix[len(prefix)-1] == '/' {
+		return prefix + name
+	}
+	return prefix + "/" + name
+}
 
 // walkDiff streams the differences between two Git trees.
 //
@@ -70,6 +105,8 @@ func walkDiff(
 	if err != nil {
 		return err
 	}
+	defer putTreeIter(oldIter)
+	defer putTreeIter(newIter)
 
 	// State of the "current" entry of each iterator.
 	var (
@@ -136,21 +173,29 @@ func walkDiff(
 			switch {
 			case oidOld == oidNew && modeOld == modeNew:
 				// Identical entry → skip.
-			case modeOld&040000 != 0 && modeNew&040000 != 0:
+			case isTreeMode(modeOld) && isTreeMode(modeNew):
 				// Directory exists on both sides → recurse.
 				if err := walkDiff(
 					tc,
 					oidOld,
 					oidNew,
-					filepath.Join(prefix, nln),
+					joinPath(prefix, nln),
 					fn,
 				); err != nil {
 					return err
 				}
 			default:
-				// File replaced or mode changed.
+				// Type transition or mode change. This covers cases such as:
+				//   - A regular file replaced by a symlink (mode change).
+				//   - A file replaced by a directory, or vice versa. When a
+				//     file is replaced by a directory (or the reverse), the
+				//     entry name is the same on both sides but the modes
+				//     differ in their type bits. We report this as a single
+				//     callback with both old and new OIDs rather than a
+				//     delete + add pair, letting the caller decide how to
+				//     interpret the transition.
 				if err := fn(
-					filepath.ToSlash(filepath.Join(prefix, nln)),
+					joinPath(prefix, nln),
 					oidOld,
 					oidNew,
 					modeNew,
@@ -198,10 +243,10 @@ func handleAdd(
 	mode uint32,
 	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
-	if mode&040000 != 0 { // directory
-		return walkDiff(tc, Hash{}, oid, filepath.Join(prefix, name), fn)
+	if isTreeMode(mode) { // directory
+		return walkDiff(tc, Hash{}, oid, joinPath(prefix, name), fn)
 	}
-	return fn(filepath.ToSlash(filepath.Join(prefix, name)), Hash{}, oid, mode)
+	return fn(joinPath(prefix, name), Hash{}, oid, mode)
 }
 
 // handleDel reports a deleted entry discovered by walkDiff.
@@ -217,8 +262,8 @@ func handleDel(
 	mode uint32,
 	fn func(path string, oldOID, newOID Hash, mode uint32) error,
 ) error {
-	if mode&040000 != 0 { // directory
-		return walkDiff(tc, oid, Hash{}, filepath.Join(prefix, name), fn)
+	if isTreeMode(mode) { // directory
+		return walkDiff(tc, oid, Hash{}, joinPath(prefix, name), fn)
 	}
-	return fn(filepath.ToSlash(filepath.Join(prefix, name)), oid, Hash{}, mode)
+	return fn(joinPath(prefix, name), oid, Hash{}, mode)
 }

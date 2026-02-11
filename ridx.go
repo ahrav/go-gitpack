@@ -36,8 +36,11 @@ func loadReverseIndex(packPath string, pf *idxFile) ([]uint32, error) {
 	if pf == nil || pf.sortedOffsets == nil {
 		panic("loadReverseIndex called before parseIdx finished")
 	}
-
-	// *.ridx is the modern extension; *.rev is the old one kept for b/w compat.
+	// Git originally used the ".rev" extension for reverse-index files.
+	// Starting with Git 2.34 the canonical extension was changed to ".ridx"
+	// and a proper binary format with magic bytes and version was introduced.
+	// We probe ".ridx" first (modern) and fall back to ".rev" (legacy) for
+	// backward compatibility with older repositories.
 	var ridxPath string
 	for _, ext := range []string{".ridx", ".rev"} {
 		try := strings.TrimSuffix(packPath, ".pack") + ext
@@ -47,18 +50,35 @@ func loadReverseIndex(packPath string, pf *idxFile) ([]uint32, error) {
 		}
 	}
 	if ridxPath == "" {
-		// No on‑disk file – build from ascending offset order.
-		return buildReverseFromOffsets(pf.sortedOffsets), nil
+		// No on‑disk file – build from the entries and ascending offset order.
+		// buildReverseFromEntries produces a correct offset→entries mapping,
+		// so the result is trusted for CRC lookups.
+		pf.ridxCRCTrusted = true
+		return buildReverseFromEntries(pf), nil
 	}
 
 	ridx, err := tryLoadRidxFile(ridxPath, pf)
 	if err != nil {
 		// Any error during ridx parsing -> fall back to building from offsets.
-		return buildReverseFromOffsets(pf.sortedOffsets), nil
+		// The error is intentionally swallowed because a corrupt or
+		// incompatible .ridx/.rev file is non-fatal: we can always
+		// reconstruct the reverse index from the forward-sorted offsets
+		// already loaded in idxFile. Logging would be noisy for
+		// repositories with stale or partially-written files.
+		return buildReverseFromEntries(pf), nil
 	}
+	pf.ridxCRCTrusted = true
 	return ridx, nil
 }
 
+// tryLoadRidxFile attempts to memory-map and parse a single .ridx (or .rev)
+// file. It validates the magic bytes, version, fanout object count against
+// the already-parsed idxFile, reads the uint32 reverse-index table, and
+// optionally verifies the pack and idx trailer checksums.
+//
+// Returns the reverse-index slice on success, or an error if any validation
+// step fails. The caller (loadReverseIndex) decides whether to fall back to
+// a computed reverse index on error.
 func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	mr, err := mmap.Open(ridxPath)
 	if err != nil {
@@ -136,14 +156,29 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	return ridx, nil
 }
 
-// buildReverseFromOffsets constructs a reverse‑index purely from the ascending
-// pack‑offset slice already present in idxFile.  O(n) & allocation‑free aside
-// from the returned slice.
-func buildReverseFromOffsets(sorted []uint64) []uint32 {
-	n := len(sorted)
+// buildReverseFromEntries constructs a correct reverse-index from the parsed
+// idxFile. The ridx maps descending-offset positions to entries-table indices
+// (OID order), which is needed by crcAtOffset to look up the right CRC.
+//
+// The previous implementation (buildReverseFromOffsets) only performed a
+// simple position reversal (r[i] = n-1-i), which is incorrect whenever OID
+// order differs from pack-offset order — the common case in real repositories.
+func buildReverseFromEntries(pf *idxFile) []uint32 {
+	n := len(pf.sortedOffsets)
 	r := make([]uint32, n)
-	for i := range n {
-		r[i] = uint32(n - 1 - i) // descending offset order
+
+	// Build a map from pack offset → entries-table index.
+	offsetToIdx := make(map[uint64]uint32, n)
+	for i, e := range pf.entries {
+		offsetToIdx[e.offset] = uint32(i)
+	}
+
+	// ridx[desc] must equal the entries-table index for the object whose
+	// pack offset is at descending position desc.
+	// Descending position k corresponds to ascending position n-1-k.
+	for k := range n {
+		off := pf.sortedOffsets[n-1-k]
+		r[k] = offsetToIdx[off]
 	}
 	return r
 }

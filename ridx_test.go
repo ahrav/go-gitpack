@@ -1,3 +1,21 @@
+// ridx_test.go tests the reverse index (.ridx / .rev) loader and the
+// in-memory builder that derives a reverse index from sorted pack offsets.
+//
+// A reverse index maps positions in offset-descending order back to the
+// corresponding index positions in the .idx file. This is used for efficient
+// pack traversal in offset order without scanning the entire index.
+//
+// The tests cover:
+//   - Loading a .ridx file from disk (TestLoadReverseIndex_FromFile).
+//   - Falling back to building the reverse index from offsets when no .ridx
+//     file is present (TestLoadReverseIndex_BuildFromOffsets).
+//   - Backward compatibility with the older .rev extension
+//     (TestLoadReverseIndex_OldRevExtension).
+//   - Validation of magic bytes, version, object counts, fanout, and trailer
+//     checksums (TestLoadReverseIndex_InvalidFiles, _TrailerVerification).
+//   - Edge cases such as nil packfile handles and midx-only packs.
+//   - Benchmarks for building the reverse index and resolving index positions.
+
 package objstore
 
 import (
@@ -56,6 +74,11 @@ func createValidRidxFile(
 	return os.WriteFile(ridxPath, buf.Bytes(), 0644)
 }
 
+// TestLoadReverseIndex_FromFile verifies that loadReverseIndex correctly reads
+// a .ridx file from disk and returns the expected mapping. The test creates a
+// minimal pack with a single blob object, writes a corresponding .ridx file,
+// and asserts that the returned reverse index has one entry mapping to idx
+// position 0.
 func TestLoadReverseIndex_FromFile(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -86,6 +109,12 @@ func TestLoadReverseIndex_FromFile(t *testing.T) {
 	assert.Equal(t, uint32(0), ridx[0])
 }
 
+// TestLoadReverseIndex_BuildFromOffsets verifies the fallback path where no
+// .ridx file exists on disk. In this case loadReverseIndex builds the reverse
+// index in memory from the sorted offsets in the parsed index file. The test
+// creates three objects at offsets [12, 50, 100] and confirms the reverse
+// mapping sorts them in descending offset order: offset 100 -> idx 2,
+// offset 50 -> idx 1, offset 12 -> idx 0.
 func TestLoadReverseIndex_BuildFromOffsets(t *testing.T) {
 	dir := t.TempDir()
 	packPath := filepath.Join(dir, "test.pack")
@@ -122,10 +151,20 @@ func TestLoadReverseIndex_BuildFromOffsets(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Len(t, ridx, 3)
-	// Verify descending offset order mapping.
-	assert.Equal(t, uint32(2), ridx[0]) // offset 100 -> idx 2
-	assert.Equal(t, uint32(1), ridx[1]) // offset 50 -> idx 1
-	assert.Equal(t, uint32(0), ridx[2]) // offset 12 -> idx 0
+
+	// Verify that the ridx correctly maps descending offset positions
+	// back to the entries-table indices. For each descending position k,
+	// ridx[k] should give us the entries index whose offset is
+	// sortedOffsets[n-1-k].
+	n := len(pf.sortedOffsets)
+	for k := range n {
+		idxPos := int(ridx[k])
+		require.Less(t, idxPos, len(pf.entries), "ridx[%d] out of range", k)
+		wantOff := pf.sortedOffsets[n-1-k]
+		gotOff := pf.entries[idxPos].offset
+		assert.Equal(t, wantOff, gotOff,
+			"ridx[%d] should map to entry with offset %d, got offset %d", k, wantOff, gotOff)
+	}
 }
 
 func TestLoadReverseIndex_OldRevExtension(t *testing.T) {
@@ -350,32 +389,41 @@ func TestLoadReverseIndex_TrailerVerification(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestBuildReverseFromOffsets(t *testing.T) {
+func TestBuildReverseFromEntries(t *testing.T) {
 	tests := []struct {
 		name     string
-		offsets  []uint64
+		pf       *idxFile
 		expected []uint32
 	}{
 		{
-			name:     "single object",
-			offsets:  []uint64{100},
+			name: "single object",
+			pf: &idxFile{
+				entries:       []idxEntry{{offset: 100}},
+				sortedOffsets: []uint64{100},
+			},
 			expected: []uint32{0},
 		},
 		{
-			name:     "multiple objects ascending",
-			offsets:  []uint64{10, 50, 100, 200},
+			name: "multiple objects ascending",
+			pf: &idxFile{
+				entries:       []idxEntry{{offset: 10}, {offset: 50}, {offset: 100}, {offset: 200}},
+				sortedOffsets: []uint64{10, 50, 100, 200},
+			},
 			expected: []uint32{3, 2, 1, 0}, // descending order
 		},
 		{
-			name:     "empty",
-			offsets:  []uint64{},
+			name: "empty",
+			pf: &idxFile{
+				entries:       []idxEntry{},
+				sortedOffsets: []uint64{},
+			},
 			expected: []uint32{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := buildReverseFromOffsets(tt.offsets)
+			result := buildReverseFromEntries(tt.pf)
 			assert.Equal(t, tt.expected, result)
 		})
 	}
@@ -388,7 +436,11 @@ func TestReverseIndexMapping(t *testing.T) {
 	// reverse:  [ 3,  2,   1,   0] (maps descending offset order to idx pos)
 
 	offsets := []uint64{10, 50, 100, 200}
-	ridx := buildReverseFromOffsets(offsets)
+	pf := &idxFile{
+		entries:       []idxEntry{{offset: 10}, {offset: 50}, {offset: 100}, {offset: 200}},
+		sortedOffsets: offsets,
+	}
+	ridx := buildReverseFromEntries(pf)
 
 	// In offset-descending order:
 	// Position 0 (offset 200) -> idx position 3
@@ -517,20 +569,29 @@ func TestLoadReverseIndex_MidxOnlyPack(t *testing.T) {
 	assert.Len(t, ridx, 1)
 }
 
-func BenchmarkBuildReverseFromOffsets(b *testing.B) {
-	// Create a realistic set of offsets.
+// BenchmarkBuildReverseFromOffsets measures the time to build a reverse index
+// from 10,000 sorted offsets. This simulates a moderately-sized packfile and
+// exercises the sort-based construction path.
+func BenchmarkBuildReverseFromEntries(b *testing.B) {
+	// Create a realistic set of offsets (10,000 objects spaced 100 bytes apart).
 	numObjects := 10000
+	entries := make([]idxEntry, numObjects)
 	offsets := make([]uint64, numObjects)
 	for i := range numObjects {
 		offsets[i] = uint64(i * 100)
+		entries[i] = idxEntry{offset: uint64(i * 100)}
 	}
+	pf := &idxFile{entries: entries, sortedOffsets: offsets}
 
 	b.ResetTimer()
 	for b.Loop() {
-		_ = buildReverseFromOffsets(offsets)
+		_ = buildReverseFromEntries(pf)
 	}
 }
 
+// BenchmarkLoadReverseIndex_FromFile measures the time to load and parse a
+// .ridx file containing 1,000 objects. This covers the mmap + binary parse
+// hot path used when a pre-built reverse index is available.
 func BenchmarkLoadReverseIndex_FromFile(b *testing.B) {
 	dir := b.TempDir()
 	packPath := filepath.Join(dir, "bench.pack")
@@ -555,6 +616,10 @@ func BenchmarkLoadReverseIndex_FromFile(b *testing.B) {
 	}
 }
 
+// BenchmarkResolveIdxPos measures the cost of resolving bit positions through
+// the reverse index. It tests three positions (first, middle, last) per
+// iteration across a 10,000-entry index to capture any position-dependent
+// performance differences.
 func BenchmarkResolveIdxPos(b *testing.B) {
 	numObjects := 10000
 	ridx := make([]uint32, numObjects)
@@ -621,4 +686,64 @@ func TestLoadReverseIndex_Integration(t *testing.T) {
 	assert.Equal(t, uint32(2), pf.resolveIdxPos(0))
 	assert.Equal(t, uint32(1), pf.resolveIdxPos(1))
 	assert.Equal(t, uint32(0), pf.resolveIdxPos(2))
+}
+
+func TestSyntheticRidxCRCLookup(t *testing.T) {
+	t.Parallel()
+
+	f := &idxFile{
+		entries: []idxEntry{
+			{offset: 500, crc: 0x1111},
+			{offset: 100, crc: 0x2222},
+			{offset: 300, crc: 0x3333},
+		},
+		sortedOffsets: []uint64{100, 300, 500},
+	}
+
+	f.ridx = buildReverseFromEntries(f)
+	f.ridxCRCTrusted = true
+	t.Logf("synthetic ridx: %v", f.ridx)
+
+	crc, ok := f.crcAtOffset(100)
+	require.True(t, ok, "should find offset 100")
+	assert.Equal(t, uint32(0x2222), crc,
+		"CRC for offset 100 should be BBB's CRC (0x2222), not AAA's (0x1111)")
+
+	crc, ok = f.crcAtOffset(300)
+	require.True(t, ok, "should find offset 300")
+	assert.Equal(t, uint32(0x3333), crc,
+		"CRC for offset 300 should be CCC's CRC (0x3333)")
+
+	crc, ok = f.crcAtOffset(500)
+	require.True(t, ok, "should find offset 500")
+	assert.Equal(t, uint32(0x1111), crc,
+		"CRC for offset 500 should be AAA's CRC (0x1111)")
+}
+
+func TestSyntheticRidxCRCLookupMatchingOrder(t *testing.T) {
+	t.Parallel()
+
+	f := &idxFile{
+		entries: []idxEntry{
+			{offset: 100, crc: 0x1111},
+			{offset: 300, crc: 0x2222},
+			{offset: 500, crc: 0x3333},
+		},
+		sortedOffsets: []uint64{100, 300, 500},
+	}
+
+	f.ridx = buildReverseFromEntries(f)
+	f.ridxCRCTrusted = true
+
+	crc, ok := f.crcAtOffset(100)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0x1111), crc, "should get correct CRC when orders match")
+
+	crc, ok = f.crcAtOffset(300)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0x2222), crc)
+
+	crc, ok = f.crcAtOffset(500)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0x3333), crc)
 }

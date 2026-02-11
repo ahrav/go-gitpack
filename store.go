@@ -10,9 +10,9 @@
 //
 // The store memory-maps one or more *.pack / *.idx pairs, builds an in-memory map
 // from SHA-1 object IDs to their pack offsets, and inflates objects on demand.
-// It coordinates between pack-index (IDX), multi-pack-index (MIDX), and
-// reverse-index (RIDX) files, providing unified access across multiple packfiles
-// with transparent delta chain resolution and caching.
+// It coordinates between pack-index (IDX) and reverse-index (RIDX) data,
+// and builds a unified in-memory lookup across packfiles with transparent
+// delta chain resolution and caching.
 //
 // All packfiles are memory-mapped for zero-copy access, with an adaptive
 // replacement cache (ARC) and delta window for hot objects. Delta chains are
@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -46,10 +45,26 @@ var hostLittle = func() bool {
 	return *(*byte)(unsafe.Pointer(&i)) == 1
 }()
 
+var (
+	ErrObjectNotCommit = errors.New("object is not a commit")
+	ErrObjectNotFound  = errors.New("object not found")
+)
+
+func objectNotFoundError(oid Hash) error {
+	return fmt.Errorf("%w: %x", ErrObjectNotFound, oid)
+}
+
 func init() {
-	// On Windows an mmapped file cannot be closed while any outstanding
-	// slices are still referenced. A finalizer makes sure users who forget
-	// to call (*store).Close() do not trigger ERROR_LOCK_VIOLATION.
+	// On Windows, memory-mapped files hold an OS-level lock that prevents the
+	// file from being deleted, renamed, or opened exclusively by another
+	// process. If a store is garbage-collected without an explicit Close(),
+	// those locks remain until the process exits, causing ERROR_LOCK_VIOLATION
+	// for other Git operations. A runtime finalizer provides a safety net by
+	// closing the mappings when the GC reclaims the store.
+	//
+	// This is Windows-only because Unix mmap does not hold a file lock; an
+	// unlinked file with outstanding mappings is silently reclaimed by the
+	// kernel when the last mapping is unmapped or the process exits.
 	if runtime.GOOS == "windows" {
 		runtime.SetFinalizer(&store{}, func(s *store) { _ = s.Close() })
 	}
@@ -74,6 +89,11 @@ const (
 
 	// defaultMaxDeltaDepth is the default maximum depth for resolving delta chains.
 	defaultMaxDeltaDepth = 100
+
+	// defaultMaxDeltaObjectSize bounds delta materialization to prevent runaway
+	// allocations on very large delta chains.
+	defaultMaxDeltaObjectSize = 512 << 20 // 512 MiB
+
 	// maxCacheableSize is the maximum size of an object that will be stored in the cache.
 	maxCacheableSize = 4 << 20 // 4 MiB
 )
@@ -105,14 +125,37 @@ type ObjectCache interface {
 // The store memory-maps packfiles and their indices, maintains an in-memory index
 // for fast object lookups, and handles delta chain resolution transparently.
 // All operations are safe for concurrent use.
+//
+// Two-tier caching strategy:
+//
+// Objects pass through two cache layers before reaching the caller:
+//
+//  1. Delta window (dw) -- a small, sharded, write-through window that holds
+//     recently inflated objects. It is optimized for the access pattern of
+//     delta-chain resolution, where the same base object is often needed by
+//     multiple child deltas in quick succession. Objects are inserted here on
+//     first inflation.
+//
+//  2. ARC cache (cache) -- a larger Adaptive Replacement Cache that balances
+//     recency and frequency. Objects are promoted from the delta window to
+//     the ARC on their *second* access (i.e. when get() finds a delta-window
+//     hit). This two-step promotion avoids polluting the ARC with one-shot
+//     objects during bulk scans and reduces lock contention on the ARC's
+//     internal mutexes during high-throughput inflation.
+//
+// Together, the two layers ensure that hot delta bases remain resident (via
+// the delta window) while frequently accessed non-delta objects benefit from
+// the ARC's superior eviction policy.
 type store struct {
 	// packs contains one idxFile per memory-mapped packfile.
 	// Each entry provides object offset lookups and CRC validation.
 	packs []*idxFile
 
-	// midx references the multi-pack-index file if present.
-	// When non-nil, it provides unified access across multiple packfiles.
-	midx *midxFile
+	// memoryMidx is synthesized from individual *.idx files.
+	memoryMidx *inMemoryMidx
+
+	// objectsDir points to ".git/objects" and is used for loose-object fallback.
+	objectsDir string
 
 	// packMap prevents duplicate memory mappings of the same packfile.
 	// Keys are absolute file paths, values are mmap handles.
@@ -128,11 +171,15 @@ type store struct {
 
 	// dw maintains a small window of recently materialized objects.
 	// Objects likely to be delta bases are kept here for fast access.
-	dw *refCountedDeltaWindow
+	dw deltaWindow
 
 	// maxDeltaDepth limits delta chain traversal depth.
-	// The default value matches Git's own limit of 50.
+	// The default value is 100 (see defaultMaxDeltaDepth).
 	maxDeltaDepth int
+
+	// maxDeltaObjectSize bounds delta target materialization.
+	// Zero disables the bound.
+	maxDeltaObjectSize uint64
 
 	// VerifyCRC enables CRC-32 validation for each object read.
 	// When false (default), it prioritizes speed over integrity checks.
@@ -146,8 +193,10 @@ type store struct {
 // The directory should contain matched pairs of *.pack and *.idx files.
 // For bare repositories, pass ".git/objects/pack" as the directory.
 //
-// The function returns an error if no packfiles are found or if any index file is
-// missing or malformed.
+// If no packfiles are found, a valid store is still returned and loose-object
+// fallback remains available.
+//
+// The function returns an error if any discovered index file is missing or malformed.
 // All I/O uses memory mapping for zero-copy access.
 //
 // The returned store is safe for concurrent use without additional
@@ -157,29 +206,9 @@ func open(dir string) (*store, error) {
 	if err != nil {
 		return nil, err
 	}
+	objectsDir := filepath.Dir(absDir)
 
 	packCache := make(map[string]*mmap.ReaderAt)
-
-	// Attempt to mmap a multi-pack-index, which is named exactly
-	// "…/objects/pack/multi-pack-index".
-	midxPath := filepath.Join(absDir, "multi-pack-index")
-	var midx *midxFile
-	if st, err := os.Stat(midxPath); err == nil && !st.IsDir() {
-		mr, err := mmap.Open(midxPath)
-		if err != nil {
-			return nil, fmt.Errorf("mmap midx: %w", err)
-		}
-		defer func() {
-			if midx == nil {
-				_ = mr.Close()
-			}
-		}()
-		midx, err = parseMidx(absDir, mr, packCache)
-		if err != nil {
-			_ = mr.Close()
-			return nil, fmt.Errorf("parse midx: %w", err)
-		}
-	}
 
 	// Enumerate standard pack and index files.
 	pattern := filepath.Join(absDir, "*.pack")
@@ -187,13 +216,15 @@ func open(dir string) (*store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(packs) == 0 && midx == nil {
+	if len(packs) == 0 {
 		// If no packs are found, return a valid but empty store for an empty repository.
 		store := &store{
-			maxDeltaDepth: defaultMaxDeltaDepth,
-			packs:         []*idxFile{}, // Use an empty slice instead of nil for consistency.
-			packMap:       make(map[string]*mmap.ReaderAt),
-			dw:            newRefCountedDeltaWindow(),
+			maxDeltaDepth:      defaultMaxDeltaDepth,
+			maxDeltaObjectSize: defaultMaxDeltaObjectSize,
+			packs:              []*idxFile{}, // Use an empty slice instead of nil for consistency.
+			objectsDir:         objectsDir,
+			packMap:            make(map[string]*mmap.ReaderAt),
+			dw:                 newShardedDeltaWindow(64, windowBudget),
 		}
 
 		const defaultCacheSize = 1 << 14 // 16K entries, approximately 96MiB.
@@ -206,7 +237,7 @@ func open(dir string) (*store, error) {
 		return store, nil
 	}
 
-	// Map any remaining *.pack files not already covered by the multi-pack-index.
+	// Map all pack files in the directory.
 	for _, pack := range packs {
 		if _, ok := packCache[pack]; ok {
 			continue
@@ -219,10 +250,11 @@ func open(dir string) (*store, error) {
 	}
 
 	store := &store{
-		maxDeltaDepth: defaultMaxDeltaDepth,
-		midx:          midx,
-		packMap:       packCache,
-		dw:            newRefCountedDeltaWindow(),
+		maxDeltaDepth:      defaultMaxDeltaDepth,
+		maxDeltaObjectSize: defaultMaxDeltaObjectSize,
+		objectsDir:         objectsDir,
+		packMap:            packCache,
+		dw:                 newShardedDeltaWindow(64, windowBudget),
 	}
 
 	const defaultCacheSize = 1 << 14 // 16K entries, approximately 96MiB.
@@ -233,15 +265,17 @@ func open(dir string) (*store, error) {
 		return nil, fmt.Errorf("failed to create ARC cache: %w", err)
 	}
 
-	// Build idxFile instances, reusing the existing mmap handles.
-	for path, handle := range packCache {
+	// Build idxFile instances in deterministic path order, reusing existing mmap handles.
+	packPaths := make([]string, 0, len(packCache))
+	for path := range packCache {
+		packPaths = append(packPaths, path)
+	}
+	slices.Sort(packPaths)
+	for _, path := range packPaths {
+		handle := packCache[path]
 		idxPath := strings.TrimSuffix(path, ".pack") + ".idx"
 		ix, err := mmap.Open(idxPath)
-		if errors.Is(err, os.ErrNotExist) && midx != nil {
-			// If a pack is referenced only by the multi-pack-index, its CRC will be sourced from the MIDX v2 later.
-			store.packs = append(store.packs, &idxFile{pack: handle}) // Create a minimal stub for now.
-			continue
-		} else if err != nil {
+		if err != nil {
 			return nil, fmt.Errorf("mmap idx: %w", err)
 		}
 		f, err := parseIdx(ix)
@@ -261,12 +295,15 @@ func open(dir string) (*store, error) {
 			}
 		}
 	}
+	if len(store.packs) > 1 {
+		store.memoryMidx = buildInMemoryMidx(store.packs)
+	}
 
 	return store, nil
 }
 
 // SetMaxDeltaDepth configures the maximum number of delta hops allowed.
-// The default value of 50 matches Git's own limit.
+// The default value is 100 (see defaultMaxDeltaDepth).
 //
 // Lower values reduce CPU usage but may reject valid deeply-chained objects.
 // Higher values risk stack overflow with maliciously crafted repositories.
@@ -278,10 +315,18 @@ func (s *store) SetMaxDeltaDepth(depth int) {
 	s.maxDeltaDepth = depth
 }
 
+// SetMaxDeltaObjectSize configures the maximum reconstructed delta size in bytes.
+// Values greater than zero prevent excessive allocations for huge delta chains.
+func (s *store) SetMaxDeltaObjectSize(maxBytes uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.maxDeltaObjectSize = maxBytes
+}
+
 // Close releases all memory-mapped files associated with the store.
 // After Close returns, the store must not be used.
-//
-// Multiple calls to Close are safe and return the first error encountered.
+// Close must be called exactly once; calling it multiple times may
+// attempt to close already-closed handles.
 func (s *store) Close() error {
 	if s == nil {
 		return nil
@@ -318,12 +363,12 @@ func (s *store) treeIter(oid Hash) (*TreeIter, error) {
 		return nil, fmt.Errorf("failed to get tree %s: %w", oid, err)
 	}
 	if typ != ObjTree {
-		return nil, fmt.Errorf("expected tree type for %s, got %v", oid, typ)
+		return nil, fmt.Errorf("%w: expected tree type for %s, got %v", ErrTypeMismatch, oid, typ)
 	}
 	if len(raw) > 0 && raw[0] == 0 {
 		return nil, fmt.Errorf("tree %s starts with null byte (likely corrupted)", oid)
 	}
-	return newTreeIter(raw), nil
+	return getTreeIter(raw), nil
 }
 
 // get retrieves the specified Git object and returns its data and type.
@@ -334,13 +379,18 @@ func (s *store) treeIter(oid Hash) (*TreeIter, error) {
 // up to maxDeltaDepth, reconstructing the full object content.
 // When VerifyCRC is enabled, get validates checksums from index files.
 //
-// The returned byte slice is a fresh allocation that callers may modify.
+// The returned byte slice may alias internal cache buffers. Callers MUST NOT
+// modify the returned data. If mutation is needed, the caller must copy first.
 // get is safe for concurrent use.
 func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// Fast path: check the delta window, which holds recently materialized objects
 	// that are likely to be bases for upcoming delta resolutions.
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
+		// Promote to ARC cache on second access (delta window hit).
+		if len(d) <= maxCacheableSize {
+			s.cache.Add(oid, cachedObj{data: d, typ: t})
+		}
 		b.Release()
 		return d, t, nil
 	}
@@ -351,8 +401,75 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	}
 
 	// On a cache miss, inflate the object from a packfile, tracking delta depth
-	// to prevent cycles and excessive recursion.
-	return s.getWithContext(oid, newDeltaContext(s.maxDeltaDepth))
+	// to prevent cycles and excessive recursion. Skip cache checks since we
+	// already verified both caches above.
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
+	return s.getWithContextSkipCache(oid, ctx)
+}
+
+// getMaterialized retrieves the fully materialized object, including commit bodies.
+// The returned byte slice may alias internal cache buffers. Callers MUST NOT
+// modify the returned data.
+func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
+	if b, ok := s.dw.acquire(oid); ok {
+		d, t := b.Data(), b.Type()
+		b.Release()
+		return d, t, nil
+	}
+
+	if b, ok := s.cache.Get(oid); ok {
+		return b.data, b.typ, nil
+	}
+
+	p, off, ok := s.findPackedObject(oid)
+	if !ok {
+		return s.readLooseObject(oid)
+	}
+
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
+	return s.inflateFromPackWithOptions(inflationParams{
+		p:             p,
+		off:           off,
+		oid:           oid,
+		ctx:           ctx,
+		maxObjectSize: s.maxDeltaObjectSize,
+	}, false, true)
+}
+
+// getNoCache retrieves the specified Git object without touching cache layers.
+func (s *store) getNoCache(oid Hash) ([]byte, ObjectType, error) {
+	p, off, ok := s.findPackedObject(oid)
+	if !ok {
+		return s.readLooseObject(oid)
+	}
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
+	return s.inflateFromPackWithOptions(inflationParams{
+		p:             p,
+		off:           off,
+		oid:           oid,
+		ctx:           ctx,
+		maxObjectSize: s.maxDeltaObjectSize,
+	}, true, false)
+}
+
+// getPackedObjectNoCache materializes the object at a known pack offset
+// without consulting in-memory caches or performing an OID lookup.
+func (s *store) getPackedObjectNoCache(p *mmap.ReaderAt, off uint64, oid Hash) ([]byte, ObjectType, error) {
+	if p == nil {
+		return nil, ObjBad, fmt.Errorf("pack handle is nil")
+	}
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
+	return s.inflateFromPackWithOptions(inflationParams{
+		p:             p,
+		off:           off,
+		oid:           oid,
+		ctx:           ctx,
+		maxObjectSize: s.maxDeltaObjectSize,
+	}, false, false)
 }
 
 // getWithContext retrieves an object while tracking delta chain depth.
@@ -369,13 +486,14 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		return b.data, b.typ, nil
 	}
 
-	if s.midx != nil {
-		if p, off, ok := s.midx.findObject(oid); ok {
+	if s.memoryMidx != nil {
+		if p, off, ok := s.memoryMidx.findObject(oid); ok {
 			return s.inflateFromPack(inflationParams{
-				p:   p,
-				off: off,
-				oid: oid,
-				ctx: ctx,
+				p:             p,
+				off:           off,
+				oid:           oid,
+				ctx:           ctx,
+				maxObjectSize: s.maxDeltaObjectSize,
 			})
 		}
 	}
@@ -386,14 +504,70 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 			continue
 		}
 		return s.inflateFromPack(inflationParams{
-			p:   pf.pack,
-			off: offset,
-			oid: oid,
-			ctx: ctx,
+			p:             pf.pack,
+			off:           offset,
+			oid:           oid,
+			ctx:           ctx,
+			maxObjectSize: s.maxDeltaObjectSize,
 		})
 	}
+	data, typ, err := s.readLooseObject(oid)
+	if err == nil {
+		if len(data) <= maxCacheableSize {
+			s.dw.add(oid, data, typ)
+			s.cache.Add(oid, cachedObj{data: data, typ: typ})
+		}
+		return data, typ, nil
+	}
+	return nil, ObjBad, err
+}
 
-	return nil, ObjBad, fmt.Errorf("object %x not found", oid)
+// getWithContextSkipCache is like getWithContext but skips the delta-window
+// and ARC cache checks.
+//
+// Duplication rationale: getWithContext and getWithContextSkipCache share
+// nearly identical pack-lookup and loose-object-fallback logic. The
+// duplication is intentional -- the public get() method already checks both
+// cache tiers before calling into this code path. Re-checking them here
+// would add two lock-guarded map lookups per cache-miss object, which is
+// measurable during bulk scans that inflate millions of objects. Keeping a
+// separate "skip cache" variant avoids that overhead at the cost of a small
+// amount of code duplication that is straightforward to maintain.
+func (s *store) getWithContextSkipCache(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
+	if s.memoryMidx != nil {
+		if p, off, ok := s.memoryMidx.findObject(oid); ok {
+			return s.inflateFromPack(inflationParams{
+				p:             p,
+				off:           off,
+				oid:           oid,
+				ctx:           ctx,
+				maxObjectSize: s.maxDeltaObjectSize,
+			})
+		}
+	}
+
+	for _, pf := range s.packs {
+		offset, found := pf.findObject(oid)
+		if !found {
+			continue
+		}
+		return s.inflateFromPack(inflationParams{
+			p:             pf.pack,
+			off:           offset,
+			oid:           oid,
+			ctx:           ctx,
+			maxObjectSize: s.maxDeltaObjectSize,
+		})
+	}
+	data, typ, err := s.readLooseObject(oid)
+	if err == nil {
+		if len(data) <= maxCacheableSize {
+			s.dw.add(oid, data, typ)
+			s.cache.Add(oid, cachedObj{data: data, typ: typ})
+		}
+		return data, typ, nil
+	}
+	return nil, ObjBad, err
 }
 
 // inflateFromPack reads and materializes an object from a packfile.
@@ -406,26 +580,54 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 // inflateFromPack returns the inflated object data, its type, and any error encountered.
 // The returned data is a fresh allocation safe for modification.
 func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, error) {
+	return s.inflateFromPackWithOptions(params, true, true)
+}
+
+// inflateFromPackWithOptions reads and materializes an object from a packfile
+// with fine-grained control over the commit fast-path and caching behavior.
+//
+// Parameters:
+//   - allowCommitFastPath: when true and the object at params.off is a plain
+//     (non-delta) commit, the method returns (nil, ObjCommit, nil) immediately
+//     without inflating the body. The nil data signals to the caller that
+//     commit metadata should be obtained from the commit-graph instead. This
+//     optimization avoids zlib decompression for commits whose headers are
+//     already available in the graph. Callers that need the full commit body
+//     (e.g. getMaterialized) must pass false.
+//   - cacheResult: when true the inflated object is written to the delta
+//     window (and potentially promoted to the ARC cache on later access).
+//     Callers that will not re-read the object should pass false to avoid
+//     evicting useful entries.
+func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFastPath, cacheResult bool) ([]byte, ObjectType, error) {
 	// Perform a cheap header peek to avoid full inflation for commits
 	// that are already covered by the commit-graph.
 	objType, _, err := peekObjectType(params.p, params.off)
 	if err != nil {
 		return nil, ObjBad, err
 	}
-	if objType == ObjCommit {
+	if allowCommitFastPath && objType == ObjCommit {
 		return nil, ObjCommit, nil
 	}
 
 	// For delta objects, resolve the entire chain iteratively.
 	if objType == ObjOfsDelta || objType == ObjRefDelta {
-		full, baseType, err := inflateDeltaChainStreaming(s, params)
+		var full []byte
+		var baseType ObjectType
+		var err error
+		if cacheResult {
+			full, baseType, err = inflateDeltaChainStreaming(s, params)
+		} else {
+			// Borrowed path: skip final copy for consume-and-discard callers.
+			full, baseType, err = inflateDeltaChainBorrowed(s, params)
+		}
 		if err != nil {
 			return nil, ObjBad, err
 		}
-		// Add the fully resolved object to both the delta window and the ARC cache.
-		if len(full) <= maxCacheableSize {
+		// Write only to the delta window on first inflation. Objects are
+		// promoted to the ARC cache on second access (via get()'s cache-hit
+		// path), reducing lock contention on the ARC during bulk inflation.
+		if cacheResult && len(full) <= maxCacheableSize {
 			s.dw.add(params.oid, full, baseType)
-			s.cache.Add(params.oid, cachedObj{data: full, typ: baseType})
 		}
 		return full, baseType, nil
 	}
@@ -442,25 +644,22 @@ func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, err
 			if err := s.verifyCRCForPackObject(params.p, params.off, crc); err != nil {
 				return nil, ObjBad, err
 			}
-		} else if s.midx != nil && s.midx.version >= 2 {
-			return nil, ObjBad, fmt.Errorf("no CRC found for object %x in MIDX v2", params.oid)
 		}
 	}
 
-	if len(data) <= maxCacheableSize {
+	if cacheResult && len(data) <= maxCacheableSize {
 		s.dw.add(params.oid, data, objType)
-		s.cache.Add(params.oid, cachedObj{data: data, typ: objType})
 	}
 	return data, objType, nil
 }
 
 // findPackedObject locates an object in any mapped packfile.
-// The method checks the multi-pack-index first if available, then searches individual packs.
+// The method consults the in-memory merged index first, then individual packs.
 //
 // findPackedObject returns the pack handle, byte offset, and true if found.
 func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
-	if s.midx != nil {
-		if p, off, ok := s.midx.findObject(oid); ok {
+	if s.memoryMidx != nil {
+		if p, off, ok := s.memoryMidx.findObject(oid); ok {
 			return p, off, true
 		}
 	}
@@ -481,95 +680,124 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	// Locate the commit object and skip past its generic object header.
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		return nil, fmt.Errorf("object %x not found", oid)
+		full, typ, err := s.readLooseObject(oid)
+		if err != nil {
+			return nil, err
+		}
+		if typ != ObjCommit {
+			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+		}
+		return trimCommitHeader(full)
 	}
 	typ, hdrLen, err := peekObjectType(p, off)
 	if err != nil {
 		return nil, err
 	}
-	if typ != ObjCommit {
-		return nil, fmt.Errorf("%x is not a commit", oid)
-	}
-	off += uint64(hdrLen)
+	if typ == ObjCommit {
+		off += uint64(hdrLen)
 
-	// Decompress only the beginning of the object, typically less than 512 bytes.
-	zr, err := getZlibReader(io.NewSectionReader(p, int64(off), 1<<63-1))
+		// Decompress only the beginning of the object, typically less than 512 bytes.
+		zr, err := getZlibReader(io.NewSectionReader(p, int64(off), 1<<63-1))
+		if err != nil {
+			return nil, err
+		}
+		defer putZlibReader(zr)
+
+		return readCommitHeaderFromStream(zr)
+	}
+
+	if typ != ObjOfsDelta && typ != ObjRefDelta {
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
+
+	full, resolvedType, err := s.getMaterialized(oid)
 	if err != nil {
 		return nil, err
 	}
-	defer putZlibReader(zr)
+	if resolvedType != ObjCommit {
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
+	return trimCommitHeader(full)
+}
+
+// readCommitHeaderFromStream incrementally reads lines from a zlib stream
+// until it encounters the "committer" line, then returns all bytes read up
+// to and including that line.
+//
+// This allows the caller to obtain tree, parent, author, and committer
+// metadata without decompressing the entire commit object (which may include
+// a large message body). The returned slice is a heap-allocated copy that
+// does not alias the pooled buffer.
+//
+// The zlib reader is wrapped in a pooled bufio.Reader so that reads go
+// through an 8 KiB buffer instead of issuing one-byte reads against the
+// decompressor. ReadBytes('\n') replaces the former readUntilLF loop,
+// cutting per-line allocations from ~6 append-growths to 1.
+func readCommitHeaderFromStream(r io.Reader) ([]byte, error) {
+	br := getBR(r)
+	defer putBR(br)
 
 	buf := GetBuf()
 	defer PutBuf(buf)
 
 	for len(*buf) < MaxHdr {
-		line, err := readUntilLF(zr)
+		line, err := br.ReadBytes('\n')
 		*buf = append(*buf, line...)
-		if bytes.HasPrefix(line, []byte("author ")) ||
-			bytes.HasPrefix(line, []byte("committer ")) {
-			// The desired line has been found; copy it to a new slice and return.
+		if bytes.HasPrefix(line, []byte("committer ")) {
 			return append([]byte(nil), *buf...), nil
 		}
-		if err != nil { // This indicates an EOF before the author/committer line was found.
+		if err != nil {
 			return nil, err
 		}
 	}
 
-	return nil, fmt.Errorf("commit header exceeds %d bytes without author line", MaxHdr)
+	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
 }
 
-// readUntilLF reads a complete line including the terminating newline.
-// The function returns the line with '\n' included or any partial line if EOF is encountered.
-func readUntilLF(r io.Reader) ([]byte, error) {
-	var line []byte
-	var b [1]byte
-	for {
-		n, err := r.Read(b[:])
-		if n == 1 {
-			line = append(line, b[0])
-			if b[0] == '\n' { // A newline indicates the end of the line.
-				return line, nil
-			}
+// trimCommitHeader extracts the header portion of a fully materialized commit
+// object (up to and including the "committer" line). Unlike
+// readCommitHeaderFromStream, this operates on an already-inflated byte slice
+// rather than a streaming reader. The returned slice is a fresh copy.
+func trimCommitHeader(full []byte) ([]byte, error) {
+	end := 0
+	for end < len(full) && end < MaxHdr {
+		nl := bytes.IndexByte(full[end:], '\n')
+		if nl < 0 {
+			break
 		}
-		if err != nil {
-			return line, err
+		lineEnd := end + nl + 1
+		line := full[end:lineEnd]
+		if bytes.HasPrefix(line, []byte("committer ")) {
+			out := make([]byte, lineEnd)
+			copy(out, full[:lineEnd])
+			return out, nil
 		}
+		end = lineEnd
 	}
+
+	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
 }
 
 // findCRCForObject returns the CRC-32 checksum for the specified object.
-// The method searches pack index files first, then falls back to multi-pack-index v2 if available.
+// The method searches pack index files first, then falls back to the in-memory merged index.
 //
 // The second return value indicates whether a CRC was found.
 // findCRCForObject is read-only and safe for concurrent use.
 func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32, bool) {
 	for _, pf := range s.packs {
-		if pf.pack == p && pf.entriesByOff != nil {
-			if entry, ok := pf.entriesByOff[off]; ok {
-				return entry.crc, true
+		if pf.pack == p {
+			if crc, ok := pf.crcAtOffset(off); ok {
+				return crc, true
 			}
 		}
 	}
 
-	if s.midx != nil && s.midx.version >= 2 {
-		first := oid[0]
-		start := uint32(0)
-		if first > 0 {
-			start = s.midx.fanout[first-1]
-		}
-		end := s.midx.fanout[first]
-
-		rel, hit := slices.BinarySearchFunc(
-			s.midx.objectIDs[start:end],
-			oid,
-			func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
-		)
-		if hit {
-			abs := int(start) + rel
-			entry := s.midx.entries[abs]
-			if entry.crc != 0 {
-				return entry.crc, true
-			}
+	if s.memoryMidx != nil {
+		if entry, ok := s.memoryMidx.findEntry(oid); ok &&
+			entry.pack == p &&
+			entry.offset == off &&
+			entry.crc != 0 {
+			return entry.crc, true
 		}
 	}
 
@@ -577,21 +805,10 @@ func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32
 }
 
 // verifyCRCForPackObject validates the CRC-32 checksum of a pack object.
-// The method creates a minimal index structure for packs referenced only through MIDX
-// to enable CRC verification.
-//
 // verifyCRCForPackObject returns an error if the pack cannot be located or checksum verification fails.
 func (s *store) verifyCRCForPackObject(p *mmap.ReaderAt, off uint64, crc uint32) error {
 	for _, pf := range s.packs {
 		if pf.pack == p {
-			if pf.sortedOffsets == nil {
-				// This is a stub idxFile created from the multi-pack-index.
-				// Minimal structures must be built to perform CRC verification.
-				pf.sortedOffsets = []uint64{off}
-				pf.entriesByOff = map[uint64]idxEntry{
-					off: {offset: off, crc: crc},
-				}
-			}
 			return verifyCRC32(pf, off, crc)
 		}
 	}

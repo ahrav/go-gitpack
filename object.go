@@ -1,3 +1,17 @@
+// object.go
+//
+// Git object type definitions and packfile object-header parsing routines.
+//
+// The ObjectType enumeration mirrors Git's internal type encoding exactly:
+// the iota values 0-7 correspond to the 3-bit type field stored in bits
+// 6-4 of a packfile object header byte. The parser functions in this file
+// decode those headers using both safe and unsafe (zero-copy) techniques
+// for performance-critical paths.
+//
+// Cross-file dependencies:
+//   - hostLittle (endian.go) -- governs byte-order branches in detectType.
+//   - Hash (hash.go) -- object identity type used throughout the store.
+
 package objstore
 
 import (
@@ -15,29 +29,34 @@ import (
 // The String method returns the canonical, lower-case Git spelling.
 type ObjectType byte
 
+// INVARIANT: The iota values below MUST match Git's internal 3-bit type
+// encoding stored in packfile object headers (bits 6-4 of the first byte).
+// Changing the order or inserting new constants will break header parsing
+// in parseObjectHeaderUnsafe and every caller that casts a raw header
+// nibble to ObjectType.
 const (
 	// ObjBad represents an invalid or unspecified object kind.
-	ObjBad ObjectType = iota
+	ObjBad ObjectType = iota // 0
 
 	// ObjCommit is a regular commit object.
-	ObjCommit
+	ObjCommit // 1
 
 	// ObjTree is a directory tree object describing the hierarchy of a commit.
-	ObjTree
+	ObjTree // 2
 
 	// ObjBlob is a file-content blob object.
-	ObjBlob
+	ObjBlob // 3
 
 	// ObjTag is an annotated tag object.
-	ObjTag
+	ObjTag // 4
 
-	_ // Ununused
+	_ // 5 -- unused; reserved by Git for future expansion.
 
 	// ObjOfsDelta is a delta object whose base is addressed by packfile offset.
-	ObjOfsDelta
+	ObjOfsDelta // 6
 
 	// ObjRefDelta is a delta object whose base is addressed by object ID.
-	ObjRefDelta
+	ObjRefDelta // 7
 )
 
 var typeNames = map[ObjectType]string{
@@ -66,7 +85,11 @@ func detectType(data []byte) ObjectType {
 	// Use an aligned uint32 load so we can compare four bytes at once.
 	first4 := *(*uint32)(unsafe.Pointer(&data[0]))
 
-	// Compare against little-endian representations.
+	// Compare against endianness-specific uint32 representations of the
+	// ASCII strings "tree" and "blob". On little-endian hosts (the common
+	// case) the bytes are stored in reversed order, so "tree" (0x74 0x72
+	// 0x65 0x65) becomes 0x65657274 when loaded as a native uint32.
+	// The big-endian constants below are the straightforward byte ordering.
 	const (
 		treeLE = 0x65657274 // "tree" in little-endian
 		blobLE = 0x626f6c62 // "blob" in little-endian
@@ -111,6 +134,10 @@ func detectType(data []byte) ObjectType {
 		return ObjTag
 	}
 
+	// Default to ObjBlob when no markers match. This is intentional: in a
+	// test/heuristic context, binary file content is the most common
+	// unrecognised payload, and treating it as a blob is the safest
+	// fallback since blobs have no structural invariants to violate.
 	return ObjBlob
 }
 
@@ -140,13 +167,28 @@ func peekObjectType(r *mmap.ReaderAt, off uint64) (ObjectType, int, error) {
 	return ot, hdrLen, nil
 }
 
-// parseObjectHeaderUnsafe parses a Git object header using unsafe pointer operations.
-// The header encodes object type in bits 6-4 of the first byte and size as a
-// variable-length integer.
+// parseObjectHeaderUnsafe parses a Git packfile object header using unsafe
+// pointer operations for speed on the hot path.
 //
-// parseObjectHeaderUnsafe returns the object type, decompressed size,
-// and number of header bytes consumed.
-// The function uses unsafe operations for performance but never panics.
+// The header format (defined by Git's pack format documentation):
+//   - Byte 0, bits 6-4: 3-bit object type (maps directly to ObjectType iota).
+//   - Byte 0, bits 3-0: lowest 4 bits of the decompressed size.
+//   - Byte 0, bit 7: continuation flag. If set, subsequent bytes contribute
+//     7 additional size bits each (standard variable-length integer encoding).
+//
+// Return convention:
+//   - On success: (type, decompressedSize, headerByteCount) where
+//     headerByteCount >= 1.
+//   - On error (empty input or unterminated varint): (ObjBad, 0, -1).
+//     Callers MUST check headerByteCount > 0 before using the other values.
+//
+// The loop processes at most 10 bytes (enough for a 64-bit size with 4+9*7 = 67
+// available bits), which bounds worst-case execution time and prevents
+// runaway reads on corrupt data.
+//
+// Safety: the function never panics -- it checks len(data) before every
+// unsafe dereference. The unsafe.Add pointer arithmetic stays within the
+// bounds of the original slice's backing array.
 func parseObjectHeaderUnsafe(data []byte) (ObjectType, uint64, int) {
 	if len(data) == 0 {
 		return ObjBad, 0, -1

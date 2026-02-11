@@ -7,7 +7,10 @@ require (
 	golang.org/x/exp v0.0.0-20250606033433-dcc06ee1d476
 )
 
-require github.com/hashicorp/golang-lru/v2 v2.0.7
+require (
+	github.com/hashicorp/golang-lru/v2 v2.0.7
+	github.com/klauspost/compress v1.18.4
+)
 
 require (
 	github.com/kr/pretty v0.1.0 // indirect

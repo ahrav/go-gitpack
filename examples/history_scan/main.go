@@ -1,3 +1,7 @@
+// Package main demonstrates streaming commit-history hunk additions from a
+// Git repository using the go-gitpack library. It opens the nearest .git
+// directory, calls DiffHistoryHunks to stream per-commit file additions, and
+// prints each hunk with its commit, path, line range, and a content preview.
 package main
 
 import (
@@ -35,18 +39,20 @@ func main() {
 	fmt.Println("Starting to stream commit history hunks...")
 	fmt.Println("Press Ctrl+C to stop")
 
-	// DiffHistoryHunks returns streaming channels for additions and errors.
-	hunkAdditions, errors := scanner.DiffHistoryHunks()
+	// DiffHistoryHunks returns two channels: a stream of hunk additions and
+	// an error channel. Drain hunks completely in a goroutine, then check the
+	// error channel. This avoids a select race where the error channel becomes
+	// readable before the hunk channel is closed.
+	hunks, errs := scanner.DiffHistoryHunks()
 
 	hunkCount := 0
-	// const maxHunks = 50 // Limit output for demo purposes.
-	const maxHunks = math.MaxInt // Limit output for demo purposes.
+	// maxHunks controls how many hunks to process before stopping.
+	// Set to a small value (e.g. 50) for demo/testing purposes, or
+	// math.MaxInt to process the entire history.
+	const maxHunks = math.MaxInt
 
-	// Launch a goroutine to process hunk additions from the stream.
-	done := make(chan bool)
 	go func() {
-		defer close(done)
-		for hunkAddition := range hunkAdditions {
+		for hunkAddition := range hunks {
 			if hunkCount >= maxHunks {
 				fmt.Printf("... (stopping after %d hunks for demo purposes)\n", maxHunks)
 				return
@@ -64,7 +70,7 @@ func main() {
 			showLines := min(3, len(lines))
 			fmt.Printf("  Content (first %d lines):\n", showLines)
 			for i := range showLines {
-				content := string(lines[i])
+				content := lines[i]
 				if len(content) > 80 {
 					content = content[:77] + "..."
 				}
@@ -81,40 +87,10 @@ func main() {
 		}
 	}()
 
-	// Wait for either the completion of hunk processing or an error.
-	select {
-	case err := <-errors:
-		if err != nil {
-			log.Fatalf("Error during history scan: %v", err)
-		}
-		fmt.Println("✅ History scan completed successfully!")
-	case <-done:
-		fmt.Printf("✅ Processed %d hunks\n", hunkCount)
+	if err := <-errs; err != nil {
+		log.Fatalf("Error during history scan: %v", err)
 	}
-
-	fmt.Println("\n--- Additional Scanner Capabilities ---")
-
-	// LoadAllCommits demonstrates loading all commits.
-	commits, err := scanner.LoadAllCommits()
-	if err != nil {
-		log.Printf("Failed to load commits: %v", err)
-	} else {
-		fmt.Printf("📊 Total commits in repository: %d\n", len(commits))
-
-		showCount := min(5, len(commits))
-		fmt.Printf("📝 First %d commits:\n", showCount)
-		for i := range showCount {
-			commit := commits[i]
-			metadata, err := scanner.GetCommitMetadata(commit.OID)
-			if err != nil {
-				log.Printf("Failed to get commit metadata: %v", err)
-				continue
-			}
-
-			fmt.Printf("  %s (tree: %s, parents: %d, time: %d)\n",
-				commit.OID, commit.TreeOID, len(commit.ParentOIDs), metadata.Timestamp)
-		}
-	}
+	fmt.Printf("Processed %d hunks\n", hunkCount)
 }
 
 // findGitDir walks up the directory tree to find a .git directory.

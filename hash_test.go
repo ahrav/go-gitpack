@@ -1,3 +1,6 @@
+// hash_test.go tests the Hash type, including parsing from hex strings via
+// ParseHash and the String() round-trip representation.
+
 package objstore
 
 import (
@@ -8,6 +11,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestHash validates ParseHash for valid 40-character hex strings, invalid
+// (non-hex) input, and wrong-length input. It ensures that valid hashes
+// decode to the expected byte representation and that error cases are rejected.
 func TestHash(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -51,6 +57,9 @@ func TestHash(t *testing.T) {
 	}
 }
 
+// TestHashString verifies that Hash.String() produces the canonical lowercase
+// 40-character hex representation, covering a normal hash, all-zeros, and
+// all-ones boundary values.
 func TestHashString(t *testing.T) {
 	tests := []struct {
 		name     string

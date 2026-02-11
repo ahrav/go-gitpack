@@ -1,3 +1,7 @@
+// Package main demonstrates simple streaming consumption of commit-history
+// hunks using the go-gitpack library. It locates the nearest .git directory,
+// opens a HistoryScanner, and prints a rolling summary of added hunks as
+// they are streamed from DiffHistoryHunks.
 package main
 
 import (
@@ -52,18 +56,16 @@ func main() {
 
 	fmt.Println("🚀 Streaming commit hunks from repository history...")
 
-	hunkAdditions, errors := scanner.DiffHistoryHunks()
+	hunks, errs := scanner.DiffHistoryHunks()
 
+	// Drain the hunk channel completely in a goroutine, then check the
+	// error channel. This avoids a select race where the error channel
+	// becomes readable before the hunk channel is closed, which could
+	// silently drop trailing buffered hunks.
 	count := 0
 	totalLines := 0
-	for {
-		select {
-		case hunkAddition, ok := <-hunkAdditions:
-			if !ok {
-				fmt.Printf("\n✅ Finished! Processed %d hunks with %d total lines.\n", count, totalLines)
-				return
-			}
-
+	go func() {
+		for hunkAddition := range hunks {
 			count++
 			hunkLineCount := len(hunkAddition.Lines())
 			totalLines += hunkLineCount
@@ -81,7 +83,7 @@ func main() {
 
 					showLines := min(2, len(lines))
 					for i := 0; i < showLines; i++ {
-						content := string(lines[i])
+						content := lines[i]
 						if len(content) > 80 {
 							content = content[:77] + "..."
 						}
@@ -92,13 +94,11 @@ func main() {
 					}
 				}
 			}
-
-		case err := <-errors:
-			if err != nil {
-				log.Fatalf("❌ Error during streaming: %v", err)
-			}
-			fmt.Printf("\n✅ Streaming completed successfully! Total hunks: %d, total lines: %d\n", count, totalLines)
-			return
 		}
+	}()
+
+	if err := <-errs; err != nil {
+		log.Fatalf("Error during streaming: %v", err)
 	}
+	fmt.Printf("\nStreaming completed successfully! Total hunks: %d, total lines: %d\n", count, totalLines)
 }

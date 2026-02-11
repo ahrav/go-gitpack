@@ -1,3 +1,7 @@
+// commit_attribution_test.go tests the commit attribution subsystem, including
+// the metaCache (which maps commit OIDs to author metadata and timestamps),
+// the parseAuthorHeader parser, and concurrent-access safety of the cache.
+
 package objstore
 
 import (
@@ -10,6 +14,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// mockCommitHeaderReader is an in-memory implementation of commitHeaderReader
+// used by tests to supply pre-configured commit headers keyed by OID.
+// It is safe for concurrent use via an internal RWMutex.
 type mockCommitHeaderReader struct {
 	headers map[Hash][]byte
 	mu      sync.RWMutex
@@ -52,6 +59,8 @@ func (m *mockCommitHeaderReader) addRawHeader(oid Hash, header []byte) {
 	m.headers[oid] = header
 }
 
+// TestNewMetaCache validates that newMetaCache correctly initializes a metaCache
+// with the provided commit graph data and reader, and starts with an empty map.
 func TestNewMetaCache(t *testing.T) {
 	graph := &commitGraphData{
 		Timestamps: []int64{1000, 2000, 3000, 4000, 5000},
@@ -75,6 +84,9 @@ func TestNewMetaCache(t *testing.T) {
 	assert.Equal(t, 0, len(cache.m))
 }
 
+// TestMetaCacheTimestamp validates that metaCache.get returns the correct
+// timestamp for known OIDs, returns errors for unknown OIDs, and handles
+// out-of-bounds index conditions gracefully.
 func TestMetaCacheTimestamp(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -154,6 +166,10 @@ func TestMetaCacheTimestamp(t *testing.T) {
 	}
 }
 
+// TestParseAuthorHeader exercises the parseAuthorHeader function against a wide
+// range of inputs including standard headers, edge cases (empty names, special
+// characters, missing fields), and error conditions (malformed timestamps, missing
+// author/committer lines).
 func TestParseAuthorHeader(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -296,6 +312,8 @@ func TestParseAuthorHeader(t *testing.T) {
 	}
 }
 
+// TestMetaCacheAuthor validates successful retrieval, caching behaviour, and
+// error paths (missing object, malformed header) of metaCache.get for author info.
 func TestMetaCacheAuthor(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
 
@@ -345,6 +363,9 @@ func TestMetaCacheAuthor(t *testing.T) {
 	})
 }
 
+// TestMetaCacheConcurrentAccess verifies that metaCache is safe for concurrent
+// reads from multiple goroutines. It spawns 20 goroutines each performing 100
+// reads across 50 distinct OIDs and asserts no data races or incorrect results.
 func TestMetaCacheConcurrentAccess(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
 
@@ -409,92 +430,16 @@ func TestMetaCacheConcurrentAccess(t *testing.T) {
 	}
 }
 
-// func TestMetaCacheEdgeCases(t *testing.T) {
-// 	synctest.Run(func() {
-// 		t.Run("concurrent reads of same oid", func(t *testing.T) {
-// 			mockReader := newMockCommitHeaderReader()
-// 			oid := Hash{1, 2, 3}
-// 			mockReader.addCommit(oid, "John Doe", "john@example.com", 1234567890)
+// TODO: TestMetaCacheEdgeCases is disabled because it depends on synctest.Run
+// (from the Go sync/synctest experiment) which is not yet available in the
+// standard library. Re-enable once synctest graduates or replace with a
+// compatible concurrency-testing approach.
+//
+// func TestMetaCacheEdgeCases(t *testing.T) { ... }
 
-// 			metaCache := &metaCache{
-// 				store: mockReader,
-// 				m:     make(map[Hash]AuthorInfo),
-// 			}
-
-// 			// Multiple goroutines trying to read the same OID concurrently
-// 			var wg sync.WaitGroup
-// 			numGoroutines := 50
-// 			results := make([]AuthorInfo, numGoroutines)
-// 			errors := make([]error, numGoroutines)
-
-// 			for i := 0; i < numGoroutines; i++ {
-// 				wg.Add(1)
-// 				go func(idx int) {
-// 					defer wg.Done()
-// 					results[idx], errors[idx] = metaCache.author(oid)
-// 				}(i)
-// 			}
-
-// 			wg.Wait()
-
-// 			// All reads should succeed with the same result
-// 			for i := 0; i < numGoroutines; i++ {
-// 				assert.NoError(t, errors[i])
-// 				if i > 0 {
-// 					assert.Equal(t, results[0], results[i])
-// 				}
-// 			}
-
-// 			// Should be cached after first read
-// 			assert.Contains(t, metaCache.m, oid)
-// 		})
-
-// 		t.Run("cache miss followed by concurrent reads", func(t *testing.T) {
-// 			mockReader := newMockCommitHeaderReader()
-// 			oid := Hash{4, 5, 6}
-
-// 			// Simulate slow header read
-// 			slowReader := &slowCommitHeaderReader{
-// 				delegate: mockReader,
-// 				delay:    50 * time.Millisecond,
-// 			}
-// 			slowReader.delegate.addCommit(oid, "Jane Doe", "jane@example.com", 1234567890)
-
-// 			metaCache := &metaCache{
-// 				store: slowReader,
-// 				m:     make(map[Hash]AuthorInfo),
-// 			}
-
-// 			// Start multiple readers simultaneously
-// 			var wg sync.WaitGroup
-// 			results := make([]AuthorInfo, 10)
-
-// 			start := time.Now()
-// 			for i := 0; i < 10; i++ {
-// 				wg.Add(1)
-// 				go func(idx int) {
-// 					defer wg.Done()
-// 					ai, err := metaCache.author(oid)
-// 					assert.NoError(t, err)
-// 					results[idx] = ai
-// 				}(i)
-// 			}
-
-// 			wg.Wait()
-// 			elapsed := time.Since(start)
-
-// 			// All results should be identical
-// 			for i := 1; i < 10; i++ {
-// 				assert.Equal(t, results[0], results[i])
-// 			}
-
-// 			// Should have taken roughly the delay time, not 10x the delay
-// 			// (meaning requests were coalesced, not serialized)
-// 			assert.Less(t, elapsed, 100*time.Millisecond)
-// 		})
-// 	})
-// }
-
+// slowCommitHeaderReader wraps a mockCommitHeaderReader and injects an
+// artificial delay before each read. It is used to test cache-miss coalescing
+// and slow-path behaviour in the metaCache.
 type slowCommitHeaderReader struct {
 	delegate *mockCommitHeaderReader
 	delay    time.Duration
@@ -505,6 +450,8 @@ func (s *slowCommitHeaderReader) readCommitHeader(oid Hash) ([]byte, error) {
 	return s.delegate.readCommitHeader(oid)
 }
 
+// BenchmarkParseAuthorHeader measures the throughput of parseAuthorHeader across
+// several representative header formats (short, multi-line, long name).
 func BenchmarkParseAuthorHeader(b *testing.B) {
 	headers := [][]byte{
 		[]byte("author John Doe <john@example.com> 1234567890 +0000"),
@@ -518,6 +465,9 @@ func BenchmarkParseAuthorHeader(b *testing.B) {
 	}
 }
 
+// BenchmarkMetaCacheAuthor measures the fast-path (cache-hit) performance of
+// metaCache.get by pre-populating the cache with 1000 entries and reading from
+// a rotating set of 10 OIDs.
 func BenchmarkMetaCacheAuthor(b *testing.B) {
 	mockReader := newMockCommitHeaderReader()
 
@@ -553,6 +503,9 @@ func BenchmarkMetaCacheAuthor(b *testing.B) {
 	})
 }
 
+// BenchmarkMetaCacheConcurrent measures the throughput of metaCache.get under
+// parallel access from multiple goroutines, all reading from a pre-populated
+// cache of 100 entries.
 func BenchmarkMetaCacheConcurrent(b *testing.B) {
 	mockReader := newMockCommitHeaderReader()
 
@@ -586,6 +539,9 @@ func BenchmarkMetaCacheConcurrent(b *testing.B) {
 	})
 }
 
+// BenchmarkMetaCacheAuthorSlow measures slow-path (cache-miss) performance by
+// periodically clearing the cache, forcing metaCache.get to re-parse commit
+// headers from the mock reader across a wide range of 10,000 OIDs.
 func BenchmarkMetaCacheAuthorSlow(b *testing.B) {
 	mockReader := newMockCommitHeaderReader()
 
@@ -619,6 +575,9 @@ func BenchmarkMetaCacheAuthorSlow(b *testing.B) {
 	}
 }
 
+// TestMetaCacheAuthorSlowPath verifies the cache-miss (slow) path: when an OID
+// is not in the cache, metaCache.get fetches the header from the store, parses
+// the author info, and populates the cache for subsequent lookups.
 func TestMetaCacheAuthorSlowPath(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
 
@@ -662,6 +621,9 @@ func TestMetaCacheAuthorSlowPath(t *testing.T) {
 	assert.Equal(t, result1.Author, cached1, "Cached result should match returned result")
 }
 
+// TestMetaCacheAuthorFastPathAfterCache verifies that after an initial fetch
+// populates the cache, a second get for the same OID returns identical results
+// from the fast (cached) path without re-reading from the store.
 func TestMetaCacheAuthorFastPathAfterCache(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
 
@@ -686,6 +648,8 @@ func TestMetaCacheAuthorFastPathAfterCache(t *testing.T) {
 	assert.Equal(t, result1.Author, result2.Author, "Cache hit should return identical result")
 }
 
+// TestMetaCacheAuthorSlowPathError verifies that metaCache.get returns an error
+// when the requested OID does not exist in the graph or the underlying store.
 func TestMetaCacheAuthorSlowPathError(t *testing.T) {
 	mockReader := newMockCommitHeaderReader()
 

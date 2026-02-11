@@ -1,3 +1,10 @@
+// history_scanner_integration_test.go is an oracle-based integration test that
+// validates DiffHistoryHunks output against `git show <commit>:<path>`. For
+// each hunk emitted by the scanner, the test fetches the authoritative file
+// snapshot from Git and asserts that every hunk line matches the corresponding
+// line in the real file. This ensures the diff and history-walking pipeline
+// produces byte-accurate results for a known test repository.
+
 package objstore
 
 import (
@@ -11,6 +18,21 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestDiffHistoryHunks_AdditionIntegrity walks the full commit history of the
+// "simple-linear" test repository via DiffHistoryHunks, then cross-checks
+// every emitted hunk against `git show <commit>:<path>`.
+//
+// Strategy:
+//  1. Scan all diff hunks from the history scanner.
+//  2. Group hunks by (commit, path).
+//  3. For each group, invoke `git show` to get the authoritative file snapshot.
+//  4. Assert every hunk line matches the corresponding line number in the file.
+//  5. Verify EndLine = StartLine + len(Lines) - 1.
+//
+// Prerequisites:
+//   - The testdata/repos/simple-linear repository must exist and be a valid
+//     Git repository. It is typically created by a test-fixture setup script.
+//   - The `git` CLI must be available on PATH.
 func TestDiffHistoryHunks_AdditionIntegrity(t *testing.T) {
 	repo := "simple-linear"
 	repoPath := filepath.Join("testdata", "repos", repo)

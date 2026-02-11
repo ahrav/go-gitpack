@@ -1,14 +1,19 @@
-// Package objstore provides profiling support for performance analysis.
+// profiling.go
 //
-// This file implements optional profiling capabilities using Go's standard
-// net/http/pprof package, allowing on-demand profile capture via HTTP endpoints.
+// Optional profiling and execution-tracing support for HistoryScanner.
+//
+// When enabled via the WithProfiling ScannerOption, this file starts an HTTP
+// server that exposes the standard net/http/pprof endpoints and, optionally,
+// an execution trace that is written to disk for the duration of the scan.
+// Neither capability affects scanning correctness; if anything in this file
+// fails the scanner can still operate normally.
 package objstore
 
 import (
 	"context"
 	"fmt"
 	"net/http"
-	_ "net/http/pprof" // Register pprof handlers
+	pprof "net/http/pprof"
 	"os"
 	"runtime/trace"
 	"time"
@@ -37,7 +42,10 @@ type ProfilingConfig struct {
 	TraceOutputPath string
 }
 
-// ScannerOption is a function that configures a HistoryScanner during construction.
+// ScannerOption is a function that configures a HistoryScanner during
+// construction. Options are applied in the order they are passed to
+// NewHistoryScanner; later options therefore override earlier ones when they
+// touch the same field.
 type ScannerOption func(*HistoryScanner)
 
 // WithProfiling returns a ScannerOption that enables profiling with the given configuration.
@@ -70,8 +78,14 @@ func WithProfiling(config *ProfilingConfig) ScannerOption {
 	}
 }
 
-// startProfiling starts the HTTP profiling server and/or trace based on configuration.
-// Returns an error if profiling setup fails, but scanning can continue.
+// startProfiling starts the HTTP profiling server and/or execution trace
+// based on the current ProfilingConfig.
+//
+// Error semantics: a non-nil error is returned only when trace file creation
+// or trace.Start fails -- conditions that indicate a real I/O problem the
+// caller should surface. HTTP server bind failures are logged to stderr but
+// do not produce an error because profiling is advisory and should never
+// block scanning.
 func (hs *HistoryScanner) startProfiling() error {
 	if hs.profiling == nil {
 		return nil
@@ -98,7 +112,10 @@ func (hs *HistoryScanner) startProfiling() error {
 			}
 		}()
 
-		// Brief pause ensures the server is ready before continuing.
+		// Brief pause to give the goroutine time to bind the listening socket.
+		// This is a known limitation: there is no synchronization channel
+		// back from ListenAndServe, so we rely on a short sleep. In practice
+		// 100 ms is more than sufficient for a local TCP bind.
 		time.Sleep(100 * time.Millisecond)
 		fmt.Fprintf(os.Stderr, "Profiling server started on %s\n", hs.profiling.ProfileAddr)
 		fmt.Fprintf(os.Stderr, "Capture profiles with: curl http://%s/debug/pprof/heap > heap.prof\n", hs.profiling.ProfileAddr)
@@ -120,8 +137,11 @@ func (hs *HistoryScanner) startProfiling() error {
 	return nil
 }
 
-// stopProfiling stops the HTTP profiling server and/or trace.
-// It ensures graceful shutdown even if called during error handling.
+// stopProfiling stops the HTTP profiling server and/or execution trace.
+//
+// Idempotency: stopProfiling is safe to call multiple times or when
+// startProfiling was never called. Each resource (HTTP server, trace file)
+// is nil-checked and cleared after shutdown, so a second call is a no-op.
 func (hs *HistoryScanner) stopProfiling() {
 	if hs.profiling == nil {
 		return

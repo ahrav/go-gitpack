@@ -1,3 +1,6 @@
+// object_test.go tests the ObjectType enumeration, type detection heuristics,
+// and platform endianness detection used throughout the objstore package.
+
 package objstore
 
 import (
@@ -6,6 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// TestObjectTypeString verifies that every defined ObjectType maps to its
+// canonical Git string representation (e.g., ObjCommit -> "commit") and that
+// an undefined ObjectType value (ObjectType(99)) returns an empty string to
+// signal that it is not a recognized type.
 func TestObjectTypeString(t *testing.T) {
 	tests := []struct {
 		objType  ObjectType
@@ -17,7 +24,7 @@ func TestObjectTypeString(t *testing.T) {
 		{ObjTag, "tag"},
 		{ObjOfsDelta, "ofs-delta"},
 		{ObjRefDelta, "ref-delta"},
-		{ObjectType(99), ""},
+		{ObjectType(99), ""}, // Unrecognized type should return empty string.
 	}
 
 	for _, test := range tests {
@@ -25,6 +32,10 @@ func TestObjectTypeString(t *testing.T) {
 	}
 }
 
+// TestDetectType verifies the heuristic that infers an object's type from its
+// raw content. The function looks for characteristic prefixes: "tree " for
+// trees, "parent " or "author " near the start for commits, and falls back to
+// blob for anything else.
 func TestDetectType(t *testing.T) {
 	tests := []struct {
 		data     []byte
@@ -41,6 +52,10 @@ func TestDetectType(t *testing.T) {
 	}
 }
 
+// TestIsLittleEndian checks that the compile-time endianness constant
+// (hostLittle) returns a consistent boolean value. The test does not assert a
+// specific value because the code must work on both little-endian (amd64,
+// arm64) and big-endian platforms; it only confirms determinism and type.
 func TestIsLittleEndian(t *testing.T) {
 	result1 := hostLittle
 	result2 := hostLittle

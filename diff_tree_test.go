@@ -1,3 +1,20 @@
+// diff_tree_test.go tests walkDiff, which computes the set of blob-level
+// changes between two Git tree objects. The function recursively descends
+// into sub-trees and emits a change for every file that was added, modified
+// (content or mode), or deleted.
+//
+// The tests exercise:
+//   - Empty and identical trees (no changes expected).
+//   - Insert, modify, and delete of regular files.
+//   - Mode-only changes (e.g., 0644 -> 0755).
+//   - Gitlink (submodule) entries treated as opaque, non-recursive changes.
+//   - Recursive descent with a path prefix.
+//   - File-to-directory and directory-to-file conversions.
+//   - Error propagation from the emit callback.
+//   - Cache misses on tree resolution.
+//   - Deeply nested directory structures (depth 40).
+//   - Benchmarks for small (64-entry) and large (4096-entry) flat trees.
+
 package objstore
 
 import (
@@ -100,6 +117,10 @@ func collect(tc *store, parent, child Hash, prefix string) ([]change, error) {
 	return out, err
 }
 
+// equalChanges reports whether two change slices contain the same elements,
+// regardless of order. Both slices are sorted by Path before comparison so
+// that tests are not sensitive to the traversal order of walkDiff, which may
+// vary depending on the tree entry layout.
 func equalChanges(a, b []change) bool {
 	if len(a) != len(b) {
 		return false
@@ -184,6 +205,38 @@ func TestWalkDiff_ModeOnlyChange(t *testing.T) {
 	assert.NoError(t, err)
 	want := []change{{"exec.sh", h, h, 0100755}}
 	assert.True(t, equalChanges(got, want), "mode change not reported: %+v", got)
+}
+
+func TestWalkDiff_GitlinkNotRecursed(t *testing.T) {
+	oldSub := newHash("sub-old")
+	newSub := newHash("sub-new")
+	parentOID := newHash("parent-sub")
+	childOID := newHash("child-sub")
+
+	tc := buildTestStore(map[Hash][]byte{
+		parentOID: createRawTreeData(
+			struct {
+				mode uint32
+				name string
+				hash Hash
+			}{0160000, "vendor", oldSub},
+		),
+		childOID: createRawTreeData(
+			struct {
+				mode uint32
+				name string
+				hash Hash
+			}{0160000, "vendor", newSub},
+		),
+	})
+
+	got, err := collect(tc, parentOID, childOID, "")
+	assert.NoError(t, err)
+
+	want := []change{
+		{"vendor", oldSub, newSub, 0160000},
+	}
+	assert.True(t, equalChanges(got, want), "gitlink change should be reported as a file replacement")
 }
 
 func TestWalkDiff_RecursiveAndPrefix(t *testing.T) {
@@ -284,6 +337,19 @@ func TestWalkDiff_SpecialNames(t *testing.T) {
 	}
 }
 
+// TestWalkDiff_FileDirConversions checks both directions of file/directory
+// conversion:
+//
+//   - File -> Directory ("foo" was a regular file, now it is a tree containing
+//     "bar"). The expected behavior is a single change reported at path "foo"
+//     because walkDiff treats the type change as a replacement rather than
+//     recursing into the new directory to enumerate individual additions.
+//
+//   - Directory -> File ("foo" was a tree, now it is a regular file). Again,
+//     a single change at path "foo" is expected.
+//
+// In both cases exactly one change is emitted at the conversion path; the
+// contents of the old/new tree are not individually enumerated.
 func TestWalkDiff_FileDirConversions(t *testing.T) {
 	dirOID := newHash("D")
 	tc := buildTestStore(map[Hash][]byte{

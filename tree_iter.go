@@ -15,8 +15,19 @@ import (
 )
 
 var (
-	ErrCorruptTree  = errors.New("corrupt tree object")
+	// ErrCorruptTree is returned when a raw tree object's byte layout violates
+	// the Git tree format (e.g. missing NUL terminator, truncated SHA, invalid
+	// octal mode digit). Callers should treat the enclosing pack or loose file
+	// as damaged.
+	ErrCorruptTree = errors.New("corrupt tree object")
+
+	// ErrTypeMismatch is returned when an object retrieved from the store has a
+	// different type than the caller expected (e.g. a blob where a tree was
+	// required).
 	ErrTypeMismatch = errors.New("unexpected object type")
+
+	// ErrTreeNotFound is returned when the requested tree OID cannot be
+	// located in any pack index or the loose-object directory.
 	ErrTreeNotFound = errors.New("tree object not found")
 )
 
@@ -37,6 +48,10 @@ type TreeIter struct {
 	rest []byte
 }
 
+// newTreeIter returns a TreeIter that will walk the entries encoded in raw.
+// raw must be the body of a Git tree object (i.e. everything after the
+// "tree <size>\0" header has been stripped). The caller must guarantee that
+// the slice is not mutated for the lifetime of the returned iterator.
 func newTreeIter(raw []byte) *TreeIter { return &TreeIter{rest: raw} }
 
 // Next parses and returns the next entry in the raw Git tree.
@@ -46,6 +61,11 @@ func newTreeIter(raw []byte) *TreeIter { return &TreeIter{rest: raw} }
 // err is io.EOF.
 // Any malformed input results in ok == false and a non-nil err,
 // typically ErrCorruptTree.
+//
+// The returned name is produced via btostr and therefore shares the backing
+// array of the original raw slice. The string is valid only as long as the
+// raw slice is alive and unmodified; callers that need to retain the name
+// past the iterator's lifetime must copy it.
 //
 // The iterator keeps a slice pointing at the original raw buffer;
 // callers must therefore ensure that the underlying slice is not mutated
@@ -57,8 +77,14 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 		return "", Hash{}, 0, false, io.EOF
 	}
 
-	// Safety check: if we have less than the minimum possible tree entry
-	// (at least 1 char mode + space + 1 char name + null + 20 bytes SHA)
+	// Safety check: if we have less than the minimum possible tree entry.
+	// The magic number 24 is the minimum byte count for a valid entry:
+	//   1 byte  mode  (at least one octal digit, e.g. "0")
+	// + 1 byte  space separator
+	// + 1 byte  name  (at least one character)
+	// + 1 byte  NUL terminator after the name
+	// + 20 bytes SHA-1 object ID
+	// = 24 bytes total.
 	if len(it.rest) < 24 {
 		return "", Hash{}, 0, false, fmt.Errorf("%w: insufficient data for tree entry (%d bytes)", ErrCorruptTree, len(it.rest))
 	}

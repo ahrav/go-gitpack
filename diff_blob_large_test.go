@@ -1,3 +1,9 @@
+// diff_blob_large_test.go tests the tiered diff algorithms used for large files.
+// Files above SmallFileThreshold (1 MB) use addedHunksWithLineSet, and files
+// above LargeFileThreshold (500 MB) use addedHunksWithHashing. These tests
+// verify correctness, cross-algorithm consistency, and proper hunk grouping for
+// files across the various size tiers.
+
 package objstore
 
 import (
@@ -39,8 +45,9 @@ func TestAddedHunksLargeFiles(t *testing.T) {
 	}
 
 	t.Run("medium_file_line_set_algorithm", func(t *testing.T) {
-		// Create files just over SmallFileThreshold (1 MB)
-		// This should trigger addedHunksWithLineSet
+		// Create files just over SmallFileThreshold (1 MB).
+		// SmallFileThreshold is the size boundary above which the diff engine
+		// switches from the position-tracking algorithm to the line-set algorithm.
 		size := SmallFileThreshold + 1024 // 1 MB + 1 KB
 
 		// Create old file with pattern
@@ -72,10 +79,10 @@ func TestAddedHunksLargeFiles(t *testing.T) {
 	})
 
 	t.Run("large_file_hash_algorithm", func(t *testing.T) {
-		// Create files just over LargeFileThreshold (500 MB)
-		// This should trigger addedHunksWithHashing
-		// For testing, we'll simulate this with a smaller size
-		// but test the hash algorithm directly
+		// LargeFileThreshold (500 MB) is the boundary above which the diff
+		// engine switches to the hashing algorithm. We cannot allocate 500 MB
+		// in a unit test, so we call addedHunksWithHashing directly on a
+		// smaller dataset to exercise the same code path.
 		oldLines := make([]string, 100000)
 		for i := 0; i < 100000; i++ {
 			oldLines[i] = fmt.Sprintf("Original line %d with some content", i)
@@ -225,8 +232,10 @@ func TestAddedHunksLargeFiles(t *testing.T) {
 		assert.Len(t, result[0].Lines, 3)
 	})
 
-	t.Run("performance_characteristics", func(t *testing.T) {
-		// Test that demonstrates why we use different algorithms for different sizes
+	t.Run("cross_algorithm_consistency", func(t *testing.T) {
+		// Verifies that all three algorithms (pos, lineSet, hashing) produce
+		// the same addition count for the same input, confirming correctness
+		// across the tiered size thresholds.
 
 		// Create files with many unique lines
 		numLines := 50000

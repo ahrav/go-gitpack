@@ -5,16 +5,29 @@
 // to find additions and groups consecutive added lines into "hunks" for
 // efficient representation.
 //
-// The algorithm uses an adaptive optimization strategy:
-//   - For files with >50 lines: builds a hash map for O(1) line lookups
-//   - For smaller files: uses linear search to minimize memory overhead
+// The algorithm uses an adaptive, multi-tier optimization strategy selected
+// by file size (see computeAddedHunks):
 //
-// This file provides support for diff-related operations within the object
-// store, useful for analyzing changes between blob objects or computing
-// additions in commit diffs.
+//   - <= SmallFileThreshold  (1 MB):   addedHunksWithPos — greedy forward scan
+//     with optional hash-map acceleration for files with >50 lines. This is NOT
+//     a standard diff algorithm (e.g., Myers); it is a greedy heuristic that
+//     walks the old and new line sequences in order and reports lines in newB
+//     that cannot be matched to a remaining line in oldB.
+//   - <= MediumFileThreshold (50 MB):  addedHunksWithLineSet — set-membership
+//     diff that discards positional information.
+//   - <= LargeFileThreshold  (500 MB): addedHunksWithHashing — stores only
+//     64-bit FarmHash digests per line to limit memory.
+//   - > MaxDiffSize          (1 GB):   skipped entirely; a placeholder hunk is
+//     returned instead.
 //
-// The tokenization is zero-copy, creating string views into the original
-// byte slices to minimize allocations during diff computation.
+// Tokenization is zero-copy: tokenize() creates string views into the original
+// byte slices via btostr (see unsafe.go). This means the returned strings share
+// the backing array of the input []byte. Callers must not mutate the input
+// slices after tokenization, or the strings become invalid.
+//
+// Cross-file dependencies:
+//   - btostr (unsafe.go): zero-copy []byte to string conversion.
+//   - store.get (store.go): used by loadBlobs to retrieve blob content.
 
 package objstore
 
@@ -79,7 +92,13 @@ func (h *AddedHunk) EndLine() uint32 {
 // tokenize splits a byte slice into individual lines without copying the underlying data.
 // The function recognizes '\n' as the line delimiter and excludes it from the results.
 // Empty input returns nil rather than an empty slice.
-// The returned strings share memory with the input slice for zero-copy efficiency.
+//
+// Shared-memory safety invariant: the returned strings are created via btostr
+// (unsafe.go), which performs a zero-copy cast from []byte to string using
+// unsafe.String. The returned strings alias the memory of src. This is safe
+// only as long as src is not mutated after this call. If src's backing array is
+// modified, the previously returned strings will silently reflect the mutation,
+// violating Go's string immutability guarantee.
 func tokenize(src []byte) []string {
 	if len(src) == 0 {
 		return nil
@@ -115,6 +134,18 @@ func tokenize(src []byte) []string {
 // (equivalent to Git's --inter-hunk-context flag).
 // The function never inserts the untouched lines into the resulting hunks; it
 // only extends the range metadata and concatenates the added lines.
+//
+// EndLine() semantics caveat: the gap between two hunks is computed as
+//
+//	hunks[i].StartLine - cur.EndLine() - 1
+//
+// Because fuseHunks concatenates Lines from the merged hunk into cur without
+// inserting the skipped (untouched) lines, cur.EndLine() after a merge will be
+// less than hunks[i+1].StartLine by the number of omitted lines. This means
+// the merged hunk's EndLine() no longer reflects the true last line number in
+// the new file -- it reflects StartLine + len(Lines) - 1, which undercounts
+// when untouched lines were elided. Callers that need accurate final line
+// numbers should recompute them from StartLine and the actual line count.
 func fuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
 	if len(hunks) < 2 {
 		return hunks
@@ -140,6 +171,11 @@ func fuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
 
 // isBinary reports whether the first 8 KiB of data contains a null byte,
 // which is a strong indicator that the blob is a binary file.
+//
+// This matches Git's own heuristic (see buffer_is_binary() in xdiff-interface.c),
+// which considers a file binary if a NUL byte appears within the first 8000
+// bytes. Our threshold of 8192 is slightly larger but functionally equivalent
+// for the overwhelming majority of real-world files.
 func isBinary(data []byte) bool {
 	checkSize := min(len(data), 8192)
 	return bytes.IndexByte(data[:checkSize], 0) != -1
@@ -254,6 +290,14 @@ func loadBlobs(s *store, oldOID, newOID Hash) ([]byte, []byte, error) {
 // addedHunksWithPos compares two byte slices and identifies contiguous blocks of added lines.
 // The function performs a line-by-line comparison between oldB and newB to find additions.
 // It groups consecutive added lines into hunks for efficient diff representation.
+//
+// IMPORTANT: this is a greedy forward-matching heuristic, NOT a standard diff
+// algorithm (e.g., Myers or patience diff). It walks the new lines in order and,
+// for each new line, attempts to find the earliest matching line at or after the
+// current position in the old file. Lines in newB that cannot be matched are
+// reported as additions. This greedy strategy may over-report additions when
+// lines are reordered rather than truly added, but it runs in O(N) or O(N log N)
+// time without the quadratic worst case of a full edit-distance computation.
 //
 // The algorithm uses an optimized lookup strategy: for files with more than 50 lines,
 // it builds a hash map for O(1) line lookups; for smaller files, it uses linear search.
@@ -378,10 +422,19 @@ func addedHunksForLargeFiles(oldBytes, newBytes []byte) []AddedHunk {
 	return addedHunksWithLineSet(oldBytes, newBytes)
 }
 
-// addedHunksWithHashing diff‑computes added hunks by hashing each line with
+// addedHunksWithHashing diff-computes added hunks by hashing each line with
 // Farm Hash64 and storing only the hashes of the old file. This keeps memory
 // usage proportional to the number of unique lines rather than their total
 // length.
+//
+// Hash collision risk: because the comparison uses 64-bit FarmHash digests
+// rather than full line content, there is a small but nonzero probability of
+// hash collisions. A collision causes a genuinely added line to be mistakenly
+// considered present in the old file, resulting in a false negative (the line
+// is silently omitted from the diff output). With 64-bit hashes the birthday-
+// bound collision probability reaches ~50% at roughly 2^32 (~4 billion) unique
+// lines, which is far beyond typical inputs. For correctness-critical callers,
+// use addedHunksWithLineSet or addedHunksWithPos instead.
 func addedHunksWithHashing(oldBytes, newBytes []byte) []AddedHunk {
 	oldLines := tokenize(oldBytes)
 	oldLineHashes := make(map[uint64]struct{}, len(oldLines))
