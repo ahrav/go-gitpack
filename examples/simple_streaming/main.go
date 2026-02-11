@@ -1,14 +1,16 @@
-// Package main demonstrates simple streaming consumption of commit-history
-// hunks using the go-gitpack library. It locates the nearest .git directory,
-// opens a HistoryScanner, and prints a rolling summary of added hunks as
-// they are streamed from DiffHistoryHunks.
+// Package main demonstrates simple streaming blob scanning using the go-gitpack
+// library. It locates the nearest .git directory, opens a HistoryScanner, and
+// scans every unique blob reachable from the commit history, printing a rolling
+// summary as blobs are processed.
 package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 
 	objstore "github.com/ahrav/go-gitpack"
 )
@@ -25,7 +27,6 @@ func findGitDir(startDir string) string {
 
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			// Reached filesystem root
 			break
 		}
 		dir = parent
@@ -33,8 +34,33 @@ func findGitDir(startDir string) string {
 	return ""
 }
 
-// main is the entry point of the simple streaming example.
-// It demonstrates how to use the go-gitpack library to stream commit hunks from a Git repository.
+// summaryScanner implements objstore.BlobScanner by draining each blob and
+// printing periodic progress. ScanBlob is called concurrently from multiple
+// decode workers, so the counters use atomic operations.
+type summaryScanner struct {
+	blobs      atomic.Int64
+	totalBytes atomic.Int64
+}
+
+func (s *summaryScanner) ScanBlob(r io.Reader, meta objstore.ScanMeta) error {
+	n, err := io.Copy(io.Discard, r)
+	if err != nil {
+		return err
+	}
+	s.totalBytes.Add(n)
+	count := s.blobs.Add(1)
+
+	if count%50 == 0 || count <= 10 {
+		fmt.Printf("[%d] blob %s  commit %s  path %s  (%d bytes)\n",
+			count,
+			meta.Blob.String()[:8],
+			meta.Commit.String()[:8],
+			meta.Path,
+			n)
+	}
+	return nil
+}
+
 func main() {
 	cwd, err := os.Getwd()
 	if err != nil {
@@ -54,51 +80,13 @@ func main() {
 	}
 	defer scanner.Close()
 
-	fmt.Println("🚀 Streaming commit hunks from repository history...")
+	fmt.Println("Scanning all unique blobs from repository history...")
 
-	hunks, errs := scanner.DiffHistoryHunks()
-
-	// Drain the hunk channel completely in a goroutine, then check the
-	// error channel. This avoids a select race where the error channel
-	// becomes readable before the hunk channel is closed, which could
-	// silently drop trailing buffered hunks.
-	count := 0
-	totalLines := 0
-	go func() {
-		for hunkAddition := range hunks {
-			count++
-			hunkLineCount := len(hunkAddition.Lines())
-			totalLines += hunkLineCount
-			if count%50 == 0 || count <= 10 {
-				fmt.Printf("[%d] %s added hunk in %s (lines %d-%d, %d lines)\n",
-					count,
-					hunkAddition.Commit().String()[:8],
-					hunkAddition.Path(),
-					hunkAddition.StartLine(),
-					hunkAddition.EndLine(),
-					hunkLineCount)
-
-				if count <= 5 {
-					lines := hunkAddition.Lines()
-
-					showLines := min(2, len(lines))
-					for i := 0; i < showLines; i++ {
-						content := lines[i]
-						if len(content) > 80 {
-							content = content[:77] + "..."
-						}
-						fmt.Printf("     Line %d: %s\n", hunkAddition.StartLine()+i, content)
-					}
-					if len(lines) > showLines {
-						fmt.Printf("     ... and %d more lines\n", len(lines)-showLines)
-					}
-				}
-			}
-		}
-	}()
-
-	if err := <-errs; err != nil {
-		log.Fatalf("Error during streaming: %v", err)
+	s := &summaryScanner{}
+	if err := scanner.Scan(nil, s); err != nil {
+		log.Fatalf("Error during scan: %v", err)
 	}
-	fmt.Printf("\nStreaming completed successfully! Total hunks: %d, total lines: %d\n", count, totalLines)
+
+	fmt.Printf("\nScan completed. Total blobs: %d, total bytes: %d\n",
+		s.blobs.Load(), s.totalBytes.Load())
 }

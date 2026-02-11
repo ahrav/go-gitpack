@@ -1,6 +1,6 @@
 # HistoryScanner Examples
 
-This directory contains working examples demonstrating how to use the `HistoryScanner` from the go-gitpack library to stream Git commit history and analyze repository changes.
+This directory contains working examples demonstrating how to use the `HistoryScanner` from the go-gitpack library to scan Git repository history.
 
 ## Prerequisites
 
@@ -21,14 +21,14 @@ git repack -Ad
 
 ### 1. Simple Streaming (`simple_streaming/`)
 
-A minimal example demonstrating the streaming `DiffHistoryHunks()` API. Shows how to efficiently stream and process commit-history hunk additions.
+A minimal example demonstrating the streaming `Scan()` API with a `BlobScanner`. Scans every unique blob reachable from the commit history and prints periodic progress summaries.
 
 **Functionality:**
 
 -   Automatically locates the `.git` directory by traversing up the directory tree.
--   Opens the repository and streams all hunk additions using `DiffHistoryHunks()`.
--   Displays progress every 50 hunks and detailed content for the first 10.
--   Shows line-range and line-count information for each hunk.
+-   Opens the repository and scans all unique blobs using `scanner.Scan(nil, &summaryScanner{})`.
+-   Displays progress every 50 blobs and detailed output for the first 10.
+-   Shows blob OID, commit, path, and size for each reported blob.
 
 **Execution:**
 
@@ -41,30 +41,25 @@ go run main.go
 
 ```
 Found .git directory at: /path/to/go-gitpack/.git
-Streaming commit hunks from repository history...
-[1] 03693402 added hunk in .gitignore (lines 33-34, 2 lines)
-     Line 33: ...
-     ... and 1 more lines
-[2] 091ffc74 added hunk in history_scanner.go (lines 119-121, 3 lines)
-     Line 119: ...
-     ... and 2 more lines
+Scanning all unique blobs from repository history...
+[1] blob 03693402  commit a1b2c3d4  path .gitignore  (245 bytes)
+[2] blob 091ffc74  commit e5f6a7b8  path history_scanner.go  (8192 bytes)
 ...
-[50] 0cc13063 added hunk in tree.go (lines 10-25, 16 lines)
+[50] blob 0cc13063  commit c9d0e1f2  path tree.go  (4096 bytes)
 [100] ...
-...
-Streaming completed successfully! Total hunks: 5432, total lines: 89123
+
+Scan completed. Total blobs: 1234, total bytes: 5678901
 ```
 
-### 2. Full History Scan (`history_scan/`)
+### 2. History Scan (`history_scan/`)
 
-A comprehensive example demonstrating `DiffHistoryHunks()` with a goroutine-based drain pattern and detailed per-hunk output.
+A detailed example demonstrating `Scan()` with per-blob metadata output including OID, commit, path, and size.
 
 **Functionality:**
 
 -   Automatically locates the Git repository by traversing up the directory tree.
--   Streams hunk additions with detailed output (commit, file, line range, content preview).
--   Processes the entire history (configurable via the `maxHunks` constant).
--   Uses a separate goroutine to drain the hunk channel while the main goroutine waits on the error channel.
+-   Scans every unique blob with detailed per-blob output (OID, commit, path, size).
+-   Uses atomic counters for thread-safe accumulation across concurrent decode workers.
 
 **Execution:**
 
@@ -77,21 +72,18 @@ go run main.go
 
 ```
 Opening Git repository at: /path/to/go-gitpack/.git
-Starting to stream commit history hunks...
-Press Ctrl+C to stop
+Scanning all unique blobs from repository history...
 
-Hunk #1:
-  Commit:     036934028e673710825b6a347a129558804b31a5
-  File:       .gitignore
-  Start Line: 33
-  End Line:   34
-  Lines in hunk: 2
-  Content (first 3 lines):
-    Line 33: ...
+Blob #1:
+  OID:    036934028e673710825b6a347a129558804b31a5
+  Commit: a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0
+  Path:   .gitignore
+  Size:   245 bytes
   ---
-Hunk #2:
+Blob #2:
   ...
-Processed 5432 hunks
+
+Processed 1234 blobs (5678901 bytes total)
 ```
 
 ### 3. Debug Simple (`debug_simple/`)
@@ -126,11 +118,10 @@ A performance profiling example that demonstrates how to diagnose memory and CPU
 **Functionality:**
 
 -   Enables HTTP profiling server exposing pprof endpoints for real-time performance analysis.
--   Streams repository history using `DiffHistoryHunks()` for memory-efficient processing.
+-   Scans repository history using `Scan()` with a `BlobScanner` for memory-efficient processing.
 -   Provides configurable profiling options via command-line flags.
--   Displays progress statistics during scanning including processing rate.
+-   Displays progress statistics during scanning including processing rate and throughput.
 -   Supports execution tracing for detailed runtime analysis.
--   Allows limiting the number of hunks processed for controlled profiling sessions.
 
 **Command-line Flags:**
 
@@ -139,7 +130,6 @@ A performance profiling example that demonstrates how to diagnose memory and CPU
 -   `-profile-addr`: Address for profiling HTTP server (default: ":6060")
 -   `-trace`: Enable execution tracing (default: false)
 -   `-trace-path`: Path for trace output (default: "./trace.out")
--   `-max-hunks`: Maximum number of hunks to process, 0 for all (default: 0)
 
 **Execution:**
 
@@ -148,7 +138,7 @@ cd examples/profiling
 go run main.go
 
 # With custom options:
-go run main.go -repo /path/to/large/repo/.git -profile-addr :8080 -max-hunks 10000
+go run main.go -repo /path/to/large/repo/.git -profile-addr :8080
 ```
 
 **Capturing Profiles During Scan:**
@@ -184,38 +174,17 @@ if err != nil {
 defer scanner.Close()
 ```
 
-#### Streaming Diff History Hunks
-
-```go
-hunks, errs := scanner.DiffHistoryHunks()
-
-go func() {
-    for h := range hunks {
-        fmt.Printf("Commit %s added hunk in %s (lines %d-%d)\n",
-            h.Commit().String()[:8],
-            h.Path(),
-            h.StartLine(),
-            h.EndLine())
-    }
-}()
-if err := <-errs; err != nil {
-    log.Fatal(err)
-}
-```
-
-This snippet showcases the `DiffHistoryHunks()` function, which streams hunk additions and errors on separate channels. Each `HunkAddition` provides the commit hash, file path, line range, and the added lines. The hunk channel must be fully drained before reading the error channel.
-
 #### Streaming Blob Scan
 
 ```go
 type counter struct {
-    blobs int
+    blobs atomic.Int64
 }
 
 func (c *counter) ScanBlob(r io.Reader, meta objstore.ScanMeta) error {
     _, err := io.Copy(io.Discard, r)
     if err == nil {
-        c.blobs++
+        c.blobs.Add(1)
     }
     return err
 }
@@ -224,10 +193,13 @@ c := &counter{}
 if err := scanner.Scan(nil, c); err != nil {
     log.Fatalf("streaming blob scan failed: %v", err)
 }
-fmt.Printf("Scanned %d blobs\n", c.blobs)
+fmt.Printf("Scanned %d blobs\n", c.blobs.Load())
 ```
 
-This snippet demonstrates streaming blob scan mode. Blob data is delivered to `ScanBlob` one object at a time.
+`Scan` visits every unique blob exactly once in pack-offset order and passes the
+full content to `ScanBlob`. The `ScanMeta` provides blob OID, introducing commit,
+and file path. `ScanBlob` may be called from multiple goroutines concurrently, so
+shared state must be synchronized (e.g. `sync/atomic` or a mutex).
 
 #### Enabling Profiling
 
@@ -244,13 +216,6 @@ scanner, err := objstore.NewHistoryScanner(gitDir,
 ```
 
 This snippet shows how to enable profiling when creating a `HistoryScanner`. The `WithProfiling` option allows you to configure HTTP profiling server settings and execution tracing.
-
-## Understanding the Output
-
-- **Commit**: The SHA-1 hash of the commit that introduced the hunk
-- **File/Path**: The file path where lines were added (Unix-style forward slashes)
-- **StartLine/EndLine**: The 1-based line range in the new version of the file
-- **Lines**: The raw text content of each added line within the hunk
 
 ## Requirements
 
