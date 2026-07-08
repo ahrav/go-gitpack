@@ -778,7 +778,7 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	// Call with the WRONG base (different length) to trigger size mismatch.
 	wrongBase := []byte("short")
 	out := make([]byte, 0, 4096)
-	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out)
+	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out, false)
 	require.Error(t, err)
 
 	// After fix: the error message includes both sizes, not just "delta base size mismatch".
