@@ -13,7 +13,11 @@
 
 package objstore
 
-import "unsafe"
+import (
+	"unsafe"
+
+	"golang.org/x/exp/mmap"
+)
 
 // btostr converts a byte slice to a string without copying the underlying
 // data. The returned string shares the same backing memory as b.
@@ -34,4 +38,32 @@ func btostr(b []byte) string {
 		return ""
 	}
 	return unsafe.String(&b[0], len(b))
+}
+
+// strtob converts a string to a byte slice without copying. The returned
+// slice aliases the string's backing memory and MUST NOT be mutated.
+func strtob(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
+}
+
+// mmapData exposes the underlying byte slice of an mmap.ReaderAt without
+// copying.
+//
+// SAFETY: mmap.ReaderAt is a struct with exactly one field, `data []byte`
+// (see golang.org/x/exp/mmap). The cast below relies on that layout; the
+// dependency version is pinned in go.mod, and any layout change would be
+// caught immediately by the package tests since every pack read flows
+// through this helper. The returned slice aliases read-only mapped memory:
+// callers MUST NOT mutate it and MUST NOT retain it past the store's Close
+// (munmap invalidates the pages).
+//
+// Motivation: handing zlib a *bytes.Reader over this slice lets the flate
+// decompressor use its specialized bytes.Reader decode loop and reads pack
+// bytes straight from the page cache, eliminating both the io.SectionReader
+// indirection and a bufio copy per object.
+func mmapData(r *mmap.ReaderAt) []byte {
+	return (*struct{ data []byte })(unsafe.Pointer(r)).data
 }
