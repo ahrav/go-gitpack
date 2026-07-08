@@ -32,3 +32,18 @@ func WithOffsetCacheBudget(bytes int) ScannerOption {
 		hs.store.offCache.setBudget(bytes)
 	}
 }
+
+// WithDeltaArenaBudget bounds idle process-wide delta arena retention.
+//
+// Multi-hop delta reconstruction borrows 32 MiB ping-pong arenas. The arena
+// free-list deliberately survives GC to avoid repeated large allocations, but
+// without a budget it can retain one arena per active delta worker after a
+// scan. This option caps only idle retained arenas; in-flight delta resolutions
+// may still allocate the arenas they actively use. The budget is rounded down
+// to a whole arena count. A zero or negative budget disables idle retention.
+func WithDeltaArenaBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		_ = hs // The arena pool is process-wide, not scanner-local.
+		setDeltaArenaRetainLimit(bytes / defaultDeltaArenaSize)
+	}
+}

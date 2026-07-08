@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/exp/mmap"
 )
@@ -159,14 +160,17 @@ const defaultDeltaArenaSize = 2 * 16 << 20
 // runs every few milliseconds and a sync.Pool would shed its 32 MiB arenas
 // constantly — each miss re-allocates (and zeroes) 32 MiB, which showed up as
 // ~45% of all allocated bytes and ~5% of CPU in memclr. The channel retains
-// arenas across GC cycles; capacity bounds worst-case retained memory to
-// deltaArenaMaxRetained arenas.
+// arenas across GC cycles; deltaArenaRetainLimit bounds the idle population so
+// cache budgets do not leave a hidden ~1 GiB process-wide heap floor.
 var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 
-// deltaArenaMaxRetained bounds how many idle arenas the free-list may retain
-// (32 × 32 MiB = 1 GiB worst case, but the steady-state population equals the
-// peak number of concurrent delta resolutions, typically NumCPU).
+// deltaArenaMaxRetained is the hard free-list capacity. The live retention
+// limit below defaults lower and can be tuned by scanner options.
 const deltaArenaMaxRetained = 32
+
+const defaultDeltaArenaRetained = 8
+
+var deltaArenaRetainLimit int32 = defaultDeltaArenaRetained
 
 // getDeltaArena retrieves a ping‑pong arena from the free-list or allocates
 // a fresh one when the list is empty.
@@ -192,6 +196,10 @@ func prepareDeltaArenaForPool(arena *deltaArena) bool {
 	if cap(arena.data) > defaultDeltaArenaSize {
 		return false
 	}
+	limit := int(atomic.LoadInt32(&deltaArenaRetainLimit))
+	if limit <= 0 || len(deltaArenaFreeList) >= limit {
+		return false
+	}
 	arena.data = arena.data[:cap(arena.data)]
 	return true
 }
@@ -207,6 +215,24 @@ func putDeltaArena(arena *deltaArena) {
 	case deltaArenaFreeList <- arena:
 	default:
 	}
+}
+
+func setDeltaArenaRetainLimit(limit int) int {
+	if limit < 0 {
+		limit = 0
+	}
+	if limit > deltaArenaMaxRetained {
+		limit = deltaArenaMaxRetained
+	}
+	old := int(atomic.SwapInt32(&deltaArenaRetainLimit, int32(limit)))
+	for len(deltaArenaFreeList) > limit {
+		select {
+		case <-deltaArenaFreeList:
+		default:
+			return old
+		}
+	}
+	return old
 }
 
 // errDeltaOutputTooSmall reports that the caller-provided output buffer cannot
@@ -853,75 +879,6 @@ func decodeVarInt(b []byte) (uint64, int) {
 		shift += 7
 	}
 	return 0, 0
-}
-
-// decodeCopyCommand decodes the offset and size embedded in a *copy* command
-// byte according to the Git delta format.
-//
-// It reads any variable‑length operands from br and returns the computed offset
-// and size.
-// If size is encoded as zero the function substitutes 0x10000, mirroring Git's
-// behavior.
-func decodeCopyCommand(cmd byte, br *bufio.Reader) (offset, size int, err error) {
-	bits := cmd & 0x7f
-
-	// Keep these reads direct: staging operands in a local array and passing
-	// it through io.ReadFull forces the tiny buffer to escape on this hot path.
-	if bits&0x01 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset = int(b)
-	}
-	if bits&0x02 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 8
-	}
-	if bits&0x04 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 16
-	}
-	if bits&0x08 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 24
-	}
-	if bits&0x10 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size = int(b)
-	}
-	if bits&0x20 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 8
-	}
-	if bits&0x40 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 16
-	}
-
-	if size == 0 {
-		size = 0x10000
-	}
-
-	return offset, size, nil
 }
 
 // readVarIntFromReader reads a base‑128 varint from br and returns its value
