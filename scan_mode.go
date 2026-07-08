@@ -54,6 +54,14 @@ func WithScanMode(mode ScanMode) ScannerOption {
 	}
 }
 
+// WithSkipMergeDiffs makes hunk scans emit no diffs for merge commits,
+// matching `git log -p` semantics. See HistoryScanner.skipMergeDiffs.
+func WithSkipMergeDiffs(skip bool) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.skipMergeDiffs = skip
+	}
+}
+
 // ScanMode returns the scanner's currently configured scan mode.
 func (hs *HistoryScanner) ScanMode() ScanMode {
 	return hs.scanMode

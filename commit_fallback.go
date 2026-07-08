@@ -25,9 +25,11 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // loadFromRefs is the entry point for the commit-graph fallback path.
@@ -48,6 +50,19 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 
 // walkCommitsFromRefs performs a ref-based reachable commit walk and calls visit
 // once per commit.
+//
+// The walk is a parallel BFS over the commit DAG: header inflation (a zlib
+// decompression per commit) dominates the cost and is embarrassingly
+// parallel, so a serial walk leaves the machine idle while downstream
+// pipeline stages starve. Worker goroutines pop frontier OIDs from a shared
+// stack, inflate and parse headers concurrently, then push unseen parents.
+//
+// Ordering: visits happen in nondeterministic order. Both callers tolerate
+// this — DiffHistoryHunks processes commits independently, and loadFromRefs
+// re-establishes parent-first order via orderCommitsParentFirst.
+//
+// visit is invoked under an internal mutex, so it may touch caller state
+// without additional locking, but it must not block indefinitely.
 func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) error {
 	if visit == nil {
 		return nil
@@ -61,60 +76,143 @@ func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) erro
 		return nil
 	}
 
-	seen := make(map[Hash]struct{}, len(tips)*4)
-	stack := append([]Hash(nil), tips...)
+	numWorkers := min(runtime.NumCPU(), 16)
 
-	for len(stack) > 0 {
-		n := len(stack) - 1
-		oid := stack[n]
-		stack = stack[:n]
+	var (
+		mu       sync.Mutex // guards seen, stack, active, firstErr
+		cond     = sync.NewCond(&mu)
+		seen     = make(map[Hash]struct{}, len(tips)*4)
+		stack    = append([]Hash(nil), tips...)
+		active   int
+		firstErr error
+		visitMu  sync.Mutex
+	)
 
-		if _, ok := seen[oid]; ok {
-			continue
+	fail := func(err error) {
+		mu.Lock()
+		if firstErr == nil {
+			firstErr = err
 		}
-		seen[oid] = struct{}{}
+		mu.Unlock()
+		cond.Broadcast()
+	}
 
-		hdr, err := hs.store.readCommitHeader(oid)
-		if err != nil {
-			if errors.Is(err, ErrObjectNotFound) {
-				// Stale refs and shallow parents can legitimately point to objects
-				// absent from local packs. Skip and continue the reachable walk.
+	worker := func() {
+		for {
+			mu.Lock()
+			for len(stack) == 0 && active > 0 && firstErr == nil {
+				cond.Wait()
+			}
+			if firstErr != nil || len(stack) == 0 {
+				// Done: either an error occurred, or the stack is empty with
+				// no worker still processing (which could add more work).
+				// Broadcast so peers blocked in Wait also observe the
+				// termination condition and exit.
+				mu.Unlock()
+				cond.Broadcast()
+				return
+			}
+			n := len(stack) - 1
+			oid := stack[n]
+			stack = stack[:n]
+			if _, ok := seen[oid]; ok {
+				mu.Unlock()
 				continue
 			}
-			if !errors.Is(err, ErrObjectNotCommit) {
-				return fmt.Errorf("read commit header %s: %w", oid, err)
-			}
-			// Non-commit refs (tags, trees, etc.) are allowed.
-			target, ok, tagErr := hs.resolveTagTarget(oid)
-			if tagErr != nil {
-				if errors.Is(tagErr, ErrObjectNotFound) {
-					continue
+			seen[oid] = struct{}{}
+			active++
+			mu.Unlock()
+
+			pushed := hs.walkOne(oid, visit, &visitMu, func(next Hash) {
+				mu.Lock()
+				if _, ok := seen[next]; !ok {
+					stack = append(stack, next)
 				}
-				return tagErr
-			}
-			if ok {
-				stack = append(stack, target)
-			}
-			continue
-		}
+				mu.Unlock()
+			}, fail)
 
-		info, err := parseCommitInfoFromHeader(oid, hdr)
-		if err != nil {
-			return err
-		}
-		if err := visit(info); err != nil {
-			return err
-		}
-
-		for _, p := range info.ParentOIDs {
-			if _, ok := seen[p]; ok {
-				continue
+			mu.Lock()
+			active--
+			mu.Unlock()
+			// Wake waiters: either new work was pushed or active hit zero.
+			if pushed {
+				cond.Broadcast()
+			} else {
+				cond.Signal()
 			}
-			stack = append(stack, p)
 		}
 	}
 
-	return nil
+	var wg sync.WaitGroup
+	for range numWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			worker()
+		}()
+	}
+	wg.Wait()
+
+	return firstErr
+}
+
+// walkOne processes a single OID popped from the walk frontier: it inflates
+// the commit header, invokes visit, and enqueues parents via push. Tag
+// objects are peeled to their target. The return value reports whether any
+// new OIDs were pushed. Errors are reported through fail.
+func (hs *HistoryScanner) walkOne(
+	oid Hash,
+	visit func(commitInfo) error,
+	visitMu *sync.Mutex,
+	push func(Hash),
+	fail func(error),
+) (pushed bool) {
+	hdr, err := hs.store.readCommitHeader(oid)
+	if err != nil {
+		if errors.Is(err, ErrObjectNotFound) {
+			// Stale refs and shallow parents can legitimately point to objects
+			// absent from local packs. Skip and continue the reachable walk.
+			return false
+		}
+		if !errors.Is(err, ErrObjectNotCommit) {
+			fail(fmt.Errorf("read commit header %s: %w", oid, err))
+			return false
+		}
+		// Non-commit refs (tags, trees, etc.) are allowed.
+		target, ok, tagErr := hs.resolveTagTarget(oid)
+		if tagErr != nil {
+			if errors.Is(tagErr, ErrObjectNotFound) {
+				return false
+			}
+			fail(tagErr)
+			return false
+		}
+		if ok {
+			push(target)
+			return true
+		}
+		return false
+	}
+
+	info, err := parseCommitInfoFromHeader(oid, hdr)
+	if err != nil {
+		fail(err)
+		return false
+	}
+
+	visitMu.Lock()
+	err = visit(info)
+	visitMu.Unlock()
+	if err != nil {
+		fail(err)
+		return false
+	}
+
+	for _, p := range info.ParentOIDs {
+		push(p)
+		pushed = true
+	}
+	return pushed
 }
 
 // resolveTagTarget attempts to peel an annotated tag object to find its
