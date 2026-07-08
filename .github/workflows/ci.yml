@@ -15,8 +15,8 @@
 #
 # NOTE ON THE MODULE REPLACE: go.mod replaces github.com/klauspost/compress with
 # the sibling directory ../klauspost-compress (a perf fork that adds the
-# bytes.Reader flate fast path), introduced in the next stacked PR. Each job
-# checks out this repo AND the fork side-by-side under the workspace so the
+# bytes.Reader flate fast path). Each job checks out this repo AND the fork
+# side-by-side under the workspace so the
 # relative `replace` resolves, then runs go from the repo checkout via
 # `working-directory`.
 
