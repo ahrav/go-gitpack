@@ -23,8 +23,8 @@ import (
 // low bits (pack entries are byte-aligned, so low bits are well mixed).
 const offsetCacheShards = 32
 
-// offsetCacheBudget bounds the total bytes retained across all shards.
-const offsetCacheBudget = 256 << 20
+// defaultOffsetCacheBudget bounds the total bytes retained across all shards.
+const defaultOffsetCacheBudget = 256 << 20
 
 // offCacheKey identifies a pack-local byte offset. The pack pointer
 // disambiguates offsets across multiple mapped packfiles.
@@ -49,11 +49,40 @@ type offsetCache struct {
 }
 
 func newOffsetCache() *offsetCache {
-	c := &offsetCache{budgetPerShard: offsetCacheBudget / offsetCacheShards}
+	return newOffsetCacheWithBudget(defaultOffsetCacheBudget)
+}
+
+func newOffsetCacheWithBudget(budget int) *offsetCache {
+	c := &offsetCache{}
+	c.setBudget(budget)
 	for i := range c.shards {
 		c.shards[i].m = make(map[offCacheKey]cachedObj, 256)
 	}
 	return c
+}
+
+func (c *offsetCache) setBudget(budget int) {
+	if c == nil {
+		return
+	}
+	if budget < 0 {
+		budget = 0
+	}
+	c.budgetPerShard = budget / offsetCacheShards
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		if s.m != nil {
+			for key, v := range s.m {
+				if s.used <= c.budgetPerShard {
+					break
+				}
+				delete(s.m, key)
+				s.used -= len(v.data)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (c *offsetCache) shard(off uint64) *offsetCacheShard {
@@ -80,7 +109,7 @@ func (c *offsetCache) get(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, 
 // add stores a materialized object under (pack, off). The cache takes shared
 // ownership of data; callers must treat it as immutable afterwards.
 func (c *offsetCache) add(pack *mmap.ReaderAt, off uint64, data []byte, typ ObjectType) {
-	if c == nil || len(data) > maxCacheableSize {
+	if c == nil || c.budgetPerShard <= 0 || len(data) > maxCacheableSize || len(data) > c.budgetPerShard {
 		return
 	}
 	s := c.shard(off)
