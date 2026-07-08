@@ -450,12 +450,10 @@ const (
 // memory allocation and reuse across multiple delta operations.
 func TestDeltaArenaPooling(t *testing.T) {
 	t.Run("ArenaContract", func(t *testing.T) {
-		// sync.Pool explicitly disclaims any relation between values passed
-		// to Put and values returned by Get, so pointer-reuse assertions
-		// fail intermittently on correct code; and once an arena has been
-		// handed to Put, another goroutine may retrieve and mutate it, so
-		// nothing may be inspected after ownership transfers. The
-		// deterministic, safely-observable surface is therefore:
+		// Once an arena has been returned to the process-wide free-list,
+		// another goroutine may retrieve and mutate it, so nothing may be
+		// inspected after ownership transfers. The deterministic,
+		// safely-observable surface is therefore:
 		//
 		//   1. getDeltaArena returns a full-length arena of the standard
 		//      capacity, whether it came from New or the pool.
@@ -465,8 +463,6 @@ func TestDeltaArenaPooling(t *testing.T) {
 		//      pool-eligible.
 		//   3. Oversized arenas are reported ineligible and left untouched.
 		//
-		// Whether pooled arenas are actually reused is an allocation-rate
-		// property for a benchmark.
 		arena := getDeltaArena()
 		assert.Equal(t, defaultDeltaArenaSize, cap(arena.data), "standard arena capacity")
 		assert.Equal(t, cap(arena.data), len(arena.data), "arena must arrive full-length")
@@ -475,7 +471,7 @@ func TestDeltaArenaPooling(t *testing.T) {
 		assert.True(t, prepareDeltaArenaForPool(arena), "standard arena must be pool-eligible")
 		assert.Equal(t, defaultDeltaArenaSize, len(arena.data),
 			"reset must restore len == cap before pooling")
-		deltaArenaPool.Put(arena) // return it; not inspected again
+		putDeltaArena(arena) // return it; not inspected again
 
 		oversized := &deltaArena{data: make([]byte, defaultDeltaArenaSize+1)}
 		oversized.data = oversized.data[:5]
@@ -797,7 +793,7 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	// Call with the WRONG base (different length) to trigger size mismatch.
 	wrongBase := []byte("short")
 	out := make([]byte, 0, 4096)
-	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out)
+	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out, false)
 	require.Error(t, err)
 
 	// After fix: the error message includes both sizes, not just "delta base size mismatch".
