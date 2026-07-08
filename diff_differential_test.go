@@ -189,9 +189,9 @@ func TestAddedHunksWithPos_DifferentialEdgeCases(t *testing.T) {
 		{"", "\n"},
 		{"\n\n\n", "\n\n"},
 		{"a\nb\nc", "a\nb\nc\nd"},
-		{"a\nb\nc\n", "c\nb\na\n"},                // reorder
-		{"x\nx\nx\n", "x\nx\nx\nx\n"},             // duplicates
-		{"a\nb\n", "b\na\n"},                      // swap
+		{"a\nb\nc\n", "c\nb\na\n"},    // reorder
+		{"x\nx\nx\n", "x\nx\nx\nx\n"}, // duplicates
+		{"a\nb\n", "b\na\n"},          // swap
 		{"common\ncommon\nold\n", "common\ncommon\nnew\n"}, // shared prefix
 	}
 	for i, c := range cases {

@@ -21,6 +21,28 @@ func TestPairCacheBudgetCanDisableAndRetain(t *testing.T) {
 	}
 }
 
+func TestPairCacheClonesHunkLinesBeforeRetaining(t *testing.T) {
+	var oldOID, newOID Hash
+	newOID[0] = 2
+	key := makePairKey(oldOID, newOID)
+
+	backing := []byte("prefix\nsecret\nsuffix")
+	line := btostr(backing[len("prefix\n"):len("prefix\nsecret")])
+	hunks := []AddedHunk{{StartLine: 2, Lines: []string{line}}}
+
+	cache := newPairCacheWithBudget(1 << 20)
+	cache.add(key, hunks)
+
+	copy(backing[len("prefix\n"):len("prefix\nsecret")], "mutate")
+	got, ok := cache.get(key)
+	if !ok {
+		t.Fatalf("pair cache did not retain cloned hunk")
+	}
+	if got[0].Lines[0] != "secret" {
+		t.Fatalf("pair cache retained alias to caller backing storage: got %q", got[0].Lines[0])
+	}
+}
+
 func TestOffsetCacheBudgetCanDisableAndRetain(t *testing.T) {
 	disabled := newOffsetCacheWithBudget(0)
 	disabled.add(nil, 1, []byte("blob"), ObjBlob)

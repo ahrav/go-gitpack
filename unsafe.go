@@ -40,15 +40,6 @@ func btostr(b []byte) string {
 	return unsafe.String(&b[0], len(b))
 }
 
-// strtob converts a string to a byte slice without copying. The returned
-// slice aliases the string's backing memory and MUST NOT be mutated.
-func strtob(s string) []byte {
-	if len(s) == 0 {
-		return nil
-	}
-	return unsafe.Slice(unsafe.StringData(s), len(s))
-}
-
 // mmapData exposes the underlying byte slice of an mmap.ReaderAt without
 // copying.
 //

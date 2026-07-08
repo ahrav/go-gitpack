@@ -450,6 +450,19 @@ const (
 // memory allocation and reuse across multiple delta operations.
 func TestDeltaArenaPooling(t *testing.T) {
 	t.Run("ArenaReuse", func(t *testing.T) {
+		// The free-list (deltaArenaFreeList) is process-global and FIFO, so any
+		// arena left queued by an earlier test would make get→put→get return a
+		// different arena than the one just put. Drain it first so this
+		// reuse assertion observes a known-empty pool regardless of test order.
+		for {
+			select {
+			case <-deltaArenaFreeList:
+				continue
+			default:
+			}
+			break
+		}
+
 		// Get initial arena to establish baseline.
 		arena1 := getDeltaArena()
 		baselinePtr := uintptr(unsafe.Pointer(&arena1.data[0]))
@@ -544,6 +557,36 @@ func TestDeltaArenaPooling(t *testing.T) {
 	})
 }
 
+func TestDeltaArenaRetainLimitDropsIdleExcess(t *testing.T) {
+	oldLimit := setDeltaArenaRetainLimit(2)
+	defer setDeltaArenaRetainLimit(oldLimit)
+
+	drainDeltaArenaFreeList()
+
+	arenas := []*deltaArena{
+		getDeltaArena(),
+		getDeltaArena(),
+		getDeltaArena(),
+	}
+	for _, arena := range arenas {
+		putDeltaArena(arena)
+	}
+	if got := len(deltaArenaFreeList); got != 2 {
+		t.Fatalf("delta arena free-list retained %d arenas, want 2", got)
+	}
+}
+
+func drainDeltaArenaFreeList() {
+	for {
+		select {
+		case <-deltaArenaFreeList:
+			continue
+		default:
+		}
+		break
+	}
+}
+
 // TestDeltaArenaPoolOversizeDiscard verifies that arenas grown beyond the
 // default pool size during dynamic resizing are not returned to the pool.
 // Without the size guard in putDeltaArena, an oversized arena pollutes the
@@ -552,9 +595,7 @@ func TestDeltaArenaPoolOversizeDiscard(t *testing.T) {
 	const defaultArenaSize = 2 * 16 << 20 // 32 MiB — matches deltaArenaPool.New
 
 	// Drain the pool so we get a fresh arena from New.
-	for range 16 {
-		getDeltaArena()
-	}
+	drainDeltaArenaFreeList()
 
 	arena := getDeltaArena()
 	assert.Equal(t, defaultArenaSize, cap(arena.data), "fresh arena should be 32 MiB")
