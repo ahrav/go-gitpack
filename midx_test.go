@@ -7,10 +7,10 @@ package objstore
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"github.com/klauspost/compress/zlib"
 	"os"
 	"os/exec"
 	"path/filepath"

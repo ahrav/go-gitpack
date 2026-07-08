@@ -8,11 +8,17 @@
 #                 compiles (it is gated behind the gitpack_libdeflate build
 #                 tag), so it would otherwise ship untested
 #
+# Each job delegates to the Makefile targets (make build/vet/fmt-check/test/...)
+# so CI and local `make check` cannot drift. The test targets depend on `make
+# fixtures`, which runs ./generate_testdata.sh to build the gitignored
+# testdata/repos fixtures on a fresh runner.
+#
 # NOTE ON THE MODULE REPLACE: go.mod replaces github.com/klauspost/compress with
 # the sibling directory ../klauspost-compress (a perf fork that adds the
-# bytes.Reader flate fast path). Each job therefore checks out this repo AND the
-# fork side-by-side under the workspace so the relative `replace` resolves, then
-# runs go from the repo checkout via `working-directory`.
+# bytes.Reader flate fast path), introduced in the next stacked PR. Each job
+# checks out this repo AND the fork side-by-side under the workspace so the
+# relative `replace` resolves, then runs go from the repo checkout via
+# `working-directory`.
 
 name: CI
 
@@ -20,68 +26,79 @@ on:
   push:
   pull_request:
 
+# Cancel superseded runs for the same ref so a burst of pushes does not keep
+# stale jobs occupying runners.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
 jobs:
   test:
+    name: test (pure-Go)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
         with:
           path: go-gitpack
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: ahrav/compress
           ref: go-gitpack-autoresearch
           path: klauspost-compress
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go-gitpack/go.mod
-      - name: build
-        working-directory: go-gitpack
-        run: go build ./...
-      - name: vet
-        working-directory: go-gitpack
-        run: go vet ./...
-      - name: gofmt
+      - name: fmt-check, vet, build, test
         working-directory: go-gitpack
         run: |
-          out=$(gofmt -l .)
-          if [ -n "$out" ]; then echo "gofmt needed:"; echo "$out"; exit 1; fi
-      - name: test
-        working-directory: go-gitpack
-        run: go test -count=1 ./...
+          make fmt-check
+          make vet
+          make build
+          make test
 
   race:
+    name: race detector
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           path: go-gitpack
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: ahrav/compress
           ref: go-gitpack-autoresearch
           path: klauspost-compress
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go-gitpack/go.mod
       - name: test -race
         working-directory: go-gitpack
-        run: go test -race -count=1 ./...
+        run: make test-race
 
   libdeflate:
+    name: cgo libdeflate backend
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
           path: go-gitpack
+          persist-credentials: false
       - uses: actions/checkout@v4
         with:
           repository: ahrav/compress
           ref: go-gitpack-autoresearch
           path: klauspost-compress
+          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go-gitpack/go.mod
@@ -89,7 +106,4 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdeflate-dev
       - name: test -tags gitpack_libdeflate
         working-directory: go-gitpack
-        env:
-          CGO_ENABLED: "1"
-          CGO_LDFLAGS: "-ldeflate"
-        run: go test -tags gitpack_libdeflate -count=1 ./...
+        run: make test-libdeflate
