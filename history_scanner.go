@@ -50,6 +50,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 )
 
@@ -300,6 +302,10 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // CPU-bound consumers.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
 	numWorkers := runtime.NumCPU()
+	// Tree diffing is a producer stage and much cheaper than hunk scanning.
+	// Capping it prevents one 32 MiB delta arena per CPU from becoming a
+	// hidden RSS floor on machines with many cores.
+	treeWorkers := min(numWorkers, maxTreeDiffWorkers)
 
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
 
@@ -344,7 +350,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			})
 		}
 
-		for range numWorkers {
+		for range treeWorkers {
 			treeWG.Add(1)
 			go func() {
 				defer treeWG.Done()
@@ -424,6 +430,8 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 	}
 }
 
+const maxTreeDiffWorkers = 8
+
 // errScanAborted marks an internal early-stop condition used to unwind commit walks.
 var errScanAborted = errors.New("scan aborted")
 
@@ -477,6 +485,19 @@ type blobPairWork struct {
 	newOID Hash
 }
 
+type exactRenameEvidence struct {
+	oldPath string
+	newPath string
+}
+
+type directoryRenameCandidate struct {
+	oldDir string
+	newDir string
+	count  int
+}
+
+const minDirectoryRenameEvidence = 2
+
 // emitCommitBlobPairs walks the first-parent tree diff of a single commit and
 // fans out one blobPairWork per changed blob. Tree walking is cheap relative
 // to blob diffing, so this stage keeps the expensive stage-2 workers supplied
@@ -493,7 +514,8 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 
 	var (
 		adds         []blobPairWork
-		deletesByOID map[Hash]int
+		deletes      []blobPairWork
+		deletesByOID map[Hash][]int
 	)
 	err := walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
 		if !isBlobMode(mode) {
@@ -506,9 +528,10 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 		switch {
 		case newH.IsZero():
 			if deletesByOID == nil {
-				deletesByOID = make(map[Hash]int, 4)
+				deletesByOID = make(map[Hash][]int, 4)
 			}
-			deletesByOID[old]++
+			deletesByOID[old] = append(deletesByOID[old], len(deletes))
+			deletes = append(deletes, work)
 			return nil
 		case old.IsZero():
 			adds = append(adds, work)
@@ -521,16 +544,147 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 		return err
 	}
 
+	usedDeletes := make([]bool, len(deletes))
+	unmatchedAdds := adds[:0]
+	var evidence []exactRenameEvidence
 	for i := range adds {
-		if n := deletesByOID[adds[i].newOID]; n > 0 {
-			deletesByOID[adds[i].newOID] = n - 1
+		deleteIdx, ok := takeExactRenameDelete(adds[i], deletes, usedDeletes, deletesByOID)
+		if ok {
+			usedDeletes[deleteIdx] = true
+			evidence = append(evidence, exactRenameEvidence{
+				oldPath: deletes[deleteIdx].path,
+				newPath: adds[i].path,
+			})
 			continue // exact-OID rename: content-addressed bytes are unchanged.
 		}
-		if err := emit(adds[i]); err != nil {
+		unmatchedAdds = append(unmatchedAdds, adds[i])
+	}
+
+	unusedDeletesByPath := make(map[string]int, len(deletes))
+	for i := range deletes {
+		if !usedDeletes[i] {
+			unusedDeletesByPath[deletes[i].path] = i
+		}
+	}
+	dirRenames := inferDirectoryRenames(evidence)
+
+	for i := range unmatchedAdds {
+		if deleteIdx, ok := matchDirectoryRename(unmatchedAdds[i].path, dirRenames, unusedDeletesByPath, usedDeletes); ok {
+			usedDeletes[deleteIdx] = true
+			delete(unusedDeletesByPath, deletes[deleteIdx].path)
+			work := unmatchedAdds[i]
+			work.oldOID = deletes[deleteIdx].oldOID
+			if err := emit(work); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := emit(unmatchedAdds[i]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func takeExactRenameDelete(add blobPairWork, deletes []blobPairWork, used []bool, deletesByOID map[Hash][]int) (int, bool) {
+	candidates := deletesByOID[add.newOID]
+	best := -1
+	addBase := pathBase(add.path)
+	for _, idx := range candidates {
+		if used[idx] {
+			continue
+		}
+		if pathBase(deletes[idx].path) == addBase {
+			return idx, true
+		}
+		if best == -1 {
+			best = idx
+		}
+	}
+	if best == -1 {
+		return 0, false
+	}
+	return best, true
+}
+
+func inferDirectoryRenames(evidence []exactRenameEvidence) []directoryRenameCandidate {
+	if len(evidence) < minDirectoryRenameEvidence {
+		return nil
+	}
+	counts := make(map[[2]string]int, len(evidence))
+	for _, ev := range evidence {
+		if pathBase(ev.oldPath) != pathBase(ev.newPath) {
+			continue
+		}
+		oldDir := pathDir(ev.oldPath)
+		newDir := pathDir(ev.newPath)
+		if oldDir == "" || newDir == "" || oldDir == newDir {
+			continue
+		}
+		counts[[2]string{oldDir, newDir}]++
+	}
+	if len(counts) == 0 {
+		return nil
+	}
+	candidates := make([]directoryRenameCandidate, 0, len(counts))
+	for dirs, count := range counts {
+		if count < minDirectoryRenameEvidence {
+			continue
+		}
+		candidates = append(candidates, directoryRenameCandidate{
+			oldDir: dirs[0],
+			newDir: dirs[1],
+			count:  count,
+		})
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		if candidates[i].count != candidates[j].count {
+			return candidates[i].count > candidates[j].count
+		}
+		return len(candidates[i].newDir) > len(candidates[j].newDir)
+	})
+	return candidates
+}
+
+func matchDirectoryRename(addPath string, candidates []directoryRenameCandidate, deletesByPath map[string]int, used []bool) (int, bool) {
+	for _, candidate := range candidates {
+		rel, ok := trimPathPrefix(addPath, candidate.newDir)
+		if !ok {
+			continue
+		}
+		oldPath := joinPath(candidate.oldDir, rel)
+		idx, ok := deletesByPath[oldPath]
+		if ok && !used[idx] {
+			return idx, true
+		}
+	}
+	return 0, false
+}
+
+func pathDir(p string) string {
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return ""
+	}
+	return p[:i]
+}
+
+func pathBase(p string) string {
+	i := strings.LastIndexByte(p, '/')
+	if i < 0 {
+		return p
+	}
+	return p[i+1:]
+}
+
+func trimPathPrefix(p, prefix string) (string, bool) {
+	if prefix == "" {
+		return p, true
+	}
+	if !strings.HasPrefix(p, prefix) || len(p) == len(prefix) || p[len(prefix)] != '/' {
+		return "", false
+	}
+	return p[len(prefix)+1:], true
 }
 
 // streamBlobPairHunks computes the added hunks for one changed file and
