@@ -56,3 +56,6 @@ commit-graph
 commit-graphs/
 .env
 
+# Plan documents (never commit)
+plans/
+docs/plans/
