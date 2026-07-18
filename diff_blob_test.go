@@ -22,10 +22,10 @@ func TestMetaCacheConcurrency(t *testing.T) {
 	var h Hash
 	g := &commitGraphData{Timestamps: []int64{123}, OrderedOIDs: []Hash{h},
 		OIDToIndex: map[Hash]int{h: 0}}
-	s := &store{} // nil internals; we won't call get() which would call readCommitHeader
+	s := &store{} // nil internals; we won't call get() which would call readCommitPayload
 
 	mc := newMetaCache(g, s)
-	mc.m[h] = AuthorInfo{Name: "test", Email: "test@test.com", When: time.Unix(123, 0)}
+	mc.m[h] = metaEntry{ai: AuthorInfo{Name: "test", Email: "test@test.com", When: time.Unix(123, 0)}}
 
 	meta, err := mc.get(h)
 	require.NoError(t, err)
