@@ -834,6 +834,90 @@ func trimCommitHeader(full []byte) ([]byte, error) {
 	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
 }
 
+// maxCommitPayload caps the decompressed size readCommitPayload accepts for
+// a single commit object. Real commit payloads are tiny (hundreds of bytes;
+// multi-KiB for merge shortlogs), so the cap only trips on corrupt or
+// adversarial packs claiming giant commits, and it is enforced before any
+// payload-sized allocation.
+const maxCommitPayload = 64 << 20 // 64 MiB
+
+// readCommitPayload reads the full uncompressed payload of a commit object:
+// header lines and the message that follows them.
+//
+// Unlike readCommitHeader (which stops at the committer line and serves the
+// commit walk), this inflates the whole object; it backs metadata attribution,
+// where the message is part of the result. The returned slice is always a
+// fresh allocation owned by the caller — it never aliases pooled buffers or
+// shared cache entries, so callers may retain it (or strings sliced from it)
+// indefinitely.
+func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
+	p, off, ok := s.findPackedObject(oid)
+	if !ok {
+		// Loose fallback: readLooseObject inflates into a fresh buffer, so
+		// it can be returned without copying.
+		full, typ, err := s.readLooseObject(oid)
+		if err != nil {
+			return nil, err
+		}
+		if typ != ObjCommit {
+			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+		}
+		if len(full) > maxCommitPayload {
+			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", len(full), maxCommitPayload, oid)
+		}
+		return full, nil
+	}
+
+	// Parse the generic object header ourselves (rather than via
+	// peekObjectType) because the declared decompressed size gates the
+	// allocation below.
+	var hdr [32]byte
+	n, err := p.ReadAt(hdr[:], int64(off))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, ErrEmptyObjectHeader
+	}
+	typ, size, hdrLen := parseObjectHeaderUnsafe(hdr[:n])
+	if hdrLen <= 0 {
+		return nil, ErrCannotParseObjectHeader
+	}
+
+	switch typ {
+	case ObjCommit:
+		// Plain packed commit: one exact-size allocation, one-shot inflate.
+		// The size comes from the pack header, so the cap check precedes
+		// the allocation.
+		if size > maxCommitPayload {
+			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", size, maxCommitPayload, oid)
+		}
+		payload := make([]byte, size)
+		if err := inflateExact(p, int64(off)+int64(hdrLen), payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
+
+	case ObjOfsDelta, ObjRefDelta:
+		full, resolvedType, err := s.getMaterialized(oid)
+		if err != nil {
+			return nil, err
+		}
+		if resolvedType != ObjCommit {
+			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+		}
+		if len(full) > maxCommitPayload {
+			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", len(full), maxCommitPayload, oid)
+		}
+		// The copy is mandatory: materialized bytes may alias shared cache
+		// buffers, and the caller retains the payload.
+		return append([]byte(nil), full...), nil
+
+	default:
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
+}
+
 // findCRCForObject returns the CRC-32 checksum for the specified object.
 // The method searches pack index files first, then falls back to the in-memory merged index.
 //

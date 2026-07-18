@@ -766,8 +766,8 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // It is idempotent; subsequent calls are no‑ops.
 func (hs *HistoryScanner) Close() error { return hs.store.Close() }
 
-// CommitMetadata bundles the author identity and commit timestamp for a single
-// commit.
+// CommitMetadata bundles the author identity, commit timestamp, and commit
+// message for a single commit.
 //
 // Instances are immutable and therefore safe for concurrent reads.
 type CommitMetadata struct {
@@ -776,9 +776,18 @@ type CommitMetadata struct {
 
 	// Timestamp holds the committer time in seconds since the Unix epoch.
 	Timestamp int64
+
+	// Message holds the raw commit message: the bytes after the first blank
+	// line of the commit object, byte-faithful to `git cat-file commit`
+	// output. No encoding normalization or NUL truncation is applied (those
+	// are git-log presentation behaviors, not object format); any such
+	// normalization belongs to the consumer. Empty when the commit has no
+	// message.
+	Message string
 }
 
-// GetCommitMetadata returns (and caches) the commit's author and timestamp.
+// GetCommitMetadata returns (and caches) the commit's author, timestamp, and
+// message.
 func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
