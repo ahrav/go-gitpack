@@ -1,13 +1,15 @@
 // commit_attribution.go
 //
-// Efficient extraction and caching of Git commit author metadata.
+// Efficient extraction and caching of Git commit author metadata and
+// commit messages.
 //
-// Every secret finding needs to be attributed to a commit author (name, email,
-// timestamp). Parsing the raw commit header each time is expensive, so this
-// file provides metaCache -- a concurrency-safe, read-through cache that
-// stores AuthorInfo keyed by commit OID. When a commit-graph file is
-// available, timestamps are served from the precomputed graph slice instead
-// of re-parsing the header.
+// Every secret finding needs to be attributed to a commit author (name,
+// email, timestamp) and its commit message. Inflating and parsing the raw
+// commit object each time is expensive, so this file provides metaCache --
+// a concurrency-safe, read-through cache that stores attribution entries
+// keyed by commit OID. When a commit-graph file is available, timestamps
+// are served from the precomputed graph slice instead of re-parsing the
+// header.
 package objstore
 
 import (
@@ -38,26 +40,45 @@ type AuthorInfo struct {
 	When time.Time
 }
 
-// commitHeaderReader is an interface for reading commit headers
-// commitHeaderReader provides access to raw Git commit header data.
-// It abstracts the storage and retrieval of commit metadata
-// to support different backing stores and caching strategies.
-type commitHeaderReader interface {
-	// readCommitHeader retrieves the raw header bytes for a commit.
-	// It returns the uncompressed header data or an error if the commit cannot be found
-	// or the header is malformed.
-	readCommitHeader(oid Hash) ([]byte, error)
+// commitPayloadReader provides access to raw Git commit payload data
+// (header lines plus message). It abstracts the storage and retrieval of
+// commit objects to support different backing stores and caching strategies.
+type commitPayloadReader interface {
+	// readCommitPayload retrieves the full uncompressed bytes of a commit
+	// object: header lines, the blank separator line, and the message.
+	// The returned slice is a fresh allocation owned by the caller; it must
+	// not alias pooled or shared cache buffers, because the caller retains
+	// strings sliced from it. It returns an error if the object cannot be
+	// found or is not a commit.
+	readCommitPayload(oid Hash) ([]byte, error)
 }
 
-// metaCache provides efficient access to Git commit metadata by caching author information
-// and timestamps. It coordinates with a commit graph for fast lookups and uses a
-// reader interface to load raw commit data only when needed.
+// metaEntry is one cached attribution record: the parsed author identity and
+// the raw commit message.
+//
+// Lifetime: ai.Name and ai.Email alias the payload copy the entry was parsed
+// from (see parseAuthorHeader), and msg is a string conversion of the
+// message half, so each entry retains roughly one payload's worth of bytes.
+// The cache is insert-only and unbounded — typical messages are ~200-700 B,
+// so even 10k commits cost only a few MB, comparable to the header bytes the
+// cache has always retained. Monorepo-scale histories (~1M+ commits) would
+// push this toward a GB; the recorded escape hatches (don't-retain-oversize
+// flag, budgeted cache) are deliberately not built at this scale.
+type metaEntry struct {
+	ai  AuthorInfo
+	msg string
+}
+
+// metaCache provides efficient access to Git commit metadata by caching author
+// information and commit messages. It coordinates with a commit graph for fast
+// timestamp lookups and uses a reader interface to load raw commit data only
+// when needed.
 type metaCache struct {
 	// graph holds the commit graph structure used for traversal and lookups.
 	graph *commitGraphData
 
-	// store provides access to raw commit header data when cache misses occur.
-	store commitHeaderReader
+	// store provides access to raw commit payload data when cache misses occur.
+	store commitPayloadReader
 
 	// ts contains commit timestamps from the graph for quick access.
 	// This is an alias to graph.Timestamps - no data is copied.
@@ -66,16 +87,17 @@ type metaCache struct {
 	// mu guards concurrent access to the cache map.
 	mu sync.RWMutex
 
-	// m caches AuthorInfo by commit hash to avoid repeated parsing of commit headers.
-	m map[Hash]AuthorInfo
+	// m caches attribution entries by commit hash to avoid repeated
+	// inflation and parsing of commit payloads.
+	m map[Hash]metaEntry
 }
 
 // newMetaCache constructs a metaCache with the given commit graph (may be nil)
-// and commit header reader. It is called once during NewHistoryScanner
+// and commit payload reader. It is called once during NewHistoryScanner
 // initialization. The initial map capacity (1024) is a heuristic that avoids
 // early rehashing for typical repository sizes without over-allocating for
 // very small repos.
-func newMetaCache(g *commitGraphData, s commitHeaderReader) *metaCache {
+func newMetaCache(g *commitGraphData, s commitPayloadReader) *metaCache {
 	const cacheSize = 1024
 	var ts []int64
 	if g != nil {
@@ -86,7 +108,7 @@ func newMetaCache(g *commitGraphData, s commitHeaderReader) *metaCache {
 		graph: g,
 		store: s,
 		ts:    ts,
-		m:     make(map[Hash]AuthorInfo, cacheSize),
+		m:     make(map[Hash]metaEntry, cacheSize),
 	}
 }
 
@@ -108,41 +130,52 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 }
 
 // get returns the CommitMetadata for the given OID, using the cache when
-// possible and falling back to header parsing on a miss.
+// possible and falling back to payload parsing on a miss.
 //
 // Concurrency protocol:
 //  1. Acquire RLock, probe the map. (fast path -- no allocation)
-//  2. On miss: release RLock, parse header (potentially expensive I/O),
-//     acquire write Lock, insert into map, release Lock.
+//  2. On miss: release RLock, read and parse the payload (potentially
+//     expensive I/O), acquire write Lock, insert into map, release Lock.
 //  3. Read graph pointer and timestamp slice under RLock, then look up
 //     the precomputed timestamp.
 //
 // This two-phase locking pattern means the same OID may be parsed twice if
-// two goroutines miss concurrently, but that is safe because AuthorInfo is
+// two goroutines miss concurrently, but that is safe because metaEntry is
 // an immutable value type and the second write simply overwrites with an
 // identical value.
 func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
-	// Fast read-only path for author info.
+	// Fast read-only path.
 	c.mu.RLock()
-	ai, ok := c.m[oid]
+	entry, ok := c.m[oid]
 	c.mu.RUnlock()
 
 	if !ok {
-		// Slow path -- inflate and parse the commit header once.
-		hdr, err := c.store.readCommitHeader(oid)
+		// Slow path -- inflate and parse the commit payload once.
+		payload, err := c.store.readCommitPayload(oid)
 		if err != nil {
 			return CommitMetadata{}, err
 		}
-		ai, err = parseAuthorHeader(hdr)
+		// Split BEFORE parsing: a commit message can legally contain a line
+		// starting with "author " at column 0, which would corrupt the
+		// parse if the full payload were scanned. Within the header half,
+		// continuation lines (gpgsig, mergetag) are space-prefixed, so no
+		// embedded line can false-match at column 0.
+		hdr, msg := splitCommitPayload(payload)
+		ai, err := parseAuthorHeader(hdr)
 		if err != nil {
 			return CommitMetadata{}, err
 		}
+		// string(msg) makes a fresh copy; slicing (or btostr) would work
+		// too since payload is caller-owned, but a copy keeps msg
+		// independent of the header bytes ai already pins.
+		entry = metaEntry{ai: ai, msg: string(msg)}
 
 		// Promote to cache.
 		c.mu.Lock()
-		c.m[oid] = ai
+		c.m[oid] = entry
 		c.mu.Unlock()
 	}
+	ai := entry.ai
 
 	// Prefer the commit-graph timestamp when available because it avoids
 	// reparsing the header and is authoritative for the committer date.
@@ -168,7 +201,23 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 	return CommitMetadata{
 		Author:    ai,
 		Timestamp: ts,
+		Message:   entry.msg,
 	}, nil
+}
+
+// splitCommitPayload splits a raw commit payload into its header half and
+// message half at the first blank line (the "\n\n" separator defined by the
+// commit object format). The message keeps its raw bytes — no encoding
+// normalization, no NUL truncation, trailing newline preserved — because
+// those are presentation behaviors of git-log, not object format.
+//
+// A payload without a separator (header-only commit) yields the full payload
+// as header and a nil message. The returned slices alias payload.
+func splitCommitPayload(payload []byte) (header, message []byte) {
+	if i := bytes.Index(payload, []byte("\n\n")); i >= 0 {
+		return payload[:i], payload[i+2:]
+	}
+	return payload, nil
 }
 
 var (

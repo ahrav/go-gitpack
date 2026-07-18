@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 
 	objstore "github.com/ahrav/go-gitpack"
@@ -36,7 +37,7 @@ func main() {
 
 	fmt.Println("Scanning all unique blobs from repository history...")
 
-	s := &detailedScanner{}
+	s := &detailedScanner{scanner: scanner}
 	if err := scanner.Scan(nil, s); err != nil {
 		log.Fatalf("Error during scan: %v", err)
 	}
@@ -46,9 +47,12 @@ func main() {
 }
 
 // detailedScanner implements objstore.BlobScanner by draining each blob and
-// printing per-blob metadata. ScanBlob is called concurrently from multiple
-// decode workers, so counters use atomic operations.
+// printing per-blob metadata, attributed to the introducing commit's author
+// and commit message. ScanBlob is called concurrently from multiple decode
+// workers, so counters use atomic operations; GetCommitMetadata is safe for
+// concurrent use and caches per-commit results internally.
 type detailedScanner struct {
+	scanner    *objstore.HistoryScanner
 	blobs      atomic.Int64
 	totalBytes atomic.Int64
 }
@@ -66,6 +70,11 @@ func (s *detailedScanner) ScanBlob(r io.Reader, meta objstore.ScanMeta) error {
 	fmt.Printf("  Commit: %s\n", meta.Commit)
 	fmt.Printf("  Path:   %s\n", meta.Path)
 	fmt.Printf("  Size:   %d bytes\n", n)
+	if cm, err := s.scanner.GetCommitMetadata(meta.Commit); err == nil {
+		title, _, _ := strings.Cut(cm.Message, "\n")
+		fmt.Printf("  Author: %s <%s>\n", cm.Author.Name, cm.Author.Email)
+		fmt.Printf("  Title:  %s\n", title)
+	}
 	fmt.Println("  ---")
 
 	return nil
