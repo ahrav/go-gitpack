@@ -43,7 +43,7 @@ func buildMergeRepo(t *testing.T) string {
 	repoDir := t.TempDir()
 	git := func(args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+		cmd := gitTestCommand(repoDir, args...)
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
 			"GIT_AUTHOR_DATE=2005-04-07T22:13:13 +0000",
