@@ -134,3 +134,20 @@ func checkMmapLayout(r *mmap.ReaderAt) error {
 	}
 	return nil
 }
+
+// openCommitHeaderStream positions a pooled zlib reader at the deflate
+// payload of the object starting at off, reading zero-copy from the mapped
+// region. The returned release func returns the pooled resources and must be
+// invoked exactly once, after all reads have finished. The reader aliases
+// mmap'd memory: callers must keep the pack alive (runtime.KeepAlive) for the
+// duration and must not use the reader after the store is closed.
+func openCommitHeaderStream(p *mmap.ReaderAt, off int64) (io.Reader, func(), error) {
+	zr, br, err := getZlibReaderAt(mmapData(p), off)
+	if err != nil {
+		return nil, nil, err
+	}
+	return zr, func() {
+		putFlateReader(zr)
+		putBytesReader(br)
+	}, nil
+}

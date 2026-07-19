@@ -734,7 +734,7 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 		pack, err := mmap.Open(path)
 		require.NoError(t, err)
 
-		typ, hdrLen, err := peekObjectType(pack, 0)
+		typ, _, err := peekObjectType(pack, 0)
 		require.NoError(t, err)
 		require.Equal(t, ObjRefDelta, typ)
 
@@ -743,7 +743,6 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 					pack:   pack,
 					offset: 0,
 					typ:    typ,
-					hdrLen: hdrLen,
 				},
 			}, func() {
 				require.NoError(t, pack.Close())
@@ -786,14 +785,14 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	require.NoError(t, err)
 	defer pack.Close()
 
-	typ, hdrLen, err := peekObjectType(pack, 0)
+	typ, _, err := peekObjectType(pack, 0)
 	require.NoError(t, err)
 	require.Equal(t, ObjRefDelta, typ)
 
 	// Call with the WRONG base (different length) to trigger size mismatch.
 	wrongBase := []byte("short")
 	out := make([]byte, 0, 4096)
-	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out, false)
+	_, err = applyDeltaStreaming(pack, 0, typ, wrongBase, out, false, 0)
 	require.Error(t, err)
 
 	// After fix: the error message includes both sizes, not just "delta base size mismatch".

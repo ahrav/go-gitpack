@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"runtime"
 	"sync"
 
 	"golang.org/x/exp/mmap"
@@ -42,10 +44,6 @@ type deltaInfo struct {
 
 	// typ indicates whether this is an ofs-delta or ref-delta object.
 	typ ObjectType
-
-	// hdrLen caches the parsed object header length so downstream consumers
-	// (applyDeltaStreaming) can skip re-parsing the header.
-	hdrLen int
 }
 
 // deltaStack is a stack of deltaInfo objects, used to iteratively resolve a
@@ -163,10 +161,14 @@ const defaultDeltaArenaSize = 2 * 16 << 20
 // deltaArenaMaxRetained arenas.
 var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 
-// deltaArenaMaxRetained bounds how many idle arenas the free-list may retain
-// (32 × 32 MiB = 1 GiB worst case, but the steady-state population equals the
-// peak number of concurrent delta resolutions, typically NumCPU).
-const deltaArenaMaxRetained = 32
+// deltaArenaMaxRetained bounds how many idle arenas the free-list may retain.
+// The steady-state population equals the peak number of concurrent delta
+// resolutions, so the cap is derived from GOMAXPROCS at startup: hosts with
+// fewer CPUs cannot productively use more concurrent arenas, and sizing the
+// list to the parallelism budget keeps the idle reserve proportional to the
+// machine (e.g. 8 procs → 256 MiB) instead of a flat 32 × 32 MiB = 1 GiB.
+// The upper cap of 32 preserves the historical worst case on large hosts.
+var deltaArenaMaxRetained = min(32, max(2, runtime.GOMAXPROCS(0)))
 
 // getDeltaArena retrieves a ping‑pong arena from the free-list or allocates
 // a fresh one when the list is empty.
@@ -376,11 +378,27 @@ func walkUpDeltaChain(
 			if err != nil {
 				return nil, ObjBad, err
 			}
+			// Verify the raw pack record before publishing it: store.get
+			// serves offset-cache hits directly, so an unverified entry
+			// here would let later direct reads of this object bypass the
+			// CRC check that inflateFromPack would otherwise perform.
+			// Mirrors inflateFromPackWithOptions: verify when the CRC is
+			// known, proceed when the index has none. Reconstructed delta
+			// hops published by applyDeltaStackCached are not affected —
+			// pack CRCs cover raw records only, and delta-typed reads
+			// never carried a CRC check.
+			if s.VerifyCRC {
+				if crc, ok := s.findCRCForObject(currPack, currOff, params.oid); ok {
+					if err := s.verifyCRCForPackObject(currPack, currOff, crc); err != nil {
+						return nil, ObjBad, err
+					}
+				}
+			}
 			s.offCache.add(currPack, currOff, baseData, typ)
 			return baseData, typ, nil
 		}
 
-		*stack = append(*stack, deltaInfo{currPack, currOff, typ, hdrLen})
+		*stack = append(*stack, deltaInfo{currPack, currOff, typ})
 
 		if typ == ObjRefDelta {
 			var baseOID Hash
@@ -471,9 +489,12 @@ func applyDeltaStackCached(
 	// Single-hop fast path (the majority of chains once the offset cache
 	// short-circuits walk-up): apply the one delta into a fresh exact-size
 	// buffer and return it directly — no arena, no detach copy.
+	// applyDeltaStreaming enforces maxObjectSize before allocating the
+	// exact-size buffer, so a hostile advertised target cannot force a
+	// large allocation ahead of the limit check.
 	if len(stack) == 1 {
 		d := stack[0]
-		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, baseData, nil, true)
+		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, baseData, nil, true, maxObjectSize)
 		if err != nil {
 			var tooSmall *errDeltaOutputTooSmall
 			// allocExact never under-allocates, so errDeltaOutputTooSmall
@@ -508,9 +529,15 @@ func applyDeltaStackCached(
 		arena.data = make([]byte, maxTarget*2)
 	}
 
-	// Let's ping-pong!
-	bufA := arena.data[:maxTarget]
-	bufB := arena.data[maxTarget : maxTarget*2]
+	// Let's ping-pong! Full slice expressions pin each half's capacity to
+	// its own boundary: without them bufA's capacity would extend through
+	// bufB (and bufB's through any arena tail), letting a later hop whose
+	// target exceeds maxTarget write straight across the A/B boundary and
+	// corrupt the buffer the next hop reads — instead of taking the
+	// errDeltaOutputTooSmall resize path (which also enforces
+	// maxObjectSize).
+	bufA := arena.data[0:maxTarget:maxTarget]
+	bufB := arena.data[maxTarget : maxTarget*2 : maxTarget*2]
 
 	// The first application reads the base directly — applyDeltaStreaming
 	// never writes its input, so copying baseData into the arena first was
@@ -532,7 +559,7 @@ func applyDeltaStackCached(
 				out = bufA[:0]
 			}
 
-			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, current, out, false)
+			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out, false, maxObjectSize)
 			if err != nil {
 				var tooSmall *errDeltaOutputTooSmall
 				if errors.As(err, &tooSmall) {
@@ -545,8 +572,8 @@ func applyDeltaStackCached(
 
 					maxTarget = tooSmall.need
 					arena.data = make([]byte, maxTarget*2)
-					bufA = arena.data[:maxTarget]
-					bufB = arena.data[maxTarget : maxTarget*2]
+					bufA = arena.data[0:maxTarget:maxTarget]
+					bufB = arena.data[maxTarget : maxTarget*2 : maxTarget*2]
 
 					// Re-anchor current into the new arena and retry this delta.
 					rebased := bufA[:len(current)]
@@ -569,7 +596,10 @@ func applyDeltaStackCached(
 		// later chains sharing this tail stop climbing here. The copy is
 		// required because 'current' aliases the recycled ping-pong arena;
 		// a memmove is far cheaper than the inflate+apply work it saves.
-		if i > 0 && oc != nil {
+		// The eligibility check runs BEFORE the detach copy: offsetCache.add
+		// rejects objects above maxCacheableSize, so copying first would
+		// burn a guaranteed-discarded allocation at every oversized hop.
+		if i > 0 && oc != nil && len(current) <= maxCacheableSize {
 			detached := make([]byte, len(current))
 			copy(detached, current)
 			oc.add(d.pack, d.offset, detached, baseType)
@@ -634,17 +664,25 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
 // The method uses pre-allocated buffers and streaming decompression to minimize memory usage.
 //
 // The output buffer must be pre-allocated with sufficient capacity for the
-// target object size.
+// target object size (unless allocExact is set, in which case out is ignored
+// and a fresh exact-size buffer is allocated after the advertised target has
+// been validated against maxObjectSize).
+//
+// maxObjectSize bounds both the advertised target size and the delta payload
+// itself; zero disables the bound. Enforcing it here — before any allocation
+// is sized from pack-controlled headers — means a corrupt or hostile pack
+// cannot force a large allocation ahead of the limit check.
+//
 // applyDeltaStreaming returns an error if the delta instructions are malformed or reference
 // data outside the base object bounds.
 func applyDeltaStreaming(
 	pack *mmap.ReaderAt,
 	offset uint64,
 	deltaType ObjectType,
-	cachedHdrLen int, // pre-parsed header length from walkUpDeltaChain; 0 means re-parse
 	base []byte,
 	out []byte, // Pre-allocated output buffer (ignored when allocExact)
 	allocExact bool, // allocate a fresh exact-size output after reading the header
+	maxObjectSize uint64, // reject targets/payloads beyond this bound; 0 disables
 ) ([]byte, error) {
 	// Parse the pack object header ourselves: its size field is the
 	// decompressed length of the delta payload (varint header + instruction
@@ -653,15 +691,21 @@ func applyDeltaStreaming(
 	// []byte with index arithmetic — no bufio layer, no per-command
 	// ReadByte virtual calls, and (with the libdeflate backend) no
 	// streaming inflater state at all.
-	packData := mmapData(pack)
-	if offset >= uint64(len(packData)) {
+	//
+	// The header (and the ofs-delta base offset below) is read through the
+	// public ReadAt API rather than mmapData so this file stays portable:
+	// on mmap-backed platforms ReadAt is a bounds-checked copy of ≤32
+	// bytes, and on fallback platforms (no mmapData symbol) it is real
+	// file I/O of the same size.
+	var hdrBuf [32]byte
+	n, err := pack.ReadAt(hdrBuf[:], int64(offset))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if n == 0 {
 		return nil, io.ErrUnexpectedEOF
 	}
-	hdr := packData[offset:]
-	if len(hdr) > 32 {
-		hdr = hdr[:32]
-	}
-	_, payloadSize, hdrLen := parseObjectHeaderUnsafe(hdr)
+	_, payloadSize, hdrLen := parseObjectHeaderUnsafe(hdrBuf[:n])
 	if hdrLen <= 0 {
 		return nil, ErrCannotParseObjectHeader
 	}
@@ -672,16 +716,38 @@ func applyDeltaStreaming(
 	case ObjRefDelta:
 		pos += 20
 	case ObjOfsDelta:
-		// Skip the variable-length offset for ofs-delta.
-		for {
-			if pos >= int64(len(packData)) {
-				return nil, io.ErrUnexpectedEOF
-			}
-			b := packData[pos]
-			pos++
-			if b&0x80 == 0 {
-				break
-			}
+		// Skip the variable-length backward offset (≤9 bytes, matching
+		// readOfsDeltaOffset's bound; git never emits more).
+		var ofsBuf [9]byte
+		on, oerr := pack.ReadAt(ofsBuf[:], pos)
+		if oerr != nil && !errors.Is(oerr, io.EOF) {
+			return nil, oerr
+		}
+		j := 0
+		for j < on && ofsBuf[j]&0x80 != 0 {
+			j++
+		}
+		if j >= on {
+			return nil, io.ErrUnexpectedEOF
+		}
+		pos += int64(j) + 1
+	}
+
+	// Bound the payload before sizing any allocation from it. payloadSize
+	// comes straight from the pack header, so a malformed pack can
+	// advertise an arbitrary value: unchecked, int(payloadSize) overflows
+	// on 32-bit (and wraps negative for values above MaxInt on 64-bit),
+	// and getDeltaScratch would allocate the full advertised amount. A
+	// valid payload for a target bounded by maxObjectSize can never exceed
+	// 8×target + 32: a copy command encodes at most 8 bytes per ≥1 output
+	// byte, an insert at most 2 per output byte, plus two size varints.
+	if payloadSize > uint64(math.MaxInt) {
+		return nil, fmt.Errorf("delta payload size %d exceeds addressable memory", payloadSize)
+	}
+	if maxObjectSize > 0 && maxObjectSize <= (math.MaxUint64-32)/8 {
+		if bound := 8*maxObjectSize + 32; payloadSize > bound {
+			return nil, fmt.Errorf("%w: payload=%d exceeds bound %d for limit=%d",
+				ErrDeltaTargetTooLarge, payloadSize, bound, maxObjectSize)
 		}
 	}
 
@@ -707,6 +773,12 @@ func applyDeltaStreaming(
 		return nil, errors.New("invalid delta target size")
 	}
 	delta = delta[n:]
+
+	// Enforce the size limit on the advertised target BEFORE any output
+	// buffer is allocated from it.
+	if maxObjectSize > 0 && targetSize > maxObjectSize {
+		return nil, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, targetSize, maxObjectSize)
+	}
 
 	if allocExact {
 		// Caller asked for a fresh, exactly-sized output buffer. This lets
@@ -782,8 +854,19 @@ func applyDeltaStreaming(
 				cpSize = 0x10000
 			}
 
-			if cpOff+cpSize > len(base) {
+			// Overflow-safe bounds check: cpOff can go negative on 32-bit
+			// ints (4th operand byte ≥ 0x80), and cpOff+cpSize can wrap;
+			// the subtraction form avoids both.
+			if cpOff < 0 || cpSize > len(base) || cpOff > len(base)-cpSize {
 				return nil, errors.New("copy beyond base bounds")
+			}
+
+			// Bound the write against the declared target BEFORE extending:
+			// with allocExact the output capacity is exactly targetSize, so
+			// an oversized command would panic on the slice extension
+			// instead of returning an error.
+			if uint64(cpSize) > targetSize-uint64(len(out)) {
+				return nil, errors.New("delta copy exceeds declared target size")
 			}
 
 			// Extend the output slice and copy the specified segment from the base.
@@ -795,6 +878,9 @@ func applyDeltaStreaming(
 			size := int(cmd)
 			if i+size > len(delta) {
 				return nil, io.ErrUnexpectedEOF
+			}
+			if uint64(size) > targetSize-uint64(len(out)) {
+				return nil, errors.New("delta insert exceeds declared target size")
 			}
 			outPos := len(out)
 			out = out[:outPos+size]
@@ -853,75 +939,6 @@ func decodeVarInt(b []byte) (uint64, int) {
 		shift += 7
 	}
 	return 0, 0
-}
-
-// decodeCopyCommand decodes the offset and size embedded in a *copy* command
-// byte according to the Git delta format.
-//
-// It reads any variable‑length operands from br and returns the computed offset
-// and size.
-// If size is encoded as zero the function substitutes 0x10000, mirroring Git's
-// behavior.
-func decodeCopyCommand(cmd byte, br *bufio.Reader) (offset, size int, err error) {
-	bits := cmd & 0x7f
-
-	// Keep these reads direct: staging operands in a local array and passing
-	// it through io.ReadFull forces the tiny buffer to escape on this hot path.
-	if bits&0x01 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset = int(b)
-	}
-	if bits&0x02 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 8
-	}
-	if bits&0x04 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 16
-	}
-	if bits&0x08 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		offset |= int(b) << 24
-	}
-	if bits&0x10 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size = int(b)
-	}
-	if bits&0x20 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 8
-	}
-	if bits&0x40 != 0 {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, 0, err
-		}
-		size |= int(b) << 16
-	}
-
-	if size == 0 {
-		size = 0x10000
-	}
-
-	return offset, size, nil
 }
 
 // readVarIntFromReader reads a base‑128 varint from br and returns its value

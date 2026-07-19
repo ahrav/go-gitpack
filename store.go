@@ -751,13 +751,15 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		off += uint64(hdrLen)
 
 		// Decompress only the beginning of the object, typically less than 512 bytes.
+		// openCommitHeaderStream is platform-abstracted: zero-copy over the
+		// mapped bytes on mmap-backed platforms, SectionReader-based zlib on
+		// the ReaderAt fallback build.
 		defer runtime.KeepAlive(p)
-		zr, br, err := getZlibReaderAt(mmapData(p), int64(off))
+		zr, release, err := openCommitHeaderStream(p, int64(off))
 		if err != nil {
 			return nil, err
 		}
-		defer putBytesReader(br)
-		defer putFlateReader(zr)
+		defer release()
 
 		return readCommitHeaderFromStream(zr)
 	}
