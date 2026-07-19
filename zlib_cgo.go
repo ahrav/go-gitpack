@@ -12,14 +12,21 @@ package objstore
 // implementation because it decodes into the output buffer in place.
 //
 // This file is gated behind the `gitpack_libdeflate` build tag so the pure-Go
-// build remains the default. Enable with:
+// build remains the default. With libdeflate installed in the default search
+// paths (Debian/Ubuntu: `apt-get install libdeflate-dev`), enable with:
+//
+//	go build -tags gitpack_libdeflate ./...
+//
+// For a libdeflate in a non-standard location, or to link a static archive,
+// override the search paths externally:
 //
 //	CGO_CFLAGS="-I/path/to/libdeflate" \
-//	CGO_LDFLAGS="/path/to/libdeflate/build/libdeflate.a" \
+//	CGO_LDFLAGS="-L/path/to/libdeflate/build" \
 //	go build -tags gitpack_libdeflate ./...
 
 /*
 #cgo CFLAGS: -O2
+#cgo LDFLAGS: -ldeflate
 #include <stdlib.h>
 #include "libdeflate.h"
 */
