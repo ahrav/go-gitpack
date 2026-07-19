@@ -17,7 +17,9 @@
 //     commit_walk_determinism_test.go), every dedup emission must appear
 //     verbatim in the streaming scan (hunks are removed whole, never
 //     split), the dedup-off path must be unaffected, and the pipeline must
-//     abandon cleanly (no goroutine leaks) when fn errors.
+//     abandon cleanly (no goroutine leaks, no shutdown deadlock) when fn
+//     errors or when a corrupted pack object fails the tree or hunk stage
+//     mid-scan.
 
 package objstore
 
@@ -31,6 +33,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -880,6 +883,24 @@ func TestDiffHistoryHunksDedup_StreamingContainment(t *testing.T) {
 	}
 }
 
+// requireGoroutinesSettle polls until the process goroutine count returns
+// to at most before, failing after a deadline. The dedup pipeline waits for
+// all its goroutines before returning, but unrelated runtime goroutines add
+// noise, hence the poll.
+func requireGoroutinesSettle(t *testing.T, before int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if runtime.NumGoroutine() <= before {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("goroutines leaked: before=%d after=%d", before, runtime.NumGoroutine())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestDiffHistoryHunksDedup_ErrorStopsPromptlyNoLeak asserts that an fn
 // error aborts the scan with that error and that every pipeline goroutine
 // exits — the goroutine count must return to its pre-scan level.
@@ -901,17 +922,134 @@ func TestDiffHistoryHunksDedup_ErrorStopsPromptlyNoLeak(t *testing.T) {
 		return nil
 	})
 	require.ErrorIs(t, err, sentinel)
+	requireGoroutinesSettle(t, before)
+}
 
-	// diffHistoryHunksDedup waits for all its goroutines before returning,
-	// but unrelated runtime goroutines add noise; poll with a deadline.
-	deadline := time.Now().Add(5 * time.Second)
-	for {
-		if runtime.NumGoroutine() <= before {
-			break
+// --- mid-scan object failures (tree and hunk stage abort paths) ---
+
+// packObjectSpan locates oid's entry in the fixture's single packfile via
+// `git verify-pack -v` and returns the pack path plus the byte span
+// [offset, offset+size) that the object's packed representation occupies.
+func packObjectSpan(t *testing.T, gitDir, oid string) (packPath string, offset, size int64) {
+	t.Helper()
+	idxs, err := filepath.Glob(filepath.Join(gitDir, "objects", "pack", "*.idx"))
+	require.NoError(t, err)
+	require.Len(t, idxs, 1, "fixture must be repacked into exactly one pack")
+
+	out, err := exec.Command("git", "verify-pack", "-v", idxs[0]).CombinedOutput()
+	require.NoErrorf(t, err, "git verify-pack -v: %s", out)
+
+	// Object lines are "oid type size size-in-packfile offset-in-packfile"
+	// with " depth base-oid" appended for deltified entries.
+	for line := range strings.Lines(string(out)) {
+		fields := strings.Fields(line)
+		if len(fields) < 5 || fields[0] != oid {
+			continue
 		}
-		if time.Now().After(deadline) {
-			t.Fatalf("goroutines leaked: before=%d after=%d", before, runtime.NumGoroutine())
-		}
-		time.Sleep(10 * time.Millisecond)
+		size, err := strconv.ParseInt(fields[3], 10, 64)
+		require.NoError(t, err)
+		offset, err := strconv.ParseInt(fields[4], 10, 64)
+		require.NoError(t, err)
+		return strings.TrimSuffix(idxs[0], ".idx") + ".pack", offset, size
 	}
+	t.Fatalf("object %s not found in %s", oid, idxs[0])
+	return "", 0, 0
+}
+
+// corruptPackObject flips the last byte of oid's packed representation in
+// place. The flipped byte is always inside the span covered by the object's
+// idx CRC-32 entry, so a scanner running with VerifyCRC detects the damage
+// deterministically on that object's first read, wherever the byte lands in
+// the zlib stream.
+func corruptPackObject(t *testing.T, gitDir, oid string) {
+	t.Helper()
+	packPath, offset, size := packObjectSpan(t, gitDir, oid)
+
+	// git writes packfiles read-only; the fixture is throwaway.
+	require.NoError(t, os.Chmod(packPath, 0o644))
+	f, err := os.OpenFile(packPath, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, f.Close()) }()
+
+	buf := make([]byte, 1)
+	_, err = f.ReadAt(buf, offset+size-1)
+	require.NoError(t, err)
+	buf[0] ^= 0xFF
+	_, err = f.WriteAt(buf, offset+size-1)
+	require.NoError(t, err)
+}
+
+// scanDedupCorrupted runs a CRC-verifying dedup scan over a fixture with a
+// corrupted pack object and returns the scan error. It fails the test if
+// the scan deadlocks instead of returning or if any pipeline goroutine
+// outlives the call — the shutdown-chain obligations of the mid-scan error
+// paths, which the fn-error test alone cannot reach.
+func scanDedupCorrupted(t *testing.T, gitDir string) error {
+	t.Helper()
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
+	require.NoError(t, err)
+	defer s.Close()
+	s.SetVerifyCRC(true)
+
+	before := runtime.NumGoroutine()
+	var scanErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		scanErr = s.DiffHistoryHunksFunc(func(HunkAddition) error { return nil })
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Minute):
+		t.Fatal("dedup scan did not return after a mid-scan object failure (possible shutdown deadlock)")
+	}
+	requireGoroutinesSettle(t, before)
+	require.Error(t, scanErr, "scan over a corrupted object must fail")
+	return scanErr
+}
+
+// TestDiffHistoryHunksDedup_HunkStageErrorAborts corrupts a blob so the
+// hunk workers' materialization of it fails mid-scan: the scan must return
+// the hunk-stage error, terminate, and leak nothing. Blobs are read only by
+// the hunk stage (tree diffing compares OIDs without loading blob bytes),
+// so the failing stage is deterministic and the error must carry the hunk
+// stage's "failed diffing" wrapper.
+func TestDiffHistoryHunksDedup_HunkStageErrorAborts(t *testing.T) {
+	b := newDedupRepoBuilder(t)
+	b.write("clean.txt", "clean-one\n")
+	b.commit("root")
+	b.write("payload.txt", "payload-a\npayload-b\n")
+	b.commit("add payload")
+	b.write("clean.txt", "clean-one\nclean-two\n")
+	b.commit("grow clean")
+	blobOID := b.git("rev-parse", "HEAD:payload.txt")
+	gitDir := b.finish()
+	corruptPackObject(t, gitDir, blobOID)
+
+	err := scanDedupCorrupted(t, gitDir)
+	require.ErrorContains(t, err, "failed diffing",
+		"a corrupted blob must surface as a hunk-stage failure")
+}
+
+// TestDiffHistoryHunksDedup_TreeStageErrorAborts corrupts a root tree so
+// the tree workers' diff of its commit fails mid-scan, exercising the
+// slot.err hand-off to the sequencer: the scan must return the tree-stage
+// error, terminate, and leak nothing. Trees are read only by the tree stage
+// (collectCommitPairs), so the error must carry its "failed processing
+// commit" wrapper.
+func TestDiffHistoryHunksDedup_TreeStageErrorAborts(t *testing.T) {
+	b := newDedupRepoBuilder(t)
+	b.write("a.txt", "one\n")
+	b.commit("root")
+	b.write("a.txt", "one\ntwo\n")
+	b.commit("grow a")
+	b.write("b.txt", "bee\n")
+	b.commit("add b")
+	treeOID := b.git("rev-parse", "HEAD^{tree}")
+	gitDir := b.finish()
+	corruptPackObject(t, gitDir, treeOID)
+
+	err := scanDedupCorrupted(t, gitDir)
+	require.ErrorContains(t, err, "failed processing commit",
+		"a corrupted tree must surface as a tree-stage failure")
 }
