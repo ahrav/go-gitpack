@@ -1,4 +1,4 @@
-//go:build arm64 && !purego && !gitpack_libdeflate
+//go:build arm64 && !purego && (!cgo || !gitpack_libdeflate)
 
 package objstore
 
@@ -199,8 +199,8 @@ func arm64PrepareHuffmanBlock(
 			t.Fatal("loadFixedTables failed")
 		}
 	case 2:
-		if !d.loadDynamicTables(&r) {
-			t.Fatal("loadDynamicTables failed")
+		if err := d.loadDynamicTables(&r); err != nil {
+			t.Fatalf("loadDynamicTables failed: %v", err)
 		}
 	default:
 		t.Fatalf("unsupported Huffman block type %d", wantType)

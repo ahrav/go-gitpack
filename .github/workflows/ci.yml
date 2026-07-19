@@ -1,7 +1,8 @@
 # CI for go-gitpack.
 #
-# Three gates run on every push/PR:
+# Four gates run on every push/PR:
 #   - test        default pure-Go flate backend, full suite
+#   - arm64       default backend and assembly fast path on native ARM64
 #   - race        the same suite under the data-race detector (guards the
 #                 concurrent read path and the parallel commit walk)
 #   - libdeflate  the cgo libdeflate backend, which a plain `go test` never
@@ -50,6 +51,25 @@ jobs:
           make fmt-check
           make vet
           make build
+          make test
+
+  arm64:
+    name: test (ARM64 assembly)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: go-gitpack
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-gitpack/go.mod
+      - name: build, vet, test
+        working-directory: go-gitpack
+        run: |
+          make build
+          make vet
           make test
 
   race:

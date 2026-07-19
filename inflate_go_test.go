@@ -445,8 +445,10 @@ func TestGoInflaterInvalidatesFixedCacheBeforeDynamicParse(t *testing.T) {
 	}
 
 	r := deflateBits{}
-	if d.loadDynamicTables(&r) {
+	if err := d.loadDynamicTables(&r); err == nil {
 		t.Fatal("truncated dynamic header accepted")
+	} else if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated dynamic header reported %v, want unexpected-EOF identity", err)
 	}
 	if d.static {
 		t.Fatal("failed dynamic parse left fixed-table cache valid")
@@ -497,9 +499,9 @@ func TestDecodeTableEntryUsesLongCodeSubtable(t *testing.T) {
 				byte(reverseCode(next[n]+sym-11, int(n)) >> 8),
 			}
 			r := deflateBits{src: raw}
-			entry, _, ok := decodeTableEntry(&r, d.litlen[:], uint(tableBits))
-			if !ok || entry&huffLiteral == 0 || int(byte(entry>>16)) != sym {
-				t.Fatalf("symbol %d: entry=%08x ok=%v", sym, entry, ok)
+			entry, _, err := decodeTableEntry(&r, d.litlen[:], uint(tableBits))
+			if err != nil || entry&huffLiteral == 0 || int(byte(entry>>16)) != sym {
+				t.Fatalf("symbol %d: entry=%08x err=%v", sym, entry, err)
 			}
 		}
 	}
@@ -813,6 +815,57 @@ func TestInflatePackZlibSingleBitDifferential(t *testing.T) {
 				mutated := append([]byte(nil), encoded...)
 				mutated[at] ^= bit
 				assertGoMatchesReference(t, mutated, len(payload))
+			}
+		}
+	}
+}
+
+// TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF pins the
+// truncation-error contract: every strict prefix of a valid member (cut
+// anywhere in the deflate payload, including mid-header, mid-dynamic-table,
+// and mid-codeword) must classify as truncation via
+// errors.Is(err, io.ErrUnexpectedEOF), never as generic bad data.
+func TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF(t *testing.T) {
+	type fixture struct {
+		encoded []byte
+		size    int
+	}
+	var fixtures []fixture
+
+	payloads := [][]byte{
+		[]byte("fixed fixture"),
+		bytes.Repeat([]byte("dynamic fixture "), 40),
+		makeDeterministicBytes(512),
+	}
+	levels := []int{zlib.HuffmanOnly, zlib.DefaultCompression, zlib.NoCompression}
+	for i, payload := range payloads {
+		fixtures = append(fixtures, fixture{encodeZlib(t, payload, levels[i]), len(payload)})
+	}
+
+	// A dynamic-block member (BTYPE=2), so cuts land inside the 14-bit
+	// counts, the precode lengths, and the code-length symbol stream.
+	dynamic, err := hex.DecodeString(
+		"789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtures = append(fixtures, fixture{dynamic, 6000})
+
+	for i, f := range fixtures {
+		memberEnd := len(f.encoded) - 4
+		for cut := 2; cut < memberEnd; cut++ {
+			_, consumed, err := guardedGoInflate(t, f.encoded[:cut], f.size)
+			if err == nil {
+				t.Fatalf("fixture=%d cut=%d: truncated stream accepted", i, cut)
+			}
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("fixture=%d cut=%d: got %v, want unexpected-EOF identity",
+					i, cut, err)
+			}
+			if consumed != 0 {
+				t.Fatalf("fixture=%d cut=%d: error returned consumed=%d, want 0",
+					i, cut, consumed)
 			}
 		}
 	}

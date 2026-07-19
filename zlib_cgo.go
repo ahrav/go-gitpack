@@ -116,8 +116,20 @@ func inflateZlibOneShot(src []byte, dst []byte) (int, error) {
 		out, C.size_t(len(dst)),
 		&inConsumed, &outProduced,
 	)
-	if res != C.LIBDEFLATE_SUCCESS || int(outProduced) != len(dst) {
+	// Failures map to the same error classes the pure-Go backend reports so
+	// errors.Is classification does not change with the build tag:
+	// INSUFFICIENT_SPACE means the stream continues past the declared size
+	// (overrun class), and a successful decode that produced fewer bytes
+	// than declared is the short-output class. Truncated input is the one
+	// class libdeflate cannot distinguish: it reports BAD_DATA for both
+	// malformed and merely truncated streams, so those collapse together.
+	switch {
+	case res == C.LIBDEFLATE_INSUFFICIENT_SPACE:
+		return 0, errDeflateOutputOverrun
+	case res != C.LIBDEFLATE_SUCCESS:
 		return 0, errLibdeflateBadData
+	case int(outProduced) != len(dst):
+		return 0, errDeflateShortOutput
 	}
 	return 2 + int(inConsumed), nil
 }

@@ -115,10 +115,16 @@ func TestInflateRejectsStreamContinuingPastDeclaredSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Declare fewer bytes than the stream actually inflates to. io.ReadFull
-	// stops once dst is full, so only the end-of-stream check can catch this.
-	if err := inflatePureGo(t, buf.Bytes(), len(payload)-6); err == nil {
+	// Declare fewer bytes than the stream actually inflates to. The decoder
+	// fills dst and then finds more compressed data where it expects the
+	// stream to end, which must classify as the overrun error, not a
+	// generic failure.
+	err := inflatePureGo(t, buf.Bytes(), len(payload)-6)
+	if err == nil {
 		t.Fatal("stream continuing past the declared size was accepted")
+	}
+	if !errors.Is(err, errZlibStreamOverrun) {
+		t.Fatalf("got %v, want the stream-overrun class", err)
 	}
 }
 
@@ -131,9 +137,10 @@ func TestInflateRejectsStreamMissingTerminator(t *testing.T) {
 	//   NLEN=^4
 	//   4 payload bytes, then nothing — no final block ever arrives.
 	//
-	// io.ReadFull fills dst with exactly the declared 4 bytes, so only the
-	// end-of-stream check can notice that the deflate stream is truncated
-	// rather than terminated.
+	// The decoder produces the declared 4 bytes while decoding the stored
+	// block, then reads the next block header and hits end of input: the
+	// missing terminator is detected as truncation, not as an output
+	// mismatch.
 	payload := []byte("abcd")
 	stream := []byte{0x78, 0x9c, 0x00, 0x04, 0x00, 0xfb, 0xff}
 	stream = append(stream, payload...)
@@ -147,7 +154,7 @@ func TestInflateRejectsStreamMissingTerminator(t *testing.T) {
 	if errors.Is(err, errZlibStreamOverrun) {
 		t.Fatalf("got overrun error, want truncation: %v", err)
 	}
-	if !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("got %v, want an unexpected-EOF truncation error", err)
 	}
 }
