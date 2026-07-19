@@ -499,7 +499,7 @@ func applyDeltaStackCached(
 	// buffer and return it directly — no arena, no detach copy.
 	if len(stack) == 1 {
 		d := stack[0]
-		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, baseData, nil, true)
+		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, baseData, nil, maxObjectSize, true)
 		if err != nil {
 			var tooSmall *errDeltaOutputTooSmall
 			// allocExact never under-allocates, so errDeltaOutputTooSmall
@@ -558,7 +558,7 @@ func applyDeltaStackCached(
 				out = bufA[:0]
 			}
 
-			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, current, out, false)
+			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, current, out, maxObjectSize, false)
 			if err != nil {
 				var tooSmall *errDeltaOutputTooSmall
 				if errors.As(err, &tooSmall) {
@@ -595,7 +595,7 @@ func applyDeltaStackCached(
 		// later chains sharing this tail stop climbing here. The copy is
 		// required because 'current' aliases the recycled ping-pong arena;
 		// a memmove is far cheaper than the inflate+apply work it saves.
-		if i > 0 && oc != nil {
+		if i > 0 && oc.canAdd(len(current)) {
 			detached := make([]byte, len(current))
 			copy(detached, current)
 			oc.add(d.pack, d.offset, detached, baseType)
@@ -670,6 +670,7 @@ func applyDeltaStreaming(
 	cachedHdrLen int, // pre-parsed header length from walkUpDeltaChain; 0 means re-parse
 	base []byte,
 	out []byte, // Pre-allocated output buffer (ignored when allocExact)
+	maxObjectSize uint64,
 	allocExact bool, // allocate a fresh exact-size output after reading the header
 ) ([]byte, error) {
 	// Parse the pack object header ourselves: its size field is the
@@ -711,6 +712,10 @@ func applyDeltaStreaming(
 		}
 	}
 
+	maxInt := uint64(^uint(0) >> 1)
+	if payloadSize > maxInt || (maxObjectSize > 0 && payloadSize > maxObjectSize) {
+		return nil, fmt.Errorf("%w: delta payload=%d limit=%d", ErrDeltaTargetTooLarge, payloadSize, maxObjectSize)
+	}
 	scratch := getDeltaScratch(int(payloadSize))
 	defer putDeltaScratch(scratch)
 	delta := scratch.buf[:payloadSize]
@@ -733,6 +738,9 @@ func applyDeltaStreaming(
 		return nil, errors.New("invalid delta target size")
 	}
 	delta = delta[n:]
+	if targetSize > maxInt || (maxObjectSize > 0 && targetSize > maxObjectSize) {
+		return nil, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, targetSize, maxObjectSize)
+	}
 
 	if allocExact {
 		// Caller asked for a fresh, exactly-sized output buffer. This lets
@@ -814,6 +822,9 @@ func applyDeltaStreaming(
 
 			// Extend the output slice and copy the specified segment from the base.
 			outPos := len(out)
+			if uint64(cpSize) > targetSize-uint64(outPos) {
+				return nil, errors.New("copy exceeds delta target size")
+			}
 			out = out[:outPos+cpSize]
 			copy(out[outPos:], base[cpOff:cpOff+cpSize])
 		} else if cmd > 0 {
@@ -823,6 +834,9 @@ func applyDeltaStreaming(
 				return nil, io.ErrUnexpectedEOF
 			}
 			outPos := len(out)
+			if uint64(size) > targetSize-uint64(outPos) {
+				return nil, errors.New("insert exceeds delta target size")
+			}
 			out = out[:outPos+size]
 			copy(out[outPos:], delta[i:i+size])
 			i += size

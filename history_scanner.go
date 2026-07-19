@@ -143,6 +143,9 @@ type HistoryScanner struct {
 	// dedup fingerprint set. See WithHunkPathFilter for the full contract.
 	hunkPathFilter func(commit Hash, path string) bool
 
+	// hunkDedupBudget bounds fingerprint storage for deduplicating scans.
+	hunkDedupBudget int
+
 	// profileServer is the HTTP server for pprof endpoints.
 	profileServer *http.Server
 
@@ -195,12 +198,13 @@ func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, e
 	mc := newMetaCache(nil, store)
 
 	hs := &HistoryScanner{
-		gitDir:    gitDir,
-		scanMode:  ScanModeBlob,
-		store:     store,
-		graphData: nil,
-		meta:      mc,
-		pairs:     newPairCache(),
+		gitDir:          gitDir,
+		scanMode:        ScanModeBlob,
+		store:           store,
+		graphData:       nil,
+		meta:            mc,
+		pairs:           newPairCache(),
+		hunkDedupBudget: defaultHunkDedupBudget,
 	}
 
 	for _, opt := range opts {
@@ -608,6 +612,16 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, emi
 
 	for i := range unmatchedAdds {
 		if deleteIdx, ok := matchDirectoryRename(unmatchedAdds[i].path, dirRenames, unusedDeletesByPath, usedDeletes); ok {
+			isRename, err := hs.hasDirectoryRenameSimilarity(deletes[deleteIdx].oldOID, unmatchedAdds[i].newOID)
+			if err != nil {
+				return err
+			}
+			if !isRename {
+				if err := emit(unmatchedAdds[i]); err != nil {
+					return err
+				}
+				continue
+			}
 			usedDeletes[deleteIdx] = true
 			delete(unusedDeletesByPath, deletes[deleteIdx].path)
 			work := unmatchedAdds[i]
@@ -622,6 +636,45 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, emi
 		}
 	}
 	return nil
+}
+
+// hasDirectoryRenameSimilarity confirms that a path-based directory rename
+// candidate also resembles the deleted blob. Exact-OID renames were removed
+// earlier; this check is intentionally conservative so uncertain candidates
+// remain full additions rather than hiding content.
+func (hs *HistoryScanner) hasDirectoryRenameSimilarity(oldOID, newOID Hash) (bool, error) {
+	oldData, oldType, err := hs.store.get(oldOID)
+	if err != nil {
+		return false, err
+	}
+	newData, newType, err := hs.store.get(newOID)
+	if err != nil {
+		return false, err
+	}
+	if oldType != ObjBlob || newType != ObjBlob || len(oldData) > SmallFileThreshold || len(newData) > SmallFileThreshold {
+		return false, nil
+	}
+	if isBinary(oldData) || isBinary(newData) {
+		return false, nil
+	}
+
+	oldLines := tokenize(oldData)
+	newLines := tokenize(newData)
+	if len(oldLines) == 0 || len(newLines) == 0 {
+		return false, nil
+	}
+	counts := make(map[string]int, len(oldLines))
+	for _, line := range oldLines {
+		counts[line]++
+	}
+	matches := 0
+	for _, line := range newLines {
+		if counts[line] > 0 {
+			counts[line]--
+			matches++
+		}
+	}
+	return matches*2 >= max(len(oldLines), len(newLines)), nil
 }
 
 func takeExactRenameDelete(add blobPairWork, deletes []blobPairWork, used []bool, deletesByOID map[Hash][]int) (int, bool) {

@@ -370,6 +370,23 @@ func TestMetaCacheAuthor(t *testing.T) {
 	})
 }
 
+func TestMetaCacheBudgetSkipsOversizedEntry(t *testing.T) {
+	reader := newMockCommitPayloadReader()
+	oid := Hash{0x42}
+	reader.addCommit(oid, "Budgeted User", "budget@example.com", 1234)
+	cache := newMetaCache(nil, reader)
+	cache.setBudget(1)
+
+	metadata, err := cache.get(oid)
+	require.NoError(t, err)
+	require.Equal(t, mockCommitMessage, metadata.Message)
+
+	cache.mu.RLock()
+	_, cached := cache.m[oid]
+	cache.mu.RUnlock()
+	require.False(t, cached, "entry larger than the budget must not be retained")
+}
+
 // TestMetaCacheConcurrentAccess verifies that metaCache is safe for concurrent
 // reads from multiple goroutines. It spawns 20 goroutines each performing 100
 // reads across 50 distinct OIDs and asserts no data races or incorrect results.

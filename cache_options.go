@@ -1,5 +1,27 @@
 package objstore
 
+// WithHunkDedupBudget bounds the line-fingerprint table retained during one
+// deduplicating hunk scan. The table grows on demand up to this budget and
+// then fails open, emitting rather than suppressing uncertain hunks.
+func WithHunkDedupBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		if bytes < 0 {
+			bytes = 0
+		}
+		hs.hunkDedupBudget = bytes
+	}
+}
+
+// WithMetadataCacheBudget bounds retained author and commit-message payloads.
+// Entries that do not fit are returned to the caller but are not cached.
+func WithMetadataCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		if hs.meta != nil {
+			hs.meta.setBudget(bytes)
+		}
+	}
+}
+
 // WithPairCacheBudget bounds the retained diff-hunk memo for hunk scans.
 //
 // A zero or negative budget disables the cache. The budget is approximate:

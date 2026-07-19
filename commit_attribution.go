@@ -56,18 +56,15 @@ type commitPayloadReader interface {
 // metaEntry is one cached attribution record: the parsed author identity and
 // the raw commit message.
 //
-// Lifetime: ai.Name and ai.Email alias the payload copy the entry was parsed
-// from (see parseAuthorHeader), and msg is a string conversion of the
-// message half, so each entry retains roughly one payload's worth of bytes.
-// The cache is insert-only and unbounded — typical messages are ~200-700 B,
-// so even 10k commits cost only a few MB, comparable to the header bytes the
-// cache has always retained. Monorepo-scale histories (~1M+ commits) would
-// push this toward a GB; the recorded escape hatches (don't-retain-oversize
-// flag, budgeted cache) are deliberately not built at this scale.
+// Lifetime: ai.Name, ai.Email, and msg alias one caller-owned payload copy.
+// Entries are retained only while the configured byte budget permits.
 type metaEntry struct {
-	ai  AuthorInfo
-	msg string
+	ai     AuthorInfo
+	msg    string
+	weight int
 }
+
+const defaultMetadataCacheBudget = 64 << 20
 
 // metaCache provides efficient access to Git commit metadata by caching author
 // information and commit messages. It coordinates with a commit graph for fast
@@ -89,7 +86,9 @@ type metaCache struct {
 
 	// m caches attribution entries by commit hash to avoid repeated
 	// inflation and parsing of commit payloads.
-	m map[Hash]metaEntry
+	m      map[Hash]metaEntry
+	used   int
+	budget int
 }
 
 // newMetaCache constructs a metaCache with the given commit graph (may be nil)
@@ -105,11 +104,28 @@ func newMetaCache(g *commitGraphData, s commitPayloadReader) *metaCache {
 	}
 
 	return &metaCache{
-		graph: g,
-		store: s,
-		ts:    ts,
-		m:     make(map[Hash]metaEntry, cacheSize),
+		graph:  g,
+		store:  s,
+		ts:     ts,
+		m:      make(map[Hash]metaEntry, cacheSize),
+		budget: defaultMetadataCacheBudget,
 	}
+}
+
+func (c *metaCache) setBudget(budget int) {
+	if budget < 0 {
+		budget = 0
+	}
+	c.mu.Lock()
+	c.budget = budget
+	for oid, entry := range c.m {
+		if c.used <= c.budget {
+			break
+		}
+		delete(c.m, oid)
+		c.used -= entry.weight
+	}
+	c.mu.Unlock()
 }
 
 // attachGraph replaces the current commit-graph reference. This is used when
@@ -165,14 +181,18 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 		if err != nil {
 			return CommitMetadata{}, err
 		}
-		// string(msg) makes a fresh copy; slicing (or btostr) would work
-		// too since payload is caller-owned, but a copy keeps msg
-		// independent of the header bytes ai already pins.
-		entry = metaEntry{ai: ai, msg: string(msg)}
+		// ai already retains payload through its zero-copy strings, so the
+		// message can safely share that same owned allocation.
+		entry = metaEntry{ai: ai, msg: btostr(msg), weight: len(payload)}
 
 		// Promote to cache.
 		c.mu.Lock()
-		c.m[oid] = entry
+		if existing, loaded := c.m[oid]; loaded {
+			entry = existing
+		} else if entry.weight <= c.budget-c.used {
+			c.m[oid] = entry
+			c.used += entry.weight
+		}
 		c.mu.Unlock()
 	}
 	ai := entry.ai
