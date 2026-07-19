@@ -701,9 +701,11 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 	if cacheResult && len(data) <= maxCacheableSize {
 		s.dw.add(params.oid, data, objType)
 	}
-	// Also publish under the pack offset so get()'s lock-free fast path
-	// and delta-chain walk-ups can find it.
-	s.offCache.add(params.p, params.off, data, objType)
+	if cacheResult {
+		// Also publish under the pack offset so get()'s lock-free fast path
+		// and delta-chain walk-ups can find it.
+		s.offCache.add(params.p, params.off, data, objType)
+	}
 	return data, objType, nil
 }
 

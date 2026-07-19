@@ -8,6 +8,7 @@ package objstore
 import (
 	"bufio"
 	"bytes"
+	"compress/zlib"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -799,6 +800,65 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	assert.Contains(t, err.Error(), "mismatch")
 	assert.Contains(t, err.Error(), fmt.Sprintf("header=%d", len(base)))
 	assert.Contains(t, err.Error(), fmt.Sprintf("actual=%d", len(wrongBase)))
+}
+
+func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
+	openPayload := func(t *testing.T, payload []byte, declaredSize uint64) (*mmap.ReaderAt, ObjectType) {
+		t.Helper()
+		if declaredSize == 0 {
+			declaredSize = uint64(len(payload))
+		}
+
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjRefDelta), declaredSize))
+		obj.Write(make([]byte, len(Hash{})))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		path := filepath.Join(t.TempDir(), "delta.packobj")
+		require.NoError(t, os.WriteFile(path, obj.Bytes(), 0o644))
+		pack, err := mmap.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pack.Close()) })
+		return pack, ObjRefDelta
+	}
+
+	t.Run("payload exceeds configured limit", func(t *testing.T) {
+		pack, typ := openPayload(t, nil, 1024)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("target exceeds configured limit", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 65)
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("copy exceeds declared target", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 2)
+		writeVarInt(&payload, 1)
+		payload.Write([]byte{0x90, 0x02}) // Copy two bytes into a one-byte target.
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, []byte("ab"), nil, true, 64)
+		require.ErrorContains(t, err, "exceeds declared target")
+	})
+
+	t.Run("insert exceeds declared target", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 1)
+		payload.Write([]byte{0x02, 'a', 'b'})
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorContains(t, err, "exceeds declared target")
+	})
 }
 
 // TestReadOfsDeltaOffset_PropagatesReadError verifies that readOfsDeltaOffset

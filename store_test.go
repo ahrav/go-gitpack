@@ -147,6 +147,28 @@ func TestOpen(t *testing.T) {
 	})
 }
 
+func TestGetNoCacheDoesNotPopulateOffsetCache(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	store, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer store.Close()
+
+	baseHash := calculateHash(ObjBlob, []byte("base content"))
+	targetHash := calculateHash(ObjBlob, []byte("modified data"))
+	for _, oid := range []Hash{baseHash, targetHash} {
+		_, _, err := store.getNoCache(oid)
+		require.NoError(t, err)
+	}
+
+	entries := 0
+	for i := range store.offCache.shards {
+		entries += len(store.offCache.shards[i].m)
+	}
+	require.Zero(t, entries)
+}
+
 // TestParseIdx validates the v2 pack-index parser against invalid magic bytes,
 // unsupported versions, minimal valid indices, large-offset handling,
 // multi-object sorted order, and truncated files.

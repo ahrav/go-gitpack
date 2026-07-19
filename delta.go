@@ -166,9 +166,8 @@ var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 // resolutions, so the cap is derived from GOMAXPROCS at startup: hosts with
 // fewer CPUs cannot productively use more concurrent arenas, and sizing the
 // list to the parallelism budget keeps the idle reserve proportional to the
-// machine (e.g. 8 procs → 256 MiB) instead of a flat 32 × 32 MiB = 1 GiB.
-// The upper cap of 32 preserves the historical worst case on large hosts.
-var deltaArenaMaxRetained = min(32, max(2, runtime.GOMAXPROCS(0)))
+// machine. The upper cap limits retained arenas to 256 MiB on large hosts.
+var deltaArenaMaxRetained = min(8, max(2, runtime.GOMAXPROCS(0)))
 
 // getDeltaArena retrieves a ping‑pong arena from the free-list or allocates
 // a fresh one when the list is empty.
@@ -310,7 +309,7 @@ type inflationParams struct {
 // does not retain it after the call returns.
 func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, ObjectType, error) {
 	stack := make(deltaStack, 0, 16) // pre-size for typical chain depths
-	base, baseType, err := walkUpDeltaChain(s, params, &stack)
+	base, baseType, err := walkUpDeltaChain(s, params, &stack, s.offCache)
 	if err != nil {
 		return nil, ObjBad, err
 	}
@@ -318,17 +317,15 @@ func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, Objec
 }
 
 // inflateDeltaChainBorrowed is the entry point for consume-and-discard callers
-// (cacheResult=false). It publishes materialized hops to the offset cache
-// exactly like inflateDeltaChainStreaming, differing only in that a zero-delta
-// result is returned without a defensive copy. Multi-hop results are always
-// detached from the pooled arena before return.
+// (cacheResult=false). It neither consults nor publishes to the offset cache.
+// Multi-hop results are detached from the pooled arena before return.
 func inflateDeltaChainBorrowed(s *store, params inflationParams) ([]byte, ObjectType, error) {
 	stack := make(deltaStack, 0, 16)
-	base, baseType, err := walkUpDeltaChain(s, params, &stack)
+	base, baseType, err := walkUpDeltaChain(s, params, &stack, nil)
 	if err != nil {
 		return nil, ObjBad, err
 	}
-	return applyDeltaStackCached(s.offCache, stack, base, baseType, params.maxObjectSize, true)
+	return applyDeltaStackCached(nil, stack, base, baseType, params.maxObjectSize, true)
 }
 
 // walkUpDeltaChain climbs the delta chain starting at (pack, off) until a
@@ -350,6 +347,7 @@ func walkUpDeltaChain(
 	s *store,
 	params inflationParams,
 	stack *deltaStack,
+	oc *offsetCache,
 ) ([]byte, ObjectType, error) {
 	if stack == nil {
 		return nil, ObjBad, errors.New("stack is nil")
@@ -364,7 +362,7 @@ func walkUpDeltaChain(
 		// scans ~90% of hops land on an already-materialized offset. The
 		// check also fires at depth 0: OID-keyed caches (delta window, ARC)
 		// can miss objects that the offset cache still holds.
-		if data, typ, ok := s.offCache.get(currPack, currOff); ok {
+		if data, typ, ok := oc.get(currPack, currOff); ok {
 			return data, typ, nil
 		}
 
@@ -394,7 +392,7 @@ func walkUpDeltaChain(
 					}
 				}
 			}
-			s.offCache.add(currPack, currOff, baseData, typ)
+			oc.add(currPack, currOff, baseData, typ)
 			return baseData, typ, nil
 		}
 
@@ -669,7 +667,7 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
 // been validated against maxObjectSize).
 //
 // maxObjectSize bounds both the advertised target size and the delta payload
-// itself; zero disables the bound. Enforcing it here — before any allocation
+// itself; zero disables the bound. Enforcing it here before any allocation
 // is sized from pack-controlled headers — means a corrupt or hostile pack
 // cannot force a large allocation ahead of the limit check.
 //
@@ -738,17 +736,14 @@ func applyDeltaStreaming(
 	// advertise an arbitrary value: unchecked, int(payloadSize) overflows
 	// on 32-bit (and wraps negative for values above MaxInt on 64-bit),
 	// and getDeltaScratch would allocate the full advertised amount. A
-	// valid payload for a target bounded by maxObjectSize can never exceed
-	// 8×target + 32: a copy command encodes at most 8 bytes per ≥1 output
-	// byte, an insert at most 2 per output byte, plus two size varints.
+	// Oversized delta payloads are rejected even if they advertise a smaller
+	// target; accepting them would defeat the configured allocation ceiling.
 	if payloadSize > uint64(math.MaxInt) {
 		return nil, fmt.Errorf("delta payload size %d exceeds addressable memory", payloadSize)
 	}
-	if maxObjectSize > 0 && maxObjectSize <= (math.MaxUint64-32)/8 {
-		if bound := 8*maxObjectSize + 32; payloadSize > bound {
-			return nil, fmt.Errorf("%w: payload=%d exceeds bound %d for limit=%d",
-				ErrDeltaTargetTooLarge, payloadSize, bound, maxObjectSize)
-		}
+	if maxObjectSize > 0 && payloadSize > maxObjectSize {
+		return nil, fmt.Errorf("%w: payload=%d limit=%d",
+			ErrDeltaTargetTooLarge, payloadSize, maxObjectSize)
 	}
 
 	scratch := getDeltaScratch(int(payloadSize))
