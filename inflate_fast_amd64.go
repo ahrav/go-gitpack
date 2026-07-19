@@ -1,15 +1,22 @@
-//go:build arm64 && !purego && !gitpack_libdeflate
+//go:build amd64 && !purego && !gitpack_libdeflate
 
 package objstore
 
 import "unsafe"
 
-const inflateFastAsmEnabled = true
+const (
+	inflateFastAsmEnabled         = true
+	inflateFastAMD64MinLitlenBits = 7
+)
 
 //go:noescape
-func inflateHuffmanFastArm64(state *inflateFastState)
+func inflateHuffmanFastAMD64(state *inflateFastState)
 
 func (d *goInflater) decodeHuffman(r *deflateBits, dst []byte, out int) (int, error) {
+	// Small dynamic tables favor Go's overlap-aware match copier.
+	if d.litlenBits < inflateFastAMD64MinLitlenBits {
+		return d.decodeHuffmanGo(r, dst, out)
+	}
 	if len(r.src)-r.pos <= deflateFastInputMargin ||
 		len(dst)-out <= deflateFastOutputMargin {
 		return d.decodeHuffmanTail(r, dst, out)
@@ -32,7 +39,7 @@ func (d *goInflater) decodeHuffman(r *deflateBits, dst []byte, out int) (int, er
 	}
 
 	for {
-		inflateHuffmanFastArm64(&state)
+		inflateHuffmanFastAMD64(&state)
 		if state.status == inflateFastYield {
 			continue
 		}
@@ -50,7 +57,7 @@ func (d *goInflater) decodeHuffman(r *deflateBits, dst []byte, out int) (int, er
 		case inflateFastBadData:
 			return out, errDeflateBadData
 		default:
-			panic("invalid ARM64 inflate fast-loop status")
+			panic("invalid AMD64 inflate fast-loop status")
 		}
 	}
 }
