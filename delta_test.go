@@ -15,6 +15,7 @@ import (
 	"testing"
 	"unsafe"
 
+	"github.com/klauspost/compress/zlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/mmap"
@@ -821,13 +822,81 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	// Call with the WRONG base (different length) to trigger size mismatch.
 	wrongBase := []byte("short")
 	out := make([]byte, 0, 4096)
-	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out, false)
+	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out, defaultMaxDeltaObjectSize, false)
 	require.Error(t, err)
 
 	// After fix: the error message includes both sizes, not just "delta base size mismatch".
 	assert.Contains(t, err.Error(), "mismatch")
 	assert.Contains(t, err.Error(), fmt.Sprintf("header=%d", len(base)))
 	assert.Contains(t, err.Error(), fmt.Sprintf("actual=%d", len(wrongBase)))
+}
+
+func TestApplyDeltaStreaming_RejectsSizesBeforeAllocation(t *testing.T) {
+	base := []byte("a")
+	baseOID := calculateHash(ObjBlob, base)
+
+	openDelta := func(t *testing.T, payload []byte, declaredSize uint64) (*mmap.ReaderAt, ObjectType, int) {
+		t.Helper()
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjRefDelta), declaredSize))
+		obj.Write(baseOID[:])
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+		path := filepath.Join(t.TempDir(), "delta.obj")
+		require.NoError(t, os.WriteFile(path, obj.Bytes(), 0o644))
+		pack, err := mmap.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pack.Close()) })
+		typ, hdrLen, err := peekObjectType(pack, 0)
+		require.NoError(t, err)
+		return pack, typ, hdrLen
+	}
+
+	t.Run("payload exceeds limit", func(t *testing.T) {
+		pack, typ, hdrLen := openDelta(t, []byte{1, 1, 1, 'x'}, 9)
+		_, err := applyDeltaStreaming(pack, 0, typ, hdrLen, base, nil, 8, true)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("target exceeds limit", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, uint64(len(base)))
+		writeVarInt(&payload, 9)
+		pack, typ, hdrLen := openDelta(t, payload.Bytes(), uint64(payload.Len()))
+		_, err := applyDeltaStreaming(pack, 0, typ, hdrLen, base, nil, 8, true)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+}
+
+func TestApplyDeltaStreaming_RejectsOutputOverrun(t *testing.T) {
+	base := []byte("a")
+	baseOID := calculateHash(ObjBlob, base)
+	var payload bytes.Buffer
+	writeVarInt(&payload, 1)
+	writeVarInt(&payload, 1)
+	payload.Write([]byte{2, 'x', 'y'}) // Insert two bytes into a one-byte target.
+
+	var encoded bytes.Buffer
+	encoded.Write(encodeObjHeader(uint8(ObjRefDelta), uint64(payload.Len())))
+	encoded.Write(baseOID[:])
+	zw := zlib.NewWriter(&encoded)
+	_, err := zw.Write(payload.Bytes())
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	path := filepath.Join(t.TempDir(), "overrun.obj")
+	require.NoError(t, os.WriteFile(path, encoded.Bytes(), 0o644))
+	pack, err := mmap.Open(path)
+	require.NoError(t, err)
+	defer pack.Close()
+	typ, hdrLen, err := peekObjectType(pack, 0)
+	require.NoError(t, err)
+
+	require.NotPanics(t, func() {
+		_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, base, nil, 8, true)
+	})
+	require.ErrorContains(t, err, "exceeds delta target size")
 }
 
 // TestReadOfsDeltaOffset_PropagatesReadError verifies that readOfsDeltaOffset

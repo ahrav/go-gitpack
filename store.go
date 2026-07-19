@@ -855,7 +855,7 @@ func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
 	if !ok {
 		// Loose fallback: readLooseObject inflates into a fresh buffer, so
 		// it can be returned without copying.
-		full, typ, err := s.readLooseObject(oid)
+		full, typ, err := s.readLooseObjectLimited(oid, maxCommitPayload)
 		if err != nil {
 			return nil, err
 		}
