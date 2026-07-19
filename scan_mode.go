@@ -15,6 +15,7 @@ package objstore
 import (
 	"bytes"
 	"fmt"
+	"strings"
 )
 
 // ScanMode selects the high-level scanning strategy used by HistoryScanner.Scan.
@@ -118,19 +119,24 @@ func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
 			continue
 		}
 
-		var payload bytes.Buffer
-		for i, line := range hunk.lines {
-			if i > 0 {
-				payload.WriteByte('\n')
-			}
-			payload.WriteString(line)
-		}
-
 		meta := ScanMeta{
 			Commit: hunk.commit,
 			Path:   hunk.path,
 		}
-		if err := scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta); err != nil {
+		var err error
+		if hunk.isBinary && len(hunk.lines) == 1 {
+			err = scanner.ScanBlob(strings.NewReader(hunk.lines[0]), meta)
+		} else {
+			var payload bytes.Buffer
+			for i, line := range hunk.lines {
+				if i > 0 {
+					payload.WriteByte('\n')
+				}
+				payload.WriteString(line)
+			}
+			err = scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta)
+		}
+		if err != nil {
 			scanErr = fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
 				hunk.commit, hunk.path, hunk.startLine, hunk.endLine, err)
 		}
