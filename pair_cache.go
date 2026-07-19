@@ -15,8 +15,8 @@ import "sync"
 // pairCacheShards spreads pair lookups across independent locks.
 const pairCacheShards = 32
 
-// pairCacheBudget bounds retained hunk bytes (approximate, line lengths).
-const pairCacheBudget = 128 << 20
+// defaultPairCacheBudget bounds retained hunk bytes (approximate, line lengths).
+const defaultPairCacheBudget = 128 << 20
 
 // pairKey is the concatenation of the old and new blob OIDs.
 type pairKey [2 * hashSize]byte
@@ -41,11 +41,37 @@ type pairCache struct {
 }
 
 func newPairCache() *pairCache {
-	c := &pairCache{budgetPerShard: pairCacheBudget / pairCacheShards}
+	return newPairCacheWithBudget(defaultPairCacheBudget)
+}
+
+func newPairCacheWithBudget(budget int) *pairCache {
+	c := &pairCache{}
+	c.setBudget(budget)
 	for i := range c.shards {
 		c.shards[i].m = make(map[pairKey]pairCacheEntry, 128)
 	}
 	return c
+}
+
+func (c *pairCache) setBudget(budget int) {
+	if budget < 0 {
+		budget = 0
+	}
+	c.budgetPerShard = budget / pairCacheShards
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		if s.m != nil {
+			for key, v := range s.m {
+				if s.used <= c.budgetPerShard {
+					break
+				}
+				delete(s.m, key)
+				s.used -= v.size
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 func makePairKey(oldOID, newOID Hash) pairKey {
@@ -68,12 +94,15 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 }
 
 func (c *pairCache) add(k pairKey, hunks []AddedHunk) {
+	if c.budgetPerShard <= 0 {
+		return
+	}
 	size := 0
 	for i := range hunks {
 		for _, l := range hunks[i].Lines {
 			size += len(l)
 		}
-		size += 64 // struct + slice headers, approximate
+		size += 64 + len(hunks[i].Lines)*16 // struct + slice/string headers, approximate
 	}
 	if size > c.budgetPerShard/4 {
 		return // one giant diff must not evict a whole shard
