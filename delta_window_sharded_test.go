@@ -7,10 +7,10 @@
 package objstore
 
 import (
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -125,24 +125,14 @@ func TestEvictionDoesNotInfiniteLoop(t *testing.T) {
 		done <- w.add(makeHash("B"), make([]byte, 60), ObjBlob)
 	}()
 
+	// A generous wall-clock deadline: add() either returns ErrWindowFull
+	// promptly or is genuinely looping. The previous watchdog raced 200
+	// runtime.Gosched() yields against goroutine scheduling, which falsely
+	// fired on loaded CI runners before add() ever ran.
 	select {
 	case err := <-done:
 		assert.ErrorIs(t, err, ErrWindowFull, "should return ErrWindowFull, not loop forever")
-	case <-func() <-chan struct{} {
-		ch := make(chan struct{})
-		go func() {
-			t2 := make(chan struct{})
-			go func() {
-				for i := 0; i < 200; i++ {
-					runtime.Gosched()
-				}
-				close(t2)
-			}()
-			<-t2
-			close(ch)
-		}()
-		return ch
-	}():
+	case <-time.After(10 * time.Second):
 		t.Fatal("add() appears to be stuck in an infinite loop")
 	}
 }
