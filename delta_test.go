@@ -449,36 +449,40 @@ const (
 // TestDeltaArenaPooling verifies that the delta arena pool correctly manages
 // memory allocation and reuse across multiple delta operations.
 func TestDeltaArenaPooling(t *testing.T) {
-	t.Run("ArenaReuse", func(t *testing.T) {
-		// sync.Pool guarantees neither retention nor same-P delivery: a GC
-		// pair may clear the pool (victim cache survives only one cycle)
-		// and P migration can route Get to a different cache, so a single
-		// Put/Get round-trip observing a different pointer is legitimate
-		// behavior, not a pooling bug. Asserting one round-trip is flaky
-		// under -race on loaded CI runners. Instead require that reuse
-		// happens at least once across several attempts: a genuinely broken
-		// putDeltaArena (arenas never pooled) still fails every attempt,
-		// while scheduler/GC interference cannot plausibly defeat all of
-		// them.
-		const attempts = 20
-		reused := false
-		for range attempts {
-			arena1 := getDeltaArena()
-			baselinePtr := uintptr(unsafe.Pointer(&arena1.data[0]))
-			baselineCap := cap(arena1.data)
-			putDeltaArena(arena1)
+	t.Run("ArenaContract", func(t *testing.T) {
+		// sync.Pool explicitly disclaims any relation between values passed
+		// to Put and values returned by Get, so pointer-reuse assertions
+		// fail intermittently on correct code (GC pairs clear the pool, P
+		// migration routes Get elsewhere). Whether reuse actually happens
+		// is an allocation-rate property for a benchmark. What IS
+		// deterministic — and what callers rely on — is the get/put
+		// contract, which putDeltaArena mutates in place and can therefore
+		// be observed directly:
+		//
+		//   1. getDeltaArena returns a full-length arena of the standard
+		//      capacity, whether it came from New or the pool.
+		//   2. putDeltaArena restores len == cap before pooling, so a
+		//      shrunken arena can never resurface short.
+		//   3. putDeltaArena discards oversized arenas (early return, no
+		//      reset) instead of polluting the pool with them.
+		arena := getDeltaArena()
+		assert.Equal(t, defaultDeltaArenaSize, cap(arena.data), "standard arena capacity")
+		assert.Equal(t, cap(arena.data), len(arena.data), "arena must arrive full-length")
 
-			arena2 := getDeltaArena()
-			reusedPtr := uintptr(unsafe.Pointer(&arena2.data[0]))
-			assert.Equal(t, baselineCap, cap(arena2.data), "Arena capacity should remain the same")
-			putDeltaArena(arena2)
+		// Shrink, then return: the in-place reset is observable through
+		// our retained pointer regardless of pool internals.
+		arena.data = arena.data[:10]
+		putDeltaArena(arena)
+		assert.Equal(t, defaultDeltaArenaSize, len(arena.data),
+			"putDeltaArena must restore len == cap before pooling")
 
-			if reusedPtr == baselinePtr {
-				reused = true
-				break
-			}
-		}
-		assert.True(t, reused, "Arena was never reused from the pool across %d Put/Get cycles", attempts)
+		// Oversized arenas take the discard branch, which returns before
+		// the reset — the unchanged length proves they were not pooled.
+		oversized := &deltaArena{data: make([]byte, defaultDeltaArenaSize+1)}
+		oversized.data = oversized.data[:5]
+		putDeltaArena(oversized)
+		assert.Equal(t, 5, len(oversized.data),
+			"oversized arena must be discarded (no reset), not pooled")
 	})
 
 	t.Run("MultipleConcurrentArenas", func(t *testing.T) {
