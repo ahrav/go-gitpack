@@ -1,4 +1,4 @@
-//go:build amd64 && !purego && !gitpack_libdeflate
+//go:build amd64 && !purego && !(gitpack_libdeflate && cgo)
 
 #include "go_asm.h"
 #include "textflag.h"

@@ -6,8 +6,8 @@
 package objstore
 
 import (
-	"bufio"
 	"bytes"
+	"compress/zlib"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -20,35 +20,30 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
-// TestReadVarIntFromReader validates the Git-style variable-length integer
-// decoder, covering single-byte values, multi-byte continuation sequences,
-// and the empty-input error case.
-// NOTE: consider adding a "name" field to each test case for clearer subtest output.
-func TestReadVarIntFromReader(t *testing.T) {
+// TestDecodeVarInt validates the Git-style variable-length integer decoder,
+// covering single-byte values, multi-byte continuation sequences, the
+// empty-input case, and the 9-byte corruption bound.
+func TestDecodeVarInt(t *testing.T) {
 	tests := []struct {
-		data        []byte
-		expected    uint64
-		consumed    int
-		expectError bool
+		data     []byte
+		expected uint64
+		consumed int // 0 means truncated/over-long input was rejected
 	}{
-		{[]byte{0x00}, 0, 1, false},
-		{[]byte{0x7f}, 127, 1, false},
-		{[]byte{0x80, 0x01}, 128, 2, false},
-		{[]byte{0xff, 0x7f}, 16383, 2, false},
-		{[]byte{0x80, 0x80, 0x01}, 16384, 3, false},
-		{[]byte{}, 0, -1, true}, // empty buffer now returns error
+		{[]byte{0x00}, 0, 1},
+		{[]byte{0x7f}, 127, 1},
+		{[]byte{0x80, 0x01}, 128, 2},
+		{[]byte{0xff, 0x7f}, 16383, 2},
+		{[]byte{0x80, 0x80, 0x01}, 16384, 3},
+		{[]byte{}, 0, 0},     // empty buffer is rejected
+		{[]byte{0x80}, 0, 0}, // truncated continuation is rejected
+		{[]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}, 0, 0}, // >9 bytes rejected
 	}
 
 	for _, test := range tests {
-		reader := bufio.NewReader(bytes.NewReader(test.data))
-		value, consumed, err := readVarIntFromReader(reader)
-
-		if test.expectError {
-			assert.Error(t, err)
-		} else {
-			assert.NoError(t, err)
-			assert.Equal(t, test.expected, value)
-			assert.Equal(t, test.consumed, consumed)
+		value, consumed := decodeVarInt(test.data)
+		assert.Equal(t, test.consumed, consumed, "input %x", test.data)
+		if test.consumed > 0 {
+			assert.Equal(t, test.expected, value, "input %x", test.data)
 		}
 	}
 }
@@ -450,12 +445,10 @@ const (
 // memory allocation and reuse across multiple delta operations.
 func TestDeltaArenaPooling(t *testing.T) {
 	t.Run("ArenaContract", func(t *testing.T) {
-		// sync.Pool explicitly disclaims any relation between values passed
-		// to Put and values returned by Get, so pointer-reuse assertions
-		// fail intermittently on correct code; and once an arena has been
-		// handed to Put, another goroutine may retrieve and mutate it, so
-		// nothing may be inspected after ownership transfers. The
-		// deterministic, safely-observable surface is therefore:
+		// Once an arena has been returned to the process-wide free-list,
+		// another goroutine may retrieve and mutate it, so nothing may be
+		// inspected after ownership transfers. The deterministic,
+		// safely-observable surface is therefore:
 		//
 		//   1. getDeltaArena returns a full-length arena of the standard
 		//      capacity, whether it came from New or the pool.
@@ -465,8 +458,6 @@ func TestDeltaArenaPooling(t *testing.T) {
 		//      pool-eligible.
 		//   3. Oversized arenas are reported ineligible and left untouched.
 		//
-		// Whether pooled arenas are actually reused is an allocation-rate
-		// property for a benchmark.
 		arena := getDeltaArena()
 		assert.Equal(t, defaultDeltaArenaSize, cap(arena.data), "standard arena capacity")
 		assert.Equal(t, cap(arena.data), len(arena.data), "arena must arrive full-length")
@@ -475,7 +466,7 @@ func TestDeltaArenaPooling(t *testing.T) {
 		assert.True(t, prepareDeltaArenaForPool(arena), "standard arena must be pool-eligible")
 		assert.Equal(t, defaultDeltaArenaSize, len(arena.data),
 			"reset must restore len == cap before pooling")
-		deltaArenaPool.Put(arena) // return it; not inspected again
+		putDeltaArena(arena) // return it; not inspected again
 
 		oversized := &deltaArena{data: make([]byte, defaultDeltaArenaSize+1)}
 		oversized.data = oversized.data[:5]
@@ -738,7 +729,7 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 		pack, err := mmap.Open(path)
 		require.NoError(t, err)
 
-		typ, hdrLen, err := peekObjectType(pack, 0)
+		typ, _, err := peekObjectType(pack, 0)
 		require.NoError(t, err)
 		require.Equal(t, ObjRefDelta, typ)
 
@@ -747,7 +738,6 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 					pack:   pack,
 					offset: 0,
 					typ:    typ,
-					hdrLen: hdrLen,
 				},
 			}, func() {
 				require.NoError(t, pack.Close())
@@ -759,12 +749,12 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 	stackB, closeB := makeStack("b", targetB)
 	defer closeB()
 
-	first, typ, err := applyDeltaStack(stackA, base, ObjBlob, 0, true)
+	first, typ, err := applyDeltaStackCached(nil, stackA, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	require.Equal(t, ObjBlob, typ)
 	require.Equal(t, targetA, first)
 
-	second, typ, err := applyDeltaStack(stackB, base, ObjBlob, 0, true)
+	second, typ, err := applyDeltaStackCached(nil, stackB, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	require.Equal(t, ObjBlob, typ)
 	require.Equal(t, targetB, second)
@@ -790,20 +780,98 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	require.NoError(t, err)
 	defer pack.Close()
 
-	typ, hdrLen, err := peekObjectType(pack, 0)
+	typ, _, err := peekObjectType(pack, 0)
 	require.NoError(t, err)
 	require.Equal(t, ObjRefDelta, typ)
 
 	// Call with the WRONG base (different length) to trigger size mismatch.
 	wrongBase := []byte("short")
 	out := make([]byte, 0, 4096)
-	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out)
+	_, err = applyDeltaStreaming(pack, 0, typ, wrongBase, out, false, 0)
 	require.Error(t, err)
 
 	// After fix: the error message includes both sizes, not just "delta base size mismatch".
 	assert.Contains(t, err.Error(), "mismatch")
 	assert.Contains(t, err.Error(), fmt.Sprintf("header=%d", len(base)))
 	assert.Contains(t, err.Error(), fmt.Sprintf("actual=%d", len(wrongBase)))
+}
+
+func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
+	openPayload := func(t *testing.T, payload []byte, declaredSize uint64) (*mmap.ReaderAt, ObjectType) {
+		t.Helper()
+		if declaredSize == 0 {
+			declaredSize = uint64(len(payload))
+		}
+
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjRefDelta), declaredSize))
+		obj.Write(make([]byte, len(Hash{})))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		path := filepath.Join(t.TempDir(), "delta.packobj")
+		require.NoError(t, os.WriteFile(path, obj.Bytes(), 0o644))
+		pack, err := mmap.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pack.Close()) })
+		return pack, ObjRefDelta
+	}
+
+	t.Run("payload exceeds configured limit", func(t *testing.T) {
+		pack, typ := openPayload(t, nil, 1024)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("payload overhead above target limit is accepted", func(t *testing.T) {
+		// A literal-heavy delta for a target AT the limit necessarily has a
+		// payload LARGER than the limit (varints + insert command bytes).
+		// The payload bound must account for that overhead: rejecting on
+		// payload > maxObjectSize would fail valid deltas whose
+		// reconstructed target is within the documented bound.
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)  // base size
+		writeVarInt(&payload, 64) // target size == limit
+		payload.WriteByte(0x40)   // insert 64 literal bytes
+		payload.Write(bytes.Repeat([]byte{'x'}, 64))
+		require.Greater(t, payload.Len(), 64, "test premise: payload exceeds the target limit")
+
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		out, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.NoError(t, err)
+		require.Equal(t, bytes.Repeat([]byte{'x'}, 64), out)
+	})
+
+	t.Run("target exceeds configured limit", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 65)
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("copy exceeds declared target", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 2)
+		writeVarInt(&payload, 1)
+		payload.Write([]byte{0x90, 0x02}) // Copy two bytes into a one-byte target.
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, []byte("ab"), nil, true, 64)
+		require.ErrorContains(t, err, "exceeds declared target")
+	})
+
+	t.Run("insert exceeds declared target", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 1)
+		payload.Write([]byte{0x02, 'a', 'b'})
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorContains(t, err, "exceeds declared target")
+	})
 }
 
 // TestReadOfsDeltaOffset_PropagatesReadError verifies that readOfsDeltaOffset
@@ -907,13 +975,13 @@ func TestApplyDeltaStack_BorrowedVsCopy(t *testing.T) {
 
 	// For empty stack, borrowed=true returns baseData directly (no arena).
 	base := []byte("hello world")
-	result, typ, err := applyDeltaStack(nil, base, ObjBlob, 0, true)
+	result, typ, err := applyDeltaStackCached(nil, nil, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, base, result)
 
 	// For empty stack, borrowed=false returns a COPY.
-	result2, _, err := applyDeltaStack(nil, base, ObjBlob, 0, false)
+	result2, _, err := applyDeltaStackCached(nil, nil, base, ObjBlob, 0, false)
 	require.NoError(t, err)
 	// Modify original; copy should be independent.
 	base[0] = 'H'
@@ -926,11 +994,11 @@ func TestDeltaArenaOverflowProtection(t *testing.T) {
 	maxObj := uint64(512 << 20)
 	base := []byte("base")
 
-	_, _, err := applyDeltaStack(nil, base, ObjBlob, maxObj, false)
+	_, _, err := applyDeltaStackCached(nil, nil, base, ObjBlob, maxObj, false)
 	assert.NoError(t, err, "empty stack with maxObjectSize should succeed")
 
 	hugeBase := make([]byte, 1)
-	_, _, err = applyDeltaStack(nil, hugeBase, ObjBlob, 0, false)
+	_, _, err = applyDeltaStackCached(nil, nil, hugeBase, ObjBlob, 0, false)
 	assert.NoError(t, err, "empty stack should always succeed regardless of base size")
 }
 

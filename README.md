@@ -35,3 +35,14 @@ if err := scanner.Scan(nil, &myScanner{}); err != nil {
 }
 ```
 
+## Memory characteristics
+
+- **Per-scanner offset cache** — each `HistoryScanner` keeps a cache of
+  materialized pack objects (default budget 256 MiB) that accelerates
+  delta-chain resolution. Processes that open many repositories concurrently
+  should lower it with `objstore.WithOffsetCacheBudget(bytes)`; a budget
+  `<= 0` disables the cache. The memory is released on `Close`.
+- **Process-global delta arenas** — delta resolution reuses 32 MiB scratch
+  arenas from a bounded free-list sized from `GOMAXPROCS` (at most 8 arenas,
+  256 MiB). The reserve is retained for the process lifetime after peak
+  concurrency; bounding scan concurrency bounds it proportionally.

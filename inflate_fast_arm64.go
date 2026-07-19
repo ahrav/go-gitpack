@@ -1,10 +1,8 @@
-//go:build arm64 && !purego && !gitpack_libdeflate
+//go:build arm64 && !purego && !(gitpack_libdeflate && cgo)
 
 package objstore
 
 import "unsafe"
-
-const inflateFastAsmEnabled = true
 
 //go:noescape
 func inflateHuffmanFastArm64(state *inflateFastState)

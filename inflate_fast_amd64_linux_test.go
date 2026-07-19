@@ -1,4 +1,4 @@
-//go:build amd64 && linux && !purego && !gitpack_libdeflate
+//go:build amd64 && linux && !purego && !(gitpack_libdeflate && cgo)
 
 package objstore
 

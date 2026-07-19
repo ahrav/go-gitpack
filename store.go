@@ -173,6 +173,12 @@ type store struct {
 	// Objects likely to be delta bases are kept here for fast access.
 	dw deltaWindow
 
+	// offCache caches materialized objects by (pack, offset) so that
+	// delta-chain walk-up can short-circuit at any previously resolved
+	// intermediate hop. See offset_cache.go for why OID-keyed caches
+	// cannot intercept ofs-delta hops.
+	offCache *offsetCache
+
 	// maxDeltaDepth limits delta chain traversal depth.
 	// The default value is 100 (see defaultMaxDeltaDepth).
 	maxDeltaDepth int
@@ -225,6 +231,7 @@ func open(dir string) (*store, error) {
 			objectsDir:         objectsDir,
 			packMap:            make(map[string]*mmap.ReaderAt),
 			dw:                 newShardedDeltaWindow(64, windowBudget),
+			offCache:           newOffsetCache(),
 		}
 
 		const defaultCacheSize = 1 << 14 // 16K entries, approximately 96MiB.
@@ -276,6 +283,7 @@ func open(dir string) (*store, error) {
 		objectsDir:         objectsDir,
 		packMap:            packCache,
 		dw:                 newShardedDeltaWindow(64, windowBudget),
+		offCache:           newOffsetCache(),
 	}
 
 	const defaultCacheSize = 1 << 14 // 16K entries, approximately 96MiB.
@@ -370,6 +378,12 @@ func (s *store) Close() error {
 			}
 		}
 	}
+
+	// Release cached object bytes eagerly. Callers may retain the store
+	// value after Close; without this, up to the full offset-cache budget
+	// of materialized objects would stay reachable until the store itself
+	// becomes unreachable.
+	s.offCache.clear()
 	return firstErr
 }
 
@@ -406,8 +420,25 @@ func (s *store) treeIter(oid Hash) (*TreeIter, error) {
 // modify the returned data. If mutation is needed, the caller must copy first.
 // get is safe for concurrent use.
 func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
-	// Fast path: check the delta window, which holds recently materialized objects
-	// that are likely to be bases for upcoming delta resolutions.
+	// Fast path: resolve the OID to its pack offset (lock-free binary
+	// search over mmap'd indexes) and consult the offset cache first.
+	// During bulk scans nearly every repeated read hits here, skipping
+	// the mutex acquisitions of the delta window and ARC cache.
+	p, off, inPack := s.findPackedObject(oid)
+	if inPack {
+		if data, typ, ok := s.offCache.get(p, off); ok {
+			return data, typ, nil
+		}
+	}
+
+	// OID-keyed caches: the primary path for loose objects, and the
+	// fallback for pack-resident objects whenever the offset cache misses
+	// (disabled via WithOffsetCacheBudget, entry evicted, or first read).
+	// On the hot path an offset-cache hit above returns without paying
+	// these two mutex acquisitions; on a miss the probes are noise next
+	// to the inflation they can avoid — without them, repeated reads of a
+	// packed object would re-inflate every time in memory-constrained
+	// configurations even though inflation populates the delta window.
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
 		// Promote to ARC cache on second access (delta window hit).
@@ -417,17 +448,21 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 		b.Release()
 		return d, t, nil
 	}
-
-	// If not in the delta window, check the larger ARC cache.
 	if b, ok := s.cache.Get(oid); ok {
 		return b.data, b.typ, nil
 	}
 
-	// On a cache miss, inflate the object from a packfile, tracking delta depth
-	// to prevent cycles and excessive recursion. Skip cache checks since we
-	// already verified both caches above.
 	ctx := getDeltaContext(s.maxDeltaDepth)
 	defer putDeltaContext(ctx)
+	if inPack {
+		return s.inflateFromPack(inflationParams{
+			p:             p,
+			off:           off,
+			oid:           oid,
+			ctx:           ctx,
+			maxObjectSize: s.maxDeltaObjectSize,
+		})
+	}
 	return s.getWithContextSkipCache(oid, ctx)
 }
 
@@ -673,6 +708,11 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 	if cacheResult && len(data) <= maxCacheableSize {
 		s.dw.add(params.oid, data, objType)
 	}
+	if cacheResult {
+		// Also publish under the pack offset so get()'s lock-free fast path
+		// and delta-chain walk-ups can find it.
+		s.offCache.add(params.p, params.off, data, objType)
+	}
 	return data, objType, nil
 }
 
@@ -682,9 +722,12 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 // findPackedObject returns the pack handle, byte offset, and true if found.
 func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 	if s.memoryMidx != nil {
-		if p, off, ok := s.memoryMidx.findObject(oid); ok {
-			return p, off, true
-		}
+		// The merged index is built from the same oidTable/entries the
+		// per-pack searches consult, so a miss here is authoritative.
+		// Falling through would repeat the identical lookup once per pack
+		// — a guaranteed-miss O(packs · log n) scan that get() would pay
+		// on every read of a loose object before probing its caches.
+		return s.memoryMidx.findObject(oid)
 	}
 	for _, pf := range s.packs {
 		if off, ok := pf.findObject(oid); ok {
@@ -720,11 +763,15 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		off += uint64(hdrLen)
 
 		// Decompress only the beginning of the object, typically less than 512 bytes.
-		zr, err := getZlibReader(io.NewSectionReader(p, int64(off), 1<<63-1))
+		// openCommitHeaderStream is platform-abstracted: zero-copy over the
+		// mapped bytes on mmap-backed platforms, SectionReader-based zlib on
+		// the ReaderAt fallback build.
+		defer runtime.KeepAlive(p)
+		zr, release, err := openCommitHeaderStream(p, int64(off))
 		if err != nil {
 			return nil, err
 		}
-		defer putZlibReader(zr)
+		defer release()
 
 		return readCommitHeaderFromStream(zr)
 	}
