@@ -10,11 +10,14 @@
 //     oracle on random line sequences;
 //   - repository-level oracle and determinism tests: a dead-simple serial
 //     reference implementation (ordered walk + plain map) must produce the
-//     same emission multiset as the four-stage parallel pipeline, the
-//     multiset must be stable across runs, scanners, and GOMAXPROCS
-//     (imitating commit_walk_determinism_test.go), the dedup-off path must
-//     be unaffected, and the pipeline must survive a whale commit without
-//     deadlocking and abandon cleanly (no goroutine leaks) when fn errors.
+//     same emission multiset as the four-stage parallel pipeline — on both
+//     the small fixture and a whale fixture that stresses the reorder
+//     buffer and reuses every slot of the dispatch ring — the multiset
+//     must be stable across runs, scanners, and GOMAXPROCS (imitating
+//     commit_walk_determinism_test.go), every dedup emission must appear
+//     verbatim in the streaming scan (hunks are removed whole, never
+//     split), the dedup-off path must be unaffected, and the pipeline must
+//     abandon cleanly (no goroutine leaks) when fn errors.
 
 package objstore
 
@@ -798,7 +801,9 @@ func buildDedupWhaleRepo(t *testing.T) string {
 
 	var small strings.Builder
 	small.WriteString("seed\n")
-	for i := range 320 { // > dedupLookaheadCommits: forces slot-ring reuse
+	// > 2*dedupLookaheadCommits total commits: every one of the 256 ring
+	// slots is reused at least once, not just the low indices.
+	for i := range 520 {
 		fmt.Fprintf(&small, "small line %d\n", i)
 		b.write("small.txt", small.String())
 		b.commit(fmt.Sprintf("small %d", i))
@@ -808,8 +813,11 @@ func buildDedupWhaleRepo(t *testing.T) string {
 }
 
 // TestDiffHistoryHunksDedup_WhaleStress runs the dedup scan over the whale
-// fixture under a hard timeout: the pipeline must complete (no deadlock)
-// and emit hunks.
+// fixture under a hard timeout and checks its output against the serial
+// reference. Completion alone would only prove liveness; the equality check
+// makes the reorder buffer, seq stamping, and slot-ring reuse — the pieces
+// this fixture stresses with skewed pair-completion times — accountable for
+// producing the correct multiset, not just any multiset.
 func TestDiffHistoryHunksDedup_WhaleStress(t *testing.T) {
 	gitDir := buildDedupWhaleRepo(t)
 
@@ -818,14 +826,17 @@ func TestDiffHistoryHunksDedup_WhaleStress(t *testing.T) {
 	defer s.Close()
 
 	var (
-		count   atomic.Int64
+		mu      sync.Mutex
+		got     []string
 		scanErr error
 	)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		scanErr = s.DiffHistoryHunksFunc(func(h HunkAddition) error {
-			count.Add(1)
+			mu.Lock()
+			got = append(got, canonicalHunkAddition(h))
+			mu.Unlock()
 			return nil
 		})
 	}()
@@ -836,7 +847,37 @@ func TestDiffHistoryHunksDedup_WhaleStress(t *testing.T) {
 		t.Fatal("dedup scan did not complete within timeout (possible pipeline deadlock)")
 	}
 	require.NoError(t, scanErr)
-	require.Positive(t, count.Load())
+	sort.Strings(got)
+	require.NotEmpty(t, got)
+
+	require.Equal(t, serialDedupReference(t, gitDir, false, nil), got,
+		"parallel pipeline diverged from the serial reference under reorder stress")
+}
+
+// TestDiffHistoryHunksDedup_StreamingContainment asserts every dedup
+// emission appears verbatim in the streaming (non-dedup) scan's multiset.
+// Unlike the serial-oracle test — whose reference shares emitCommitBlobPairs
+// and streamBlobPairHunks with the pipeline under test — the streaming scan
+// enumerates commits through walkCommitsFromRefs, so this catches commit-set
+// drift between the two pipelines' commit sources as well as any hunk that
+// dedup split, truncated, or otherwise modified in flight. Dedup may only
+// ever remove whole emissions.
+func TestDiffHistoryHunksDedup_StreamingContainment(t *testing.T) {
+	gitDir := buildDedupOracleRepo(t)
+
+	streaming := collectHunkScan(t, gitDir)
+	dedup := collectHunkScan(t, gitDir, WithHunkLineDedup(true))
+	require.NotEmpty(t, dedup)
+
+	remaining := make(map[string]int, len(streaming))
+	for _, e := range streaming {
+		remaining[e]++
+	}
+	for _, e := range dedup {
+		require.Positivef(t, remaining[e],
+			"dedup emitted a hunk absent from (or more often than) the streaming scan: %s", e)
+		remaining[e]--
+	}
 }
 
 // TestDiffHistoryHunksDedup_ErrorStopsPromptlyNoLeak asserts that an fn
