@@ -15,12 +15,24 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// gitTestCommand disables detached maintenance while a fixture is being built.
+// Fixtures perform explicit repacks once their object graph is complete.
+func gitTestCommand(repoDir string, args ...string) *exec.Cmd {
+	gitArgs := []string{
+		"-c", "maintenance.auto=false",
+		"-c", "gc.auto=0",
+		"-C", repoDir,
+	}
+	return exec.Command("git", append(gitArgs, args...)...)
+}
 
 // createTempFileWithData creates a temporary file with the given data.
 func createTempFileWithData(t *testing.T, data []byte) string {

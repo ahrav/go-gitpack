@@ -48,7 +48,7 @@ func buildDeltaHeavyRepo(t *testing.T) (repoDir, packDir string) {
 	repoDir = t.TempDir()
 	git := func(args ...string) {
 		t.Helper()
-		cmd := exec.Command("git", append([]string{"-C", repoDir}, args...)...)
+		cmd := gitTestCommand(repoDir, args...)
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
