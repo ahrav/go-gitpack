@@ -26,24 +26,8 @@ func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
 	if pos < 0 || pos > int64(len(data)) {
 		return io.ErrUnexpectedEOF
 	}
-	if libdeflateAvailable {
-		_, err := inflateZlibOneShot(data[pos:], dst)
-		return err
-	}
-
-	zr, br, err := getZlibReaderAt(data, pos)
-	if err != nil {
-		return err
-	}
-	defer putBytesReader(br)
-	defer putFlateReader(zr)
-
-	if _, err = io.ReadFull(zr, dst); err != nil {
-		return err
-	}
-	// Reject streams that do not terminate at the declared object size;
-	// ReadFull succeeding proves only that enough bytes were produced.
-	return ensureZlibStreamEnd(zr)
+	_, err := inflateZlibOneShot(data[pos:], dst)
+	return err
 }
 
 // getZlibReaderAt opens the *deflate* payload of a zlib stream positioned at
