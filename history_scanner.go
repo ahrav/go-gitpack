@@ -482,17 +482,55 @@ type blobPairWork struct {
 // to blob diffing, so this stage keeps the expensive stage-2 workers supplied
 // with fine-grained work even when one commit touches thousands of files.
 func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- blobPairWork, stopCh <-chan struct{}) error {
-	return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
-		if !isBlobMode(mode) {
-			return nil
-		}
+	emit := func(work blobPairWork) error {
 		select {
 		case <-stopCh:
 			return errScanAborted
-		case blobs <- blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH}:
+		case blobs <- work:
 			return nil
 		}
+	}
+
+	var (
+		adds         []blobPairWork
+		deletesByOID map[Hash]int
+	)
+	err := walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		if !isBlobMode(mode) {
+			return nil
+		}
+		if old == newH {
+			return nil
+		}
+		work := blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH}
+		switch {
+		case newH.IsZero():
+			if deletesByOID == nil {
+				deletesByOID = make(map[Hash]int, 4)
+			}
+			deletesByOID[old]++
+			return nil
+		case old.IsZero():
+			adds = append(adds, work)
+			return nil
+		default:
+			return emit(work)
+		}
 	})
+	if err != nil {
+		return err
+	}
+
+	for i := range adds {
+		if n := deletesByOID[adds[i].newOID]; n > 0 {
+			deletesByOID[adds[i].newOID] = n - 1
+			continue // exact-OID rename: content-addressed bytes are unchanged.
+		}
+		if err := emit(adds[i]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // streamBlobPairHunks computes the added hunks for one changed file and
