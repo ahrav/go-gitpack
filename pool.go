@@ -19,14 +19,10 @@ package objstore
 
 import (
 	"bufio"
-	"bytes"
-	"fmt"
 	"io"
 	"sync"
 
-	"github.com/klauspost/compress/flate"
 	"github.com/klauspost/compress/zlib"
-	"golang.org/x/exp/mmap"
 )
 
 // zrPool reuses zlib.Reader instances to reduce allocations.
@@ -42,68 +38,6 @@ var zrPool = sync.Pool{New: func() any { return nil }}
 // for every delta operation. With ~800k delta hops, this saves ~3.3 GiB.
 var brPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, 8<<10) }, // 8 KiB buf once
-}
-
-// flatePool recycles flate decompressor state (~40 KiB of Huffman tables and
-// window per instance). Unlike zlib.Reader, flate.NewReader can construct a
-// valid instance without source bytes, so New can populate the pool directly.
-var flatePool = sync.Pool{
-	New: func() any { return flate.NewReader(nil) },
-}
-
-// getZlibReaderAt opens the *deflate* payload of a zlib stream positioned at
-// pos inside the memory-mapped pack.
-//
-// Two deliberate deviations from a stock zlib reader:
-//
-//  1. Zero-copy source: the compressed stream is presented as a pooled
-//     *bytes.Reader aliasing the mapped pages directly. klauspost/flate
-//     detects *bytes.Reader sources and switches to a specialized decode
-//     loop that consumes the slice without intermediate buffering.
-//
-//  2. No adler32: the 2-byte zlib header is validated here and the raw
-//     deflate stream is handed to a pooled flate reader, skipping zlib's
-//     adler32 accumulation over every decompressed byte (~4% of scan CPU)
-//     and the trailing checksum comparison. Pack integrity is instead
-//     covered by the optional CRC-32 verification against the pack index
-//     (store.VerifyCRC), which checks the *compressed* bytes and therefore
-//     subsumes what adler32 would catch.
-//
-// Callers must release both returned values: first putFlateReader(zr), then
-// putBytesReader(br). The returned readers alias mmap'd memory and must not
-// be used after the store is closed.
-func getZlibReaderAt(pack *mmap.ReaderAt, pos int64) (io.ReadCloser, *bytes.Reader, error) {
-	data := mmapData(pack)
-	if pos < 0 || pos+2 > int64(len(data)) {
-		return nil, nil, io.ErrUnexpectedEOF
-	}
-
-	// Validate the 2-byte zlib header (RFC 1950): CM must be 8 (deflate),
-	// FDICT must be clear (Git never uses preset dictionaries), and the
-	// header checksum must hold. Reject anything else so corrupt offsets
-	// fail loudly instead of producing garbage.
-	cmf, flg := data[pos], data[pos+1]
-	if cmf&0x0f != 8 || flg&0x20 != 0 || (uint16(cmf)<<8|uint16(flg))%31 != 0 {
-		return nil, nil, fmt.Errorf("invalid zlib header at pack offset %d", pos)
-	}
-
-	br := getBytesReader(data[pos+2:])
-	fr := flatePool.Get().(io.ReadCloser)
-	if err := fr.(flate.Resetter).Reset(br, nil); err != nil {
-		flatePool.Put(fr)
-		putBytesReader(br)
-		return nil, nil, err
-	}
-	return fr, br, nil
-}
-
-// putFlateReader returns a flate reader obtained from getZlibReaderAt to its
-// pool. It must never be passed a reader from getZlibReader / the zlib pool;
-// the two pools hold different concrete types and mixing them would corrupt
-// stream decoding.
-func putFlateReader(fr io.ReadCloser) {
-	_ = fr.Close()
-	flatePool.Put(fr)
 }
 
 // getZlibReader obtains a zlib.Reader from the pool or creates a new one.

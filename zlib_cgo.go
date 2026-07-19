@@ -27,7 +27,7 @@ import "C"
 
 import (
 	"errors"
-	"sync"
+	"runtime"
 	"unsafe"
 )
 
@@ -36,14 +36,26 @@ const libdeflateAvailable = true
 
 var errLibdeflateBadData = errors.New("libdeflate: corrupt zlib stream")
 
-// decompressorPool recycles libdeflate decompressor state (~32 KiB each).
-// Allocation is malloc-backed and must be freed with the matching libdeflate
-// call, so the pool never discards entries to the GC; the process exits with
-// at most NumCPU retained decompressors.
-var decompressorPool = sync.Pool{
-	New: func() any {
+// decompressorPool bounds retained native allocations. Unlike sync.Pool, a
+// channel never discards C pointers during GC without giving us a chance to
+// release them.
+var decompressorPool = make(chan unsafe.Pointer, runtime.GOMAXPROCS(0))
+
+func getLibdeflateDecompressor() unsafe.Pointer {
+	select {
+	case d := <-decompressorPool:
+		return d
+	default:
 		return unsafe.Pointer(C.libdeflate_alloc_decompressor())
-	},
+	}
+}
+
+func putLibdeflateDecompressor(d unsafe.Pointer) {
+	select {
+	case decompressorPool <- d:
+	default:
+		C.libdeflate_free_decompressor((*C.struct_libdeflate_decompressor)(d))
+	}
 }
 
 // inflateZlibOneShot decompresses the zlib stream at the beginning of src
@@ -52,23 +64,31 @@ var decompressorPool = sync.Pool{
 //
 // The src slice may alias mmap'd pack memory; libdeflate only reads it.
 func inflateZlibOneShot(src []byte, dst []byte) (int, error) {
-	if len(dst) == 0 {
-		// Zero-length objects still carry a valid zlib wrapper; accept and
-		// report zero consumption — callers only need the payload.
-		return 0, nil
-	}
 	if len(src) == 0 {
 		return 0, errLibdeflateBadData
 	}
 
-	d := decompressorPool.Get().(unsafe.Pointer)
-	defer decompressorPool.Put(d)
+	d := getLibdeflateDecompressor()
+	if d == nil {
+		return 0, errors.New("libdeflate: decompressor allocation failed")
+	}
+	defer putLibdeflateDecompressor(d)
+
+	var out unsafe.Pointer
+	if len(dst) == 0 {
+		// libdeflate still validates the complete zlib stream when the expected
+		// output is empty; use a non-nil pointer with a zero-sized output buffer.
+		var empty byte
+		out = unsafe.Pointer(&empty)
+	} else {
+		out = unsafe.Pointer(&dst[0])
+	}
 
 	var inConsumed, outProduced C.size_t
 	res := C.libdeflate_zlib_decompress_ex(
 		(*C.struct_libdeflate_decompressor)(d),
 		unsafe.Pointer(&src[0]), C.size_t(len(src)),
-		unsafe.Pointer(&dst[0]), C.size_t(len(dst)),
+		out, C.size_t(len(dst)),
 		&inConsumed, &outProduced,
 	)
 	if res != C.LIBDEFLATE_SUCCESS || int(outProduced) != len(dst) {

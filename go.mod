@@ -26,5 +26,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
 
-// Local fork branch: go-gitpack-autoresearch.
-replace github.com/klauspost/compress => ../klauspost-compress
+// Pinned fork containing the bytes.Reader flate fast path.
+replace github.com/klauspost/compress => github.com/ahrav/compress v0.0.0-20260708010904-f4b8e874a3f0

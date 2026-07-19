@@ -125,34 +125,3 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	}
 	return objType, out, nil
 }
-
-// inflateExact decompresses the zlib stream at pos in the mapped pack into
-// dst, whose length must equal the object's decompressed size (known from
-// the pack object header).
-//
-// When the libdeflate backend is compiled in (build tag gitpack_libdeflate),
-// the whole stream is decoded in one call — the exact-size contract lets
-// libdeflate skip all streaming state, which is ~2x faster than any
-// streaming inflater. Otherwise the pooled flate-reader path is used. The
-// compressed length is unknown up front in both cases; libdeflate stops at
-// the stream's own EOB marker and the flate reader at its EOF marker.
-func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
-	if libdeflateAvailable {
-		data := mmapData(r)
-		if pos < 0 || pos > int64(len(data)) {
-			return io.ErrUnexpectedEOF
-		}
-		_, err := inflateZlibOneShot(data[pos:], dst)
-		return err
-	}
-
-	zr, br, err := getZlibReaderAt(r, pos)
-	if err != nil {
-		return err
-	}
-	defer putBytesReader(br)
-	defer putFlateReader(zr)
-
-	_, err = io.ReadFull(zr, dst)
-	return err
-}
