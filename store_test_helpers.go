@@ -8,10 +8,10 @@ package objstore
 
 import (
 	"bytes"
-	"github.com/klauspost/compress/zlib"
 	"crypto/sha1"
 	"encoding/binary"
 	"fmt"
+	"github.com/klauspost/compress/zlib"
 	"hash/crc32"
 	"io"
 	"os"
