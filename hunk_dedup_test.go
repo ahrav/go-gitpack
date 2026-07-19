@@ -116,6 +116,42 @@ func TestLineFingerprintSet_DeterministicVerdicts(t *testing.T) {
 	require.Equal(t, verdicts(), verdicts(), "verdicts must be a pure function of the insert sequence")
 }
 
+// TestLineFingerprintSet_HasProbesWithoutInserting verifies has is a pure
+// probe — it never inserts — and that it shares markNew's zero-fingerprint
+// remap, so the two views of the set always agree on membership.
+func TestLineFingerprintSet_HasProbesWithoutInserting(t *testing.T) {
+	set := newLineFingerprintSet(8)
+
+	require.False(t, set.has(5), "empty set must not contain 5")
+	require.False(t, set.has(5), "a has probe must not insert")
+	require.True(t, set.markNew(5), "5 must still be new after has probes")
+	require.True(t, set.has(5), "5 must be present after markNew")
+
+	require.False(t, set.has(0), "empty set must not contain the zero fingerprint")
+	require.True(t, set.markNew(0))
+	require.True(t, set.has(0), "zero fingerprint must be found via the remap")
+	require.True(t, set.has(dedupZeroFingerprint),
+		"substitute constant aliases the remapped zero, mirroring markNew")
+}
+
+// TestLineFingerprintSet_HasFailOpenAfterSaturation verifies the saturated
+// set's two views stay consistent in the fail-open direction: has reports
+// false even for fingerprints that were inserted before saturation. A
+// regression flipping this to true would make dedupHunkEmission suppress
+// every hunk forever after saturation — fail-closed data loss, the exact
+// disaster the design avoids.
+func TestLineFingerprintSet_HasFailOpenAfterSaturation(t *testing.T) {
+	set := newLineFingerprintSet(4) // 16 slots => saturates after 11 inserts
+	limit := 16 * 7 / 10
+	for i := range limit {
+		require.True(t, set.markNew(uint64(i+1)))
+	}
+	require.True(t, set.saturated)
+
+	require.False(t, set.has(1), "inserted fingerprint must probe as absent after saturation")
+	require.False(t, set.has(uint64(limit+100)), "unseen fingerprint must probe as absent after saturation")
+}
+
 // --- dedupHunkEmission ---
 
 // mkTestHunk builds a text HunkAddition with the package's endLine
@@ -240,6 +276,44 @@ func TestDedupHunkEmission_BinaryPassthrough(t *testing.T) {
 		require.Truef(t, dedupHunkEmission(bin, set),
 			"pass %d: binary hunk must never be suppressed", pass)
 	}
+}
+
+// TestDedupHunkEmission_SaturationFailOpen drives the verdict function
+// itself across the saturation boundary. Post-saturation correctness is a
+// conjunction — has must report absent AND markNew must report new — and
+// the verdict is where the two meet: before saturation an all-seen hunk is
+// suppressed; after saturation the identical hunk must survive.
+func TestDedupHunkEmission_SaturationFailOpen(t *testing.T) {
+	set := newLineFingerprintSet(4) // 16 slots => saturates after 11 inserts
+
+	first := mkTestHunk(1, "s1", "s2", "s3", "s4", "s5", "s6")
+	require.True(t, dedupHunkEmission(first, set), "six fresh lines must emit")
+	require.False(t, set.saturated, "6 of 11 inserts must not saturate")
+	require.False(t, dedupHunkEmission(first, set),
+		"below saturation the duplicate hunk is suppressed")
+
+	saturating := mkTestHunk(10, "t1", "t2", "t3", "t4", "t5")
+	require.True(t, dedupHunkEmission(saturating, set), "five more fresh lines must emit")
+	require.True(t, set.saturated, "11th insert must saturate the set")
+
+	require.True(t, dedupHunkEmission(first, set),
+		"after saturation the previously suppressed hunk must fail open and emit")
+	require.True(t, dedupHunkEmission(first, set),
+		"fail-open verdicts must hold on every subsequent call")
+}
+
+// TestDedupHunkEmission_EmptyLines pins the degenerate case: a non-binary
+// hunk with no lines has no first introduction to report, so it is
+// suppressed (anyNew never becomes true) and leaves the set untouched.
+// computeAddedHunks never emits an empty text hunk, so this documents
+// defensive behavior rather than a reachable pipeline state.
+func TestDedupHunkEmission_EmptyLines(t *testing.T) {
+	set := newLineFingerprintSet(8)
+	empty := HunkAddition{commit: Hash{0x01}, path: "f.txt", startLine: 1, endLine: 1}
+
+	require.False(t, dedupHunkEmission(empty, set), "an empty hunk has nothing new to emit")
+	require.True(t, dedupHunkEmission(mkTestHunk(1, "later"), set),
+		"the empty hunk must not have marked or saturated anything")
 }
 
 // oracleWholeHunkVerdict is the trivial reference for the whole-hunk dedup
