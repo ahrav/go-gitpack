@@ -19,6 +19,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/klauspost/compress/zlib"
 	"github.com/stretchr/testify/require"
 )
 
@@ -188,17 +189,22 @@ func TestReadCommitPayload_DifferentialAgainstGit(t *testing.T) {
 // non-commit object (a blob) fails with ErrObjectNotCommit rather than
 // returning payload bytes.
 func TestReadCommitPayload_NotACommit(t *testing.T) {
-	repoDir, packDir := buildCommitShapesRepo(t)
+	objectsDir := t.TempDir()
+	body := []byte("not a commit")
+	blobOID := calculateHash(ObjBlob, body)
+	path := looseObjectPath(objectsDir, blobOID)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 
-	out, err := exec.Command("git", "-C", repoDir, "rev-parse", "HEAD:f.txt").Output()
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, err := fmt.Fprintf(zw, "blob %d\x00", len(body))
 	require.NoError(t, err)
-	blobOID, err := ParseHash(strings.TrimSpace(string(out)))
+	_, err = zw.Write(body)
 	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, os.WriteFile(path, compressed.Bytes(), 0o644))
 
-	st, err := OpenForTesting(packDir)
-	require.NoError(t, err)
-	defer st.Close()
-
+	st := &store{objectsDir: objectsDir}
 	_, err = st.readCommitPayload(blobOID)
 	require.ErrorIs(t, err, ErrObjectNotCommit)
 }
