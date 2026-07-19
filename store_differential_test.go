@@ -52,6 +52,8 @@ func buildDeltaHeavyRepo(t *testing.T) (repoDir, packDir string) {
 		cmd.Env = append(os.Environ(),
 			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
 			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
+			"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
+			"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
 		)
 		out, err := cmd.CombinedOutput()
 		require.NoErrorf(t, err, "git %s: %s", strings.Join(args, " "), out)
@@ -98,7 +100,7 @@ func buildDeltaHeavyRepo(t *testing.T) (repoDir, packDir string) {
 	// Force everything into a single pack with deep delta chains. -f discards
 	// existing deltas and recomputes them; the large window/depth maximizes
 	// chain length so the walk-up, ping-pong, and offset-cache paths all run.
-	git("repack", "-a", "-d", "-f", "--window=250", "--depth=50")
+	git("repack", "-a", "-d", "-f", "--window=250", "--depth=50", "--threads=1")
 
 	packDir = filepath.Join(repoDir, ".git", "objects", "pack")
 	return repoDir, packDir
@@ -209,8 +211,14 @@ func requireHasDeltas(t *testing.T, packDir string) {
 	out, err := exec.Command("git", "verify-pack", "-v", idxs[0]).Output()
 	require.NoError(t, err)
 
-	// Histogram lines look like: "chain length = 2: 3 objects".
-	totalDeltas, maxChain := 0, 0
+	totalDeltas, maxChain := parseVerifyPackDeltaStats(out)
+	require.Positive(t, totalDeltas, "repacked pack contains no delta objects")
+	t.Logf("pack contains %d delta objects, deepest chain = %d hops", totalDeltas, maxChain)
+}
+
+// parseVerifyPackDeltaStats extracts Git's chain-length histogram. Git uses
+// "object" for a count of one and "objects" otherwise.
+func parseVerifyPackDeltaStats(out []byte) (totalDeltas, maxChain int) {
 	sc := bufio.NewScanner(bytes.NewReader(out))
 	for sc.Scan() {
 		line := sc.Text()
@@ -222,8 +230,13 @@ func requireHasDeltas(t *testing.T, packDir string) {
 		if !ok {
 			continue
 		}
+		countFields := strings.Fields(cntStr)
+		if len(countFields) != 2 ||
+			(countFields[1] != "object" && countFields[1] != "objects") {
+			continue
+		}
 		length, err1 := strconv.Atoi(strings.TrimSpace(numStr))
-		count, err2 := strconv.Atoi(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(cntStr), " objects")))
+		count, err2 := strconv.Atoi(countFields[0])
 		if err1 != nil || err2 != nil {
 			continue
 		}
@@ -232,8 +245,20 @@ func requireHasDeltas(t *testing.T, packDir string) {
 			maxChain = length
 		}
 	}
-	require.Positive(t, totalDeltas, "repacked pack contains no delta objects")
-	t.Logf("pack contains %d delta objects, deepest chain = %d hops", totalDeltas, maxChain)
+	return totalDeltas, maxChain
+}
+
+func TestParseVerifyPackDeltaStats(t *testing.T) {
+	out := []byte(strings.Join([]string{
+		"non delta: 4 objects",
+		"chain length = 1: 1 object",
+		"chain length = 2: 3 objects",
+		"pack-example.pack: ok",
+	}, "\n"))
+
+	totalDeltas, maxChain := parseVerifyPackDeltaStats(out)
+	require.Equal(t, 4, totalDeltas)
+	require.Equal(t, 2, maxChain)
 }
 
 // TestStore_DifferentialUnderGOMAXPROCS1 repeats the differential check with a
