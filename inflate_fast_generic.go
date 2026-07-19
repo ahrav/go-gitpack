@@ -2,8 +2,6 @@
 
 package objstore
 
-const inflateFastAsmEnabled = false
-
 func (d *goInflater) decodeHuffman(r *deflateBits, dst []byte, out int) (int, error) {
 	return d.decodeHuffmanGo(r, dst, out)
 }

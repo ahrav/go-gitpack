@@ -37,10 +37,10 @@ func TestCheckMmapLayout(t *testing.T) {
 	}
 }
 
-func TestGetZlibReaderAtRejectsOversizedWindow(t *testing.T) {
+func TestInflateOneShotRejectsOversizedWindow(t *testing.T) {
 	// CM=deflate and FCHECK is valid, but CINFO=8 exceeds RFC 1950's limit.
 	data := []byte{0x88, 0x1c}
-	if _, _, err := getZlibReaderAt(data, 0); err == nil {
+	if _, err := inflateZlibOneShot(data, nil); err == nil {
 		t.Fatal("expected invalid CINFO to be rejected")
 	}
 }
@@ -77,22 +77,15 @@ func TestInflateIgnoresAdler32Trailer(t *testing.T) {
 	}
 }
 
-// inflatePureGo mirrors the pure-Go branch of inflateExact: fill dst from the
-// deflate payload, then require the stream to terminate at the declared size.
+// inflatePureGo drives the production pure-Go pack decode path
+// (inflatePackZlibGo, the inflateZlibOneShot backend in non-libdeflate
+// builds): fill dst from the zlib stream and require the DEFLATE stream to
+// terminate exactly at the declared size.
 func inflatePureGo(t *testing.T, src []byte, declaredSize int) error {
 	t.Helper()
-	zr, br, err := getZlibReaderAt(src, 0)
-	if err != nil {
-		t.Fatalf("open zlib stream: %v", err)
-	}
-	defer putBytesReader(br)
-	defer putFlateReader(zr)
-
 	dst := make([]byte, declaredSize)
-	if _, err := io.ReadFull(zr, dst); err != nil {
-		return err
-	}
-	return ensureZlibStreamEnd(zr)
+	_, err := inflatePackZlibGo(src, dst)
+	return err
 }
 
 func TestInflateAcceptsExactlyTerminatedStream(t *testing.T) {

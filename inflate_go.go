@@ -29,6 +29,8 @@ SOFTWARE.
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"math/bits"
 	"sync"
 	"unsafe"
@@ -47,6 +49,11 @@ const (
 	maxOffsetSyms = 32
 	maxCodeLen    = 15
 
+	// maxOffsetExtraBits is the largest extra-bit count of any DEFLATE
+	// offset code (codes 28-29, RFC 1951 section 3.2.5). It must match
+	// the largest value in offsetExtraBits.
+	maxOffsetExtraBits = 13
+
 	// A fast iteration can emit two literals, a 258-byte match, and
 	// intentionally overwrite up to 39 bytes while copying whole words.
 	deflateFastInputMargin  = 25
@@ -62,9 +69,18 @@ const (
 )
 
 var (
-	errDeflateBadData       = errors.New("deflate: invalid data")
-	errDeflateShortOutput   = errors.New("deflate: output shorter than destination")
-	errDeflateOutputOverrun = errors.New("deflate: output exceeds destination")
+	errDeflateBadData = errors.New("deflate: invalid data")
+
+	// Truncation-class errors wrap io.ErrUnexpectedEOF so callers that
+	// classified the previous flate-based path's truncation failures with
+	// errors.Is(err, io.ErrUnexpectedEOF) observe the same identity.
+	errDeflateTruncated   = fmt.Errorf("deflate: truncated input: %w", io.ErrUnexpectedEOF)
+	errDeflateShortOutput = fmt.Errorf("deflate: output shorter than destination: %w", io.ErrUnexpectedEOF)
+
+	// errDeflateOutputOverrun wraps errZlibStreamOverrun so the one-shot
+	// path and the fallback ensureZlibStreamEnd path report the same error
+	// class for streams that continue past the declared object size.
+	errDeflateOutputOverrun = fmt.Errorf("deflate: output exceeds destination: %w", errZlibStreamOverrun)
 )
 
 var lengthBases = [...]uint16{
@@ -266,7 +282,7 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 	for {
 		header, ok := r.read(3)
 		if !ok {
-			return 0, out, errDeflateBadData
+			return 0, out, errDeflateTruncated
 		}
 		final := header&1 != 0
 
@@ -274,13 +290,16 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 		case 0:
 			r.alignToByte()
 			if len(src)-r.pos < 4 {
-				return 0, out, errDeflateBadData
+				return 0, out, errDeflateTruncated
 			}
 			n := int(binary.LittleEndian.Uint16(src[r.pos:]))
 			nn := binary.LittleEndian.Uint16(src[r.pos+2:])
 			r.pos += 4
-			if uint16(n) != ^nn || n > len(src)-r.pos {
+			if uint16(n) != ^nn {
 				return 0, out, errDeflateBadData
+			}
+			if n > len(src)-r.pos {
+				return 0, out, errDeflateTruncated
 			}
 			if n > len(dst)-out {
 				return 0, out, errDeflateOutputOverrun
@@ -670,7 +689,7 @@ func (d *goInflater) decodeHuffmanTail(r *deflateBits, dst []byte, out int) (int
 			if r.nbits < n {
 				r.refill()
 				if r.nbits < n {
-					return out, errDeflateBadData
+					return out, errDeflateTruncated
 				}
 			}
 			saved = r.buf
@@ -719,7 +738,7 @@ func (d *goInflater) decodeHuffmanTail(r *deflateBits, dst []byte, out int) (int
 			if r.nbits < n {
 				r.refill()
 				if r.nbits < n {
-					return out, errDeflateBadData
+					return out, errDeflateTruncated
 				}
 			}
 			saved = r.buf

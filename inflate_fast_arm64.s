@@ -69,7 +69,7 @@ have_length:
 	TBNZ	$15, R14, offset_exception
 
 	AND	$0xff, R6, R16
-	CMP	$30, R16
+	CMP	$const_inflateFastOffsetRefillThreshold, R16
 	BGT	offset_direct_ready
 	MOVD	(R7), R17
 	EOR	$56, R6, R16
@@ -243,7 +243,7 @@ subtable_literal:
 
 offset_exception:
 	AND	$0xff, R6, R16
-	CMP	$37, R16
+	CMP	$const_inflateFastOffsetSubRefillThreshold, R16
 	BGT	offset_exception_ready
 	MOVD	(R7), R17
 	EOR	$56, R6, R16
