@@ -86,14 +86,44 @@ func mmapData(r *mmap.ReaderAt) []byte {
 	return (*struct{ data []byte })(unsafe.Pointer(r)).data
 }
 
+// errMmapLayout is returned when the forged slice header produced by
+// mmapData does not behave like the real mapped region.
+var errMmapLayout = errors.New("objstore: x/exp/mmap ReaderAt layout changed; update mmapData in inflate_mmap.go")
+
 // checkMmapLayout verifies at pack-open time that the unsafe cast in mmapData
-// still matches x/exp/mmap's ReaderAt layout. Comparing lengths never
-// dereferences the forged slice's data pointer, so a layout change in a
-// future dependency bump surfaces as a deterministic open error instead of
-// silent memory corruption on the read path.
+// still matches x/exp/mmap's ReaderAt layout, so a layout change in a future
+// dependency bump (including a newer x/exp selected by a downstream module's
+// MVS resolution — our go.mod pin is not a ceiling for consumers) surfaces as
+// a deterministic open error instead of silent memory corruption on the read
+// path.
+//
+// Two independent probes:
+//
+//  1. Length: the forged header's len must equal the public Len(). This
+//     catches layouts that put a non-length word where the slice length
+//     lives.
+//  2. Content: bytes read through the forged slice must match bytes read
+//     through the public ReadAt API at the start, middle, and end of the
+//     region. A hypothetical layout that happens to preserve a plausible
+//     length while pointing the data word at unrelated memory (e.g. a
+//     leading *os.File field, as in x/exp/mmap's non-mmap fallback struct)
+//     fails this comparison instead of corrupting object reads later.
 func checkMmapLayout(r *mmap.ReaderAt) error {
-	if len(mmapData(r)) != r.Len() {
-		return errors.New("objstore: x/exp/mmap ReaderAt layout changed; update mmapData in inflate_mmap.go")
+	data := mmapData(r)
+	if len(data) != r.Len() {
+		return errMmapLayout
+	}
+	if len(data) == 0 {
+		return nil
+	}
+	for _, off := range []int{0, len(data) / 2, len(data) - 1} {
+		var b [1]byte
+		if _, err := r.ReadAt(b[:], int64(off)); err != nil {
+			return err
+		}
+		if b[0] != data[off] {
+			return errMmapLayout
+		}
 	}
 	return nil
 }

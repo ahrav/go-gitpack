@@ -5,6 +5,7 @@ package objstore
 import (
 	"bytes"
 	"compress/zlib"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -129,20 +130,31 @@ func TestInflateRejectsStreamContinuingPastDeclaredSize(t *testing.T) {
 }
 
 func TestInflateRejectsStreamMissingTerminator(t *testing.T) {
-	payload := []byte("hello world")
-	var buf bytes.Buffer
-	zw := zlib.NewWriter(&buf)
-	if _, err := zw.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := zw.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// Construct a raw deflate stream whose single stored block is NOT final
+	// (BFINAL=0) and which ends at input EOF immediately after its payload:
+	//
+	//   0x00        BFINAL=0, BTYPE=00 (stored)
+	//   LEN=4       little-endian
+	//   NLEN=^4
+	//   4 payload bytes, then nothing — no final block ever arrives.
+	//
+	// io.ReadFull fills dst with exactly the declared 4 bytes, so only the
+	// end-of-stream check can notice that the deflate stream is truncated
+	// rather than terminated.
+	payload := []byte("abcd")
+	stream := []byte{0x78, 0x9c, 0x00, 0x04, 0x00, 0xfb, 0xff}
+	stream = append(stream, payload...)
 
-	// Truncate the compressed bytes so the deflate stream never reaches its
-	// final-block marker even though it can still produce the payload prefix.
-	truncated := buf.Bytes()[:buf.Len()-6]
-	if err := inflatePureGo(t, truncated, 4); err == nil {
-		t.Fatal("truncated stream accepted")
+	err := inflatePureGo(t, stream, len(payload))
+	if err == nil {
+		t.Fatal("stream with no final block accepted")
+	}
+	// The failure must be the truncation case, not the overrun case: EOF
+	// arrived where the decoder still expected another block header.
+	if errors.Is(err, errZlibStreamOverrun) {
+		t.Fatalf("got overrun error, want truncation: %v", err)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+		t.Fatalf("got %v, want an unexpected-EOF truncation error", err)
 	}
 }
