@@ -450,18 +450,35 @@ const (
 // memory allocation and reuse across multiple delta operations.
 func TestDeltaArenaPooling(t *testing.T) {
 	t.Run("ArenaReuse", func(t *testing.T) {
-		// Get initial arena to establish baseline.
-		arena1 := getDeltaArena()
-		baselinePtr := uintptr(unsafe.Pointer(&arena1.data[0]))
-		baselineCap := cap(arena1.data)
-		putDeltaArena(arena1)
+		// sync.Pool guarantees neither retention nor same-P delivery: a GC
+		// pair may clear the pool (victim cache survives only one cycle)
+		// and P migration can route Get to a different cache, so a single
+		// Put/Get round-trip observing a different pointer is legitimate
+		// behavior, not a pooling bug. Asserting one round-trip is flaky
+		// under -race on loaded CI runners. Instead require that reuse
+		// happens at least once across several attempts: a genuinely broken
+		// putDeltaArena (arenas never pooled) still fails every attempt,
+		// while scheduler/GC interference cannot plausibly defeat all of
+		// them.
+		const attempts = 20
+		reused := false
+		for range attempts {
+			arena1 := getDeltaArena()
+			baselinePtr := uintptr(unsafe.Pointer(&arena1.data[0]))
+			baselineCap := cap(arena1.data)
+			putDeltaArena(arena1)
 
-		// Verify arena reuse.
-		arena2 := getDeltaArena()
-		reusedPtr := uintptr(unsafe.Pointer(&arena2.data[0]))
-		assert.Equal(t, baselinePtr, reusedPtr, "Arena should be reused from pool")
-		assert.Equal(t, baselineCap, cap(arena2.data), "Arena capacity should remain the same")
-		putDeltaArena(arena2)
+			arena2 := getDeltaArena()
+			reusedPtr := uintptr(unsafe.Pointer(&arena2.data[0]))
+			assert.Equal(t, baselineCap, cap(arena2.data), "Arena capacity should remain the same")
+			putDeltaArena(arena2)
+
+			if reusedPtr == baselinePtr {
+				reused = true
+				break
+			}
+		}
+		assert.True(t, reused, "Arena was never reused from the pool across %d Put/Get cycles", attempts)
 	})
 
 	t.Run("MultipleConcurrentArenas", func(t *testing.T) {
