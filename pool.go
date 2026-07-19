@@ -23,12 +23,52 @@ import (
 	"io"
 	"sync"
 
+	"github.com/klauspost/compress/flate"
 	"github.com/klauspost/compress/zlib"
 )
 
 // errZlibStreamOverrun reports a zlib stream that keeps producing data past
 // the decompressed size declared by the pack object header.
 var errZlibStreamOverrun = errors.New("zlib stream continues past declared object size")
+
+// errInvalidZlibHeader reports a pack object whose 2-byte zlib wrapper fails
+// RFC 1950 validation.
+var errInvalidZlibHeader = errors.New("invalid zlib header")
+
+// validateZlibHeader checks the 2-byte zlib stream header (RFC 1950): CM must
+// be 8 (deflate), CINFO must not exceed 7 (32 KiB window), FDICT must be clear
+// (Git never uses preset dictionaries), and the FCHECK checksum must hold.
+//
+// This is the single header-validation policy for every inflate backend
+// (pure-Go mmap, cgo libdeflate, and the non-mmap fallback), so a stream is
+// accepted or rejected identically regardless of platform or build tag.
+//
+// INTEGRITY POLICY: pack object streams are validated by this header check
+// plus an exact-termination check of the deflate stream; the trailing adler32
+// checksum is intentionally NOT verified on any backend. Opt-in integrity is
+// provided by Store.VerifyCRC, which validates the *compressed* bytes against
+// the pack index CRC-32 and therefore subsumes what adler32 would catch.
+func validateZlibHeader(cmf, flg byte) error {
+	if cmf&0x0f != 8 || cmf>>4 > 7 || flg&0x20 != 0 || (uint16(cmf)<<8|uint16(flg))%31 != 0 {
+		return errInvalidZlibHeader
+	}
+	return nil
+}
+
+// flatePool recycles flate decompressor state (~40 KiB of Huffman tables and
+// window per instance). Unlike zlib.Reader, flate.NewReader can construct a
+// valid instance without source bytes, so New can populate the pool directly.
+var flatePool = sync.Pool{
+	New: func() any { return flate.NewReader(nil) },
+}
+
+// putFlateReader returns a flate reader obtained from flatePool. It must
+// never be passed a reader from getZlibReader / zrPool; the two pools hold
+// different concrete types and mixing them would corrupt stream decoding.
+func putFlateReader(fr io.ReadCloser) {
+	_ = fr.Close()
+	flatePool.Put(fr)
+}
 
 // ensureZlibStreamEnd verifies that a fully drained decompression stream
 // terminates exactly where the object header said it would: one more read

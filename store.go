@@ -246,6 +246,10 @@ func open(dir string) (*store, error) {
 		if err != nil {
 			return nil, err
 		}
+		if err := checkMmapLayout(h); err != nil {
+			_ = h.Close()
+			return nil, err
+		}
 		packCache[pack] = h
 	}
 

@@ -27,4 +27,10 @@ require (
 )
 
 // Pinned fork containing the bytes.Reader flate fast path.
+//
+// NOTE FOR CONSUMERS: replace directives only apply when this repo is the
+// main module. Downstream modules importing this library resolve the
+// upstream klauspost/compress version above — behavior is identical, but the
+// bytes.Reader decode fast path (and its throughput gain) is absent. To opt
+// in, copy this replace line into your own go.mod.
 replace github.com/klauspost/compress => github.com/ahrav/compress v0.0.0-20260708010904-f4b8e874a3f0

@@ -4,18 +4,14 @@ package objstore
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
-	"sync"
 	"unsafe"
 
 	"github.com/klauspost/compress/flate"
 	"golang.org/x/exp/mmap"
 )
-
-var flatePool = sync.Pool{
-	New: func() any { return flate.NewReader(nil) },
-}
 
 // inflateExact decompresses the zlib stream at pos into an exactly sized dst.
 func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
@@ -43,14 +39,36 @@ func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
 	return ensureZlibStreamEnd(zr)
 }
 
+// getZlibReaderAt opens the *deflate* payload of a zlib stream positioned at
+// pos inside the memory-mapped pack.
+//
+// Two deliberate deviations from a stock zlib reader:
+//
+//  1. Zero-copy source: the compressed stream is presented as a pooled
+//     *bytes.Reader aliasing the mapped pages directly. klauspost/flate
+//     detects *bytes.Reader sources and switches to a specialized decode
+//     loop that consumes the slice without intermediate buffering.
+//
+//  2. No adler32: the 2-byte zlib header is validated here and the raw
+//     deflate stream is handed to a pooled flate reader, skipping zlib's
+//     adler32 accumulation over every decompressed byte (~4% of scan CPU)
+//     and the trailing checksum comparison. Pack integrity is instead
+//     covered by the optional CRC-32 verification against the pack index
+//     (store.VerifyCRC): verifyCRC32 streams the object's full on-disk
+//     byte range — zlib header, deflate payload, AND the adler32 trailer
+//     bytes — so trailer corruption is caught there, and CRC-32 over the
+//     compressed bytes subsumes what adler32 would catch in the output.
+//
+// Callers must release both returned values: first putFlateReader(zr), then
+// putBytesReader(br). The returned readers alias mmap'd memory and must not
+// be used after the store is closed.
 func getZlibReaderAt(data []byte, pos int64) (io.ReadCloser, *bytes.Reader, error) {
 	if pos < 0 || pos+2 > int64(len(data)) {
 		return nil, nil, io.ErrUnexpectedEOF
 	}
 
-	cmf, flg := data[pos], data[pos+1]
-	if cmf&0x0f != 8 || cmf>>4 > 7 || flg&0x20 != 0 || (uint16(cmf)<<8|uint16(flg))%31 != 0 {
-		return nil, nil, fmt.Errorf("invalid zlib header at pack offset %d", pos)
+	if err := validateZlibHeader(data[pos], data[pos+1]); err != nil {
+		return nil, nil, fmt.Errorf("%w at pack offset %d", err, pos)
 	}
 
 	br := getBytesReader(data[pos+2:])
@@ -63,12 +81,19 @@ func getZlibReaderAt(data []byte, pos int64) (io.ReadCloser, *bytes.Reader, erro
 	return fr, br, nil
 }
 
-func putFlateReader(fr io.ReadCloser) {
-	_ = fr.Close()
-	flatePool.Put(fr)
-}
-
 // mmapData relies on the pinned x/exp/mmap layout for mmap-backed platforms.
 func mmapData(r *mmap.ReaderAt) []byte {
 	return (*struct{ data []byte })(unsafe.Pointer(r)).data
+}
+
+// checkMmapLayout verifies at pack-open time that the unsafe cast in mmapData
+// still matches x/exp/mmap's ReaderAt layout. Comparing lengths never
+// dereferences the forged slice's data pointer, so a layout change in a
+// future dependency bump surfaces as a deterministic open error instead of
+// silent memory corruption on the read path.
+func checkMmapLayout(r *mmap.ReaderAt) error {
+	if len(mmapData(r)) != r.Len() {
+		return errors.New("objstore: x/exp/mmap ReaderAt layout changed; update mmapData in inflate_mmap.go")
+	}
+	return nil
 }

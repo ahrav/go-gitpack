@@ -67,11 +67,28 @@ func putLibdeflateDecompressor(d unsafe.Pointer) {
 
 // inflateZlibOneShot decompresses the zlib stream at the beginning of src
 // into dst, which must be sized to exactly the expected output length.
-// Returns the number of compressed bytes consumed.
+// Returns the number of compressed bytes consumed (the 2-byte zlib header
+// plus the deflate payload; the 4-byte adler32 trailer is not consumed).
+//
+// The zlib wrapper is handled here rather than by libdeflate so that every
+// backend enforces the same integrity policy (see validateZlibHeader in
+// pool.go): the 2-byte header is validated, the deflate stream must
+// terminate exactly at len(dst), and the adler32 trailer is intentionally
+// not verified. libdeflate_zlib_decompress_ex would enforce adler32, which
+// the pure-Go backend deliberately skips; using the raw deflate entry point
+// keeps corrupt-trailer packs behaving identically across build tags.
 //
 // The src slice may alias mmap'd pack memory; libdeflate only reads it.
 func inflateZlibOneShot(src []byte, dst []byte) (int, error) {
-	if len(src) == 0 {
+	if len(src) < 2 {
+		return 0, errLibdeflateBadData
+	}
+	if err := validateZlibHeader(src[0], src[1]); err != nil {
+		return 0, err
+	}
+	payload := src[2:]
+	if len(payload) == 0 {
+		// Even a zero-length object carries at least one deflate block.
 		return 0, errLibdeflateBadData
 	}
 
@@ -83,8 +100,9 @@ func inflateZlibOneShot(src []byte, dst []byte) (int, error) {
 
 	var out unsafe.Pointer
 	if len(dst) == 0 {
-		// libdeflate still validates the complete zlib stream when the expected
-		// output is empty; use a non-nil pointer with a zero-sized output buffer.
+		// libdeflate still validates the complete deflate stream when the
+		// expected output is empty; use a non-nil pointer with a zero-sized
+		// output buffer.
 		var empty byte
 		out = unsafe.Pointer(&empty)
 	} else {
@@ -92,14 +110,14 @@ func inflateZlibOneShot(src []byte, dst []byte) (int, error) {
 	}
 
 	var inConsumed, outProduced C.size_t
-	res := C.libdeflate_zlib_decompress_ex(
+	res := C.libdeflate_deflate_decompress_ex(
 		(*C.struct_libdeflate_decompressor)(d),
-		unsafe.Pointer(&src[0]), C.size_t(len(src)),
+		unsafe.Pointer(&payload[0]), C.size_t(len(payload)),
 		out, C.size_t(len(dst)),
 		&inConsumed, &outProduced,
 	)
 	if res != C.LIBDEFLATE_SUCCESS || int(outProduced) != len(dst) {
 		return 0, errLibdeflateBadData
 	}
-	return int(inConsumed), nil
+	return 2 + int(inConsumed), nil
 }
