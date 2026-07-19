@@ -1,11 +1,14 @@
 #!/bin/bash
 # generate_testdata.sh - Generate test Git repositories with guaranteed pack files
 
-set -e
+set -Ee
 
-# Surface the failing command and line when set -e aborts: every git stderr
-# in this script is silenced for signal-to-noise, which previously made CI
-# failures ("make fixtures: Error 1") undiagnosable.
+# Diagnose set -e aborts: report the failing line and command, including
+# inside helper functions (set -E propagates the ERR trap into functions).
+# Most git invocations here silence stderr for signal-to-noise; this trap
+# supplies the line/command context those silenced failures would otherwise
+# lose, and the large-repo commit loops additionally keep stderr visible so
+# git's own error text reaches the log.
 trap 'echo "generate_testdata.sh: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
 
 # Keep fixture generation deterministic and self-contained: no background
