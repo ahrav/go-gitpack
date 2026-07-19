@@ -825,6 +825,25 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
 	})
 
+	t.Run("payload overhead above target limit is accepted", func(t *testing.T) {
+		// A literal-heavy delta for a target AT the limit necessarily has a
+		// payload LARGER than the limit (varints + insert command bytes).
+		// The payload bound must account for that overhead: rejecting on
+		// payload > maxObjectSize would fail valid deltas whose
+		// reconstructed target is within the documented bound.
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)  // base size
+		writeVarInt(&payload, 64) // target size == limit
+		payload.WriteByte(0x40)   // insert 64 literal bytes
+		payload.Write(bytes.Repeat([]byte{'x'}, 64))
+		require.Greater(t, payload.Len(), 64, "test premise: payload exceeds the target limit")
+
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		out, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.NoError(t, err)
+		require.Equal(t, bytes.Repeat([]byte{'x'}, 64), out)
+	})
+
 	t.Run("target exceeds configured limit", func(t *testing.T) {
 		var payload bytes.Buffer
 		writeVarInt(&payload, 0)

@@ -758,15 +758,25 @@ func applyDeltaStreaming(
 	// comes straight from the pack header, so a malformed pack can
 	// advertise an arbitrary value: unchecked, int(payloadSize) overflows
 	// on 32-bit (and wraps negative for values above MaxInt on 64-bit),
-	// and getDeltaScratch would allocate the full advertised amount. A
-	// Oversized delta payloads are rejected even if they advertise a smaller
-	// target; accepting them would defeat the configured allocation ceiling.
+	// and getDeltaScratch would allocate the full advertised amount.
+	//
+	// The bound must account for delta encoding overhead: the payload
+	// holds the two size varints plus the instruction stream, so a valid
+	// delta for a target at the limit is necessarily LARGER than the
+	// target itself (a literal-heavy delta is ~target+target/127 bytes;
+	// a pathological-but-valid stream of size-1 copies costs up to 8
+	// bytes per output byte). 8×maxObjectSize+32 admits every payload
+	// that can possibly reconstruct a within-limit target while still
+	// capping scratch allocation at a small multiple of the configured
+	// ceiling.
 	if payloadSize > uint64(math.MaxInt) {
 		return nil, fmt.Errorf("delta payload size %d exceeds addressable memory", payloadSize)
 	}
-	if maxObjectSize > 0 && payloadSize > maxObjectSize {
-		return nil, fmt.Errorf("%w: payload=%d limit=%d",
-			ErrDeltaTargetTooLarge, payloadSize, maxObjectSize)
+	if maxObjectSize > 0 && maxObjectSize <= (math.MaxUint64-32)/8 {
+		if bound := 8*maxObjectSize + 32; payloadSize > bound {
+			return nil, fmt.Errorf("%w: payload=%d exceeds bound %d for limit=%d",
+				ErrDeltaTargetTooLarge, payloadSize, bound, maxObjectSize)
+		}
 	}
 
 	scratch := getDeltaScratch(int(payloadSize))

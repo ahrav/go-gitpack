@@ -168,6 +168,40 @@ func TestGetNoCacheDoesNotPopulateOffsetCache(t *testing.T) {
 	require.Zero(t, entries)
 }
 
+// TestGetFallsBackToOIDCachesWhenOffsetCacheDisabled verifies that
+// pack-resident reads fall back to the delta window and ARC cache when the
+// offset cache misses (e.g. disabled via WithOffsetCacheBudget). Without the
+// fallback, every repeated read of a packed object re-inflates from disk in
+// memory-constrained configurations even though inflation populates the
+// delta window.
+func TestGetFallsBackToOIDCachesWhenOffsetCacheDisabled(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	store, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer store.Close()
+
+	store.offCache.setBudget(0) // Disable the offset cache entirely.
+
+	targetHash := calculateHash(ObjBlob, []byte("modified data"))
+
+	// First read inflates from the pack and populates the delta window.
+	want, _, err := store.get(targetHash)
+	require.NoError(t, err)
+
+	// Second read must be served by the delta window, whose hit path
+	// promotes the object into the ARC cache — observable proof the
+	// OID-keyed fallback ran instead of a straight re-inflation.
+	got, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	_, ok := store.cache.Get(targetHash)
+	require.True(t, ok,
+		"second read must hit the delta window and promote to the ARC cache")
+}
+
 // TestParseIdx validates the v2 pack-index parser against invalid magic bytes,
 // unsupported versions, minimal valid indices, large-offset handling,
 // multi-object sorted order, and truncated files.

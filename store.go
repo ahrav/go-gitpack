@@ -426,27 +426,19 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// the mutex acquisitions of the delta window and ARC cache.
 	p, off, inPack := s.findPackedObject(oid)
 	if inPack {
-		// Pack-resident objects are served exclusively by the offset
-		// cache. The delta window and ARC are deliberately NOT consulted
-		// for them: the offset cache already intercepts every re-read,
-		// so the extra probes only added two mutex acquisitions per read.
-		// Both caches still serve delta-resolution internals and the
-		// loose-object path below.
 		if data, typ, ok := s.offCache.get(p, off); ok {
 			return data, typ, nil
 		}
-		ctx := getDeltaContext(s.maxDeltaDepth)
-		defer putDeltaContext(ctx)
-		return s.inflateFromPack(inflationParams{
-			p:             p,
-			off:           off,
-			oid:           oid,
-			ctx:           ctx,
-			maxObjectSize: s.maxDeltaObjectSize,
-		})
 	}
 
-	// Loose-object path: delta window first, then the ARC cache.
+	// OID-keyed caches: the primary path for loose objects, and the
+	// fallback for pack-resident objects whenever the offset cache misses
+	// (disabled via WithOffsetCacheBudget, entry evicted, or first read).
+	// On the hot path an offset-cache hit above returns without paying
+	// these two mutex acquisitions; on a miss the probes are noise next
+	// to the inflation they can avoid — without them, repeated reads of a
+	// packed object would re-inflate every time in memory-constrained
+	// configurations even though inflation populates the delta window.
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
 		// Promote to ARC cache on second access (delta window hit).
@@ -462,6 +454,15 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 
 	ctx := getDeltaContext(s.maxDeltaDepth)
 	defer putDeltaContext(ctx)
+	if inPack {
+		return s.inflateFromPack(inflationParams{
+			p:             p,
+			off:           off,
+			oid:           oid,
+			ctx:           ctx,
+			maxObjectSize: s.maxDeltaObjectSize,
+		})
+	}
 	return s.getWithContextSkipCache(oid, ctx)
 }
 
