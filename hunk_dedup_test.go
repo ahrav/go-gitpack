@@ -316,7 +316,7 @@ func newDedupRepoBuilder(t *testing.T) *dedupRepoBuilder {
 func (b *dedupRepoBuilder) git(args ...string) string {
 	b.t.Helper()
 	ts := fmt.Sprintf("%d +0000", b.tick)
-	cmd := exec.Command("git", append([]string{"-C", b.repoDir}, args...)...)
+	cmd := gitTestCommand(b.repoDir, args...)
 	cmd.Env = append(os.Environ(),
 		"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
 		"GIT_AUTHOR_DATE="+ts,
