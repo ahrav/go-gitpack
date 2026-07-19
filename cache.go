@@ -237,16 +237,21 @@ func newRefCountedDeltaWindow() *refCountedDeltaWindow {
 // the underlying entry cannot be evicted while the handle exists.
 type Handle struct {
 	data  []byte
+	typ   ObjectType
 	entry *refCountedEntry
 	w     *refCountedDeltaWindow
 }
 
 // Type returns the Git ObjectType associated with the cached data.
+//
+// The type is snapshotted into the Handle under the window lock at acquire
+// time (like Data), so reading it here requires no lock and cannot race with a
+// concurrent in-place add() that rewrites the shared entry's fields. Because
+// Git objects are content-addressed, any concurrent re-add of the same OID
+// carries an identical (data, typ) pair, so the snapshot is always consistent
+// with Data().
 func (h *Handle) Type() ObjectType {
-	if h.entry != nil {
-		return h.entry.typ
-	}
-	return ObjBad
+	return h.typ
 }
 
 // Release decrements the reference count for this handle's entry and
@@ -308,6 +313,7 @@ func (w *refCountedDeltaWindow) acquire(oid Hash) (*Handle, bool) {
 
 	handle := w.handlePool.Get().(*Handle)
 	handle.data = entry.data
+	handle.typ = entry.typ
 	handle.entry = entry
 	handle.w = w
 

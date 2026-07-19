@@ -10,7 +10,10 @@
 // contents, its result can be shared across those repeats.
 package objstore
 
-import "sync"
+import (
+	"strings"
+	"sync"
+)
 
 // pairCacheShards spreads pair lookups across independent locks.
 const pairCacheShards = 32
@@ -97,22 +100,17 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) {
 	if c.budgetPerShard <= 0 {
 		return
 	}
-	size := 0
-	for i := range hunks {
-		for _, l := range hunks[i].Lines {
-			size += len(l)
-		}
-		size += 64 + len(hunks[i].Lines)*16 // struct + slice/string headers, approximate
-	}
+	size := estimateAddedHunksSize(hunks)
 	if size > c.budgetPerShard/4 {
 		return // one giant diff must not evict a whole shard
 	}
+	cached := cloneAddedHunksForCache(hunks)
 	s := c.shard(&k)
 	s.mu.Lock()
 	if old, ok := s.m[k]; ok {
 		s.used -= old.size
 	}
-	s.m[k] = pairCacheEntry{hunks: hunks, size: size}
+	s.m[k] = pairCacheEntry{hunks: cached, size: size}
 	s.used += size
 	if s.used > c.budgetPerShard {
 		for key, v := range s.m {
@@ -127,4 +125,57 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) {
 		}
 	}
 	s.mu.Unlock()
+}
+
+func estimateAddedHunksSize(hunks []AddedHunk) int {
+	size := 96 // map entry, key, and slice header overhead, approximate
+	for i := range hunks {
+		for _, l := range hunks[i].Lines {
+			size += len(l)
+		}
+		size += 64 + len(hunks[i].Lines)*16 // struct + slice/string headers, approximate
+	}
+	return size
+}
+
+func cloneAddedHunksForCache(hunks []AddedHunk) []AddedHunk {
+	if len(hunks) == 0 {
+		return nil
+	}
+	totalLineBytes := 0
+	totalLines := 0
+	for i := range hunks {
+		totalLines += len(hunks[i].Lines)
+		for _, line := range hunks[i].Lines {
+			totalLineBytes += len(line)
+		}
+	}
+	starts := make([]int, 0, totalLines)
+	var packed strings.Builder
+	packed.Grow(totalLineBytes)
+	for i := range hunks {
+		for _, line := range hunks[i].Lines {
+			start := packed.Len()
+			packed.WriteString(line)
+			starts = append(starts, start)
+		}
+	}
+	backing := packed.String()
+
+	cached := make([]AddedHunk, len(hunks))
+	startIdx := 0
+	for i := range hunks {
+		cached[i] = hunks[i]
+		if len(hunks[i].Lines) == 0 {
+			continue
+		}
+		lines := make([]string, len(hunks[i].Lines))
+		for j := range hunks[i].Lines {
+			start := starts[startIdx]
+			lines[j] = backing[start : start+len(hunks[i].Lines[j])]
+			startIdx++
+		}
+		cached[i].Lines = lines
+	}
+	return cached
 }
