@@ -125,10 +125,9 @@ func TestEvictionDoesNotInfiniteLoop(t *testing.T) {
 		done <- w.add(makeHash("B"), make([]byte, 60), ObjBlob)
 	}()
 
-	// A generous wall-clock deadline: add() either returns ErrWindowFull
-	// promptly or is genuinely looping. The previous watchdog raced 200
-	// runtime.Gosched() yields against goroutine scheduling, which falsely
-	// fired on loaded CI runners before add() ever ran.
+	// A generous wall-clock deadline: long enough to absorb scheduling
+	// delays on loaded CI runners, while still bounding a genuine
+	// non-termination in add().
 	select {
 	case err := <-done:
 		assert.ErrorIs(t, err, ErrWindowFull, "should return ErrWindowFull, not loop forever")

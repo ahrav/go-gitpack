@@ -160,15 +160,29 @@ var deltaArenaPool = sync.Pool{
 // getDeltaArena retrieves a ping‑pong arena from the pool.
 func getDeltaArena() *deltaArena { return deltaArenaPool.Get().(*deltaArena) }
 
-// putDeltaArena returns arena to the pool and resets its slice length.
-// Arenas that were grown beyond the default pool size during dynamic resizing
-// are discarded rather than returned, preventing pool pollution with oversized
-// allocations.
-func putDeltaArena(arena *deltaArena) {
+// prepareDeltaArenaForPool reports whether arena may be returned to the pool,
+// restoring its full length in place when it may. Arenas that were grown
+// beyond the default pool size during dynamic resizing are ineligible (and
+// left untouched) so the pool is never polluted with oversized allocations.
+//
+// Split from putDeltaArena so the reset/discard decision is testable before
+// ownership transfers to the pool: once Put runs, another goroutine may
+// legitimately retrieve and mutate the arena, so no caller (test or
+// otherwise) may inspect it afterwards.
+func prepareDeltaArenaForPool(arena *deltaArena) bool {
 	if cap(arena.data) > defaultDeltaArenaSize {
-		return
+		return false
 	}
 	arena.data = arena.data[:cap(arena.data)]
+	return true
+}
+
+// putDeltaArena returns arena to the pool when it is pool-eligible (see
+// prepareDeltaArenaForPool). The arena must not be touched after this call.
+func putDeltaArena(arena *deltaArena) {
+	if !prepareDeltaArenaForPool(arena) {
+		return
+	}
 	deltaArenaPool.Put(arena)
 }
 
