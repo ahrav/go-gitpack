@@ -293,6 +293,16 @@ func TestInflatePackZlibAdversarialDynamicStreams(t *testing.T) {
 			size: 1,
 		},
 		{
+			name: "reserved HLIT count",
+			raw:  reservedAlphabetCountStream(true),
+			size: 0,
+		},
+		{
+			name: "reserved HDIST count",
+			raw:  reservedAlphabetCountStream(false),
+			size: 0,
+		},
+		{
 			name: "truncated all-zero literal codeword",
 			raw:  overreadStream(),
 			size: 256,
@@ -1115,6 +1125,58 @@ func incompleteSingletonOffsetStream(nonzero bool) []byte {
 	w.write(3, 2)
 	w.write(0, 1)
 	w.write(1, 2)
+	return w.bytes()
+}
+
+// reservedAlphabetCountStream builds a dynamic block whose HLIT or HDIST
+// field carries a reserved value (HLIT=30 encodes 287 literal/length codes;
+// HDIST=30 encodes 31 distance codes). Everything else in the stream is
+// well-formed and the unused trailing code lengths are zero, so only the
+// reserved count itself makes the stream invalid (RFC 1951 section 3.2.7).
+func reservedAlphabetCountStream(litlen bool) []byte {
+	var w deflateTestBits
+	w.write(1, 1) // BFINAL
+	w.write(2, 2) // BTYPE = dynamic
+	if litlen {
+		w.write(30, 5) // HLIT = 30 -> 287 litlen codes (valid max is 29 -> 286)
+		w.write(0, 5)  // HDIST = 0 -> 1 offset code
+	} else {
+		w.write(0, 5)  // HLIT = 0 -> 257 litlen codes
+		w.write(30, 5) // HDIST = 30 -> 31 offset codes (valid max is 29 -> 30)
+	}
+	w.write(14, 4) // HCLEN = 14 -> 18 precode lengths
+
+	// Precode lengths in precodeOrder: sym18=1, sym0=2, sym1=2.
+	w.write(0, 3) // 16
+	w.write(0, 3) // 17
+	w.write(1, 3) // 18
+	w.write(2, 3) // 0
+	for range 13 {
+		w.write(0, 3)
+	}
+	w.write(2, 3) // 1
+
+	// Canonical precode, bit-reversed for the stream: sym18 -> 0 (1 bit),
+	// sym1 -> 3 (2 bits). Code lengths for all litlen+offset entries:
+	// lit 0 and EOB get 1-bit codes; every other litlen length is zero.
+	w.write(3, 2) // lens[0] = 1 (literal 0)
+	w.write(0, 1)
+	w.write(127, 7) // repeat-zero 138 (symbols 1..138)
+	w.write(0, 1)
+	w.write(106, 7) // repeat-zero 117 (symbols 139..255)
+	w.write(3, 2)   // lens[256] = 1 (end of block)
+	if litlen {
+		w.write(0, 1)
+		w.write(19, 7) // repeat-zero 30 (reserved litlen symbols 257..286)
+		w.write(3, 2)  // singleton offset symbol 0
+	} else {
+		w.write(3, 2) // offset symbol 0 = 1 bit
+		w.write(0, 1)
+		w.write(19, 7) // repeat-zero 30 (reserved offset symbols 1..30)
+	}
+
+	// Block body: immediate end of block (1-bit code 1).
+	w.write(1, 1)
 	return w.bytes()
 }
 

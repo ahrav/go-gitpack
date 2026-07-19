@@ -397,6 +397,14 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) bool {
 	numLitlen := 257 + int(counts&31)
 	numOffset := 1 + int((counts>>5)&31)
 	numPrecode := 4 + int((counts>>10)&15)
+	// RFC 1951 section 3.2.7: HLIT may encode at most 286 literal/length
+	// codes and HDIST at most 30 distance codes; the remaining field values
+	// are reserved. zlib and compress/flate (the differential-fuzz oracle)
+	// both reject them during header parsing, so accepting them here would
+	// let malformed pack data through on one backend only.
+	if numLitlen > 286 || numOffset > 30 {
+		return false
+	}
 
 	clear(d.precodeLens[:])
 	for i := 0; i < numPrecode; i++ {
