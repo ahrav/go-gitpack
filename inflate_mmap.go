@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"unsafe"
 
 	"github.com/klauspost/compress/flate"
@@ -15,6 +16,11 @@ import (
 
 // inflateExact decompresses the zlib stream at pos into an exactly sized dst.
 func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
+	// The forged data slice does not keep r reachable, and x/exp/mmap sets
+	// a finalizer that munmaps the region. Pin r until decompression has
+	// finished reading the mapped bytes so a GC cannot unmap them mid-read.
+	defer runtime.KeepAlive(r)
+
 	data := mmapData(r)
 	if pos < 0 || pos > int64(len(data)) {
 		return io.ErrUnexpectedEOF
@@ -109,6 +115,10 @@ var errMmapLayout = errors.New("objstore: x/exp/mmap ReaderAt layout changed; up
 //     leading *os.File field, as in x/exp/mmap's non-mmap fallback struct)
 //     fails this comparison instead of corrupting object reads later.
 func checkMmapLayout(r *mmap.ReaderAt) error {
+	// Pin r for the duration: the forged slice alone does not keep it
+	// reachable, and its finalizer munmaps the region (see inflateExact).
+	defer runtime.KeepAlive(r)
+
 	data := mmapData(r)
 	if len(data) != r.Len() {
 		return errMmapLayout
