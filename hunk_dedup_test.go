@@ -110,6 +110,16 @@ func TestLineFingerprintSet_DeterministicVerdicts(t *testing.T) {
 	require.Equal(t, verdicts(), verdicts(), "verdicts must be a pure function of the insert sequence")
 }
 
+func TestLineFingerprintSet_GrowsWithinBudget(t *testing.T) {
+	set := newLineFingerprintSetWithBudget(2, 16*8) // 4 initial slots, 16 maximum.
+	for fp := uint64(1); fp <= 6; fp++ {
+		require.True(t, set.markNew(fp))
+	}
+	require.Greater(t, len(set.slots), 4)
+	require.LessOrEqual(t, len(set.slots), 16)
+	require.False(t, set.markNew(1), "growth must preserve existing fingerprints")
+}
+
 // --- dedupHunkEmission ---
 
 // mkTestHunk builds a text HunkAddition with the package's endLine

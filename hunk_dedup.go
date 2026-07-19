@@ -60,11 +60,10 @@ import (
 )
 
 const (
-	// dedupTableSlotsLog2 sizes the fingerprint table at 2^25 slots
-	// (256 MiB of uint64 slots, faulted in lazily as entries scatter).
-	// At the 0.7 load-factor bound this holds ~23.5M unique lines —
-	// roughly 3x the ~8M unique lines measured on git.git.
-	dedupTableSlotsLog2 = 25
+	// Production tables start at 256 KiB and grow on demand. The default
+	// 32 MiB ceiling holds roughly 2.9M unique lines at the 0.7 load factor.
+	dedupInitialSlotsLog2  = 15
+	defaultHunkDedupBudget = 32 << 20
 
 	// dedupZeroFingerprint replaces a raw fingerprint of zero, which the
 	// open-addressing table reserves as its empty-slot sentinel. Lines
@@ -125,6 +124,8 @@ type lineFingerprintSet struct {
 
 	// remaining counts inserts left before the load-factor bound.
 	remaining int
+	count     int
+	maxSlots  int
 
 	// saturated is set once remaining hits zero; from then on markNew
 	// returns true unconditionally (fail-open).
@@ -140,7 +141,51 @@ func newLineFingerprintSet(log2Slots uint) *lineFingerprintSet {
 		slots:     make([]uint64, n),
 		mask:      uint64(n - 1),
 		remaining: n * 7 / 10,
+		maxSlots:  n,
 	}
+}
+
+func newLineFingerprintSetWithBudget(log2Initial uint, budget int) *lineFingerprintSet {
+	maxSlots := budget / 8
+	if maxSlots < 2 {
+		maxSlots = 2
+	}
+	maxPower := 1
+	for maxPower <= maxSlots/2 {
+		maxPower <<= 1
+	}
+	initial := 1 << log2Initial
+	if initial > maxPower {
+		initial = maxPower
+	}
+	return &lineFingerprintSet{
+		slots:     make([]uint64, initial),
+		mask:      uint64(initial - 1),
+		remaining: initial * 7 / 10,
+		maxSlots:  maxPower,
+	}
+}
+
+func (s *lineFingerprintSet) grow() bool {
+	if len(s.slots) >= s.maxSlots {
+		return false
+	}
+	newLen := min(len(s.slots)*2, s.maxSlots)
+	old := s.slots
+	s.slots = make([]uint64, newLen)
+	s.mask = uint64(newLen - 1)
+	for _, fp := range old {
+		if fp == 0 {
+			continue
+		}
+		i := fp & s.mask
+		for s.slots[i] != 0 {
+			i = (i + 1) & s.mask
+		}
+		s.slots[i] = fp
+	}
+	s.remaining = newLen*7/10 - s.count
+	return true
 }
 
 // markNew records fp and reports whether it was absent (i.e. the line is
@@ -159,9 +204,10 @@ func (s *lineFingerprintSet) markNew(fp uint64) bool {
 			return false
 		case 0:
 			s.slots[i] = fp
+			s.count++
 			s.remaining--
 			if s.remaining <= 0 {
-				s.saturated = true
+				s.saturated = !s.grow()
 			}
 			return true
 		}
@@ -418,7 +464,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	go func() {
 		defer close(decisionDone)
 		defer close(yieldChan)
-		set := newLineFingerprintSet(dedupTableSlotsLog2)
+		set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
 		// In-flight seqs are bounded by cap(blobChan) + numWorkers +
 		// cap(resultChan), so the reorder buffer stays small; it only
 		// grows toward that bound when pair completion times are skewed.

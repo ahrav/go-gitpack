@@ -71,3 +71,42 @@ func TestDiffHistoryHunks_DirectoryRenameEditPairsAgainstOldPath(t *testing.T) {
 	assert.Empty(t, linesByPath["new/same-a.txt"])
 	assert.Empty(t, linesByPath["new/same-b.txt"])
 }
+
+func TestDiffHistoryHunks_DirectoryRenameDoesNotPairUnrelatedReplacement(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.Mkdir(filepath.Join(repo, "old"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "replaced.txt"), []byte("shared\nold only\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "same-a.txt"), []byte("same a\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "same-b.txt"), []byte("same b\n"), 0o644))
+	runGit(t, repo, "add", "old")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	require.NoError(t, os.Rename(filepath.Join(repo, "old"), filepath.Join(repo, "new")))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "new", "replaced.txt"), []byte("shared\nnew one\nnew two\nnew three\n"), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "rename with replacement", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	hunks, errC := scanner.DiffHistoryHunks()
+	var occurrences int
+	for h := range hunks {
+		if h.Path() != "new/replaced.txt" {
+			continue
+		}
+		for _, line := range h.Lines() {
+			if line == "shared" {
+				occurrences++
+			}
+		}
+	}
+	require.NoError(t, <-errC)
+	assert.Equal(t, 1, occurrences, "unrelated replacement must remain a full-file addition")
+}

@@ -44,6 +44,13 @@ import (
 // operates only on local variables and pooled readers; no shared mutable
 // state is accessed.
 func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
+	return s.readLooseObjectLimited(oid, 0)
+}
+
+// readLooseObjectLimited is readLooseObject with an optional decompressed
+// body limit. A positive limit is enforced from the declared header before
+// body allocation and again while inflating malformed streams.
+func (s *store) readLooseObjectLimited(oid Hash, maxBodySize uint64) ([]byte, ObjectType, error) {
 	if s == nil || s.objectsDir == "" {
 		return nil, ObjBad, objectNotFoundError(oid)
 	}
@@ -95,8 +102,16 @@ func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
 	if err != nil {
 		return nil, ObjBad, fmt.Errorf("invalid loose object size for %x: %w", oid, err)
 	}
+	if maxBodySize > 0 && size > maxBodySize {
+		return nil, ObjBad, fmt.Errorf("loose object body %d bytes exceeds %d byte limit for %x", size, maxBodySize, oid)
+	}
 
-	body, err := io.ReadAll(br)
+	var body []byte
+	if maxBodySize > 0 {
+		body, err = io.ReadAll(io.LimitReader(br, int64(maxBodySize)+1))
+	} else {
+		body, err = io.ReadAll(br)
+	}
 	if err != nil {
 		return nil, ObjBad, err
 	}

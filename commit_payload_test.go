@@ -185,6 +185,24 @@ func TestReadCommitPayload_DifferentialAgainstGit(t *testing.T) {
 	check("loose", shapes.loose)
 }
 
+func TestReadLooseObjectLimitedRejectsDeclaredSizeBeforeBody(t *testing.T) {
+	objectsDir := t.TempDir()
+	oid := Hash{0x12, 0x34}
+	path := looseObjectPath(objectsDir, oid)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, err := zw.Write([]byte("commit 5\x00hello"))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, os.WriteFile(path, compressed.Bytes(), 0o644))
+
+	st := &store{objectsDir: objectsDir}
+	_, _, err = st.readLooseObjectLimited(oid, 4)
+	require.ErrorContains(t, err, "exceeds 4 byte limit")
+}
+
 // TestReadCommitPayload_NotACommit pins the error contract: asking for a
 // non-commit object (a blob) fails with ErrObjectNotCommit rather than
 // returning payload bytes.
