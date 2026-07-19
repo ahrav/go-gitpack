@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"reflect"
 	"runtime"
 	"unsafe"
 
@@ -103,21 +104,33 @@ var errMmapLayout = errors.New("objstore: x/exp/mmap ReaderAt layout changed; up
 // a deterministic open error instead of silent memory corruption on the read
 // path.
 //
-// Two independent probes:
+// Three probes, ordered so that no forged pointer is dereferenced until the
+// layout is proven:
 //
-//  1. Length: the forged header's len must equal the public Len(). This
-//     catches layouts that put a non-length word where the slice length
-//     lives.
-//  2. Content: bytes read through the forged slice must match bytes read
+//  1. Shape (reflection, no unsafe): mmap.ReaderAt must be a struct with
+//     exactly one field, of type []byte, at offset 0. Reflection reads only
+//     type metadata — never field values — so this cannot fault, and it
+//     gates the unsafe cast: a changed layout is rejected here before any
+//     forged slice header exists.
+//  2. Length: the forged header's len must equal the public Len().
+//  3. Content: bytes read through the forged slice must match bytes read
 //     through the public ReadAt API at the start, middle, and end of the
-//     region. A hypothetical layout that happens to preserve a plausible
-//     length while pointing the data word at unrelated memory (e.g. a
-//     leading *os.File field, as in x/exp/mmap's non-mmap fallback struct)
-//     fails this comparison instead of corrupting object reads later.
+//     region. After the shape check the forged slice IS the struct's real
+//     []byte field, so indexing within its length is memory-safe; this
+//     probe guards semantic drift (e.g. the field no longer holding the
+//     exact mapped region).
 func checkMmapLayout(r *mmap.ReaderAt) error {
 	// Pin r for the duration: the forged slice alone does not keep it
 	// reachable, and its finalizer munmaps the region (see inflateExact).
 	defer runtime.KeepAlive(r)
+
+	t := reflect.TypeOf(mmap.ReaderAt{})
+	if t.Kind() != reflect.Struct || t.NumField() != 1 {
+		return errMmapLayout
+	}
+	if f := t.Field(0); f.Offset != 0 || f.Type != reflect.TypeOf([]byte(nil)) {
+		return errMmapLayout
+	}
 
 	data := mmapData(r)
 	if len(data) != r.Len() {
