@@ -928,6 +928,19 @@ func buildDedupWhaleRepo(t *testing.T) string {
 	for i := range 520 {
 		fmt.Fprintf(&small, "small line %d\n", i)
 		b.write("small.txt", small.String())
+		// Order-sensitive echoes: every eighth commit also adds a fresh
+		// file whose lines were all first introduced earlier — two whale
+		// lines and the small line from eight commits back. In seq order
+		// every echo hunk is entirely already-seen and is suppressed; a
+		// decision-order slip (echo verdict computed before the whale's
+		// or the earlier small commit's) emits it and changes the
+		// multiset. Without these, every whale-fixture line is globally
+		// unique and the oracle equality is blind to decision reordering.
+		if i >= 8 && i%8 == 0 {
+			b.write(fmt.Sprintf("echo-%d.txt", i), fmt.Sprintf(
+				"whale line %d payload %d\nwhale line %d payload %d\nsmall line %d\n",
+				i, i*i, i+1, (i+1)*(i+1), i-8))
+		}
 		b.commit(fmt.Sprintf("small %d", i))
 	}
 
@@ -939,7 +952,9 @@ func buildDedupWhaleRepo(t *testing.T) string {
 // reference. Completion alone would only prove liveness; the equality check
 // makes the reorder buffer, seq stamping, and slot-ring reuse — the pieces
 // this fixture stresses with skewed pair-completion times — accountable for
-// producing the correct multiset, not just any multiset.
+// producing the correct multiset. The fixture's echo files carry the
+// order-sensitive verdicts: their hunks are entirely already-seen in seq
+// order, so a decision-order slip emits them and breaks both assertions.
 func TestDiffHistoryHunksDedup_WhaleStress(t *testing.T) {
 	gitDir := buildDedupWhaleRepo(t)
 
@@ -972,6 +987,21 @@ func TestDiffHistoryHunksDedup_WhaleStress(t *testing.T) {
 	sort.Strings(got)
 	require.NotEmpty(t, got)
 
+	// Vacuity guard: the streaming scan must emit the echo hunks that
+	// dedup is expected to suppress, or the NotContains below proves
+	// nothing about ordering.
+	echoes := 0
+	for _, e := range collectHunkScan(t, gitDir) {
+		if strings.Contains(e, "|echo-") {
+			echoes++
+		}
+	}
+	require.Positive(t, echoes, "fixture must produce echo hunks in the streaming scan")
+
+	for _, e := range got {
+		require.NotContainsf(t, e, "|echo-",
+			"echo hunks are fully already-seen in seq order and must be suppressed: %s", e)
+	}
 	require.Equal(t, serialDedupReference(t, gitDir, false, nil), got,
 		"parallel pipeline diverged from the serial reference under reorder stress")
 }
@@ -1065,6 +1095,14 @@ func packObjectSpan(t *testing.T, gitDir, oid string) (packPath string, offset, 
 		if len(fields) < 5 || fields[0] != oid {
 			continue
 		}
+		// Corruption detection relies on the idx CRC check, which the
+		// store runs only on the non-delta read path; a deltified target
+		// would make the corruption invisible. Tiny fixture objects are
+		// never deltified by git's packing heuristics — pin that here so
+		// a packing change fails loudly instead of leaving the test
+		// asserting an error that no longer occurs.
+		require.Lenf(t, fields, 5,
+			"corruption target %s must be stored non-deltified (verify-pack line: %q)", oid, line)
 		size, err := strconv.ParseInt(fields[3], 10, 64)
 		require.NoError(t, err)
 		offset, err := strconv.ParseInt(fields[4], 10, 64)
@@ -1076,10 +1114,11 @@ func packObjectSpan(t *testing.T, gitDir, oid string) (packPath string, offset, 
 }
 
 // corruptPackObject flips the last byte of oid's packed representation in
-// place. The flipped byte is always inside the span covered by the object's
-// idx CRC-32 entry, so a scanner running with VerifyCRC detects the damage
-// deterministically on that object's first read, wherever the byte lands in
-// the zlib stream.
+// place. Detection comes from the idx CRC-32 entry covering exactly that
+// span — not from zlib, whose adler32 trailer the store deliberately skips —
+// so a scanner running with VerifyCRC fails deterministically on the
+// object's first read. packObjectSpan pins the non-delta storage this
+// relies on.
 func corruptPackObject(t *testing.T, gitDir, oid string) {
 	t.Helper()
 	packPath, offset, size := packObjectSpan(t, gitDir, oid)
@@ -1151,11 +1190,13 @@ func TestDiffHistoryHunksDedup_HunkStageErrorAborts(t *testing.T) {
 }
 
 // TestDiffHistoryHunksDedup_TreeStageErrorAborts corrupts a root tree so
-// the tree workers' diff of its commit fails mid-scan, exercising the
-// slot.err hand-off to the sequencer: the scan must return the tree-stage
-// error, terminate, and leak nothing. Trees are read only by the tree stage
-// (collectCommitPairs), so the error must carry its "failed processing
-// commit" wrapper.
+// the tree workers' diff of its commit fails mid-scan: the scan must return
+// the tree-stage error, terminate, and leak nothing. The failing worker
+// records slot.err and closes stopCh, so the sequencer observes the failure
+// through whichever of slot.done or stopCh its select picks — both exits
+// converge on the same shutdown chain. Trees are read only by the tree
+// stage (collectCommitPairs), so the error must carry its "failed
+// processing commit" wrapper.
 func TestDiffHistoryHunksDedup_TreeStageErrorAborts(t *testing.T) {
 	b := newDedupRepoBuilder(t)
 	b.write("a.txt", "one\n")
