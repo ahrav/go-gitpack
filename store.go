@@ -378,6 +378,12 @@ func (s *store) Close() error {
 			}
 		}
 	}
+
+	// Release cached object bytes eagerly. Callers may retain the store
+	// value after Close; without this, up to the full offset-cache budget
+	// of materialized objects would stay reachable until the store itself
+	// becomes unreachable.
+	s.offCache.clear()
 	return firstErr
 }
 
@@ -715,9 +721,12 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 // findPackedObject returns the pack handle, byte offset, and true if found.
 func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 	if s.memoryMidx != nil {
-		if p, off, ok := s.memoryMidx.findObject(oid); ok {
-			return p, off, true
-		}
+		// The merged index is built from the same oidTable/entries the
+		// per-pack searches consult, so a miss here is authoritative.
+		// Falling through would repeat the identical lookup once per pack
+		// — a guaranteed-miss O(packs · log n) scan that get() would pay
+		// on every read of a loose object before probing its caches.
+		return s.memoryMidx.findObject(oid)
 	}
 	for _, pf := range s.packs {
 		if off, ok := pf.findObject(oid); ok {

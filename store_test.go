@@ -6,7 +6,6 @@
 package objstore
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/binary"
 	"fmt"
@@ -461,17 +460,14 @@ func BenchmarkGetCold(b *testing.B) { benchmarkGet(b, false) }
 // resident in the LRU cache.
 func BenchmarkGetWarm(b *testing.B) { benchmarkGet(b, true) }
 
-// BenchmarkReadVarIntFromReader measures the throughput of reading a
-// multi-byte variable-length integer (three bytes, maximum value) from a
-// buffered reader.
-func BenchmarkReadVarIntFromReader(b *testing.B) {
+// BenchmarkDecodeVarInt measures the throughput of decoding a multi-byte
+// variable-length integer (three bytes, maximum value) from a flat buffer.
+func BenchmarkDecodeVarInt(b *testing.B) {
 	buf := []byte{0xff, 0xff, 0x7f}
-	reader := bufio.NewReader(bytes.NewReader(buf))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		reader = bufio.NewReader(bytes.NewReader(buf))
-		readVarIntFromReader(reader)
+		decodeVarInt(buf)
 	}
 }
 

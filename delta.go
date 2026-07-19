@@ -19,7 +19,6 @@
 package objstore
 
 import (
-	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -159,6 +158,15 @@ const defaultDeltaArenaSize = 2 * 16 << 20
 // ~45% of all allocated bytes and ~5% of CPU in memclr. The channel retains
 // arenas across GC cycles; capacity bounds worst-case retained memory to
 // deltaArenaMaxRetained arenas.
+//
+// Deliberate trade-off: unlike sync.Pool, the free-list is never drained, so
+// after a burst of concurrent multi-hop delta resolutions the process
+// permanently retains up to deltaArenaMaxRetained x 32 MiB (256 MiB on
+// >= 8-CPU hosts) of idle arena memory. This is process-global and shared by
+// every open store; it is the steady-state working set of the bulk-scan
+// workload this library targets, not a leak. Long-lived embedders that are
+// memory-constrained should bound scan concurrency (or GOMAXPROCS), which
+// proportionally bounds the retained reserve.
 var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 
 // deltaArenaMaxRetained bounds how many idle arenas the free-list may retain.
@@ -354,6 +362,14 @@ func walkUpDeltaChain(
 	}
 
 	currPack, currOff := params.p, params.off
+	// currOID tracks the OID of the object at (currPack, currOff) when it is
+	// known: at depth 0 it is the lookup target itself, and each ref-delta
+	// hop names its base by OID. ofs-delta hops identify the base only by
+	// byte offset, so the OID becomes unknown (zero) until a later ref-delta
+	// re-establishes it. findCRCForObject uses the OID only for its midx
+	// fallback, which requires the entry's offset to match — so a zero OID
+	// degrades to a conservative skip, never a wrong CRC.
+	currOID := params.oid
 	for depth := 0; depth < params.ctx.maxDepth; depth++ {
 
 		// Short-circuit: if any prior resolution materialized the object at
@@ -384,9 +400,12 @@ func walkUpDeltaChain(
 			// known, proceed when the index has none. Reconstructed delta
 			// hops published by applyDeltaStackCached are not affected —
 			// pack CRCs cover raw records only, and delta-typed reads
-			// never carried a CRC check.
+			// never carried a CRC check. Note the midx CRC fallback only
+			// fires when currOID is known (see the currOID declaration);
+			// per-pack idx lookups are keyed purely by offset and always
+			// apply.
 			if s.VerifyCRC {
-				if crc, ok := s.findCRCForObject(currPack, currOff, params.oid); ok {
+				if crc, ok := s.findCRCForObject(currPack, currOff, currOID); ok {
 					if err := s.verifyCRCForPackObject(currPack, currOff, crc); err != nil {
 						return nil, ObjBad, err
 					}
@@ -414,6 +433,7 @@ func walkUpDeltaChain(
 			if !ok {
 				return nil, ObjBad, fmt.Errorf("base object %s not found", baseOID)
 			}
+			currOID = baseOID
 			continue
 		}
 
@@ -433,15 +453,21 @@ func walkUpDeltaChain(
 			return nil, ObjBad, fmt.Errorf("read ofs-delta offset: %w", err)
 		}
 		currOff -= back
+		// The base is identified only by byte offset; its OID is unknown
+		// until a subsequent ref-delta hop names one.
+		currOID = Hash{}
 	}
 
 	return nil, ObjBad, fmt.Errorf("delta chain too deep (max %d)", params.ctx.maxDepth)
 }
 
-// applyDeltaStack consumes the *same* deltaStack that was filled by
+// applyDeltaStackCached consumes the *same* deltaStack that was filled by
 // walkUpDeltaChain. The slice is treated as read-only here; no mutations are
-// performed after the walk-up phase has completed. The function then resolves
-// the chain using the established ping-pong arena strategy.
+// performed after the walk-up phase has completed. The function resolves the
+// chain using the established ping-pong arena strategy and, when oc is
+// non-nil, records every materialized hop (intermediate and final) under its
+// pack offset so later chains sharing the same tail can short-circuit in
+// walkUpDeltaChain.
 //
 // borrowed preserves the historical call-site intent for consume-and-discard
 // paths. For correctness, the final bytes are always detached from the pooled
@@ -452,20 +478,6 @@ func walkUpDeltaChain(
 // so iterating in reverse applies the oldest (closest-to-base) delta first
 // and the newest (closest-to-target) delta last, which is the correct
 // application order for reconstructing the final object.
-func applyDeltaStack(
-	stack deltaStack,
-	baseData []byte,
-	baseType ObjectType,
-	maxObjectSize uint64,
-	borrowed bool,
-) ([]byte, ObjectType, error) {
-	return applyDeltaStackCached(nil, stack, baseData, baseType, maxObjectSize, borrowed)
-}
-
-// applyDeltaStackCached is applyDeltaStack plus offset-cache publication:
-// when oc is non-nil, every materialized hop (intermediate and final) is
-// recorded under its pack offset so later chains sharing the same tail can
-// short-circuit in walkUpDeltaChain.
 func applyDeltaStackCached(
 	oc *offsetCache,
 	stack deltaStack,
@@ -655,6 +667,15 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
 		offset = (offset << 7) | uint64(buf[i]&0x7f)
 	}
 
+	// The last available byte still has its continuation bit set: either the
+	// pack is truncated mid-varint, or the encoding exceeds the 9-byte bound
+	// Git can ever produce. Returning the partial value would silently climb
+	// to a garbage offset; the inline skip in applyDeltaStreaming rejects the
+	// same input, and the two must stay in agreement.
+	if buf[n-1]&0x80 != 0 {
+		return 0, fmt.Errorf("read ofs-delta offset: truncated or over-long varint")
+	}
+
 	return offset, nil
 }
 
@@ -714,8 +735,10 @@ func applyDeltaStreaming(
 	case ObjRefDelta:
 		pos += 20
 	case ObjOfsDelta:
-		// Skip the variable-length backward offset (≤9 bytes, matching
-		// readOfsDeltaOffset's bound; git never emits more).
+		// Skip the variable-length backward offset (≤9 bytes; git never
+		// emits more). A varint that does not terminate within the buffer
+		// is rejected, exactly as readOfsDeltaOffset rejects it during
+		// walk-up; the two parsers must stay in agreement.
 		var ofsBuf [9]byte
 		on, oerr := pack.ReadAt(ofsBuf[:], pos)
 		if oerr != nil && !errors.Is(oerr, io.EOF) {
@@ -934,40 +957,4 @@ func decodeVarInt(b []byte) (uint64, int) {
 		shift += 7
 	}
 	return 0, 0
-}
-
-// readVarIntFromReader reads a base‑128 varint from br and returns its value
-// and the number of bytes consumed.
-//
-// An error is returned when the encoding exceeds nine bytes (which Git never
-// produces) or when the underlying reader reports an I/O failure.
-func readVarIntFromReader(br *bufio.Reader) (uint64, int, error) {
-	var (
-		value     uint64
-		shift     uint
-		bytesRead int
-	)
-
-	for {
-		b, err := br.ReadByte()
-		if err != nil {
-			return 0, -1, err
-		}
-		bytesRead++
-
-		value |= uint64(b&0x7f) << shift
-		if b&0x80 == 0 {
-			break
-		}
-		shift += 7
-
-		// Git encodings never exceed nine bytes; treat anything longer as
-		// corrupted input.
-		const maxEncodedVarIntSize = 9
-		if bytesRead > maxEncodedVarIntSize {
-			return 0, -1, fmt.Errorf("varint too long")
-		}
-	}
-
-	return value, bytesRead, nil
 }

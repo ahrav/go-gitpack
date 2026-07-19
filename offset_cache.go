@@ -23,8 +23,11 @@ import (
 // low bits (pack entries are byte-aligned, so low bits are well mixed).
 const offsetCacheShards = 32
 
-// offsetCacheBudget bounds the total bytes retained across all shards.
-const offsetCacheBudget = 256 << 20
+// defaultOffsetCacheBudget bounds the total bytes retained across all shards
+// of one store's offset cache. Each open store owns an independent cache, so
+// processes that open many stores concurrently should lower the budget via
+// WithOffsetCacheBudget to bound aggregate growth.
+const defaultOffsetCacheBudget = 256 << 20
 
 // offCacheKey identifies a pack-local byte offset. The pack pointer
 // disambiguates offsets across multiple mapped packfiles.
@@ -37,6 +40,12 @@ type offsetCacheShard struct {
 	mu   sync.Mutex
 	m    map[offCacheKey]cachedObj
 	used int
+
+	// _ pads each shard to its own cache line (and covers the adjacent-line
+	// prefetcher). Without padding, three 24-byte shards share every 64-byte
+	// line, so mutex traffic on distinct shards bounces the same lines and
+	// defeats the contention reduction the sharding exists to provide.
+	_ [128 - 24]byte
 }
 
 // offsetCache is safe for concurrent use. Eviction is approximate: when a
@@ -49,11 +58,46 @@ type offsetCache struct {
 }
 
 func newOffsetCache() *offsetCache {
-	c := &offsetCache{budgetPerShard: offsetCacheBudget / offsetCacheShards}
+	c := &offsetCache{budgetPerShard: defaultOffsetCacheBudget / offsetCacheShards}
 	for i := range c.shards {
 		c.shards[i].m = make(map[offCacheKey]cachedObj, 256)
 	}
 	return c
+}
+
+// setBudget adjusts the total byte budget across all shards. A budget <= 0
+// disables the cache: existing entries are dropped and later adds become
+// no-ops (gets simply miss). Safe for concurrent use, though it is intended
+// to be called once right after the owning store is opened.
+func (c *offsetCache) setBudget(total int) {
+	if c == nil {
+		return
+	}
+	per := total / offsetCacheShards
+	if total <= 0 {
+		per = 0
+	} else if per == 0 {
+		per = 1
+	}
+	c.budgetPerShard = per
+	if per == 0 {
+		c.clear()
+	}
+}
+
+// clear drops every cached entry, releasing the retained object bytes to the
+// GC. The cache remains usable afterwards (unless the budget is zero).
+func (c *offsetCache) clear() {
+	if c == nil {
+		return
+	}
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		s.m = make(map[offCacheKey]cachedObj)
+		s.used = 0
+		s.mu.Unlock()
+	}
 }
 
 func (c *offsetCache) shard(off uint64) *offsetCacheShard {
@@ -80,7 +124,7 @@ func (c *offsetCache) get(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, 
 // add stores a materialized object under (pack, off). The cache takes shared
 // ownership of data; callers must treat it as immutable afterwards.
 func (c *offsetCache) add(pack *mmap.ReaderAt, off uint64, data []byte, typ ObjectType) {
-	if c == nil || len(data) > maxCacheableSize {
+	if c == nil || c.budgetPerShard <= 0 || len(data) > maxCacheableSize {
 		return
 	}
 	s := c.shard(off)

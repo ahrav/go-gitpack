@@ -6,7 +6,6 @@
 package objstore
 
 import (
-	"bufio"
 	"bytes"
 	"compress/zlib"
 	"fmt"
@@ -21,35 +20,30 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
-// TestReadVarIntFromReader validates the Git-style variable-length integer
-// decoder, covering single-byte values, multi-byte continuation sequences,
-// and the empty-input error case.
-// NOTE: consider adding a "name" field to each test case for clearer subtest output.
-func TestReadVarIntFromReader(t *testing.T) {
+// TestDecodeVarInt validates the Git-style variable-length integer decoder,
+// covering single-byte values, multi-byte continuation sequences, the
+// empty-input case, and the 9-byte corruption bound.
+func TestDecodeVarInt(t *testing.T) {
 	tests := []struct {
-		data        []byte
-		expected    uint64
-		consumed    int
-		expectError bool
+		data     []byte
+		expected uint64
+		consumed int // 0 means truncated/over-long input was rejected
 	}{
-		{[]byte{0x00}, 0, 1, false},
-		{[]byte{0x7f}, 127, 1, false},
-		{[]byte{0x80, 0x01}, 128, 2, false},
-		{[]byte{0xff, 0x7f}, 16383, 2, false},
-		{[]byte{0x80, 0x80, 0x01}, 16384, 3, false},
-		{[]byte{}, 0, -1, true}, // empty buffer now returns error
+		{[]byte{0x00}, 0, 1},
+		{[]byte{0x7f}, 127, 1},
+		{[]byte{0x80, 0x01}, 128, 2},
+		{[]byte{0xff, 0x7f}, 16383, 2},
+		{[]byte{0x80, 0x80, 0x01}, 16384, 3},
+		{[]byte{}, 0, 0},     // empty buffer is rejected
+		{[]byte{0x80}, 0, 0}, // truncated continuation is rejected
+		{[]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}, 0, 0}, // >9 bytes rejected
 	}
 
 	for _, test := range tests {
-		reader := bufio.NewReader(bytes.NewReader(test.data))
-		value, consumed, err := readVarIntFromReader(reader)
-
-		if test.expectError {
-			assert.Error(t, err)
-		} else {
-			assert.NoError(t, err)
-			assert.Equal(t, test.expected, value)
-			assert.Equal(t, test.consumed, consumed)
+		value, consumed := decodeVarInt(test.data)
+		assert.Equal(t, test.consumed, consumed, "input %x", test.data)
+		if test.consumed > 0 {
+			assert.Equal(t, test.expected, value, "input %x", test.data)
 		}
 	}
 }
@@ -755,12 +749,12 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 	stackB, closeB := makeStack("b", targetB)
 	defer closeB()
 
-	first, typ, err := applyDeltaStack(stackA, base, ObjBlob, 0, true)
+	first, typ, err := applyDeltaStackCached(nil, stackA, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	require.Equal(t, ObjBlob, typ)
 	require.Equal(t, targetA, first)
 
-	second, typ, err := applyDeltaStack(stackB, base, ObjBlob, 0, true)
+	second, typ, err := applyDeltaStackCached(nil, stackB, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	require.Equal(t, ObjBlob, typ)
 	require.Equal(t, targetB, second)
@@ -962,13 +956,13 @@ func TestApplyDeltaStack_BorrowedVsCopy(t *testing.T) {
 
 	// For empty stack, borrowed=true returns baseData directly (no arena).
 	base := []byte("hello world")
-	result, typ, err := applyDeltaStack(nil, base, ObjBlob, 0, true)
+	result, typ, err := applyDeltaStackCached(nil, nil, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, base, result)
 
 	// For empty stack, borrowed=false returns a COPY.
-	result2, _, err := applyDeltaStack(nil, base, ObjBlob, 0, false)
+	result2, _, err := applyDeltaStackCached(nil, nil, base, ObjBlob, 0, false)
 	require.NoError(t, err)
 	// Modify original; copy should be independent.
 	base[0] = 'H'
@@ -981,11 +975,11 @@ func TestDeltaArenaOverflowProtection(t *testing.T) {
 	maxObj := uint64(512 << 20)
 	base := []byte("base")
 
-	_, _, err := applyDeltaStack(nil, base, ObjBlob, maxObj, false)
+	_, _, err := applyDeltaStackCached(nil, nil, base, ObjBlob, maxObj, false)
 	assert.NoError(t, err, "empty stack with maxObjectSize should succeed")
 
 	hugeBase := make([]byte, 1)
-	_, _, err = applyDeltaStack(nil, hugeBase, ObjBlob, 0, false)
+	_, _, err = applyDeltaStackCached(nil, nil, hugeBase, ObjBlob, 0, false)
 	assert.NoError(t, err, "empty stack should always succeed regardless of base size")
 }
 
