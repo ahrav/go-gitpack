@@ -19,11 +19,39 @@ package objstore
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"sync"
 
 	"github.com/klauspost/compress/zlib"
 )
+
+// errZlibStreamOverrun reports a zlib stream that keeps producing data past
+// the decompressed size declared by the pack object header.
+var errZlibStreamOverrun = errors.New("zlib stream continues past declared object size")
+
+// ensureZlibStreamEnd verifies that a fully drained decompression stream
+// terminates exactly where the object header said it would: one more read
+// must observe clean EOF.
+//
+// io.ReadFull alone proves only that *enough* bytes were produced. Without
+// this check a malformed pack object that inflates to more than the declared
+// size, or one whose deflate stream never reaches its final-block marker,
+// would be accepted as valid object data. The extra read costs one buffer
+// inspection on an already-positioned reader; for zlib-reader sources it
+// also forces the trailer validation that ReadFull may not have reached.
+func ensureZlibStreamEnd(zr io.Reader) error {
+	// io.Copy retries transient (0, nil) reads and maps io.EOF to nil, so a
+	// clean end-of-stream yields (0, nil) here.
+	n, err := io.Copy(io.Discard, io.LimitReader(zr, 1))
+	if err != nil {
+		return err
+	}
+	if n != 0 {
+		return errZlibStreamOverrun
+	}
+	return nil
+}
 
 // zrPool reuses zlib.Reader instances to reduce allocations.
 //

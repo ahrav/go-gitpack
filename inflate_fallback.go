@@ -21,6 +21,10 @@ func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
 	}
 	defer putZlibReader(zr)
 
-	_, err = io.ReadFull(zr, dst)
-	return err
+	if _, err = io.ReadFull(zr, dst); err != nil {
+		return err
+	}
+	// Reject streams that do not terminate at the declared object size;
+	// ReadFull succeeding proves only that enough bytes were produced.
+	return ensureZlibStreamEnd(zr)
 }
