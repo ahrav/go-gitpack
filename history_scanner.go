@@ -131,6 +131,18 @@ type HistoryScanner struct {
 	// replay hunks already seen on the merged branch.
 	skipMergeDiffs bool
 
+	// hunkLineDedup, when true, routes hunk scans through the deduplicating
+	// pipeline (hunk_dedup.go): a hunk is emitted intact iff it contains at
+	// least one line unseen earlier in deterministic parent-first order.
+	// See WithHunkLineDedup for the full behavioral contract.
+	hunkLineDedup bool
+
+	// hunkPathFilter, when non-nil, drops blob pairs whose (commit,
+	// post-image path) it reports true for before any diff work, in both
+	// the streaming and dedup hunk pipelines. Dropped pairs never reach the
+	// dedup fingerprint set. See WithHunkPathFilter for the full contract.
+	hunkPathFilter func(commit Hash, path string) bool
+
 	// profileServer is the HTTP server for pprof endpoints.
 	profileServer *http.Server
 
@@ -300,7 +312,14 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // consumer goroutine, this eliminates the channel hand-off entirely and
 // lets hunk processing scale across every worker — the preferred API for
 // CPU-bound consumers.
+//
+// When the scanner was constructed with WithHunkLineDedup(true), emissions
+// are filtered to each line's first introduction; see WithHunkLineDedup.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
+	if hs.hunkLineDedup {
+		return hs.diffHistoryHunksDedup(fn)
+	}
+
 	numWorkers := runtime.NumCPU()
 	// Tree diffing is a producer stage and much cheaper than hunk scanning.
 	// Capping it prevents one 32 MiB delta arena per CPU from becoming a
@@ -372,7 +391,14 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 							setError(fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err))
 							return
 						}
-						if err := hs.emitCommitBlobPairs(work.commit, parentTree, blobChan, stopCh); err != nil {
+						if err := hs.emitCommitBlobPairs(work.commit, parentTree, func(w blobPairWork) error {
+							select {
+							case <-stopCh:
+								return errScanAborted
+							case blobChan <- w:
+								return nil
+							}
+						}); err != nil {
 							c := work.commit
 							setError(fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err))
 							return
@@ -499,19 +525,31 @@ type directoryRenameCandidate struct {
 const minDirectoryRenameEvidence = 2
 
 // emitCommitBlobPairs walks the first-parent tree diff of a single commit and
-// fans out one blobPairWork per changed blob. Tree walking is cheap relative
-// to blob diffing, so this stage keeps the expensive stage-2 workers supplied
-// with fine-grained work even when one commit touches thousands of files.
-func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- blobPairWork, stopCh <-chan struct{}) error {
-	emit := func(work blobPairWork) error {
-		select {
-		case <-stopCh:
-			return errScanAborted
-		case blobs <- work:
-			return nil
+// fans out one blobPairWork per changed blob through emit. Tree walking is
+// cheap relative to blob diffing, so this stage keeps the expensive stage-2
+// workers supplied with fine-grained work even when one commit touches
+// thousands of files.
+//
+// emit is invoked once per surviving pair, in deterministic sorted-tree
+// order; returning a non-nil error aborts the walk and is returned as-is.
+// The streaming pipeline passes a channel send guarded by its stop channel,
+// while the dedup pipeline collects pairs into a per-commit slice.
+//
+// When hunkPathFilter is set, pairs it reports true for are dropped here —
+// before any blob is loaded or diffed — so filtered paths cost no diff work
+// and, in dedup mode, never mark the fingerprint set.
+func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, emit func(blobPairWork) error) error {
+	if skip := hs.hunkPathFilter; skip != nil {
+		inner := emit
+		emit = func(w blobPairWork) error {
+			// The predicate sees the post-image path exactly as
+			// HunkAddition.Path() would report it (forward slashes).
+			if skip(w.commit, filepath.ToSlash(w.path)) {
+				return nil
+			}
+			return inner(w)
 		}
 	}
-
 	var (
 		adds         []blobPairWork
 		deletes      []blobPairWork
@@ -792,8 +830,10 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
-// loadAllCommits is an internal helper used by package tests. Production scan
-// paths should use streaming traversal.
+// loadAllCommits enumerates every reachable commit, caching the result for
+// the scanner's lifetime. The streaming hunk pipeline uses walkCommitsFromRefs
+// directly; this materialized form serves the dedup pipeline (which needs a
+// total order up front) and package tests.
 //
 // The method uses sync.Once to ensure the expensive commit enumeration is
 // performed at most once, even under concurrent calls. After the first

@@ -63,6 +63,75 @@ func WithSkipMergeDiffs(skip bool) ScannerOption {
 	}
 }
 
+// WithHunkLineDedup makes hunk scans suppress hunks whose added lines were
+// all seen earlier in history, so each unique added line is emitted at its
+// first introduction.
+//
+// The option affects hunk scans only (DiffHistoryHunks, DiffHistoryHunksFunc,
+// and Scan in ScanModeHunks); blob-mode scans are unchanged. When enabled:
+//
+//   - Dedup granularity is the whole hunk: a hunk is emitted intact iff it
+//     contains at least one line not seen at an earlier point in the
+//     deterministic parent-first order over the commit history. Suppression
+//     means every line of the hunk was already seen at an earlier point in
+//     that order; consumers that need every per-commit occurrence should
+//     use the default mode.
+//   - Hunks are never split: StartLine/EndLine/Lines semantics are
+//     unchanged from the default mode, and a multi-line secret contiguous
+//     within one hunk is never truncated by dedup.
+//   - fn may still be invoked concurrently: only the dedup decisions are
+//     serialized internally. Output is deterministic as a multiset of
+//     emissions, never as an order.
+//   - If the internal fingerprint table saturates, dedup fails open: hunks
+//     are emitted rather than dropped, and the scan never errors for this
+//     reason.
+//   - With WithHunkPathFilter, filtered pairs never mark the fingerprint
+//     set, so each unique line is emitted at its first unskipped
+//     introduction.
+//   - Merging in foreign history with older timestamps can insert commits
+//     earlier in the parent-first order and re-attribute a line's first
+//     introduction — inherent to first-introduction semantics.
+//
+// Fingerprint-table size and the pipeline's look-ahead window are internal
+// constants.
+//
+// The default (false) preserves the per-commit emission behavior of the
+// plain scanner byte-for-byte.
+func WithHunkLineDedup(dedup bool) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.hunkLineDedup = dedup
+	}
+}
+
+// WithHunkPathFilter installs a pair-level path filter for hunk scans.
+//
+// The option affects hunk scans only (DiffHistoryHunks, DiffHistoryHunksFunc,
+// and Scan in ScanModeHunks); blob-mode scans are unchanged. When skip is
+// non-nil, every changed blob pair is offered to skip with the introducing
+// commit and the post-image path — the same path the resulting
+// HunkAddition.Path() would report — and pairs reporting true are dropped
+// BEFORE diffing, so filtered paths also skip diff cost in both dedup and
+// non-dedup hunk scans.
+//
+// In dedup mode (WithHunkLineDedup), dropped pairs never mark the
+// fingerprint set, so each unique line is emitted at its first UNSKIPPED
+// introduction. Without this, a consumer that discards emissions from
+// filtered paths after the fact would lose lines whose first introduction
+// happens to be in a filtered path: the set would already have marked them
+// seen, suppressing every later occurrence in paths the consumer keeps.
+//
+// skip MUST be a pure, deterministic function of its arguments and safe for
+// concurrent calls — it is invoked from multiple workers, and the scanner's
+// determinism guarantees only hold under that contract.
+//
+// A nil skip means no filtering (the default) and preserves existing
+// behavior byte-for-byte.
+func WithHunkPathFilter(skip func(commit Hash, path string) bool) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.hunkPathFilter = skip
+	}
+}
+
 // ScanMode returns the scanner's currently configured scan mode.
 func (hs *HistoryScanner) ScanMode() ScanMode {
 	return hs.scanMode
