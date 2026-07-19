@@ -436,10 +436,17 @@ func (b *dedupRepoBuilder) finish() string {
 	return gitDir
 }
 
+// dedupBinaryContent is the byte-identical payload committed at two paths
+// by buildDedupOracleRepo; the NUL bytes make computeAddedHunks classify
+// both blobs as binary.
+const dedupBinaryContent = "\x00\x01\x02binary-payload\x00\xfftail\n"
+
 // buildDedupOracleRepo creates the fixture used by the oracle and
 // determinism tests: a branch + merge, a revert + re-add, a rename with an
-// edit, and a copied file made entirely of already-seen lines. All four
-// shapes force dedup verdicts that differ from plain per-commit emission.
+// edit, a copied file made entirely of already-seen lines, and a re-added
+// identical binary blob. All five shapes force dedup verdicts that differ
+// from plain per-commit emission — the binary re-add in the opposite
+// direction (never suppressed).
 func buildDedupOracleRepo(t *testing.T) string {
 	b := newDedupRepoBuilder(t)
 
@@ -474,6 +481,13 @@ func buildDedupOracleRepo(t *testing.T) string {
 	// Copy: a fresh file made entirely of already-seen lines.
 	b.write("a_copy.txt", "alpha\nbravo\ncharlie\ndelta\n")
 	b.commit("copy a")
+
+	// Binary re-introduction: identical bytes at a second path. Text this
+	// redundant is suppressed; binary must bypass dedup and emit both times.
+	b.write("bin.dat", dedupBinaryContent)
+	b.commit("add binary")
+	b.write("bin_copy.dat", dedupBinaryContent)
+	b.commit("copy binary")
 
 	return b.finish()
 }
@@ -644,6 +658,37 @@ func TestDiffHistoryHunks_DedupOffUnaffected(t *testing.T) {
 
 	on := collectHunkScan(t, gitDir, WithHunkLineDedup(true))
 	require.NotEqual(t, base, on, "fixture must exercise dedup suppression")
+}
+
+// TestDiffHistoryHunksDedup_BinaryPassthroughRepoLevel drives the binary
+// bypass through the real pipeline: the identical binary payload is
+// committed at two paths, and dedup must emit a binary hunk for both
+// introductions — a text file this redundant is suppressed (a_copy.txt in
+// the same fixture proves the contrast). This is the repo-level companion
+// to TestDedupHunkEmission_BinaryPassthrough, which checks the verdict
+// function in isolation.
+func TestDiffHistoryHunksDedup_BinaryPassthroughRepoLevel(t *testing.T) {
+	gitDir := buildDedupOracleRepo(t)
+
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
+	require.NoError(t, err)
+	defer s.Close()
+
+	var (
+		mu     sync.Mutex
+		binary = map[string]int{} // path -> binary emissions
+	)
+	require.NoError(t, s.DiffHistoryHunksFunc(func(h HunkAddition) error {
+		if h.IsBinary() {
+			mu.Lock()
+			binary[h.Path()]++
+			mu.Unlock()
+		}
+		return nil
+	}))
+
+	require.Equal(t, map[string]int{"bin.dat": 1, "bin_copy.dat": 1}, binary,
+		"both introductions of the identical binary blob must survive dedup")
 }
 
 // TestScan_HunksModeHonorsHunkLineDedup verifies ScanModeHunks routes
