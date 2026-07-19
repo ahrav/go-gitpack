@@ -1,7 +1,26 @@
 #!/bin/bash
 # generate_testdata.sh - Generate test Git repositories with guaranteed pack files
 
-set -e
+set -Ee
+
+# Diagnose set -e aborts: report the failing line and command, including
+# inside helper functions (set -E propagates the ERR trap into functions).
+# Most git invocations here silence stderr for signal-to-noise; this trap
+# supplies the line/command context those silenced failures would otherwise
+# lose, and the large-repo commit loops additionally keep stderr visible so
+# git's own error text reaches the log.
+trap 'echo "generate_testdata.sh: FAILED at line $LINENO: $BASH_COMMAND" >&2' ERR
+
+# Keep fixture generation deterministic and self-contained: no background
+# auto-gc/auto-maintenance racing the commit loops, and no interference from
+# the invoking user's git configuration (hooks, templates, signing, fsmonitor).
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+export GIT_TEMPLATE_DIR=""
+export GIT_CONFIG_COUNT=3
+export GIT_CONFIG_KEY_0=gc.auto GIT_CONFIG_VALUE_0=0
+export GIT_CONFIG_KEY_1=maintenance.auto GIT_CONFIG_VALUE_1=false
+export GIT_CONFIG_KEY_2=commit.gpgsign GIT_CONFIG_VALUE_2=false
 
 TESTDATA_DIR="testdata/repos"
 
@@ -197,11 +216,12 @@ generate_large_linear_repo() {
   local progress_step=$((commit_count / 10))
   [ "$progress_step" -eq 0 ] && progress_step=1 # Avoid division by zero for small counts
 
-  # Create remaining commits
+  # Create remaining commits. Only stdout is silenced: stderr must stay
+  # visible so a failing add/commit reports WHY when the ERR trap fires.
   for i in $(seq 2 "$commit_count"); do
     echo "Content for file $i in $repo_name" >"$WORK_DIR/file_$i.txt"
-    git -C "$WORK_DIR" add "file_$i.txt"
-    git -C "$WORK_DIR" commit -m "Add file_$i.txt (commit $i of $commit_count)" >/dev/null 2>&1
+    git -C "$WORK_DIR" add "file_$i.txt" >/dev/null
+    git -C "$WORK_DIR" commit -m "Add file_$i.txt (commit $i of $commit_count)" >/dev/null
 
     # Progress indicator
     if [ $((i % progress_step)) -eq 0 ]; then

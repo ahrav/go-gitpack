@@ -13,12 +13,8 @@
 # fixtures`, which runs ./generate_testdata.sh to build the gitignored
 # testdata/repos fixtures on a fresh runner.
 #
-# NOTE ON THE MODULE REPLACE: go.mod replaces github.com/klauspost/compress with
-# the sibling directory ../klauspost-compress (a perf fork that adds the
-# bytes.Reader flate fast path). Each job checks out this repo AND the fork
-# side-by-side under the workspace so the
-# relative `replace` resolves, then runs go from the repo checkout via
-# `working-directory`.
+# go.mod pins the compress fork commit that provides the bytes.Reader flate
+# fast path, so CI and local builds resolve the same immutable source.
 
 name: CI
 
@@ -45,12 +41,6 @@ jobs:
         with:
           path: go-gitpack
           persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: ahrav/compress
-          ref: go-gitpack-autoresearch
-          path: klauspost-compress
-          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go-gitpack/go.mod
@@ -71,12 +61,6 @@ jobs:
         with:
           path: go-gitpack
           persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: ahrav/compress
-          ref: go-gitpack-autoresearch
-          path: klauspost-compress
-          persist-credentials: false
       - uses: actions/setup-go@v5
         with:
           go-version-file: go-gitpack/go.mod
@@ -92,12 +76,6 @@ jobs:
       - uses: actions/checkout@v4
         with:
           path: go-gitpack
-          persist-credentials: false
-      - uses: actions/checkout@v4
-        with:
-          repository: ahrav/compress
-          ref: go-gitpack-autoresearch
-          path: klauspost-compress
           persist-credentials: false
       - uses: actions/setup-go@v5
         with:

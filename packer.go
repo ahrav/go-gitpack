@@ -112,35 +112,15 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 		pos += int64(prefixLen)
 
 		// Inflate the zlib-compressed delta instructions into the remainder.
-		// The SectionReader length is set to 1<<63-1 (math.MaxInt64) because
-		// the exact compressed size is unknown at this point. The zlib
-		// decompressor will stop at its own internal EOF marker, so the
-		// oversized limit is harmless -- it simply tells the SectionReader
-		// "do not impose an artificial byte cap."
-		src := io.NewSectionReader(r, pos, 1<<63-1)
-		zr, err := getZlibReader(src)
-		if err != nil {
-			return ObjBad, nil, err
-		}
-		defer putZlibReader(zr)
-
-		if _, err := io.ReadFull(zr, combined[prefixLen:]); err != nil {
+		if err := inflateExact(r, pos, combined[prefixLen:]); err != nil {
 			return ObjBad, nil, err
 		}
 		return objType, combined, nil
 	}
 
-	// Regular (non-delta) object: inflate directly.
-	// See the delta branch above for why the SectionReader length is 1<<63-1.
-	src := io.NewSectionReader(r, pos, 1<<63-1)
-	zr, err := getZlibReader(src)
-	if err != nil {
-		return ObjBad, nil, err
-	}
-	defer putZlibReader(zr)
-
+	// Regular (non-delta) object: inflate directly from the mapped pack.
 	out := make([]byte, size)
-	if _, err := io.ReadFull(zr, out); err != nil {
+	if err := inflateExact(r, pos, out); err != nil {
 		return ObjBad, nil, err
 	}
 	return objType, out, nil

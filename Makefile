@@ -12,10 +12,6 @@
 GO      ?= go
 PKG     ?= .
 TESTDATA := testdata/repos
-# libdeflate-dev installs the header and shared library into the default search
-# paths on Debian/Ubuntu, so -ldeflate is sufficient. Override for a custom
-# build, e.g. CGO_LDFLAGS="/path/libdeflate.a".
-CGO_LDFLAGS ?= -ldeflate
 
 .PHONY: all check build fixtures test test-race test-libdeflate cover vet fmt fmt-check mutate tidy
 
@@ -44,9 +40,10 @@ test-race: fixtures
 
 ## test-libdeflate: run the suite against the cgo libdeflate backend. Requires
 ## libdeflate headers + library (Debian/Ubuntu: `apt-get install libdeflate-dev`).
+## The cgo preamble in zlib_cgo.go declares `-ldeflate`; override CGO_CFLAGS /
+## CGO_LDFLAGS in the environment for a libdeflate in a non-standard location.
 test-libdeflate: fixtures
-	CGO_ENABLED=1 CGO_LDFLAGS="$(CGO_LDFLAGS)" \
-		$(GO) test -tags gitpack_libdeflate -count=1 $(PKG)/...
+	CGO_ENABLED=1 $(GO) test -tags gitpack_libdeflate -count=1 $(PKG)/...
 
 ## cover: write a coverage profile and print the per-function summary.
 cover: fixtures

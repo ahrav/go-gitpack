@@ -237,6 +237,24 @@ func open(dir string) (*store, error) {
 		return store, nil
 	}
 
+	// Every mapping opened below is owned by this invocation until the store
+	// is successfully constructed. Any error return before that point must
+	// close all of them — not just the handle that failed — or repeated
+	// open() attempts leak mmap regions and file descriptors.
+	var idxHandles []*mmap.ReaderAt
+	opened := false
+	defer func() {
+		if opened {
+			return
+		}
+		for _, h := range packCache {
+			_ = h.Close()
+		}
+		for _, ih := range idxHandles {
+			_ = ih.Close()
+		}
+	}()
+
 	// Map all pack files in the directory.
 	for _, pack := range packs {
 		if _, ok := packCache[pack]; ok {
@@ -247,6 +265,9 @@ func open(dir string) (*store, error) {
 			return nil, err
 		}
 		packCache[pack] = h
+		if err := checkMmapLayout(h); err != nil {
+			return nil, err
+		}
 	}
 
 	store := &store{
@@ -278,9 +299,11 @@ func open(dir string) (*store, error) {
 		if err != nil {
 			return nil, fmt.Errorf("mmap idx: %w", err)
 		}
+		// Registered before any further fallible step so the deferred
+		// invocation cleanup owns it on every error path below.
+		idxHandles = append(idxHandles, ix)
 		f, err := parseIdx(ix)
 		if err != nil {
-			_ = ix.Close()
 			return nil, fmt.Errorf("parse idx: %w", err)
 		}
 		f.pack = handle
@@ -290,7 +313,6 @@ func open(dir string) (*store, error) {
 		if f.sortedOffsets != nil {
 			f.ridx, err = loadReverseIndex(path, f)
 			if err != nil {
-				_ = ix.Close()
 				return nil, fmt.Errorf("load ridx: %w", err)
 			}
 		}
@@ -299,6 +321,7 @@ func open(dir string) (*store, error) {
 		store.memoryMidx = buildInMemoryMidx(store.packs)
 	}
 
+	opened = true
 	return store, nil
 }
 

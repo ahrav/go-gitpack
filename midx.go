@@ -214,6 +214,12 @@ func parseMidx(dir string, mr *mmap.ReaderAt, packCache map[string]*mmap.ReaderA
 			continue
 		}
 		r, err := mmap.Open(p)
+		if err == nil {
+			if lerr := checkMmapLayout(r); lerr != nil {
+				_ = r.Close()
+				err = lerr
+			}
+		}
 		if err != nil {
 			for _, p := range packs[:i] {
 				if p != nil {

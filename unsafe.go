@@ -13,7 +13,9 @@
 
 package objstore
 
-import "unsafe"
+import (
+	"unsafe"
+)
 
 // btostr converts a byte slice to a string without copying the underlying
 // data. The returned string shares the same backing memory as b.
