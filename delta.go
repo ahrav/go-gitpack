@@ -23,7 +23,9 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"os"
 	"runtime"
+	"strconv"
 	"sync"
 
 	"golang.org/x/exp/mmap"
@@ -166,7 +168,9 @@ const defaultDeltaArenaSize = 2 * 16 << 20
 // every open store; it is the steady-state working set of the bulk-scan
 // workload this library targets, not a leak. Long-lived embedders that are
 // memory-constrained should bound scan concurrency (or GOMAXPROCS), which
-// proportionally bounds the retained reserve.
+// proportionally bounds the retained reserve — or set the
+// GOGITPACK_DELTA_ARENA_RETAIN environment variable (see
+// deltaArenaMaxRetained) to cap or disable retention without a code change.
 var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 
 // deltaArenaMaxRetained bounds how many idle arenas the free-list may retain.
@@ -175,7 +179,21 @@ var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 // fewer CPUs cannot productively use more concurrent arenas, and sizing the
 // list to the parallelism budget keeps the idle reserve proportional to the
 // machine. The upper cap limits retained arenas to 256 MiB on large hosts.
-var deltaArenaMaxRetained = min(8, max(2, runtime.GOMAXPROCS(0)))
+//
+// The GOGITPACK_DELTA_ARENA_RETAIN environment variable overrides the
+// derived cap with an explicit arena count (each arena is 32 MiB; 0 disables
+// retention entirely so every arena is released to the GC after use). This
+// is the no-rebuild control for memory-constrained, long-lived embedders.
+// Read once at process start; malformed or negative values fall back to the
+// derived default.
+var deltaArenaMaxRetained = func() int {
+	if v := os.Getenv("GOGITPACK_DELTA_ARENA_RETAIN"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return min(8, max(2, runtime.GOMAXPROCS(0)))
+}()
 
 // getDeltaArena retrieves a ping‑pong arena from the free-list or allocates
 // a fresh one when the list is empty.
@@ -396,7 +414,8 @@ func walkUpDeltaChain(
 			// serves offset-cache hits directly, so an unverified entry
 			// here would let later direct reads of this object bypass the
 			// CRC check that inflateFromPack would otherwise perform.
-			// Mirrors inflateFromPackWithOptions: verify when the CRC is
+			// verifyPackObjectCRCIfEnabled is the shared policy also used
+			// by inflateFromPackWithOptions: verify when the CRC is
 			// known, proceed when the index has none. Reconstructed delta
 			// hops published by applyDeltaStackCached are not affected —
 			// pack CRCs cover raw records only, and delta-typed reads
@@ -404,12 +423,8 @@ func walkUpDeltaChain(
 			// fires when currOID is known (see the currOID declaration);
 			// per-pack idx lookups are keyed purely by offset and always
 			// apply.
-			if s.VerifyCRC {
-				if crc, ok := s.findCRCForObject(currPack, currOff, currOID); ok {
-					if err := s.verifyCRCForPackObject(currPack, currOff, crc); err != nil {
-						return nil, ObjBad, err
-					}
-				}
+			if err := s.verifyPackObjectCRCIfEnabled(currPack, currOff, currOID); err != nil {
+				return nil, ObjBad, err
 			}
 			oc.add(currPack, currOff, baseData, typ)
 			return baseData, typ, nil

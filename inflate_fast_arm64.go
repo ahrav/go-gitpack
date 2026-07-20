@@ -2,8 +2,6 @@
 
 package objstore
 
-import "unsafe"
-
 const (
 	// Refill-skip thresholds for the assembly kernel, exported to
 	// inflate_fast_arm64.s through go_asm.h as $const_... literals.
@@ -31,53 +29,19 @@ const (
 	// Reads at or beyond this distance trail every store still in
 	// flight, so the wide loop runs stall-free.
 	inflateFastWideCopyDistance = 64
+
+	// inflateFastMinLitlenBits is this architecture's eligibility
+	// threshold for the shared decodeHuffman driver in
+	// inflate_fast_state.go. The arm64 kernel handles every table size,
+	// so the driver never routes to the Go decoder on table-size grounds.
+	inflateFastMinLitlenBits = 0
 )
 
 //go:noescape
 func inflateHuffmanFastArm64(state *inflateFastState)
 
-func (d *goInflater) decodeHuffman(r *deflateBits, dst []byte, out int) (int, error) {
-	if len(r.src)-r.pos <= deflateFastInputMargin ||
-		len(dst)-out <= deflateFastOutputMargin {
-		return d.decodeHuffmanTail(r, dst, out)
-	}
-
-	state := inflateFastState{
-		src:        unsafe.SliceData(r.src),
-		dst:        unsafe.SliceData(dst),
-		litlen:     &d.litlen[0],
-		offset:     &d.offset[0],
-		bitbuf:     r.buf,
-		nbits:      uint64(r.nbits),
-		pos:        uint64(r.pos),
-		out:        uint64(out),
-		inLimit:    uint64(len(r.src) - deflateFastInputMargin),
-		outLimit:   uint64(len(dst) - deflateFastOutputMargin),
-		litlenMask: bitMask(uint(d.litlenBits)),
-		offsetMask: bitMask(uint(d.offsetBits)),
-		yieldAt:    uint64(out + inflateFastYieldBytes),
-	}
-
-	for {
-		inflateHuffmanFastArm64(&state)
-		if state.status == inflateFastYield {
-			continue
-		}
-
-		r.buf = state.bitbuf
-		r.nbits = uint(state.nbits)
-		r.pos = int(state.pos)
-		out = int(state.out)
-
-		switch state.status {
-		case inflateFastTail:
-			return d.decodeHuffmanTail(r, dst, out)
-		case inflateFastBlockDone:
-			return out, nil
-		case inflateFastBadData:
-			return out, errDeflateBadData
-		default:
-			panic("invalid ARM64 inflate fast-loop status")
-		}
-	}
+// inflateHuffmanFastKernel adapts the shared decodeHuffman driver to the
+// arm64 assembly kernel.
+func inflateHuffmanFastKernel(state *inflateFastState) {
+	inflateHuffmanFastArm64(state)
 }

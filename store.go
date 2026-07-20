@@ -666,12 +666,8 @@ func (s *store) inflateFromPackWithOptions(params inflationParams, allowCommitFa
 	}
 
 	// If enabled, perform a CRC-32 integrity check.
-	if s.VerifyCRC {
-		if crc, ok := s.findCRCForObject(params.p, params.off, params.oid); ok {
-			if err := s.verifyCRCForPackObject(params.p, params.off, crc); err != nil {
-				return nil, ObjBad, err
-			}
-		}
+	if err := s.verifyPackObjectCRCIfEnabled(params.p, params.off, params.oid); err != nil {
+		return nil, ObjBad, err
 	}
 
 	if cacheResult && len(data) <= maxCacheableSize {
@@ -841,6 +837,26 @@ func (s *store) findCRCForObject(p *mmap.ReaderAt, off uint64, oid Hash) (uint32
 	}
 
 	return 0, false
+}
+
+// verifyPackObjectCRCIfEnabled applies the store's CRC verification policy to
+// the raw pack record at off: when VerifyCRC is set and an index knows a
+// checksum for the record, the record is verified; when no checksum is known,
+// the record is admitted unverified.
+//
+// Every path that publishes raw pack records into caches served directly by
+// store.get (inflateFromPackWithOptions and walkUpDeltaChain) must call this
+// single helper rather than open-coding the policy: if the policy tightened
+// at one site only, unverified bytes could enter the offset cache and
+// permanently bypass CRC checking on subsequent reads.
+func (s *store) verifyPackObjectCRCIfEnabled(p *mmap.ReaderAt, off uint64, oid Hash) error {
+	if !s.VerifyCRC {
+		return nil
+	}
+	if crc, ok := s.findCRCForObject(p, off, oid); ok {
+		return s.verifyCRCForPackObject(p, off, crc)
+	}
+	return nil
 }
 
 // verifyCRCForPackObject validates the CRC-32 checksum of a pack object.

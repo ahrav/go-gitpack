@@ -14,6 +14,8 @@
 package objstore
 
 import (
+	"os"
+	"strconv"
 	"sync"
 
 	"golang.org/x/exp/mmap"
@@ -28,6 +30,23 @@ const offsetCacheShards = 32
 // processes that open many stores concurrently should lower the budget via
 // WithOffsetCacheBudget to bound aggregate growth.
 const defaultOffsetCacheBudget = 256 << 20
+
+// offsetCacheDefaultBudget is defaultOffsetCacheBudget unless overridden by
+// the GOGITPACK_OFFSET_CACHE_BUDGET environment variable (bytes; a value
+// <= 0 disables the cache). The override lets operators bound or disable
+// every store's cache fleet-wide without a code change in the embedding
+// application: each open store retains up to this budget until Close, so
+// processes opening many repositories under fixed memory limits need a
+// no-rebuild control. Read once at process start; malformed values fall
+// back to the compiled default.
+var offsetCacheDefaultBudget = func() int {
+	if v := os.Getenv("GOGITPACK_OFFSET_CACHE_BUDGET"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return defaultOffsetCacheBudget
+}()
 
 // offCacheKey identifies a pack-local byte offset. The pack pointer
 // disambiguates offsets across multiple mapped packfiles.
@@ -58,10 +77,13 @@ type offsetCache struct {
 }
 
 func newOffsetCache() *offsetCache {
-	c := &offsetCache{budgetPerShard: defaultOffsetCacheBudget / offsetCacheShards}
+	c := &offsetCache{}
 	for i := range c.shards {
 		c.shards[i].m = make(map[offCacheKey]cachedObj, 256)
 	}
+	// Route through setBudget so the environment override shares the
+	// exact rounding and disable semantics of WithOffsetCacheBudget.
+	c.setBudget(offsetCacheDefaultBudget)
 	return c
 }
 

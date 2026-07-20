@@ -46,3 +46,18 @@ if err := scanner.Scan(nil, &myScanner{}); err != nil {
   arenas from a bounded free-list sized from `GOMAXPROCS` (at most 8 arenas,
   256 MiB). The reserve is retained for the process lifetime after peak
   concurrency; bounding scan concurrency bounds it proportionally.
+
+## Environment variables
+
+Runtime overrides read once at process start — no rebuild or code change
+required:
+
+- `GOGITPACK_OFFSET_CACHE_BUDGET` — per-store offset-cache budget in bytes;
+  `<= 0` disables the cache. Overrides the compiled 256 MiB default (code
+  can still call `WithOffsetCacheBudget` per scanner).
+- `GOGITPACK_DELTA_ARENA_RETAIN` — maximum idle 32 MiB delta arenas retained
+  process-wide; `0` disables retention so arenas are released to the GC
+  after use.
+- `GOGITPACK_NOASM_INFLATE` — set to `1` to disable the amd64/arm64 assembly
+  inflate kernels and use the portable Go decoder (same effect as building
+  with the `purego` tag, without rebuilding).
