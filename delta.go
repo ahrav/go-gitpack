@@ -448,7 +448,7 @@ func walkUpDeltaChain(
 		// structural property makes explicit cycle detection unnecessary for
 		// ofs-delta chains (though the depth limit still applies).
 		pos := int64(currOff) + int64(hdrLen)
-		back, err := readOfsDeltaOffset(currPack, pos)
+		back, _, err := readOfsDeltaOffset(currPack, pos)
 		if err != nil {
 			return nil, ObjBad, fmt.Errorf("read ofs-delta offset: %w", err)
 		}
@@ -606,10 +606,10 @@ func applyDeltaStackCached(
 		// later chains sharing this tail stop climbing here. The copy is
 		// required because 'current' aliases the recycled ping-pong arena;
 		// a memmove is far cheaper than the inflate+apply work it saves.
-		// The eligibility check runs BEFORE the detach copy: offsetCache.add
-		// rejects objects above maxCacheableSize, so copying first would
-		// burn a guaranteed-discarded allocation at every oversized hop.
-		if i > 0 && oc != nil && len(current) <= maxCacheableSize {
+		// The eligibility check runs BEFORE the detach copy: copying an entry
+		// that the configured cache budget rejects would burn a guaranteed-
+		// discarded allocation at every ineligible hop.
+		if i > 0 && oc.admits(len(current)) {
 			detached := make([]byte, len(current))
 			copy(detached, current)
 			oc.add(d.pack, d.offset, detached, baseType)
@@ -647,21 +647,22 @@ func applyDeltaStackCached(
 // from a non-empty continuation sequence.
 //
 // Up to 9 bytes are read in a single ReadAt to avoid per-byte syscall
-// overhead on the memory-mapped file.
-func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
+// overhead on the memory-mapped file. The second result is the encoded byte
+// length, allowing callers to advance past the same validated representation.
+func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, int, error) {
 	var buf [9]byte
 	n, err := pack.ReadAt(buf[:], pos)
 	if n == 0 {
 		if err != nil {
-			return 0, fmt.Errorf("read ofs-delta offset: %w", err)
+			return 0, 0, fmt.Errorf("read ofs-delta offset: %w", err)
 		}
-		return 0, fmt.Errorf("read ofs-delta offset: no bytes read")
+		return 0, 0, fmt.Errorf("read ofs-delta offset: no bytes read")
 	}
 
 	offset := uint64(buf[0] & 0x7f)
 	for i := 1; i < n; i++ {
 		if buf[i-1]&0x80 == 0 {
-			return offset, nil
+			return offset, i, nil
 		}
 		offset++
 		offset = (offset << 7) | uint64(buf[i]&0x7f)
@@ -670,13 +671,12 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
 	// The last available byte still has its continuation bit set: either the
 	// pack is truncated mid-varint, or the encoding exceeds the 9-byte bound
 	// Git can ever produce. Returning the partial value would silently climb
-	// to a garbage offset; the inline skip in applyDeltaStreaming rejects the
-	// same input, and the two must stay in agreement.
+	// to a garbage offset.
 	if buf[n-1]&0x80 != 0 {
-		return 0, fmt.Errorf("read ofs-delta offset: truncated or over-long varint")
+		return 0, 0, fmt.Errorf("read ofs-delta offset: truncated or over-long varint")
 	}
 
-	return offset, nil
+	return offset, n, nil
 }
 
 // applyDeltaStreaming applies delta instructions to reconstruct an object.
@@ -735,23 +735,11 @@ func applyDeltaStreaming(
 	case ObjRefDelta:
 		pos += 20
 	case ObjOfsDelta:
-		// Skip the variable-length backward offset (≤9 bytes; git never
-		// emits more). A varint that does not terminate within the buffer
-		// is rejected, exactly as readOfsDeltaOffset rejects it during
-		// walk-up; the two parsers must stay in agreement.
-		var ofsBuf [9]byte
-		on, oerr := pack.ReadAt(ofsBuf[:], pos)
-		if oerr != nil && !errors.Is(oerr, io.EOF) {
-			return nil, oerr
+		_, consumed, err := readOfsDeltaOffset(pack, pos)
+		if err != nil {
+			return nil, err
 		}
-		j := 0
-		for j < on && ofsBuf[j]&0x80 != 0 {
-			j++
-		}
-		if j >= on {
-			return nil, io.ErrUnexpectedEOF
-		}
-		pos += int64(j) + 1
+		pos += int64(consumed)
 	}
 
 	// Bound the payload before sizing any allocation from it. payloadSize

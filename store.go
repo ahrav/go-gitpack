@@ -420,11 +420,17 @@ func (s *store) treeIter(oid Hash) (*TreeIter, error) {
 // modify the returned data. If mutation is needed, the caller must copy first.
 // get is safe for concurrent use.
 func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
-	// Fast path: resolve the OID to its pack offset (lock-free binary
-	// search over mmap'd indexes) and consult the offset cache first.
-	// During bulk scans nearly every repeated read hits here, skipping
-	// the mutex acquisitions of the delta window and ARC cache.
-	p, off, inPack := s.findPackedObject(oid)
+	var p *mmap.ReaderAt
+	var off uint64
+	var inPack, packLookupDone bool
+	if s.offCache.enabled() {
+		// Fast path: resolve the OID to its pack offset (lock-free binary
+		// search over mmap'd indexes) and consult the offset cache first.
+		// During bulk scans nearly every repeated read hits here, skipping
+		// the mutex acquisitions of the delta window and ARC cache.
+		p, off, inPack = s.findPackedObject(oid)
+		packLookupDone = true
+	}
 	if inPack {
 		if data, typ, ok := s.offCache.get(p, off); ok {
 			return data, typ, nil
@@ -452,9 +458,12 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 		return b.data, b.typ, nil
 	}
 
-	ctx := getDeltaContext(s.maxDeltaDepth)
-	defer putDeltaContext(ctx)
+	if !packLookupDone {
+		p, off, inPack = s.findPackedObject(oid)
+	}
 	if inPack {
+		ctx := getDeltaContext(s.maxDeltaDepth)
+		defer putDeltaContext(ctx)
 		return s.inflateFromPack(inflationParams{
 			p:             p,
 			off:           off,
@@ -463,7 +472,15 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 			maxObjectSize: s.maxDeltaObjectSize,
 		})
 	}
-	return s.getWithContextSkipCache(oid, ctx)
+	data, typ, err := s.readLooseObject(oid)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+	if len(data) <= maxCacheableSize {
+		s.dw.add(oid, data, typ)
+		s.cache.Add(oid, cachedObj{data: data, typ: typ})
+	}
+	return data, typ, nil
 }
 
 // getMaterialized retrieves the fully materialized object, including commit bodies.
@@ -544,54 +561,6 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 		return b.data, b.typ, nil
 	}
 
-	if s.memoryMidx != nil {
-		if p, off, ok := s.memoryMidx.findObject(oid); ok {
-			return s.inflateFromPack(inflationParams{
-				p:             p,
-				off:           off,
-				oid:           oid,
-				ctx:           ctx,
-				maxObjectSize: s.maxDeltaObjectSize,
-			})
-		}
-	}
-
-	for _, pf := range s.packs {
-		offset, found := pf.findObject(oid)
-		if !found {
-			continue
-		}
-		return s.inflateFromPack(inflationParams{
-			p:             pf.pack,
-			off:           offset,
-			oid:           oid,
-			ctx:           ctx,
-			maxObjectSize: s.maxDeltaObjectSize,
-		})
-	}
-	data, typ, err := s.readLooseObject(oid)
-	if err == nil {
-		if len(data) <= maxCacheableSize {
-			s.dw.add(oid, data, typ)
-			s.cache.Add(oid, cachedObj{data: data, typ: typ})
-		}
-		return data, typ, nil
-	}
-	return nil, ObjBad, err
-}
-
-// getWithContextSkipCache is like getWithContext but skips the delta-window
-// and ARC cache checks.
-//
-// Duplication rationale: getWithContext and getWithContextSkipCache share
-// nearly identical pack-lookup and loose-object-fallback logic. The
-// duplication is intentional -- the public get() method already checks both
-// cache tiers before calling into this code path. Re-checking them here
-// would add two lock-guarded map lookups per cache-miss object, which is
-// measurable during bulk scans that inflate millions of objects. Keeping a
-// separate "skip cache" variant avoids that overhead at the cost of a small
-// amount of code duplication that is straightforward to maintain.
-func (s *store) getWithContextSkipCache(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
 	if s.memoryMidx != nil {
 		if p, off, ok := s.memoryMidx.findObject(oid); ok {
 			return s.inflateFromPack(inflationParams{

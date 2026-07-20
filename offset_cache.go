@@ -104,6 +104,14 @@ func (c *offsetCache) shard(off uint64) *offsetCacheShard {
 	return &c.shards[off&(offsetCacheShards-1)]
 }
 
+func (c *offsetCache) enabled() bool {
+	return c != nil && c.budgetPerShard > 0
+}
+
+func (c *offsetCache) admits(size int) bool {
+	return c.enabled() && size <= maxCacheableSize && size <= c.budgetPerShard
+}
+
 // get returns the materialized object stored at (pack, off), if present.
 // The returned slice is shared and MUST NOT be mutated.
 // A nil receiver reports a miss so contexts without a store can share code.
@@ -130,7 +138,7 @@ func (c *offsetCache) get(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, 
 // maxCacheableSize × offsetCacheShards process-wide, defeating small
 // WithOffsetCacheBudget settings on memory-constrained scanners).
 func (c *offsetCache) add(pack *mmap.ReaderAt, off uint64, data []byte, typ ObjectType) {
-	if c == nil || c.budgetPerShard <= 0 || len(data) > maxCacheableSize || len(data) > c.budgetPerShard {
+	if !c.admits(len(data)) {
 		return
 	}
 	s := c.shard(off)

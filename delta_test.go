@@ -887,24 +887,24 @@ func TestReadOfsDeltaOffset_PropagatesReadError(t *testing.T) {
 	defer pack.Close()
 
 	// Reading at any offset beyond the file should return an error.
-	_, err = readOfsDeltaOffset(pack, 100)
+	_, _, err = readOfsDeltaOffset(pack, 100)
 	require.Error(t, err, "expected error when reading beyond EOF, got nil")
 }
 
-// TestReadOfsDeltaOffset_ValidData verifies that readOfsDeltaOffset correctly
-// decodes a valid single-byte offset (no continuation bit set).
+// TestReadOfsDeltaOffset_ValidData verifies that readOfsDeltaOffset decodes
+// the offset and reports the exact number of bytes consumed.
 func TestReadOfsDeltaOffset_ValidData(t *testing.T) {
-	// A single byte with value 0x42 (continuation bit not set) should decode to 0x42.
 	path := filepath.Join(t.TempDir(), "valid.pack")
-	require.NoError(t, os.WriteFile(path, []byte{0x42}, 0o644))
+	require.NoError(t, os.WriteFile(path, []byte{0x80, 0x00, 0xff}, 0o644))
 
 	pack, err := mmap.Open(path)
 	require.NoError(t, err)
 	defer pack.Close()
 
-	offset, err := readOfsDeltaOffset(pack, 0)
+	offset, consumed, err := readOfsDeltaOffset(pack, 0)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(0x42), offset)
+	assert.Equal(t, uint64(128), offset)
+	assert.Equal(t, 2, consumed)
 }
 
 // testDelta represents delta information for testing.

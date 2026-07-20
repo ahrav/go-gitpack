@@ -14,6 +14,9 @@ func TestOffsetCacheBudgetRejectsOversizedEntries(t *testing.T) {
 	c.setBudget(offsetCacheShards) // 1 byte per shard
 
 	big := make([]byte, 1024)
+	if c.admits(len(big)) {
+		t.Fatal("entry larger than the per-shard budget must not be admitted")
+	}
 	c.add(nil, 0, big, ObjBlob)
 	if _, _, ok := c.get(nil, 0); ok {
 		t.Fatal("entry larger than the per-shard budget must be rejected")
@@ -25,9 +28,17 @@ func TestOffsetCacheBudgetRejectsOversizedEntries(t *testing.T) {
 	// Entries within the per-shard budget are still admitted.
 	c.setBudget(offsetCacheShards << 10) // 1 KiB per shard
 	small := make([]byte, 512)
+	if !c.admits(len(small)) {
+		t.Fatal("entry within the per-shard budget must be admitted")
+	}
 	c.add(nil, 8, small, ObjBlob)
 	if _, _, ok := c.get(nil, 8); !ok {
 		t.Fatal("entry within the per-shard budget must be admitted")
+	}
+
+	c.setBudget(0)
+	if c.enabled() || c.admits(0) {
+		t.Fatal("zero budget must disable cache admission")
 	}
 }
 
