@@ -11,6 +11,19 @@ import (
 	"testing"
 )
 
+// Shared static pack-zlib stream vectors (2-byte header + DEFLATE stream +
+// 4-byte Adler-32 trailer), referenced by the static-vector, truncation,
+// ARM64 differential, and concurrent pool-reuse tests.
+//
+// fixedHuffmanVectorHex decodes to "goodbye, world" via a single fixed-
+// Huffman (BTYPE=1) block; dynamicHuffmanVectorHex decodes to
+// bytes.Repeat([]byte("abcabc"), 1000) via a single dynamic-Huffman
+// (BTYPE=2) block.
+const (
+	fixedHuffmanVectorHex   = "789c4bcfcf4f49aa4cd55128cf2fca49010028a5055e"
+	dynamicHuffmanVectorHex = "789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959"
+)
+
 func TestInflatePackZlibStaticVectors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -29,12 +42,12 @@ func TestInflatePackZlibStaticVectors(t *testing.T) {
 		},
 		{
 			name: "fixed huffman",
-			hex:  "789c4bcfcf4f49aa4cd55128cf2fca49010028a5055e",
+			hex:  fixedHuffmanVectorHex,
 			want: []byte("goodbye, world"),
 		},
 		{
 			name: "dynamic huffman",
-			hex:  "789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959",
+			hex:  dynamicHuffmanVectorHex,
 			want: bytes.Repeat([]byte("abcabc"), 1000),
 		},
 	}
@@ -844,9 +857,7 @@ func TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF(t *testing.T) {
 
 	// A dynamic-block member (BTYPE=2), so cuts land inside the 14-bit
 	// counts, the precode lengths, and the code-length symbol stream.
-	dynamic, err := hex.DecodeString(
-		"789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959",
-	)
+	dynamic, err := hex.DecodeString(dynamicHuffmanVectorHex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,7 +885,12 @@ func TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF(t *testing.T) {
 func guardedGoInflate(tb testing.TB, src []byte, size int) ([]byte, int, error) {
 	tb.Helper()
 
-	const guardSize = 32
+	// guardSize must be >= deflateFastMatchCopy: the fast loop's worst-case
+	// whole-word match copy can overwrite up to that many bytes at once, so
+	// a narrower guard would let an out-of-dst overrun land entirely past
+	// the pattern and go undetected on platforms without the mprotect
+	// guard-page test.
+	const guardSize = 2 * deflateFastMatchCopy
 	guarded := bytes.Repeat([]byte{0xa5}, guardSize+size+guardSize)
 	dst := guarded[guardSize : guardSize+size : guardSize+size]
 	srcBefore := append([]byte(nil), src...)

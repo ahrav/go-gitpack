@@ -52,9 +52,7 @@ func TestInflateHuffmanFastArm64FixedDifferential(t *testing.T) {
 }
 
 func TestInflateHuffmanFastArm64DynamicDifferential(t *testing.T) {
-	encoded, err := hex.DecodeString(
-		"789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959",
-	)
+	encoded, err := hex.DecodeString(dynamicHuffmanVectorHex)
 	if err != nil {
 		t.Fatal(err)
 	}
