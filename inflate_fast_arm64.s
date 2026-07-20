@@ -69,7 +69,7 @@ have_length:
 	TBNZ	$15, R14, offset_exception
 
 	AND	$0xff, R6, R16
-	CMP	$30, R16
+	CMP	$const_inflateFastOffsetRefillThreshold, R16
 	BGT	offset_direct_ready
 	MOVD	(R7), R17
 	EOR	$56, R6, R16
@@ -110,9 +110,16 @@ have_offset:
 	SUB	R20, R8, R23
 	ADD	R19, R8, R8
 	CMP	$8, R20
-	BLT	copy_narrow
+	BLO	copy_short_offset
+	CMP	$const_deflateFastMatchCopy, R19
+	BGT	copy_long
 
-copy_wide:
+	// Short match, offset >= 8: one unconditional 40-byte block. Chunk
+	// reads trail the writes by at least 8 bytes, so every load reads
+	// final data; at most a few loads straddle recent stores, which is
+	// cheaper for short matches than the long-match handling in
+	// copy_long. Rarer copy shapes live past the exception handlers to
+	// keep them out of the hot instruction stream.
 	MOVD.P	8(R23), R25
 	MOVD.P	R25, 8(R22)
 	MOVD.P	8(R23), R25
@@ -123,8 +130,6 @@ copy_wide:
 	MOVD.P	R25, 8(R22)
 	MOVD.P	8(R23), R25
 	MOVD.P	R25, 8(R22)
-	CMP	R8, R22
-	BLT	copy_wide
 
 loop_check:
 	CMP	R9, R7
@@ -133,9 +138,9 @@ loop_check:
 
 return_boundary:
 	CMP	R9, R7
-	BGE	return_tail
+	BHS	return_tail
 	CMP	R13, R8
-	BGE	return_yield
+	BHS	return_yield
 
 return_tail:
 	MOVW	$const_inflateFastTail, R14
@@ -243,7 +248,7 @@ subtable_literal:
 
 offset_exception:
 	AND	$0xff, R6, R16
-	CMP	$37, R16
+	CMP	$const_inflateFastOffsetSubRefillThreshold, R16
 	BGT	offset_exception_ready
 	MOVD	(R7), R17
 	EOR	$56, R6, R16
@@ -269,23 +274,6 @@ offset_exception_ready:
 	SUB	R14, R6, R6
 	B	have_offset
 
-copy_narrow:
-	CMP	$1, R20
-	BEQ	copy_rle
-
-copy_small_offset:
-	MOVD	(R23), R25
-	MOVD	R25, (R22)
-	ADD	R20, R23, R23
-	ADD	R20, R22, R22
-	MOVD	(R23), R25
-	MOVD	R25, (R22)
-	ADD	R20, R23, R23
-	ADD	R20, R22, R22
-	CMP	R8, R22
-	BLT	copy_small_offset
-	B	loop_check
-
 copy_rle:
 	MOVBU	(R23), R25
 	MOVD	$0x0101010101010101, R26
@@ -295,5 +283,63 @@ copy_rle_loop:
 	STP	(R25, R25), 16(R22)
 	ADD	$32, R22, R22
 	CMP	R8, R22
-	BLT	copy_rle_loop
+	BLO	copy_rle_loop
+	B	loop_check
+
+copy_short_offset:
+	CMP	$1, R20
+	BEQ	copy_rle
+
+	// Long match, or an offset below the 8-byte chunk stride. Grow the
+	// read distance by chunked doubling: an 8-byte load that partially
+	// overlaps a recent store cannot store-to-load forward, and a match
+	// copy that strides through stalled loads dominates repetitive-data
+	// decode. Each round copies exactly D bytes in 8-byte chunks, which
+	// makes reading at distance 2D legal for the next round
+	// (2D <= copied + D holds exactly, and every round reads starting at
+	// the original match source). A chunk's tail may read up to 7
+	// not-yet-final bytes and write them past the round end; the next
+	// round or the finishing loop rewrites them, and the last round stays
+	// within the iteration write margin. Rounds end once D reaches the
+	// wide-copy distance, where the 32-byte block loop no longer
+	// straddles in-flight stores, or once at most D bytes remain, where
+	// one 8-byte-chunk pass finishes the match.
+copy_long:
+	CMP	$const_inflateFastWideCopyDistance, R20
+	BGE	copy_wide
+
+copy_grow:
+	SUB	R22, R8, R16
+	CMP	R20, R16
+	BLE	copy_finish
+	SUB	R20, R22, R23
+	ADD	R20, R22, R19
+copy_grow_chunk:
+	MOVD.P	8(R23), R25
+	MOVD.P	R25, 8(R22)
+	CMP	R19, R22
+	BLO	copy_grow_chunk
+	MOVD	R19, R22
+	LSL	$1, R20, R20
+	CMP	$const_inflateFastWideCopyDistance, R20
+	BLT	copy_grow
+
+copy_wide:
+	SUB	R20, R22, R23
+copy_wide_loop:
+	LDP.P	32(R23), (R25, R26)
+	LDP	-16(R23), (R16, R17)
+	STP.P	(R25, R26), 32(R22)
+	STP	(R16, R17), -16(R22)
+	CMP	R8, R22
+	BLO	copy_wide_loop
+	B	loop_check
+
+copy_finish:
+	SUB	R20, R22, R23
+copy_finish_loop:
+	MOVD.P	8(R23), R25
+	MOVD.P	R25, 8(R22)
+	CMP	R8, R22
+	BLO	copy_finish_loop
 	B	loop_check

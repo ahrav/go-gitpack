@@ -21,8 +21,12 @@ func FuzzInflatePackZlibRoundTrip(f *testing.F) {
 	}
 
 	f.Fuzz(func(t *testing.T, payload []byte, mode uint8) {
-		if len(payload) > 64<<10 {
-			payload = payload[:64<<10]
+		// The cap must exceed inflateFastYieldBytes (64 KiB) plus
+		// deflateFastOutputMargin so generated payloads can drive the
+		// ARM64 fast loop through its yield-and-resume path; a 64 KiB
+		// cap would make that path unreachable from this target.
+		if len(payload) > 128<<10 {
+			payload = payload[:128<<10]
 		}
 		encoded := encodeZlib(t, payload, levels[int(mode)%len(levels)])
 		memberEnd := len(encoded) - 4

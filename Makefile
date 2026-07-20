@@ -13,12 +13,12 @@ GO      ?= go
 PKG     ?= .
 TESTDATA := testdata/repos
 
-.PHONY: all check build fixtures test test-race test-libdeflate cover vet fmt fmt-check mutate tidy
+.PHONY: all check build build-cross fixtures test test-race test-libdeflate cover vet fmt fmt-check mutate tidy
 
 all: check
 
-## check: fmt-check + vet + tests + race (the local pre-merge gate).
-check: fmt-check vet test test-race
+## check: fmt-check + vet + cross-compile + tests + race (the local pre-merge gate).
+check: fmt-check vet build-cross test test-race
 
 ## fixtures: generate the git fixture repos the suite needs (idempotent; only
 ## runs generate_testdata.sh when testdata/repos is absent).
@@ -28,6 +28,37 @@ fixtures:
 ## build: compile all packages.
 build:
 	$(GO) build $(PKG)/...
+
+## build-cross: cross-compile smoke matrix pinning the DEFLATE build-tag algebra.
+##
+## The ARM64 assembly fast loop is gated on
+## `arm64 && !purego && (!cgo || !gitpack_libdeflate)` (inflate_fast_arm64.go)
+## with the complementary generic gate in inflate_fast_generic.go, so tag drift
+## only surfaces on targets no single native runner compiles. The legs pin
+## every arm of that expression reachable without cgo; all use CGO_ENABLED=0
+## because cross-compilation disables cgo anyway, and the explicit setting
+## keeps the legs reproducible on a native runner too (the linux/arm64 leg
+## exercises the `!cgo` arm on the machine that would otherwise default to
+## cgo). The one arm cross-compilation cannot reach — arm64 with cgo AND
+## gitpack_libdeflate, where the tag alone must deselect the asm file — is
+## pinned by the CI libdeflate job's ARM64 leg.
+##
+## `go build ./...` deliberately includes examples/ — they are plain Go with no
+## cgo or platform constraints, so they must cross-compile as well.
+##
+## Cross-vet runs only for darwin/arm64 (asm-active leg: vets the wrapper and
+## its unsafe conversions against a non-linux target) and linux/amd64
+## (generic-path leg). Vetting every leg would roughly double the cost of the
+## target for no additional tag coverage; the remaining legs share one of those
+## two code paths.
+build-cross:
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 $(GO) build $(PKG)/...
+	CGO_ENABLED=0 GOOS=windows GOARCH=arm64 $(GO) build $(PKG)/...
+	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 $(GO) build $(PKG)/...
+	CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 $(GO) build -tags purego $(PKG)/...
+	CGO_ENABLED=0 GOOS=linux   GOARCH=arm64 $(GO) build $(PKG)/...
+	CGO_ENABLED=0 GOOS=darwin  GOARCH=arm64 $(GO) vet $(PKG)/...
+	CGO_ENABLED=0 GOOS=linux   GOARCH=amd64 $(GO) vet $(PKG)/...
 
 ## test: run the full suite against the default pure-Go backend.
 test: fixtures

@@ -23,11 +23,19 @@ func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
 	defer runtime.KeepAlive(r)
 
 	data := mmapData(r)
-	if pos < 0 || pos > int64(len(data)) {
+	// A pack truncated inside the 2-byte zlib header is an unexpected-EOF
+	// class failure, matching the non-mmap fallback; only streams with a
+	// complete header reach the one-shot decoder's own classification.
+	if pos < 0 || pos+2 > int64(len(data)) {
 		return io.ErrUnexpectedEOF
 	}
 	_, err := inflateZlibOneShot(data[pos:], dst)
 	return err
+}
+
+// mmapData relies on the pinned x/exp/mmap layout for mmap-backed platforms.
+func mmapData(r *mmap.ReaderAt) []byte {
+	return (*struct{ data []byte })(unsafe.Pointer(r)).data
 }
 
 // getZlibReaderAt opens the *deflate* payload of a zlib stream positioned at
@@ -70,11 +78,6 @@ func getZlibReaderAt(data []byte, pos int64) (io.ReadCloser, *bytes.Reader, erro
 		return nil, nil, err
 	}
 	return fr, br, nil
-}
-
-// mmapData relies on the pinned x/exp/mmap layout for mmap-backed platforms.
-func mmapData(r *mmap.ReaderAt) []byte {
-	return (*struct{ data []byte })(unsafe.Pointer(r)).data
 }
 
 // errMmapLayout is returned when the forged slice header produced by

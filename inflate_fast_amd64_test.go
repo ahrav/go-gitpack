@@ -148,9 +148,7 @@ func TestInflateHuffmanFastAMD64DispatchPaths(t *testing.T) {
 func amd64DynamicMatchBlock(t *testing.T) ([]byte, []byte) {
 	t.Helper()
 
-	encoded, err := hex.DecodeString(
-		"789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959",
-	)
+	encoded, err := hex.DecodeString(dynamicHuffmanVectorHex)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,8 +359,8 @@ func amd64PrepareHuffmanBlock(
 			t.Fatal("loadFixedTables failed")
 		}
 	case 2:
-		if !d.loadDynamicTables(&r) {
-			t.Fatal("loadDynamicTables failed")
+		if err := d.loadDynamicTables(&r); err != nil {
+			t.Fatalf("loadDynamicTables failed: %v", err)
 		}
 	default:
 		t.Fatalf("unsupported Huffman block type %d", wantType)
