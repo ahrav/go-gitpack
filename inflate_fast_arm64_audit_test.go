@@ -169,7 +169,7 @@ func newArm64DeepStream(t *testing.T) *arm64DeepStream {
 	offLens[5] = 6
 	offLens[6] = 7
 	offLens[7] = 8
-	offLens[8] = 9 // distances 33..40 (3 extra bits): first subtable depth
+	offLens[8] = 9 // distances 17..24 (3 extra bits): first subtable depth
 	offLens[9] = 10
 	offLens[10] = 11
 	offLens[11] = 12
@@ -230,9 +230,9 @@ func (s *arm64DeepStream) match(length, dist int) {
 		s.w.writeCode(s.offCodes[0])
 	case dist == 4:
 		s.w.writeCode(s.offCodes[3])
-	case dist >= 33 && dist <= 40:
+	case dist >= 17 && dist <= 24:
 		s.w.writeCode(s.offCodes[8])
-		s.w.write(uint64(dist-33), 3)
+		s.w.write(uint64(dist-17), 3)
 	case dist >= 16385 && dist <= 24576:
 		s.w.writeCode(s.offCodes[28])
 		s.w.write(uint64(dist-16385), 13)
@@ -264,16 +264,30 @@ func (s *arm64DeepStream) endOfBlock() { s.w.writeCode(s.litCodes[256]) }
 func TestInflateHuffmanFastArm64DeepTables(t *testing.T) {
 	s := newArm64DeepStream(t)
 
-	// History for the deepest back-references, using 1-3 bit literals.
+	// History for the deepest back-references. The sequence is
+	// deterministic but non-periodic (an LCG over the ten literal
+	// symbols), so a kernel regression that shifts any decoded distance
+	// selects visibly different bytes; a periodic fill would mask every
+	// error that is a multiple of the period.
+	lcg := uint32(0x9e3779b9)
+	nextLit := func() byte {
+		lcg = lcg*1664525 + 1013904223
+		return byte('A' + (lcg>>24)%10)
+	}
 	for i := 0; i < 33000; i++ {
-		s.literal(byte('A' + i%3))
+		s.literal(nextLit())
 	}
 	s.literal('Z')      // 12-bit subtable literal
 	s.match(258, 32768) // subtable length + 15-bit offset code + 13 extra
 	s.match(3, 20000)   // subtable length 3 + symbol 28 + 13 extra
-	s.match(258, 1)     // RLE copy through deep tables
-	s.match(3, 4)       // 1-bit direct offset code
-	s.match(258, 33)    // 9-bit offset subtable code + 3 extra
+	// Fresh non-periodic bytes so the small-distance matches below read
+	// distinguishable history even after the long copies above.
+	for i := 0; i < 64; i++ {
+		s.literal(nextLit())
+	}
+	s.match(3, 4)    // 1-bit direct offset code
+	s.match(258, 17) // 9-bit offset subtable code + 3 extra
+	s.match(258, 1)  // RLE copy through deep tables
 	s.literal('A')
 	s.literal('B')
 	s.literal('Z')
@@ -376,21 +390,38 @@ func TestInflateHuffmanFastArm64BadDataSites(t *testing.T) {
 			},
 		},
 		{
+			// The reserved symbols must be rejected by entry recognition
+			// alone: the preceding history spans the full 32 KiB window,
+			// so a regression that maps symbol 30 to ANY valid DEFLATE
+			// distance decodes a legal match, keeps going, and diverges
+			// from the reference instead of failing through the
+			// offset-beyond-history check at the same position.
 			name: "reserved distance symbol 30",
 			build: func(w *deflateTestBits) {
 				w.writeFixedLitlen('A')
+				w.writeFixedLitlen('B')
+				for i := 0; i < 127; i++ {
+					w.writeFixedLength(258)
+					w.writeFixedDistance(1)
+				}
+				// History is now exactly 2 + 127*258 = 32768 bytes.
 				w.writeFixedLength(3)
 				w.writeFixedOffset(30)
-				w.write(0, 10)
+				w.write(0, 13)
 			},
 		},
 		{
 			name: "reserved distance symbol 31",
 			build: func(w *deflateTestBits) {
 				w.writeFixedLitlen('A')
+				w.writeFixedLitlen('B')
+				for i := 0; i < 127; i++ {
+					w.writeFixedLength(258)
+					w.writeFixedDistance(1)
+				}
 				w.writeFixedLength(3)
 				w.writeFixedOffset(31)
-				w.write(0, 10)
+				w.write(0, 13)
 			},
 		},
 	}
@@ -403,7 +434,10 @@ func TestInflateHuffmanFastArm64BadDataSites(t *testing.T) {
 			tt.build(&w)
 			src := append(w.bytes(), make([]byte, 40)...)
 			d, r := arm64PrepareHuffmanBlock(t, src, 1)
-			const dstLen = 2 * deflateFastOutputMargin
+			// Large enough that the kernel, not the tail, must detect
+			// each site, with room for the 32 KiB history the reserved
+			// cases decode first.
+			const dstLen = 32768 + 2*deflateFastOutputMargin
 
 			reference := arm64RunHuffmanGo(d, r, dstLen)
 			if reference.err != errDeflateBadData {
