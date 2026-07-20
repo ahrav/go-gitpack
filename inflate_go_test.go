@@ -1042,13 +1042,28 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 		// compress/flate: at a truncation boundary flate may stop one
 		// symbol short of the bytes zlib and libdeflate decode from the
 		// final bits, so requiring reference-side overrun evidence here
-		// would fail on streams whose overrun is genuine. Overrun
-		// misclassification is instead pinned by the dedicated
-		// full-destination classification test and the libdeflate
-		// class-parity test. Such claims fall through: gotTruncated is
-		// false for the overrun class, so only structurally comparable
-		// cases reach the assertion below.
-		//
+		// would fail on streams whose overrun is genuine. Instead the
+		// claim is validated metamorphically against this decoder
+		// itself: overrun asserts that the stream validly produces
+		// more than the declared size, so re-decoding into a
+		// destination large enough that overrun is impossible (DEFLATE
+		// expands at most ~1032x: a 258-byte match from a 2-bit
+		// degenerate dynamic code) must actually cross the declared
+		// size before hitting any terminal condition. A regression
+		// that misclassifies a truncated or invalid stream as overrun
+		// stops at or below the declared size in the probe and fails
+		// here.
+		if errors.Is(gotErr, errZlibStreamOverrun) {
+			probe := make([]byte, 1032*len(src)+64)
+			d := goInflaterPool.Get().(*goInflater)
+			_, produced, probeErr := d.inflateRaw(src[2:], probe)
+			goInflaterPool.Put(d)
+			if produced <= size {
+				t.Fatalf("unsupported overrun claim for %x size=%d: go err=%v, but headroom decode produced only %d bytes (err=%v)",
+					src, size, gotErr, produced, probeErr)
+			}
+			return
+		}
 		// Exemption 2 (one-sided comparison): compress/flate reporting
 		// truncation does not prove the input is merely truncated,
 		// because it defers some structural validation past the end of
