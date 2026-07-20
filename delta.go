@@ -793,18 +793,19 @@ func applyDeltaStreaming(
 	}
 
 	// Cross-check the advertised payload against the bytes the pack can
-	// physically supply. DEFLATE expands at most 1032:1 (a 258-byte match
-	// from a 2-bit length/distance code pair), so payloadSize decompressed
-	// bytes require at least payloadSize/1032 compressed bytes after pos;
-	// a header advertising more is provably corrupt. Rejecting it here
-	// keeps a few corrupt header bytes from forcing getDeltaScratch to
-	// materialize the full advertised amount before any compressed byte is
-	// read (up to 8×maxObjectSize under the bound above, unbounded when
-	// maxObjectSize is 0): a forced allocation is now proportional to the
+	// physically supply. DEFLATE expands at most maxDeflateExpansion:1
+	// (1032:1 — a 258-byte match from a 2-bit length/distance code pair),
+	// so payloadSize decompressed bytes require at least
+	// payloadSize/maxDeflateExpansion compressed bytes after pos; a header
+	// advertising more is provably corrupt. Rejecting it here keeps a few
+	// corrupt header bytes from forcing getDeltaScratch to materialize the
+	// full advertised amount before any compressed byte is read (up to
+	// 8×maxObjectSize under the bound above, unbounded when maxObjectSize
+	// is 0): a forced allocation is now proportional to the
 	// attacker-supplied pack size, not to a 9-byte header claim. The check
 	// never rejects a valid pack — a stream that inflates to payloadSize
 	// cannot be shorter than this floor.
-	if avail := int64(pack.Len()) - pos; avail < int64(payloadSize/1032) {
+	if avail := int64(pack.Len()) - pos; avail < int64(payloadSize/maxDeflateExpansion) {
 		return nil, fmt.Errorf(
 			"delta payload %d cannot inflate from the %d pack bytes remaining", payloadSize, avail)
 	}
