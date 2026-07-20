@@ -1039,20 +1039,31 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 			return
 		}
 		// An overrun claim by this decoder cannot be validated against
-		// compress/flate: at a truncation boundary flate may stop one
-		// symbol short of the bytes zlib and libdeflate decode from the
-		// final bits, so requiring reference-side overrun evidence here
-		// would fail on streams whose overrun is genuine. Instead the
-		// claim is validated metamorphically against this decoder
-		// itself: overrun asserts that the stream validly produces
-		// more than the declared size, so re-decoding into a
-		// destination large enough that overrun is impossible (DEFLATE
-		// expands at most ~1032x: a 258-byte match from a 2-bit
-		// degenerate dynamic code) must actually cross the declared
-		// size before hitting any terminal condition. A regression
-		// that misclassifies a truncated or invalid stream as overrun
-		// stops at or below the declared size in the probe and fails
-		// here.
+		// compress/flate's byte COUNT: at a truncation boundary flate
+		// may stop one symbol short of the bytes zlib and libdeflate
+		// decode from the final bits, so requiring reference-side
+		// overrun evidence here would fail on streams whose overrun is
+		// genuine. The claim is validated by two independent checks
+		// instead:
+		//
+		//  1. Self-consistency: overrun asserts the stream validly
+		//     produces more than the declared size, so re-decoding
+		//     into a destination sized past DEFLATE's ~1032x maximum
+		//     expansion (a 258-byte match from a 2-bit degenerate
+		//     dynamic code) — where overrun is impossible — must cross
+		//     the declared size before any terminal condition. This
+		//     catches destination-dependent early exits.
+		//  2. Content corroboration: compress/flate is correct on
+		//     every byte it does produce, so everything it decodes of
+		//     the same stream must match the headroom output
+		//     byte-for-byte — and flate may stop short of the headroom
+		//     production only at a truncation boundary (it can stop
+		//     one symbol shy of the final bits). A shorter reference
+		//     decode ending in a clean EOB or a structural rejection
+		//     means the surplus bytes were fabricated. This catches
+		//     regressions that fabricate output from misbuilt tables
+		//     or invalid codewords, which reproduce identically in
+		//     check 1 but cannot be corroborated by the reference.
 		if errors.Is(gotErr, errZlibStreamOverrun) {
 			probe := make([]byte, 1032*len(src)+64)
 			d := goInflaterPool.Get().(*goInflater)
@@ -1061,6 +1072,16 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 			if produced <= size {
 				t.Fatalf("unsupported overrun claim for %x size=%d: go err=%v, but headroom decode produced only %d bytes (err=%v)",
 					src, size, gotErr, produced, probeErr)
+			}
+			fr := stdflate.NewReader(bytes.NewReader(src[2:]))
+			flateOut, flateErr := io.ReadAll(io.LimitReader(fr, int64(produced)))
+			fr.Close()
+			corroborated := len(flateOut) == produced ||
+				errors.Is(flateErr, io.ErrUnexpectedEOF)
+			if !corroborated || !bytes.Equal(flateOut, probe[:len(flateOut)]) {
+				t.Fatalf("uncorroborated overrun claim for %x size=%d: headroom decode produced %d bytes, reference corroborates %d (contentMatch=%v, refErr=%v)",
+					src, size, produced, len(flateOut),
+					bytes.Equal(flateOut, probe[:len(flateOut)]), flateErr)
 			}
 			return
 		}
