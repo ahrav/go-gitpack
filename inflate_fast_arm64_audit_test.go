@@ -155,10 +155,15 @@ func TestInflateHuffmanFastArm64DeepTables(t *testing.T) {
 	// inflate_fast_arm64.s): two direct 10-bit literals and a 12-bit
 	// length code consume 32 bits inside one iteration, so even a full
 	// 63-bit refill leaves 31 <= 37 buffered bits when the 15-bit offset
-	// code's subtable pointer is recognized. The kernel must refill
-	// before consuming the 15 code + 13 extra bits (28 more); skipping or
-	// corrupting that refill decodes a garbage distance and diverges from
-	// the oracle. Repeated with both 13-extra-bit offset symbols.
+	// code's subtable pointer is recognized. The counter understates the
+	// loaded bits by one (31 means 32 real bits), so the current 15 code
+	// + 13 extra bits (28) still decode correctly without the refill;
+	// what the refill actually protects is the have_offset preload of
+	// the NEXT litlen entry, which would otherwise see only 4 valid bits
+	// of an 11-bit lookup — the litlenTableBits term in the threshold
+	// derivation. Skipping or corrupting the refill therefore corrupts
+	// the next iteration's decode and diverges from the oracle. Repeated
+	// with both 13-extra-bit offset symbols.
 	s.literal('J')
 	s.literal('J')
 	s.match(3, 20000) // symbol 28 + 13 extra
