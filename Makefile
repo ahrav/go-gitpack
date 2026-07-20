@@ -103,3 +103,36 @@ mutate:
 ## tidy: verify go.mod/go.sum are tidy.
 tidy:
 	$(GO) mod tidy
+
+## linkaudit-external: prove the amd64 inflate kernel survives internal vs
+## external linking with byte-identical instructions (the fast-loop PR claim;
+## the per-instruction register/ISA audit lives in
+## inflate_fast_amd64_linkaudit_test.go, which cannot afford two full builds).
+## Builds the test binary under both link modes and diffs `go tool objdump`
+## of the kernel symbol on the (file:line, opcode-bytes) columns — absolute
+## addresses shift between link modes, but relative displacements live in the
+## opcode bytes, so equal bytes mean identical instructions. Skips when the
+## effective GOARCH is not amd64 or when no C toolchain is available
+## (-linkmode=external needs one).
+.PHONY: linkaudit-external
+linkaudit-external:
+	@set -e; \
+	if [ "$$($(GO) env GOARCH)" != "amd64" ]; then \
+		echo "linkaudit-external: skipped (GOARCH=$$($(GO) env GOARCH), needs amd64)"; exit 0; \
+	fi; \
+	cc="$$($(GO) env CC)"; \
+	if ! command -v "$$cc" >/dev/null 2>&1; then \
+		echo "linkaudit-external: skipped (no C toolchain '$$cc' for -linkmode=external)"; exit 0; \
+	fi; \
+	tmp="$$(mktemp -d)"; trap 'rm -rf "$$tmp"' EXIT; \
+	$(GO) test -c -vet=off -o "$$tmp/int.test" $(PKG); \
+	CGO_ENABLED=1 $(GO) test -c -vet=off -ldflags '-linkmode=external' -o "$$tmp/ext.test" $(PKG); \
+	for m in int ext; do \
+		$(GO) tool objdump -s 'inflateHuffmanFastAMD64(\.abi0)?$$' "$$tmp/$$m.test" \
+		| awk -F'\t' 'NR>1 { n=0; loc=""; hex=""; \
+			for (i=1; i<=NF; i++) if ($$i != "") { n++; if (n==1) loc=$$i; if (n==3) hex=$$i }; \
+			print loc "\t" hex }' > "$$tmp/$$m.norm"; \
+	done; \
+	[ -s "$$tmp/int.norm" ] || { echo "linkaudit-external: kernel symbol missing from internal-link binary"; exit 1; }; \
+	diff -u "$$tmp/int.norm" "$$tmp/ext.norm"; \
+	echo "linkaudit-external: kernel byte-identical across link modes ($$(wc -l < "$$tmp/int.norm") instructions)"

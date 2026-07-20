@@ -80,6 +80,9 @@ func TestInflateHuffmanFastAMD64DynamicDifferential(t *testing.T) {
 }
 
 func TestInflateHuffmanFastAMD64DispatchPaths(t *testing.T) {
+	if inflateFastDisabled {
+		t.Skip("GOGITPACK_NOASM_INFLATE is set; decodeHuffman never dispatches to assembly")
+	}
 	smallSrc, smallWant := amd64DynamicMatchBlock(t)
 	normalSrc, normalWant := amd64FixedMatchBlock(40, 258, 40)
 
@@ -216,6 +219,114 @@ func TestInflateHuffmanFastAMD64SubtableDifferential(t *testing.T) {
 	})
 }
 
+func TestInflateHuffmanFastAMD64DispatchLitlenCutoff(t *testing.T) {
+	if inflateFastDisabled {
+		t.Skip("GOGITPACK_NOASM_INFLATE is set; decodeHuffman never dispatches to assembly")
+	}
+	tests := []struct {
+		name         string
+		litlenBits   uint8
+		wantAssembly bool
+	}{
+		{
+			name:         "seven root bits uses assembly",
+			litlenBits:   inflateFastAMD64MinLitlenBits,
+			wantAssembly: true,
+		},
+		{
+			name:       "six root bits uses Go",
+			litlenBits: inflateFastAMD64MinLitlenBits - 1,
+		},
+	}
+
+	// One stream serves both tables: the codes shorter than four bits are
+	// identical. A 'Y' literal, a length-258 distance-1 match, then end
+	// of block. The distance-1 match matters: its RLE copy overruns the
+	// output margin differently per fast loop, exposing the taken path.
+	var w deflateTestBits
+	w.write(0, 1)                             // literal 'Y': code 0
+	w.write(uint64(reverseCode(0b10, 2)), 2)  // symbol 285: length 258
+	w.write(0, 1)                             // distance 1: code 0
+	w.write(uint64(reverseCode(0b110, 3)), 3) // end of block
+	src := append(w.bytes(), make([]byte, 40)...)
+	want := bytes.Repeat([]byte{'Y'}, 259)
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := amd64CutoffInflater(tt.litlenBits)
+			if got := d.litlenBits >= inflateFastAMD64MinLitlenBits; got != tt.wantAssembly {
+				t.Fatalf("litlenBits=%d selects assembly=%v, want %v",
+					d.litlenBits, got, tt.wantAssembly)
+			}
+			r := deflateBits{src: src}
+			dstLen := len(want) + deflateFastOutputMargin + 1
+
+			reference := amd64RunHuffmanGo(d, r, dstLen)
+			if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], want) {
+				t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+			}
+
+			dispatch := amd64RunHuffmanDispatch(d, r, dstLen)
+			amd64CompareHuffmanResults(t, dispatch, reference)
+
+			kernel, statuses := amd64RunHuffmanKernel(t, d, r, dstLen)
+			amd64CompareHuffmanResults(t, kernel, reference)
+			amd64RequireStatuses(t, statuses, inflateFastBlockDone)
+
+			if bytes.Equal(reference.dst, kernel.dst) {
+				t.Fatal("fixture cannot distinguish Go and assembly margin patterns")
+			}
+			dispatchMatchesGo := bytes.Equal(dispatch.dst, reference.dst)
+			dispatchMatchesAssembly := bytes.Equal(dispatch.dst, kernel.dst)
+			if tt.wantAssembly {
+				if dispatchMatchesGo || !dispatchMatchesAssembly {
+					t.Fatalf("dispatch buffer matches Go=%v assembly=%v, want false/true",
+						dispatchMatchesGo, dispatchMatchesAssembly)
+				}
+			} else if !dispatchMatchesGo || dispatchMatchesAssembly {
+				t.Fatalf("dispatch buffer matches Go=%v assembly=%v, want true/false",
+					dispatchMatchesGo, dispatchMatchesAssembly)
+			}
+		})
+	}
+}
+
+// amd64CutoffInflater hand-builds complete decode tables whose litlen root
+// table is exactly litlenBits wide, mirroring buildTable's layout: each
+// code's entry is its decode result plus codeLen*0x101, replicated from the
+// bit-reversed codeword at stride 1<<codeLen. The canonical code assigns
+// 'Y' a one-bit code, length 258 (symbol 285) a two-bit code, end-of-block
+// a three-bit code, and fills the remaining codespace with one literal per
+// length plus two at the longest so the Kraft sum is exact and every root
+// index holds a valid entry.
+func amd64CutoffInflater(litlenBits uint8) goInflater {
+	var d goInflater
+	d.litlenBits = litlenBits
+	d.offsetBits = 1
+	// Distance 1 as a one-bit singleton, packed like buildTable's
+	// incomplete-singleton case.
+	d.offset[0] = 1<<16 | 1<<8 | 1
+	d.offset[1] = huffInvalid
+
+	fill := func(code, codeLen int, result uint32) {
+		entry := result + uint32(codeLen)*0x101
+		for i := reverseCode(code, codeLen); i < 1<<litlenBits; i += 1 << codeLen {
+			d.litlen[i] = entry
+		}
+	}
+	fill(0b0, 1, huffLiteral|uint32('Y')<<16)
+	fill(0b10, 2, 258<<16) // symbol 285: length 258, no extra bits
+	fill(0b110, 3, huffExceptional|huffEndOfBlock)
+	filler := uint32('a')
+	for codeLen := 4; codeLen < int(litlenBits); codeLen++ {
+		fill(1<<codeLen-2, codeLen, huffLiteral|filler<<16)
+		filler++
+	}
+	fill(1<<litlenBits-2, int(litlenBits), huffLiteral|filler<<16)
+	fill(1<<litlenBits-1, int(litlenBits), huffLiteral|(filler+1)<<16)
+	return d
+}
+
 func TestInflateHuffmanFastAMD64FallbackDifferential(t *testing.T) {
 	payload := []byte("fallback")
 
@@ -251,6 +362,108 @@ func TestInflateHuffmanFastAMD64FallbackDifferential(t *testing.T) {
 	})
 }
 
+func TestInflateHuffmanFastAMD64MarginBoundaries(t *testing.T) {
+	if inflateFastDisabled {
+		t.Skip("GOGITPACK_NOASM_INFLATE is set; decodeHuffman never dispatches to assembly")
+	}
+	tests := []struct {
+		name         string
+		inputGap     int // exact len(r.src)-r.pos at dispatch; 0 leaves slack
+		dstLen       int // exact len(dst); 0 leaves slack
+		wantAssembly bool
+	}{
+		{
+			name:     "input gap at margin uses tail",
+			inputGap: deflateFastInputMargin,
+		},
+		{
+			name:         "input gap above margin uses assembly",
+			inputGap:     deflateFastInputMargin + 1,
+			wantAssembly: true,
+		},
+		{
+			name:   "output at margin uses tail",
+			dstLen: deflateFastOutputMargin,
+		},
+		{
+			name:         "output above margin uses assembly",
+			dstLen:       deflateFastOutputMargin + 1,
+			wantAssembly: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// A distance-1 match makes the taken path observable: the
+			// assembly RLE copy overruns farther into the permitted
+			// output margin than the Go fast loop, and the exact tail
+			// decoder not at all.
+			src, want := amd64FixedMatchBlock(1, 258, 0)
+			if tt.inputGap != 0 {
+				// Reading the 3-bit block header refills eight bytes,
+				// so dispatch compares len(src)-8 against the margin.
+				total := 8 + tt.inputGap
+				if len(src) > total {
+					t.Fatalf("fixture is %d bytes, want at most %d", len(src), total)
+				}
+				src = append(src, make([]byte, total-len(src))...)
+			} else {
+				src = append(src, make([]byte, 40)...)
+			}
+			dstLen := tt.dstLen
+			if dstLen == 0 {
+				dstLen = len(want) + deflateFastOutputMargin + 1
+			}
+			if len(want) > dstLen {
+				t.Fatalf("fixture output is %d bytes, want at most %d", len(want), dstLen)
+			}
+
+			d, r := amd64PrepareHuffmanBlock(t, src, 1)
+			gap := len(r.src) - r.pos
+			if tt.inputGap != 0 && gap != tt.inputGap {
+				t.Fatalf("fixture input gap = %d, want %d", gap, tt.inputGap)
+			}
+			if tt.inputGap == 0 && gap <= deflateFastInputMargin {
+				t.Fatalf("fixture input gap = %d, want > %d", gap, deflateFastInputMargin)
+			}
+
+			reference := amd64RunHuffmanGo(d, r, dstLen)
+			if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], want) {
+				t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+			}
+
+			tailOnly := amd64RunHuffmanTail(d, r, dstLen)
+			amd64CompareHuffmanResults(t, tailOnly, reference)
+
+			dispatch := amd64RunHuffmanDispatch(d, r, dstLen)
+			amd64CompareHuffmanResults(t, dispatch, reference)
+
+			kernel, statuses := amd64RunHuffmanKernel(t, d, r, dstLen)
+			amd64CompareHuffmanResults(t, kernel, reference)
+			amd64RequireStatuses(t, statuses, inflateFastTail)
+
+			// Exactly at the margin the kernel must refuse to decode, so
+			// its buffer stays identical to the pure-tail run. One byte
+			// past it, the assembly match copy marks the output margin.
+			kernelDecoded := !bytes.Equal(kernel.dst, tailOnly.dst)
+			if kernelDecoded != tt.wantAssembly {
+				t.Fatalf("kernel decoded = %v, want %v", kernelDecoded, tt.wantAssembly)
+			}
+			dispatchMatchesTail := bytes.Equal(dispatch.dst, tailOnly.dst)
+			dispatchMatchesKernel := bytes.Equal(dispatch.dst, kernel.dst)
+			if tt.wantAssembly {
+				if dispatchMatchesTail || !dispatchMatchesKernel {
+					t.Fatalf("dispatch buffer matches tail=%v kernel=%v, want false/true",
+						dispatchMatchesTail, dispatchMatchesKernel)
+				}
+			} else if !dispatchMatchesTail || !dispatchMatchesKernel {
+				t.Fatalf("dispatch buffer matches tail=%v kernel=%v, want true/true",
+					dispatchMatchesTail, dispatchMatchesKernel)
+			}
+		})
+	}
+}
+
 func TestInflateHuffmanFastAMD64YieldDifferential(t *testing.T) {
 	const matches = 260
 
@@ -279,6 +492,48 @@ func TestInflateHuffmanFastAMD64YieldDifferential(t *testing.T) {
 	kernel, statuses := amd64RunHuffmanKernel(t, d, r, dstLen)
 	amd64CompareHuffmanResults(t, kernel, reference)
 	amd64RequireStatuses(t, statuses, inflateFastYield, inflateFastBlockDone)
+}
+
+func TestInflateHuffmanFastAMD64DoubleYield(t *testing.T) {
+	// 520 matches of length 258 at distance 1 after one literal produce
+	// 1+520*258 = 134161 bytes. Decoding crosses the yield boundary at
+	// 64 KiB and again at 128 KiB before the end-of-block symbol, and
+	// stays below 192 KiB, so the kernel must yield exactly twice.
+	const matches = 520
+
+	var w deflateTestBits
+	w.write(1, 1)
+	w.write(1, 2)
+	w.writeFixedLitlen('Y')
+	for range matches {
+		w.writeFixedLength(258)
+		w.writeFixedDistance(1)
+	}
+	w.writeFixedLitlen(256)
+	src := append(w.bytes(), make([]byte, 40)...)
+	want := bytes.Repeat([]byte{'Y'}, 1+matches*258)
+
+	if len(want) <= 2*inflateFastYieldBytes || len(want) >= 3*inflateFastYieldBytes {
+		t.Fatalf("fixture output = %d bytes, want in (%d, %d) for exactly two yields",
+			len(want), 2*inflateFastYieldBytes, 3*inflateFastYieldBytes)
+	}
+
+	d, r := amd64PrepareHuffmanBlock(t, src, 1)
+	dstLen := len(want) + deflateFastOutputMargin + 1
+	reference := amd64RunHuffmanGo(d, r, dstLen)
+	if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], want) {
+		t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+	}
+
+	// The dispatch run drives the production resume loop across both
+	// yields; the direct-kernel run observes the yield statuses.
+	dispatch := amd64RunHuffmanDispatch(d, r, dstLen)
+	amd64CompareHuffmanResults(t, dispatch, reference)
+
+	kernel, statuses := amd64RunHuffmanKernel(t, d, r, dstLen)
+	amd64CompareHuffmanResults(t, kernel, reference)
+	amd64RequireStatuses(t, statuses,
+		inflateFastYield, inflateFastYield, inflateFastBlockDone)
 }
 
 func TestInflateHuffmanFastAMD64BadDataStatus(t *testing.T) {
@@ -371,6 +626,15 @@ func amd64PrepareHuffmanBlock(
 func amd64RunHuffmanGo(d goInflater, r deflateBits, dstLen int) amd64HuffmanResult {
 	dst := make([]byte, dstLen)
 	out, err := d.decodeHuffmanGo(&r, dst, 0)
+	return amd64HuffmanResult{r: r, dst: dst, out: out, err: err}
+}
+
+// amd64RunHuffmanTail decodes entirely through decodeHuffmanTail. Its exact
+// writes never mark the output margin, giving path-observation tests a
+// garbage-free reference buffer.
+func amd64RunHuffmanTail(d goInflater, r deflateBits, dstLen int) amd64HuffmanResult {
+	dst := make([]byte, dstLen)
+	out, err := d.decodeHuffmanTail(&r, dst, 0)
 	return amd64HuffmanResult{r: r, dst: dst, out: out, err: err}
 }
 
