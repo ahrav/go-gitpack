@@ -20,7 +20,10 @@ func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
 	defer runtime.KeepAlive(r)
 
 	data := mmapData(r)
-	if pos < 0 || pos > int64(len(data)) {
+	// A pack truncated inside the 2-byte zlib header is an unexpected-EOF
+	// class failure, matching the non-mmap fallback; only streams with a
+	// complete header reach the one-shot decoder's own classification.
+	if pos < 0 || pos+2 > int64(len(data)) {
 		return io.ErrUnexpectedEOF
 	}
 	_, err := inflateZlibOneShot(data[pos:], dst)

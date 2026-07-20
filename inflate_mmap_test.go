@@ -37,6 +37,32 @@ func TestCheckMmapLayout(t *testing.T) {
 	}
 }
 
+// TestInflateExactTruncatedHeaderClassification pins the error class when a
+// pack ends inside the 2-byte zlib header: the mmap path must report the
+// unexpected-EOF identity like the non-mmap fallback, not the one-shot
+// decoder's generic bad-data error.
+func TestInflateExactTruncatedHeaderClassification(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncated-header")
+	if err := os.WriteFile(path, []byte{0x78}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := mmap.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	for _, pos := range []int64{0, 1} {
+		err := inflateExact(r, pos, make([]byte, 4))
+		if err == nil {
+			t.Fatalf("pos=%d: truncated header accepted", pos)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("pos=%d: got %v, want unexpected-EOF identity", pos, err)
+		}
+	}
+}
+
 func TestInflateOneShotRejectsOversizedWindow(t *testing.T) {
 	// CM=deflate and FCHECK is valid, but CINFO=8 exceeds RFC 1950's limit.
 	data := []byte{0x88, 0x1c}

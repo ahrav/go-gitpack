@@ -136,7 +136,7 @@ func TestInflatePackZlibGoConcurrentPoolReuse(t *testing.T) {
 				return fmt.Errorf("%s: malformed stream accepted (consumed=%d)", c.name, consumed)
 			}
 			if got := errors.Is(err, io.ErrUnexpectedEOF); got != c.wantEOF {
-				return fmt.Errorf("%s: error %v has EOF class %v, want %v", c.name, err, got, c.wantEOF)
+				return fmt.Errorf("%s: error %w has EOF class %v, want %v", c.name, err, got, c.wantEOF)
 			}
 			if consumed != 0 {
 				return fmt.Errorf("%s: error returned consumed=%d, want 0", c.name, consumed)
@@ -144,7 +144,7 @@ func TestInflatePackZlibGoConcurrentPoolReuse(t *testing.T) {
 			return nil
 		}
 		if err != nil {
-			return fmt.Errorf("%s: decode: %v", c.name, err)
+			return fmt.Errorf("%s: decode: %w", c.name, err)
 		}
 		if consumed != c.wantConsumed {
 			return fmt.Errorf("%s: consumed=%d, want %d", c.name, consumed, c.wantConsumed)
