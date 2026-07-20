@@ -3,22 +3,6 @@
 package objstore
 
 const (
-	// Refill-skip thresholds for the assembly kernel, exported to
-	// inflate_fast_arm64.s through go_asm.h as $const_... literals.
-	//
-	// After decoding a litlen entry, the kernel must have enough buffered
-	// bits to decode an offset entry, its extra bits, and preload the next
-	// litlen entry without an intermediate refill. The branchless refill
-	// counter understates the buffered bits by at least one (it counts at
-	// most 63 of the 64 buffered bits), and BGT passes only above the
-	// threshold, so each threshold is the worst-case bit need minus two.
-	//
-	// Direct path: a first-level offset entry consumes at most
-	// offsetTableBits code bits.
-	inflateFastOffsetRefillThreshold = offsetTableBits + maxOffsetExtraBits + litlenTableBits - 2
-	// Subtable path: a chained offset code consumes up to maxCodeLen bits.
-	inflateFastOffsetSubRefillThreshold = maxCodeLen + maxOffsetExtraBits + litlenTableBits - 2
-
 	// inflateFastWideCopyDistance is the minimum read distance for the
 	// 32-byte block-copy loop in the assembly kernel. Match copies with a
 	// shorter offset first grow the distance by chunked doubling: an

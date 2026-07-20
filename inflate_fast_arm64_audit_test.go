@@ -104,11 +104,14 @@ func TestInflateHuffmanFastArm64CopySweep(t *testing.T) {
 // at litlen_exception and offset_exception in inflate_fast_arm64.s: 12-bit
 // litlen codes for a literal, both match lengths, and end of block, plus
 // 9-bit and 15-bit offset codes whose 13 extra bits form the worst-case
-// bit cost against the refill thresholds. The stream is verified against
-// compress/flate as an independent oracle before the kernel is compared
-// with the Go reference. zlib-generated fixtures cannot pin these paths:
-// their dynamic tables stay within litlenTableBits and offsetTableBits, so
-// no encoded corpus reaches a subtable.
+// bit cost against the refill thresholds — including, via the
+// literal-heavy iterations near the end of the stream, the
+// inflateFastOffsetSubRefillThreshold refill on the offset_exception
+// path. The stream is verified against compress/flate as an independent
+// oracle before the kernel is compared with the Go reference.
+// zlib-generated fixtures cannot pin these paths: their dynamic tables
+// stay within litlenTableBits and offsetTableBits, so no encoded corpus
+// reaches a subtable.
 func TestInflateHuffmanFastArm64DeepTables(t *testing.T) {
 	s := newDeepStream(t)
 
@@ -140,11 +143,28 @@ func TestInflateHuffmanFastArm64DeepTables(t *testing.T) {
 	s.literal('B')
 	s.literal('Z')
 	// A burst of worst-case-bit-cost iterations: a 12-bit length code
-	// followed by a 15-bit offset code with 13 extra bits, repeatedly,
-	// to organically stress the subtable refill-threshold decision.
+	// followed by a 15-bit offset code with 13 extra bits, repeatedly.
+	// These pin the subtable decode itself but never the
+	// inflateFastOffsetSubRefillThreshold refill: every iteration-ending
+	// path refills to 56..63 bits, and a lone 12-bit length code leaves
+	// >= 44 buffered bits when the offset subtable pointer is found.
 	for i := 0; i < 200; i++ {
 		s.match(3, 16385+i*37)
 	}
+	// Force the offset_exception refill (the <= 37-bit branch in
+	// inflate_fast_arm64.s): two direct 10-bit literals and a 12-bit
+	// length code consume 32 bits inside one iteration, so even a full
+	// 63-bit refill leaves 31 <= 37 buffered bits when the 15-bit offset
+	// code's subtable pointer is recognized. The kernel must refill
+	// before consuming the 15 code + 13 extra bits (28 more); skipping or
+	// corrupting that refill decodes a garbage distance and diverges from
+	// the oracle. Repeated with both 13-extra-bit offset symbols.
+	s.literal('J')
+	s.literal('J')
+	s.match(3, 20000) // symbol 28 + 13 extra
+	s.literal('J')
+	s.literal('J')
+	s.match(3, 32000) // symbol 29 + 13 extra
 	s.endOfBlock()
 
 	// Independent oracle: compress/flate over the raw block.

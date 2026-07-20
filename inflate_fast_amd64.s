@@ -88,7 +88,7 @@ have_length:
 	TESTL	$0x8000, BX
 	JNZ	offset_exception
 
-	CMPQ	DX, $30
+	CMPQ	DX, $const_inflateFastOffsetRefillThreshold
 	JA	offset_direct_ready
 	MOVQ	(R8), SI
 	MOVQ	DX, CX
@@ -312,7 +312,7 @@ subtable_literal:
 	JMP	loop_check
 
 offset_exception:
-	CMPQ	DX, $37
+	CMPQ	DX, $const_inflateFastOffsetSubRefillThreshold
 	JA	offset_exception_ready
 	MOVQ	(R8), SI
 	MOVQ	DX, CX

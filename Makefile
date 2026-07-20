@@ -131,7 +131,11 @@ linkaudit-external:
 		$(GO) tool objdump -s 'inflateHuffmanFastAMD64(\.abi0)?$$' "$$tmp/$$m.test" \
 		| awk -F'\t' 'NR>1 { n=0; loc=""; hex=""; \
 			for (i=1; i<=NF; i++) if ($$i != "") { n++; if (n==1) loc=$$i; if (n==3) hex=$$i }; \
-			print loc "\t" hex }' > "$$tmp/$$m.norm"; \
+			if (loc == "" || hex !~ /^[0-9a-fA-F]+$$/) { \
+				printf "linkaudit-external: unexpected objdump row (no hex-bytes column): %s\n", $$0 > "/dev/stderr"; \
+				exit 1 }; \
+			print loc "\t" hex }' > "$$tmp/$$m.norm" \
+		|| { echo "linkaudit-external: objdump output format changed; update the awk parser"; exit 1; }; \
 	done; \
 	[ -s "$$tmp/int.norm" ] || { echo "linkaudit-external: kernel symbol missing from internal-link binary"; exit 1; }; \
 	diff -u "$$tmp/int.norm" "$$tmp/ext.norm"; \

@@ -7,6 +7,7 @@ package objstore
 
 import (
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -789,4 +790,77 @@ func TestReadRawObject_OfsDeltaReadError(t *testing.T) {
 	// actual I/O error from the failed ReadAt.
 	assert.NotErrorIs(t, err, ErrOfsDeltaBaseRefTooLong,
 		"expected I/O error, not ErrOfsDeltaBaseRefTooLong; got: %v", err)
+}
+
+// TestReadRawObject_RejectsHostileDeclaredSize verifies that readRawObject
+// bounds the header-declared decompressed size by what the remaining pack
+// bytes could possibly inflate to (DEFLATE expands at most 1032:1) before
+// sizing any allocation from it. Without the bound, a few corrupt header
+// bytes force an allocation of the full advertised amount — up to an
+// instant OOM or, above MaxInt, a make() panic — long before inflation
+// fails on the same input.
+func TestReadRawObject_RejectsHostileDeclaredSize(t *testing.T) {
+	open := func(t *testing.T, obj []byte) *mmap.ReaderAt {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "hostile.pack")
+		require.NoError(t, os.WriteFile(path, obj, 0o644))
+		pack, err := mmap.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pack.Close()) })
+		return pack
+	}
+
+	t.Run("plain object", func(t *testing.T) {
+		// A blob header advertising 1 TiB followed by a tiny zlib stream.
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjBlob), 1<<40))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write([]byte("tiny"))
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		_, _, err = readRawObject(open(t, obj.Bytes()), 0)
+		require.ErrorIs(t, err, errObjectSizeExceedsPack)
+	})
+
+	t.Run("plain object above MaxInt", func(t *testing.T) {
+		// Above MaxInt the unchecked int(size) conversion would wrap
+		// negative and panic make instead of returning an error.
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjBlob), 1<<63))
+		_, _, err := readRawObject(open(t, obj.Bytes()), 0)
+		require.ErrorIs(t, err, errObjectSizeExceedsPack)
+	})
+
+	t.Run("ref-delta record", func(t *testing.T) {
+		// The same bound must protect the combined prefix+body allocation
+		// for delta records.
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjRefDelta), 1<<40))
+		obj.Write(make([]byte, len(Hash{})))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write([]byte("tiny"))
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		_, _, err = readRawObject(open(t, obj.Bytes()), 0)
+		require.ErrorIs(t, err, errObjectSizeExceedsPack)
+	})
+
+	t.Run("valid sizes still admitted", func(t *testing.T) {
+		// The bound must never reject a valid record: a genuine object
+		// whose declared size matches its stream decodes as before.
+		payload := bytes.Repeat([]byte{'x'}, 4096)
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjBlob), uint64(len(payload))))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		typ, data, err := readRawObject(open(t, obj.Bytes()), 0)
+		require.NoError(t, err)
+		assert.Equal(t, ObjBlob, typ)
+		assert.Equal(t, payload, data)
+	})
 }

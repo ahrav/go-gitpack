@@ -89,8 +89,11 @@ func newOffsetCache() *offsetCache {
 
 // setBudget adjusts the total byte budget across all shards. A budget <= 0
 // disables the cache: existing entries are dropped and later adds become
-// no-ops (gets simply miss). Safe for concurrent use, though it is intended
-// to be called once right after the owning store is opened.
+// no-ops (gets simply miss). budgetPerShard is written without
+// synchronization, so setBudget must run before the cache is visible to
+// concurrent readers and writers — WithOffsetCacheBudget satisfies this by
+// running during store construction. Concurrent callers must synchronize
+// externally.
 func (c *offsetCache) setBudget(total int) {
 	if c == nil {
 		return
@@ -153,6 +156,12 @@ func (c *offsetCache) get(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, 
 
 // add stores a materialized object under (pack, off). The cache takes shared
 // ownership of data; callers must treat it as immutable afterwards.
+//
+// Accounting uses len(data) and relies on every producer passing an
+// exactly-sized allocation (len == cap): readRawObject, allocExact, and the
+// detach copies in applyDeltaStackCached all allocate exact. A producer
+// passing a trimmed slice with excess capacity would silently under-account
+// the bytes actually retained.
 //
 // Entries larger than the per-shard budget are rejected outright: the
 // eviction loop below never removes the just-added key, so admitting one

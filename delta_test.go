@@ -825,6 +825,18 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
 	})
 
+	t.Run("payload cannot inflate from remaining pack bytes", func(t *testing.T) {
+		// A corrupt header can advertise a payload the pack cannot
+		// physically supply (DEFLATE expands at most 1032:1). Without the
+		// feasibility check, a few header bytes force getDeltaScratch to
+		// materialize the full advertised amount before any compressed
+		// byte is read — here 1 GiB, and with maxObjectSize=0 the 8× bound
+		// is disabled entirely, so this check is the only allocation guard.
+		pack, typ := openPayload(t, nil, 1<<30)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 0)
+		require.ErrorContains(t, err, "cannot inflate")
+	})
+
 	t.Run("payload overhead above target limit is accepted", func(t *testing.T) {
 		// A literal-heavy delta for a target AT the limit necessarily has a
 		// payload LARGER than the limit (varints + insert command bytes).
@@ -851,6 +863,21 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		pack, typ := openPayload(t, payload.Bytes(), 0)
 		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
 		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("unproducible target size with limit disabled", func(t *testing.T) {
+		// With maxObjectSize=0 the configurable limit is off, so the
+		// admissibility bound (no instruction stream emits more than
+		// 0x10000 bytes per payload byte) is the only guard between the
+		// attacker-controlled target varint and make(). Without it, a
+		// 2^62 target panics make ("len out of range") instead of
+		// returning an error.
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 1<<62)
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 0)
+		require.ErrorContains(t, err, "not producible")
 	})
 
 	t.Run("copy exceeds declared target", func(t *testing.T) {

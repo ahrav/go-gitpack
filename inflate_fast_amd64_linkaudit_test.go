@@ -385,6 +385,7 @@ func amd64LinkAuditGoToolFrom(goroots []string, lookPath func(string) (string, e
 // the GOROOT environment variable, then runtime.GOROOT()/bin/go, then PATH.
 func amd64LinkAuditGoTool() (string, bool) {
 	return amd64LinkAuditGoToolFrom(
+		//nolint:staticcheck // SA1019: runtime.GOROOT() is an intentional process-start fallback candidate; see amd64LinkAuditGoToolFrom.
 		[]string{os.Getenv("GOROOT"), runtime.GOROOT()}, exec.LookPath)
 }
 

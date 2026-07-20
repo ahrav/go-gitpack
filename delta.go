@@ -467,6 +467,16 @@ func walkUpDeltaChain(
 		if err != nil {
 			return nil, ObjBad, fmt.Errorf("read ofs-delta offset: %w", err)
 		}
+		// A backward offset of zero would loop on the same record forever
+		// (the depth limit would eventually fire), and one beyond the
+		// current position would wrap currOff to a huge value that only
+		// fails later inside ReadAt with a misleading "invalid offset"
+		// error. Both are structurally impossible in a valid pack; reject
+		// them here with a precise diagnostic.
+		if back == 0 || back > currOff {
+			return nil, ObjBad, fmt.Errorf(
+				"ofs-delta at offset %d references invalid base offset (back=%d)", currOff, back)
+		}
 		currOff -= back
 		// The base is identified only by byte offset; its OID is unknown
 		// until a subsequent ref-delta hop names one.
@@ -782,6 +792,23 @@ func applyDeltaStreaming(
 		}
 	}
 
+	// Cross-check the advertised payload against the bytes the pack can
+	// physically supply. DEFLATE expands at most 1032:1 (a 258-byte match
+	// from a 2-bit length/distance code pair), so payloadSize decompressed
+	// bytes require at least payloadSize/1032 compressed bytes after pos;
+	// a header advertising more is provably corrupt. Rejecting it here
+	// keeps a few corrupt header bytes from forcing getDeltaScratch to
+	// materialize the full advertised amount before any compressed byte is
+	// read (up to 8×maxObjectSize under the bound above, unbounded when
+	// maxObjectSize is 0): a forced allocation is now proportional to the
+	// attacker-supplied pack size, not to a 9-byte header claim. The check
+	// never rejects a valid pack — a stream that inflates to payloadSize
+	// cannot be shorter than this floor.
+	if avail := int64(pack.Len()) - pos; avail < int64(payloadSize/1032) {
+		return nil, fmt.Errorf(
+			"delta payload %d cannot inflate from the %d pack bytes remaining", payloadSize, avail)
+	}
+
 	scratch := getDeltaScratch(int(payloadSize))
 	defer putDeltaScratch(scratch)
 	delta := scratch.buf[:payloadSize]
@@ -806,9 +833,28 @@ func applyDeltaStreaming(
 	delta = delta[n:]
 
 	// Enforce the size limit on the advertised target BEFORE any output
-	// buffer is allocated from it.
+	// buffer is allocated from it. This runs ahead of the producibility
+	// floor below so an over-limit target always classifies as the
+	// exported ErrDeltaTargetTooLarge sentinel, which the store paths
+	// match on, even when the same header is also structurally
+	// impossible.
 	if maxObjectSize > 0 && targetSize > maxObjectSize {
 		return nil, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, targetSize, maxObjectSize)
+	}
+
+	// Bound the advertised target unconditionally: with maxObjectSize
+	// disabled (0), an unchecked varint of up to 2^64-1 would reach
+	// make() below and panic ("cap out of range") instead of returning an
+	// error. The second clause is an admissibility floor that holds for
+	// every satisfiable delta regardless of policy: the densest
+	// instruction (a bare copy opcode, one byte) emits at most 0x10000
+	// output bytes, so no instruction stream of len(delta) bytes can
+	// produce more than len(delta)×0x10000. It never rejects a valid
+	// pack; the exact-size postcondition below would fail on the same
+	// input after allocating targetSize.
+	if targetSize > uint64(math.MaxInt) || targetSize > uint64(len(delta))*0x10000 {
+		return nil, fmt.Errorf("delta target size %d not producible by a %d-byte instruction stream",
+			targetSize, len(delta))
 	}
 
 	if allocExact {

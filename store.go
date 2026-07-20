@@ -547,56 +547,6 @@ func (s *store) getPackedObjectNoCache(p *mmap.ReaderAt, off uint64, oid Hash) (
 	}, false, false)
 }
 
-// getWithContext retrieves an object while tracking delta chain depth.
-// This internal method prevents infinite recursion and detects cycles
-// in malformed delta chains.
-func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType, error) {
-	if b, ok := s.dw.acquire(oid); ok {
-		d, t := b.Data(), b.Type()
-		b.Release()
-		return d, t, nil
-	}
-
-	if b, ok := s.cache.Get(oid); ok {
-		return b.data, b.typ, nil
-	}
-
-	if s.memoryMidx != nil {
-		if p, off, ok := s.memoryMidx.findObject(oid); ok {
-			return s.inflateFromPack(inflationParams{
-				p:             p,
-				off:           off,
-				oid:           oid,
-				ctx:           ctx,
-				maxObjectSize: s.maxDeltaObjectSize,
-			})
-		}
-	}
-
-	for _, pf := range s.packs {
-		offset, found := pf.findObject(oid)
-		if !found {
-			continue
-		}
-		return s.inflateFromPack(inflationParams{
-			p:             pf.pack,
-			off:           offset,
-			oid:           oid,
-			ctx:           ctx,
-			maxObjectSize: s.maxDeltaObjectSize,
-		})
-	}
-	data, typ, err := s.readLooseObject(oid)
-	if err == nil {
-		if len(data) <= maxCacheableSize {
-			s.dw.add(oid, data, typ)
-			s.cache.Add(oid, cachedObj{data: data, typ: typ})
-		}
-		return data, typ, nil
-	}
-	return nil, ObjBad, err
-}
-
 // inflateFromPack reads and materializes an object from a packfile.
 // The method handles both regular objects and delta-encoded objects, resolving
 // delta chains as needed.
@@ -605,7 +555,9 @@ func (s *store) getWithContext(oid Hash, ctx *deltaContext) ([]byte, ObjectType,
 // When VerifyCRC is true, the method validates object integrity using checksums.
 //
 // inflateFromPack returns the inflated object data, its type, and any error encountered.
-// The returned data is a fresh allocation safe for modification.
+// The returned slice may also be retained by the store's caches (delta
+// window, offset cache) and served to other readers; callers MUST NOT
+// modify it.
 func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, error) {
 	return s.inflateFromPackWithOptions(params, true, true)
 }

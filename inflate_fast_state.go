@@ -9,6 +9,26 @@ import (
 
 const inflateFastYieldBytes = 64 << 10
 
+// Refill-skip thresholds shared by both assembly kernels, exported to
+// inflate_fast_arm64.s and inflate_fast_amd64.s through go_asm.h as
+// $const_... literals so the two kernels cannot drift if these bounds
+// change.
+//
+// After decoding a litlen entry, a kernel must have enough buffered bits
+// to decode an offset entry, its extra bits, and preload the next litlen
+// entry without an intermediate refill. The branchless refill counter
+// understates the buffered bits by at least one (it counts at most 63 of
+// the 64 buffered bits), and the guarding branch (BGT on arm64, JA on
+// amd64) passes only above the threshold, so each threshold is the
+// worst-case bit need minus two.
+const (
+	// Direct path: a first-level offset entry consumes at most
+	// offsetTableBits code bits.
+	inflateFastOffsetRefillThreshold = offsetTableBits + maxOffsetExtraBits + litlenTableBits - 2
+	// Subtable path: a chained offset code consumes up to maxCodeLen bits.
+	inflateFastOffsetSubRefillThreshold = maxCodeLen + maxOffsetExtraBits + litlenTableBits - 2
+)
+
 // inflateFastDisabled is a process-wide kill-switch for the assembly Huffman
 // kernels. Setting GOGITPACK_NOASM_INFLATE to any value other than "", "0",
 // or "false" routes every decode through the portable Go decoder, letting

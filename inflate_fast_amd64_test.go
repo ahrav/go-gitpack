@@ -5,6 +5,7 @@ package objstore
 import (
 	"bytes"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"testing"
 	"unsafe"
@@ -340,6 +341,11 @@ func TestInflateHuffmanFastAMD64FallbackDifferential(t *testing.T) {
 		dstLen := len(payload) + deflateFastOutputMargin + 1
 
 		reference := amd64RunHuffmanGo(d, r, dstLen)
+		// Anchor the fixture absolutely: a cross-comparison alone would
+		// pass if all three decoders regressed identically.
+		if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], payload) {
+			t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+		}
 		dispatch := amd64RunHuffmanDispatch(d, r, dstLen)
 		amd64CompareHuffmanResults(t, dispatch, reference)
 
@@ -353,6 +359,9 @@ func TestInflateHuffmanFastAMD64FallbackDifferential(t *testing.T) {
 		d, r := amd64PrepareHuffmanBlock(t, src, 1)
 
 		reference := amd64RunHuffmanGo(d, r, deflateFastOutputMargin)
+		if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], payload) {
+			t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+		}
 		dispatch := amd64RunHuffmanDispatch(d, r, deflateFastOutputMargin)
 		amd64CompareHuffmanResults(t, dispatch, reference)
 
@@ -536,6 +545,68 @@ func TestInflateHuffmanFastAMD64DoubleYield(t *testing.T) {
 		inflateFastYield, inflateFastYield, inflateFastBlockDone)
 }
 
+// TestInflateHuffmanFastAMD64TailBeatsYield pins the return_boundary branch
+// order in inflate_fast_amd64.s: when one kernel return observes both an
+// exhausted input (pos >= inLimit) and an output cursor at or past
+// yieldAt, it must report inflateFastTail, not inflateFastYield. The order
+// matters for liveness: the production driver in inflate_fast_state.go
+// re-enters the kernel on yield without reloading any state, so a yield
+// that does not guarantee input headroom for the next entry refill would
+// spin forever. The state is hand-built because the driver can never
+// produce one this small: inLimit is shrunk so the first refill exhausts
+// the input, and yieldAt = 1 is crossed by the first literal, making both
+// conditions true at the first boundary check.
+func TestInflateHuffmanFastAMD64TailBeatsYield(t *testing.T) {
+	payload := makeDeterministicBytes(64)
+	src := amd64FixedLiteralBlock(payload, 40)
+	d, r := amd64PrepareHuffmanBlock(t, src, 1)
+
+	dstLen := len(payload) + deflateFastOutputMargin + 1
+	reference := amd64RunHuffmanGo(d, r, dstLen)
+	if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], payload) {
+		t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+	}
+
+	dst := make([]byte, dstLen)
+	state := inflateFastState{
+		src:        unsafe.SliceData(r.src),
+		dst:        unsafe.SliceData(dst),
+		litlen:     &d.litlen[0],
+		offset:     &d.offset[0],
+		bitbuf:     r.buf,
+		nbits:      uint64(r.nbits),
+		pos:        uint64(r.pos),
+		out:        0,
+		inLimit:    uint64(r.pos) + 1, // exhausted by the first refill
+		outLimit:   uint64(len(dst) - deflateFastOutputMargin),
+		litlenMask: bitMask(uint(d.litlenBits)),
+		offsetMask: bitMask(uint(d.offsetBits)),
+		yieldAt:    1, // crossed by the first literal
+	}
+	inflateHuffmanFastAMD64(&state)
+
+	if state.status != inflateFastTail {
+		t.Fatalf("status = %d, want inflateFastTail (input exhaustion must outrank yield)",
+			state.status)
+	}
+	if state.yieldAt != 1 {
+		t.Fatalf("yieldAt = %d, want 1 (a tail return must not advance the yield mark)",
+			state.yieldAt)
+	}
+	if state.out == 0 || state.pos <= uint64(r.pos) {
+		t.Fatalf("kernel made no progress: out=%d pos=%d", state.out, state.pos)
+	}
+
+	// The stored state must let the tail decoder finish exactly where the
+	// full-margin reference decode lands.
+	r.buf = state.bitbuf
+	r.nbits = uint(state.nbits)
+	r.pos = int(state.pos)
+	out, err := d.decodeHuffmanTail(&r, dst, int(state.out))
+	got := amd64HuffmanResult{r: r, dst: dst, out: out, err: err}
+	amd64CompareHuffmanResults(t, got, reference)
+}
+
 func TestInflateHuffmanFastAMD64BadDataStatus(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -569,7 +640,7 @@ func TestInflateHuffmanFastAMD64BadDataStatus(t *testing.T) {
 			reference := amd64RunHuffmanGo(d, r, dstLen)
 			kernel, statuses := amd64RunHuffmanKernel(t, d, r, dstLen)
 
-			if reference.err != errDeflateBadData || kernel.err != reference.err {
+			if !errors.Is(reference.err, errDeflateBadData) || !errors.Is(kernel.err, errDeflateBadData) {
 				t.Fatalf("error mismatch: kernel=%v reference=%v", kernel.err, reference.err)
 			}
 			if kernel.out != reference.out {
@@ -719,7 +790,7 @@ func amd64RunHuffmanKernelInto(
 func amd64CompareHuffmanResults(t *testing.T, got, want amd64HuffmanResult) {
 	t.Helper()
 
-	if got.err != want.err {
+	if !errors.Is(got.err, want.err) {
 		t.Fatalf("error mismatch: got=%v want=%v", got.err, want.err)
 	}
 	if got.out != want.out {
