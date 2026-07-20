@@ -1090,12 +1090,15 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 		// because it defers some structural validation past the end of
 		// input. One such family: a dynamic table that assigns no code
 		// to the end-of-block symbol is rejected by this decoder at
-		// header time (bad data, matching zlib and libdeflate), while
-		// compress/flate accepts the header, decodes until input runs
-		// out, and reports truncation. The reverse direction is strict:
-		// whenever our decoder claims the truncation identity, the
-		// reference must agree, so structurally invalid data can never
-		// hide behind io.ErrUnexpectedEOF on our side.
+		// header time (bad data, matching zlib's "invalid code --
+		// missing end-of-block" check; libdeflate defers the detection
+		// to body decode but has no truncation class at all, so it too
+		// never reports this family as truncated), while compress/flate
+		// accepts the header, decodes until input runs out, and reports
+		// truncation. The reverse direction is strict: whenever our
+		// decoder claims the truncation identity, the reference must
+		// agree, so structurally invalid data can never hide behind
+		// io.ErrUnexpectedEOF on our side.
 		gotTruncated := errors.Is(gotErr, io.ErrUnexpectedEOF)
 		wantTruncated := errors.Is(wantErr, io.ErrUnexpectedEOF)
 		if gotTruncated && !wantTruncated {
