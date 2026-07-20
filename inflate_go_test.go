@@ -833,11 +833,6 @@ func TestInflatePackZlibSingleBitDifferential(t *testing.T) {
 	}
 }
 
-// TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF pins the
-// truncation-error contract: every strict prefix of a valid member (cut
-// anywhere in the deflate payload, including mid-header, mid-dynamic-table,
-// and mid-codeword) must classify as truncation via
-// errors.Is(err, io.ErrUnexpectedEOF), never as generic bad data.
 // TestInflateMatchAtFullDestinationClassification pins the error class when
 // the destination is already full and the next symbol is a length code: the
 // overrun class applies only after the whole match decodes as structurally
@@ -890,6 +885,11 @@ func TestInflateMatchAtFullDestinationClassification(t *testing.T) {
 	})
 }
 
+// TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF pins the
+// truncation-error contract: every strict prefix of a valid member (cut
+// anywhere in the deflate payload, including mid-header, mid-dynamic-table,
+// and mid-codeword) must classify as truncation via
+// errors.Is(err, io.ErrUnexpectedEOF), never as generic bad data.
 func TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF(t *testing.T) {
 	type fixture struct {
 		encoded []byte
@@ -1025,30 +1025,41 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 		// the errDeflateTruncated and errDeflateShortOutput wrappers,
 		// compress/flate by converting an io.EOF read mid-stream.
 		//
-		// Exemption 1: a stream that produces more than the declared
-		// object size AND fails later has two independent defects, and
-		// the backends legitimately report different ones. Our one-shot
-		// decoder rejects in output order the moment the destination
-		// would overflow, while compress/flate does not know the
-		// destination size, decodes ahead, and can latch a truncation
-		// or corruption error before the reference harness observes the
-		// overrun (corpus seed ed3b9e48e3763a54). Whenever either
-		// backend classifies the failure as output overrun, only the
-		// acceptance and consumed comparisons above apply.
-		if errors.Is(gotErr, errZlibStreamOverrun) || errors.Is(wantErr, errReferenceOverrun) {
+		// Exemption 1 (granted only on the reference's evidence): a
+		// stream that produces more than the declared object size AND
+		// fails later has two independent defects, and the backends
+		// legitimately report different ones. Our one-shot decoder
+		// rejects in output order the moment the destination would
+		// overflow, while compress/flate decodes ahead and may latch
+		// whichever defect it reaches. The exemption is keyed on the
+		// reference observing output past the declared size, never on
+		// this decoder's own overrun claim, so a regression that
+		// misclassifies other failures as overrun cannot exempt itself.
+		if errors.Is(wantErr, errReferenceOverrun) {
 			return
 		}
+		// An overrun claim by this decoder cannot be validated against
+		// compress/flate: at a truncation boundary flate may stop one
+		// symbol short of the bytes zlib and libdeflate decode from the
+		// final bits, so requiring reference-side overrun evidence here
+		// would fail on streams whose overrun is genuine. Overrun
+		// misclassification is instead pinned by the dedicated
+		// full-destination classification test and the libdeflate
+		// class-parity test. Such claims fall through: gotTruncated is
+		// false for the overrun class, so only structurally comparable
+		// cases reach the assertion below.
+		//
 		// Exemption 2 (one-sided comparison): compress/flate reporting
 		// truncation does not prove the input is merely truncated,
 		// because it defers some structural validation past the end of
-		// input (corpus seed 70692aea817b4756 originally exposed a
-		// missing-end-of-block-code case; the decoder now defers that
-		// check like the stdlib does, but other class-narrowing fixes
-		// on our side must not be blocked by the reference's looser
-		// classification). The reverse direction is strict: whenever
-		// our decoder claims the truncation identity, the reference
-		// must agree, so structurally invalid data can never hide
-		// behind io.ErrUnexpectedEOF on our side.
+		// input. One such family: a dynamic table that assigns no code
+		// to the end-of-block symbol is rejected by this decoder at
+		// header time (bad data, matching zlib and libdeflate), while
+		// compress/flate accepts the header, decodes until input runs
+		// out, and reports truncation. The reverse direction is strict:
+		// whenever our decoder claims the truncation identity, the
+		// reference must agree, so structurally invalid data can never
+		// hide behind io.ErrUnexpectedEOF on our side.
 		gotTruncated := errors.Is(gotErr, io.ErrUnexpectedEOF)
 		wantTruncated := errors.Is(wantErr, io.ErrUnexpectedEOF)
 		if gotTruncated && !wantTruncated {

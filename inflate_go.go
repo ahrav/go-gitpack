@@ -485,13 +485,9 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) error {
 		}
 	}
 
-	// A table without an end-of-block code (lens[256] == 0) is not rejected
-	// here: compress/flate (the differential oracle) accepts it at header
-	// time and classifies the failure while decoding the body — truncation
-	// if input runs out first, bad data if an unassigned codeword is hit.
-	// Since no entry can carry huffEndOfBlock, the block can never decode
-	// successfully; deferring keeps the error class aligned with the
-	// reference case by case.
+	if d.lens[256] == 0 {
+		return errDeflateBadData
+	}
 
 	offsetBits, ok := d.buildTable(
 		d.offset[:], d.lens[numLitlen:total], offsetTable, offsetTableBits, maxCodeLen, true,
