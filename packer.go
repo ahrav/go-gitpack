@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 
 	"golang.org/x/exp/mmap"
 )
@@ -39,7 +40,47 @@ var (
 	// needed for any valid pack offset. Exceeding this limit indicates a
 	// corrupted or maliciously crafted packfile.
 	ErrOfsDeltaBaseRefTooLong = errors.New("ofs-delta base-ref too long")
+
+	// errObjectSizeExceedsPack rejects a header-declared decompressed size
+	// that no valid DEFLATE stream in the remaining pack bytes could
+	// produce, so a corrupt or hostile header cannot force a huge
+	// allocation before inflation fails.
+	errObjectSizeExceedsPack = errors.New("object size exceeds deflate expansion bound for remaining pack bytes")
 )
+
+// maxDeflateExpansion is the largest output:input ratio a valid DEFLATE
+// stream can achieve. A dynamic-Huffman block can encode a 258-byte match
+// in two bits, so one input byte can produce at most 8/2*258 = 1032 output
+// bytes (zlib documents the same 1032:1 limit).
+const maxDeflateExpansion = 1032
+
+// checkDeclaredSize validates a pack header's decompressed-size field
+// against what the pack bytes remaining after pos could possibly inflate
+// to. Any stream that would satisfy a larger size must run past the end of
+// the pack, so rejecting early is behavior-preserving for valid packs:
+// inflateExact would fail on the same input after the allocation this
+// check exists to avoid. The +64 slack covers block-header and bit-stream
+// overhead for tiny inputs. It also implies size fits in int (the bound is
+// far below math.MaxInt for any mappable pack), which callers rely on
+// before converting.
+func checkDeclaredSize(r *mmap.ReaderAt, pos int64, size uint64) error {
+	remaining := int64(r.Len()) - pos
+	if remaining < 0 {
+		remaining = 0
+	}
+	if uint64(remaining) > (math.MaxUint64-64)/maxDeflateExpansion {
+		// Bound arithmetic would overflow; no realizable pack is this
+		// large, but fail open to the MaxInt guard below.
+		remaining = (math.MaxInt64 - 64) / maxDeflateExpansion
+	}
+	bound := uint64(remaining)*maxDeflateExpansion + 64
+	// The MaxInt-64 clause keeps int conversions (and small prefix
+	// additions, at most 20 bytes) overflow-free even on 32-bit hosts.
+	if size > bound || size > uint64(math.MaxInt-64) {
+		return fmt.Errorf("%w: size=%d bound=%d", errObjectSizeExceedsPack, size, bound)
+	}
+	return nil
+}
 
 // readRawObject inflates a Git object from a packfile.
 // For delta objects, the function returns the delta prefix (base reference) prepended
@@ -92,6 +133,15 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	}
 
 	if prefixLen > 0 {
+		// Bound the declared body size before sizing the allocation from
+		// it: size comes straight from the pack header, so a hostile pack
+		// can advertise up to 2^64-1 (int(size) would wrap negative and
+		// panic make, and anything below that would OOM ahead of the
+		// inflate failure).
+		if err := checkDeclaredSize(r, pos+int64(prefixLen), size); err != nil {
+			return ObjBad, nil, err
+		}
+
 		// Combined buffer allocation strategy: the prefix (base reference)
 		// and the inflated delta instructions are laid out contiguously in
 		// a single allocation:
@@ -119,6 +169,10 @@ func readRawObject(r *mmap.ReaderAt, off uint64) (ObjectType, []byte, error) {
 	}
 
 	// Regular (non-delta) object: inflate directly from the mapped pack.
+	// The same declared-size bound applies before the allocation.
+	if err := checkDeclaredSize(r, pos, size); err != nil {
+		return ObjBad, nil, err
+	}
 	out := make([]byte, size)
 	if err := inflateExact(r, pos, out); err != nil {
 		return ObjBad, nil, err

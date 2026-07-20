@@ -142,6 +142,17 @@ func (e *ScanError) Error() string {
 // HistoryScanner now always builds commit metadata in memory from ref walks.
 var ErrCommitGraphRequired = errors.New("commit‑graph required but not found")
 
+// WithOffsetCacheBudget bounds the bytes of materialized pack objects the
+// scanner's (pack, offset) cache may retain (default 256 MiB). Each scanner
+// owns an independent cache, so processes that open many repositories
+// concurrently should lower the budget to bound aggregate memory growth.
+// A budget <= 0 disables the cache entirely.
+func WithOffsetCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.store.offCache.setBudget(bytes)
+	}
+}
+
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
 //

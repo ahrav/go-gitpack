@@ -6,8 +6,8 @@
 package objstore
 
 import (
-	"bufio"
 	"bytes"
+	"compress/zlib"
 	"encoding/binary"
 	"fmt"
 	"os"
@@ -145,6 +145,62 @@ func TestOpen(t *testing.T) {
 		assert.Equal(t, ObjBlob, typ)
 		assert.Equal(t, []byte("content 1"), data)
 	})
+}
+
+func TestGetNoCacheDoesNotPopulateOffsetCache(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	store, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer store.Close()
+
+	baseHash := calculateHash(ObjBlob, []byte("base content"))
+	targetHash := calculateHash(ObjBlob, []byte("modified data"))
+	for _, oid := range []Hash{baseHash, targetHash} {
+		_, _, err := store.getNoCache(oid)
+		require.NoError(t, err)
+	}
+
+	entries := 0
+	for i := range store.offCache.shards {
+		entries += len(store.offCache.shards[i].m)
+	}
+	require.Zero(t, entries)
+}
+
+// TestGetFallsBackToOIDCachesWhenOffsetCacheDisabled verifies that
+// pack-resident reads fall back to the delta window and ARC cache when the
+// offset cache misses (e.g. disabled via WithOffsetCacheBudget). Without the
+// fallback, every repeated read of a packed object re-inflates from disk in
+// memory-constrained configurations even though inflation populates the
+// delta window.
+func TestGetFallsBackToOIDCachesWhenOffsetCacheDisabled(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	store, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer store.Close()
+
+	store.offCache.setBudget(0) // Disable the offset cache entirely.
+
+	targetHash := calculateHash(ObjBlob, []byte("modified data"))
+
+	// First read inflates from the pack and populates the delta window.
+	want, _, err := store.get(targetHash)
+	require.NoError(t, err)
+
+	// Second read must be served by the delta window, whose hit path
+	// promotes the object into the ARC cache — observable proof the
+	// OID-keyed fallback ran instead of a straight re-inflation.
+	got, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	_, ok := store.cache.Get(targetHash)
+	require.True(t, ok,
+		"second read must hit the delta window and promote to the ARC cache")
 }
 
 // TestParseIdx validates the v2 pack-index parser against invalid magic bytes,
@@ -439,17 +495,14 @@ func BenchmarkGetCold(b *testing.B) { benchmarkGet(b, false) }
 // resident in the LRU cache.
 func BenchmarkGetWarm(b *testing.B) { benchmarkGet(b, true) }
 
-// BenchmarkReadVarIntFromReader measures the throughput of reading a
-// multi-byte variable-length integer (three bytes, maximum value) from a
-// buffered reader.
-func BenchmarkReadVarIntFromReader(b *testing.B) {
+// BenchmarkDecodeVarInt measures the throughput of decoding a multi-byte
+// variable-length integer (three bytes, maximum value) from a flat buffer.
+func BenchmarkDecodeVarInt(b *testing.B) {
 	buf := []byte{0xff, 0xff, 0x7f}
-	reader := bufio.NewReader(bytes.NewReader(buf))
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		reader = bufio.NewReader(bytes.NewReader(buf))
-		readVarIntFromReader(reader)
+		decodeVarInt(buf)
 	}
 }
 
@@ -737,4 +790,77 @@ func TestReadRawObject_OfsDeltaReadError(t *testing.T) {
 	// actual I/O error from the failed ReadAt.
 	assert.NotErrorIs(t, err, ErrOfsDeltaBaseRefTooLong,
 		"expected I/O error, not ErrOfsDeltaBaseRefTooLong; got: %v", err)
+}
+
+// TestReadRawObject_RejectsHostileDeclaredSize verifies that readRawObject
+// bounds the header-declared decompressed size by what the remaining pack
+// bytes could possibly inflate to (DEFLATE expands at most 1032:1) before
+// sizing any allocation from it. Without the bound, a few corrupt header
+// bytes force an allocation of the full advertised amount — up to an
+// instant OOM or, above MaxInt, a make() panic — long before inflation
+// fails on the same input.
+func TestReadRawObject_RejectsHostileDeclaredSize(t *testing.T) {
+	open := func(t *testing.T, obj []byte) *mmap.ReaderAt {
+		t.Helper()
+		path := filepath.Join(t.TempDir(), "hostile.pack")
+		require.NoError(t, os.WriteFile(path, obj, 0o644))
+		pack, err := mmap.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pack.Close()) })
+		return pack
+	}
+
+	t.Run("plain object", func(t *testing.T) {
+		// A blob header advertising 1 TiB followed by a tiny zlib stream.
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjBlob), 1<<40))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write([]byte("tiny"))
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		_, _, err = readRawObject(open(t, obj.Bytes()), 0)
+		require.ErrorIs(t, err, errObjectSizeExceedsPack)
+	})
+
+	t.Run("plain object above MaxInt", func(t *testing.T) {
+		// Above MaxInt the unchecked int(size) conversion would wrap
+		// negative and panic make instead of returning an error.
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjBlob), 1<<63))
+		_, _, err := readRawObject(open(t, obj.Bytes()), 0)
+		require.ErrorIs(t, err, errObjectSizeExceedsPack)
+	})
+
+	t.Run("ref-delta record", func(t *testing.T) {
+		// The same bound must protect the combined prefix+body allocation
+		// for delta records.
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjRefDelta), 1<<40))
+		obj.Write(make([]byte, len(Hash{})))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write([]byte("tiny"))
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		_, _, err = readRawObject(open(t, obj.Bytes()), 0)
+		require.ErrorIs(t, err, errObjectSizeExceedsPack)
+	})
+
+	t.Run("valid sizes still admitted", func(t *testing.T) {
+		// The bound must never reject a valid record: a genuine object
+		// whose declared size matches its stream decodes as before.
+		payload := bytes.Repeat([]byte{'x'}, 4096)
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjBlob), uint64(len(payload))))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		typ, data, err := readRawObject(open(t, obj.Bytes()), 0)
+		require.NoError(t, err)
+		assert.Equal(t, ObjBlob, typ)
+		assert.Equal(t, payload, data)
+	})
 }

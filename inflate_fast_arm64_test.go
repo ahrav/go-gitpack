@@ -1,4 +1,4 @@
-//go:build arm64 && !purego && (!cgo || !gitpack_libdeflate)
+//go:build arm64 && !purego && !(gitpack_libdeflate && cgo)
 
 package objstore
 
@@ -91,6 +91,11 @@ func TestInflateHuffmanFastArm64FallbackDifferential(t *testing.T) {
 		dstLen := len(payload) + deflateFastOutputMargin + 1
 
 		reference := arm64RunHuffmanGo(d, r, dstLen)
+		// Anchor the fixture absolutely: a cross-comparison alone would
+		// pass if all three decoders regressed identically.
+		if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], payload) {
+			t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+		}
 		dispatch := arm64RunHuffmanDispatch(d, r, dstLen)
 		arm64CompareHuffmanResults(t, dispatch, reference)
 
@@ -104,6 +109,9 @@ func TestInflateHuffmanFastArm64FallbackDifferential(t *testing.T) {
 		d, r := arm64PrepareHuffmanBlock(t, src, 1)
 
 		reference := arm64RunHuffmanGo(d, r, deflateFastOutputMargin)
+		if reference.err != nil || !bytes.Equal(reference.dst[:reference.out], payload) {
+			t.Fatalf("reference decode: out=%d err=%v", reference.out, reference.err)
+		}
 		dispatch := arm64RunHuffmanDispatch(d, r, deflateFastOutputMargin)
 		arm64CompareHuffmanResults(t, dispatch, reference)
 
