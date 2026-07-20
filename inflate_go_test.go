@@ -833,6 +833,37 @@ func TestInflatePackZlibSingleBitDifferential(t *testing.T) {
 	}
 }
 
+// TestInflateStoredBlockOverrunTruncationClassification pins the error class
+// for a stored block that is both truncated (LEN exceeds the remaining
+// input) and overrunning (its payload crosses the declared size). The bytes
+// actually present decide: payload in the input crossing the declared size
+// is the overrun class, matching what the streaming backends observe, while
+// a declared LEN whose bytes are absent stays a truncation.
+func TestInflateStoredBlockOverrunTruncationClassification(t *testing.T) {
+	// Stored final block: LEN=5, NLEN=^5, but only 3 payload bytes present.
+	src := []byte{0x78, 0x9c, 0x01, 0x05, 0x00, 0xfa, 0xff, 0x41, 0x42, 0x43}
+
+	// Declared size 2: the third stored byte already crosses it.
+	_, _, err := guardedGoInflate(t, src, 2)
+	if !errors.Is(err, errZlibStreamOverrun) {
+		t.Fatalf("overrun-evident stream got %v, want the stream-overrun class", err)
+	}
+
+	// Declared size 10: the 3 present bytes fit; the missing 2 are a
+	// truncation, not an overrun.
+	_, _, err = guardedGoInflate(t, src, 10)
+	if errors.Is(err, errZlibStreamOverrun) {
+		t.Fatalf("truncated stored block misclassified as overrun: %v", err)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated stored block got %v, want unexpected-EOF identity", err)
+	}
+
+	// Both classifications must satisfy the full differential oracle.
+	assertGoMatchesReference(t, src, 2)
+	assertGoMatchesReference(t, src, 10)
+}
+
 // TestInflateMatchAtFullDestinationClassification pins the error class when
 // the destination is already full and the next symbol is a length code: the
 // overrun class applies only after the whole match decodes as structurally

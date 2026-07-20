@@ -301,15 +301,26 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 			if uint16(n) != ^nn {
 				return 0, out, errDeflateBadData
 			}
-			if n > len(src)-r.pos {
-				return 0, out, errDeflateTruncated
-			}
-			if n > len(dst)-out {
+			// A block can be both truncated (LEN exceeds the remaining
+			// input) and overrunning (the payload crosses the remaining
+			// destination). Classify by the bytes actually present, like
+			// the streaming backends observe them: stored bytes already
+			// in the input that cross the declared size prove an overrun
+			// even when the block is also cut short, while a declared
+			// LEN whose bytes are absent stays a truncation. The
+			// available prefix of a truncated block is still copied, so
+			// the produced count reflects real output the way flate's
+			// streaming decode does.
+			take := min(n, len(src)-r.pos)
+			if take > len(dst)-out {
 				return 0, out, errDeflateOutputOverrun
 			}
-			copy(dst[out:out+n], src[r.pos:r.pos+n])
-			r.pos += n
-			out += n
+			copy(dst[out:out+take], src[r.pos:r.pos+take])
+			r.pos += take
+			out += take
+			if take < n {
+				return 0, out, errDeflateTruncated
+			}
 
 		case 1:
 			if !d.loadFixedTables() {
