@@ -485,9 +485,13 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) error {
 		}
 	}
 
-	if d.lens[256] == 0 {
-		return errDeflateBadData
-	}
+	// A table without an end-of-block code (lens[256] == 0) is not rejected
+	// here: compress/flate (the differential oracle) accepts it at header
+	// time and classifies the failure while decoding the body — truncation
+	// if input runs out first, bad data if an unassigned codeword is hit.
+	// Since no entry can carry huffEndOfBlock, the block can never decode
+	// successfully; deferring keeps the error class aligned with the
+	// reference case by case.
 
 	offsetBits, ok := d.buildTable(
 		d.offset[:], d.lens[numLitlen:total], offsetTable, offsetTableBits, maxCodeLen, true,
@@ -733,9 +737,6 @@ func (d *goInflater) decodeHuffmanTail(r *deflateBits, dst []byte, out int) (int
 		totalBits := uint(entry & huffBitCountMask)
 		length := int(entry >> 16)
 		length += int((saved &^ (^uint64(0) << totalBits)) >> codeBits)
-		if length > len(dst)-out {
-			return out, errDeflateOutputOverrun
-		}
 
 		if r.nbits < offsetBits {
 			r.refill()
@@ -774,6 +775,12 @@ func (d *goInflater) decodeHuffmanTail(r *deflateBits, dst []byte, out int) (int
 		offset += int((saved &^ (^uint64(0) << totalBits)) >> codeBits)
 		if offset <= 0 || offset > out {
 			return out, errDeflateBadData
+		}
+		// Only a fully decoded, structurally valid match may classify as an
+		// overrun: a truncated or invalid distance must keep its own error
+		// class even when the destination is already full.
+		if length > len(dst)-out {
+			return out, errDeflateOutputOverrun
 		}
 
 		copyMatch(dst, out, offset, length)

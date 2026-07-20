@@ -838,6 +838,58 @@ func TestInflatePackZlibSingleBitDifferential(t *testing.T) {
 // anywhere in the deflate payload, including mid-header, mid-dynamic-table,
 // and mid-codeword) must classify as truncation via
 // errors.Is(err, io.ErrUnexpectedEOF), never as generic bad data.
+// TestInflateMatchAtFullDestinationClassification pins the error class when
+// the destination is already full and the next symbol is a length code: the
+// overrun class applies only after the whole match decodes as structurally
+// valid. A missing distance code is truncation; only a complete match that
+// would exceed dst is an overrun.
+func TestInflateMatchAtFullDestinationClassification(t *testing.T) {
+	// Five 9-bit literals plus the 8-bit length-258 code end exactly on a
+	// byte boundary (3+45+8 = 56 bits), so the distance code is entirely
+	// absent from the input.
+	t.Run("truncated distance", func(t *testing.T) {
+		var w deflateTestBits
+		w.write(1, 1) // BFINAL
+		w.write(1, 2) // BTYPE = fixed
+		for i := 0; i < 5; i++ {
+			w.writeFixedLitlen(200)
+		}
+		w.writeFixedLength(258)
+		src := append([]byte{0x78, 0x9c}, w.bytes()...)
+
+		_, _, err := guardedGoInflate(t, src, 5)
+		if err == nil {
+			t.Fatal("truncated match accepted")
+		}
+		if errors.Is(err, errZlibStreamOverrun) {
+			t.Fatalf("got overrun class, want truncation: %v", err)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("got %v, want unexpected-EOF identity", err)
+		}
+	})
+
+	// The same layout with a complete, valid distance code must report the
+	// overrun class.
+	t.Run("valid match overrun", func(t *testing.T) {
+		var w deflateTestBits
+		w.write(1, 1)
+		w.write(1, 2)
+		for i := 0; i < 5; i++ {
+			w.writeFixedLitlen(200)
+		}
+		w.writeFixedLength(258)
+		w.writeFixedOffset(0) // distance 1
+		w.writeFixedLitlen(256)
+		src := append([]byte{0x78, 0x9c}, w.bytes()...)
+
+		_, _, err := guardedGoInflate(t, src, 5)
+		if !errors.Is(err, errZlibStreamOverrun) {
+			t.Fatalf("got %v, want the stream-overrun class", err)
+		}
+	})
+}
+
 func TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF(t *testing.T) {
 	type fixture struct {
 		encoded []byte
@@ -967,6 +1019,42 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 		if consumed != 0 {
 			t.Fatalf("error returned consumed=%d, want 0", consumed)
 		}
+		// Both backends reject; compare the error class where the
+		// backends define it compatibly. Truncation carries the
+		// io.ErrUnexpectedEOF identity on both sides: our decoder via
+		// the errDeflateTruncated and errDeflateShortOutput wrappers,
+		// compress/flate by converting an io.EOF read mid-stream.
+		//
+		// Exemption 1: a stream that produces more than the declared
+		// object size AND fails later has two independent defects, and
+		// the backends legitimately report different ones. Our one-shot
+		// decoder rejects in output order the moment the destination
+		// would overflow, while compress/flate does not know the
+		// destination size, decodes ahead, and can latch a truncation
+		// or corruption error before the reference harness observes the
+		// overrun (corpus seed ed3b9e48e3763a54). Whenever either
+		// backend classifies the failure as output overrun, only the
+		// acceptance and consumed comparisons above apply.
+		if errors.Is(gotErr, errZlibStreamOverrun) || errors.Is(wantErr, errReferenceOverrun) {
+			return
+		}
+		// Exemption 2 (one-sided comparison): compress/flate reporting
+		// truncation does not prove the input is merely truncated,
+		// because it defers some structural validation past the end of
+		// input (corpus seed 70692aea817b4756 originally exposed a
+		// missing-end-of-block-code case; the decoder now defers that
+		// check like the stdlib does, but other class-narrowing fixes
+		// on our side must not be blocked by the reference's looser
+		// classification). The reverse direction is strict: whenever
+		// our decoder claims the truncation identity, the reference
+		// must agree, so structurally invalid data can never hide
+		// behind io.ErrUnexpectedEOF on our side.
+		gotTruncated := errors.Is(gotErr, io.ErrUnexpectedEOF)
+		wantTruncated := errors.Is(wantErr, io.ErrUnexpectedEOF)
+		if gotTruncated && !wantTruncated {
+			t.Fatalf("error class mismatch for %x size=%d: go err=%v claims truncation, reference err=%v does not",
+				src, size, gotErr, wantErr)
+		}
 		return
 	}
 	if consumed != wantConsumed || !bytes.Equal(got, want) {
@@ -974,6 +1062,11 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 			consumed, wantConsumed, bytes.Equal(got, want))
 	}
 }
+
+// errReferenceOverrun classifies reference-harness rejections of streams
+// that produce more than the declared object size, mirroring the
+// errZlibStreamOverrun class on the Go decoder side.
+var errReferenceOverrun = errors.New("reference: output exceeds declared size")
 
 func referencePackInflate(src []byte, size int) ([]byte, int, error) {
 	if len(src) < 2 || !validPackZlibHeader(src[0], src[1]) {
@@ -984,14 +1077,27 @@ func referencePackInflate(src []byte, size int) ([]byte, int, error) {
 	fr := stdflate.NewReader(br)
 	out, err := io.ReadAll(io.LimitReader(fr, int64(size)+1))
 	closeErr := fr.Close()
+	if len(out) > size {
+		// Overrun takes precedence over any decode error: the stream
+		// exceeded the declared size before whatever failure flate may
+		// have latched while decoding ahead of the limit.
+		return nil, 0, fmt.Errorf("output size %d, want %d: %w",
+			len(out), size, errReferenceOverrun)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
 	if closeErr != nil {
 		return nil, 0, closeErr
 	}
-	if len(out) != size {
-		return nil, 0, fmt.Errorf("output size %d, want %d", len(out), size)
+	if len(out) < size {
+		// A structurally complete stream that stops short of the declared
+		// object size is a truncation-class failure: reading size bytes
+		// from the decompressed stream hits EOF early, exactly what
+		// io.ReadFull would report. This mirrors errDeflateShortOutput,
+		// which carries the same identity on the Go decoder side.
+		return nil, 0, fmt.Errorf("output size %d, want %d: %w",
+			len(out), size, io.ErrUnexpectedEOF)
 	}
 	return out, 2 + len(src[2:]) - br.Len(), nil
 }
