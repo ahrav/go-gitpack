@@ -29,7 +29,7 @@
 //
 // Cross-file dependencies:
 //   - btostr (unsafe.go): zero-copy []byte to string conversion.
-//   - store.get (store.go): used by loadBlobs to retrieve blob content.
+//   - store.get (store.go): used by loadBlob to retrieve blob content.
 
 package objstore
 
@@ -483,31 +483,6 @@ func loadBlob(s *store, oid Hash) ([]byte, error) {
 	}
 	b, _, err := s.get(oid)
 	return b, err
-}
-
-// loadBlobs retrieves the raw contents of the provided object IDs from store.
-//
-// A zero Hash yields an empty slice.  Errors are wrapped with context.
-func loadBlobs(s *store, oldOID, newOID Hash) ([]byte, []byte, error) {
-	var (
-		oldB []byte
-		newB []byte
-		err  error
-	)
-
-	if !oldOID.IsZero() {
-		if oldB, _, err = s.get(oldOID); err != nil {
-			return nil, nil, fmt.Errorf("getting old blob: %w", err)
-		}
-	}
-
-	if !newOID.IsZero() {
-		if newB, _, err = s.get(newOID); err != nil {
-			return nil, nil, fmt.Errorf("getting new blob: %w", err)
-		}
-	}
-
-	return oldB, newB, nil
 }
 
 // addedHunksWithPos compares two byte slices and identifies contiguous blocks of added lines.
