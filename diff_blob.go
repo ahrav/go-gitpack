@@ -18,7 +18,9 @@
 //   - <= LargeFileThreshold  (500 MB): addedHunksWithHashing — stores only
 //     64-bit FarmHash digests per line to limit memory.
 //   - > MaxDiffSize          (1 GB):   skipped entirely; a placeholder hunk is
-//     returned instead.
+//     returned instead. Enforced per side as each blob is lazily loaded; see
+//     the MaxDiffSize doc comment for the short-circuit paths that never
+//     consult the old blob.
 //
 // Tokenization is zero-copy: tokenize() creates string views into the original
 // byte slices via btostr (see unsafe.go). This means the returned strings share
@@ -181,9 +183,21 @@ const (
 	// based algorithm, which stores only 64‑bit hashes of each line.
 	LargeFileThreshold = 500 << 20 // 500 MB
 
-	// MaxDiffSize is 1 GB (1 << 30). If either blob is larger than this limit
-	// computeAddedHunks skips the diff and returns a single placeholder hunk.
-	MaxDiffSize = 1 << 30 // 1 GB
+	// MaxDiffSize is 1 GB (1 << 30). If a blob consulted by computeAddedHunks
+	// is larger than this limit, the diff is skipped and a single placeholder
+	// hunk is returned instead.
+	//
+	// Because blobs are loaded lazily (new side first, old side only when a
+	// text diff is actually needed), the limit is enforced per side as each
+	// blob is loaded. Two short-circuit paths never consult the old blob and
+	// therefore never apply the limit to it:
+	//
+	//   - Pure deletions (zero new OID) return no hunks without loading
+	//     either blob.
+	//   - A binary new blob at or below the limit is returned as a single
+	//     binary hunk without loading the old blob, even if the old version
+	//     was larger than the limit.
+	MaxDiffSize = 1 << 30 // 1 GB
 )
 
 // AddedHunk represents a contiguous block of added lines in a diff.
@@ -316,7 +330,10 @@ func isBinary(data []byte) bool {
 //  1. Return nil for a pure deletion (newOID zero) or a mode-only change
 //     (oldOID == newOID); neither blob is loaded.
 //  2. Load the new blob. Emit a placeholder if it exceeds MaxDiffSize, or a
-//     single binary hunk if it is binary.
+//     single binary hunk if it is binary. In the binary case the old blob is
+//     never loaded, so an old version above MaxDiffSize does not produce a
+//     placeholder here — the size limit applies per side, as each blob is
+//     loaded.
 //  3. For a pure addition (oldOID zero), tokenize the new blob.
 //  4. Otherwise load the old blob: a placeholder if it exceeds MaxDiffSize,
 //     one binary hunk on a binary→text transition, else a size-selected
@@ -373,6 +390,14 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 		// checked-in binaries); newBytes comes from the object store whose
 		// buffers are immutable by contract, matching the zero-copy
 		// convention tokenize already uses for text.
+		//
+		// The old blob is intentionally not loaded (or size-checked) on
+		// this path: its bytes cannot change the output — the hunk carries
+		// only the new content — and checking its size would require
+		// inflating it, reinstating the redundant old-side inflation this
+		// lazy-load ordering exists to avoid. Consequently a >MaxDiffSize
+		// old version rewritten to a within-limit binary new version emits
+		// the binary hunk, not the "[File too large to diff]" placeholder.
 		hunk := AddedHunk{
 			StartLine: 1,
 			Lines:     []string{btostr(newBytes)},
