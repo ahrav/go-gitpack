@@ -105,7 +105,7 @@ const maxPooledLineIndexBytes = 4 << 20 // 4 MiB
 // putLineIndex returns ix to lineIndexPool unless its retained capacity
 // exceeds maxPooledLineIndexBytes, in which case it is dropped for the GC.
 func putLineIndex(ix *lineIndex) {
-	if len(ix.slots)*8+cap(ix.next)*4 > maxPooledLineIndexBytes {
+	if cap(ix.slots)*8+cap(ix.next)*4 > maxPooledLineIndexBytes {
 		return
 	}
 	lineIndexPool.Put(ix)
