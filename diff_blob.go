@@ -88,6 +88,29 @@ var lineIndexPool = sync.Pool{
 	New: func() any { return &lineIndex{} },
 }
 
+// maxPooledLineIndexBytes bounds the retained capacity of a lineIndex that
+// may be returned to lineIndexPool. build() only ever grows slots and next,
+// and sync.Pool holds objects across GC cycles, so without a cap every
+// pooled index ratchets to the largest file it has ever indexed (~20 MiB
+// for a 2^20-line file: 16 MiB of slots plus 4 MiB of next) — retained once
+// per scan worker. Oversized indexes are dropped instead of pooled: the
+// rebuild allocation is dwarfed by the cost of diffing a file that large,
+// and re-pooling them would also make every subsequent small diff probe a
+// huge, cache-cold table. 4 MiB keeps indexes for old sides up to ~200K
+// lines pooled (a 120K-line file of 4-byte lines needs ~2.5 MiB; dropping
+// at 2 MiB measurably regressed that shape) while excluding the degenerate
+// one-byte-per-line ratchet.
+const maxPooledLineIndexBytes = 4 << 20 // 4 MiB
+
+// putLineIndex returns ix to lineIndexPool unless its retained capacity
+// exceeds maxPooledLineIndexBytes, in which case it is dropped for the GC.
+func putLineIndex(ix *lineIndex) {
+	if len(ix.slots)*8+cap(ix.next)*4 > maxPooledLineIndexBytes {
+		return
+	}
+	lineIndexPool.Put(ix)
+}
+
 // build indexes lines[from:]. Chains are threaded in ascending position
 // order by inserting from the highest index down.
 func (ix *lineIndex) build(lines []string, from int) {
@@ -538,7 +561,7 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 	var oldIndex *lineIndex
 	defer func() {
 		if oldIndex != nil {
-			lineIndexPool.Put(oldIndex)
+			putLineIndex(oldIndex)
 		}
 	}()
 

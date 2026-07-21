@@ -7,6 +7,7 @@ package objstore
 
 import (
 	"bytes"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -448,5 +449,39 @@ func TestFuseHunks(t *testing.T) {
 				prevEnd = h.EndLine()
 			}
 		})
+	}
+}
+
+// TestAddedHunksWithPosDoesNotPoolOversizedIndex proves the lineIndex pool
+// retention invariant: after diffing a file whose lineIndex exceeds
+// maxPooledLineIndexBytes, the pool must never hand back an oversized index.
+//
+// Without a retention cap, build() only ever grows slots/next and the defer
+// in addedHunksWithPos re-pools the index unconditionally, so one ~2^20-line
+// file ratchets a pooled index to ~20 MiB (16 MiB slots + 4 MiB next) that
+// sync.Pool then retains across GC cycles — once per scan worker. GC is
+// disabled for the duration of the test so the pool cannot shed entries
+// between the Put (inside addedHunksWithPos) and the Get below, making the
+// pre-fix failure deterministic when run in isolation.
+func TestAddedHunksWithPosDoesNotPoolOversizedIndex(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	// 2^20 one-byte lines. The first line of new differs, so the common-prefix
+	// skip elides nothing and the index is built over the full old side:
+	// want = 2^21 slots (16 MiB) + 2^20 int32 next entries (4 MiB).
+	oldB := bytes.Repeat([]byte("a\n"), 1<<20)
+	newB := []byte("b\n")
+
+	for range 4 {
+		_ = addedHunksWithPos(oldB, newB)
+
+		ix := lineIndexPool.Get().(*lineIndex)
+		retained := len(ix.slots)*8 + cap(ix.next)*4
+		// Return whatever we got so later diffs can still reuse small indexes.
+		lineIndexPool.Put(ix)
+
+		require.LessOrEqual(t, retained, maxPooledLineIndexBytes,
+			"pool returned an oversized lineIndex (%d bytes retained); "+
+				"oversized indexes must be dropped, not pooled", retained)
 	}
 }
