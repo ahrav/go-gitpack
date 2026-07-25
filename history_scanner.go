@@ -114,7 +114,9 @@ type HistoryScanner struct {
 
 	// treeOIDs memoizes commit OID -> root tree OID. Every commit header
 	// is otherwise inflated twice per scan: once when the walk visits the
-	// commit and once when its child resolves firstParentTree.
+	// commit and once when its child resolves firstParentTree. The memo is
+	// scoped to one walk: each scan entry point clears it on return so a
+	// long-lived scanner does not hold O(commit-count) memory.
 	treeOIDs sync.Map
 
 	// profiling holds optional profiling configuration.
@@ -228,6 +230,9 @@ func (h *HunkAddition) String() string {
 }
 
 // Lines returns all added lines without leading '+' markers.
+//
+// The returned slice and its strings are shared with internal caches and
+// other deliveries of the same content; callers must not modify them.
 func (h *HunkAddition) Lines() []string { return h.lines }
 
 // StartLine returns the first line number (1‑based) of the hunk.
@@ -249,12 +254,10 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // DiffHistoryHunks streams every added hunk from all commits, diffing each
 // commit against its first parent only (i.e. merge commits are treated as a
 // single diff against the first parent, matching `git log --first-parent`
-// semantics). This keeps output deterministic and avoids duplicate hunks from
-// merge base reconstruction.
+// semantics). This avoids duplicate hunks from merge base reconstruction.
 //
 // It returns two buffered channels: one for HunkAddition values and one for a
-// single error. The function never blocks the caller; all writes to the
-// channels are non-blocking.
+// single error.
 //
 // Goroutine ownership: DiffHistoryHunks spawns a background goroutine that
 // owns the returned channels and closes them when the walk completes. The
@@ -262,10 +265,17 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // errC channel delivers a value) to avoid leaking goroutines. Failing to
 // drain will block the internal worker pool indefinitely.
 //
-// The HunkAddition channel is buffered to runtime.NumCPU() to allow workers
-// to make progress without waiting for the consumer on every hunk. The errC
-// channel is buffered to 1 so the producer goroutine can always send its
-// final error without blocking.
+// The HunkAddition channel is deeply buffered so producer bursts (a single
+// commit can emit tens of thousands of hunks) do not stall on consumer
+// scheduling; a slow consumer still applies backpressure once the buffer
+// fills. The errC channel is buffered to 1 so the producer goroutine can
+// always send its final error without blocking.
+//
+// Ordering: hunks for one (commit, path) pair arrive contiguously in
+// ascending line order. No order is guaranteed across files or commits.
+//
+// Hunk lines may be shared with internal caches and other deliveries of the
+// same content; callers must treat Lines() as read-only.
 //
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
@@ -298,10 +308,20 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // consumer goroutine, this eliminates the channel hand-off entirely and
 // lets hunk processing scale across every worker — the preferred API for
 // CPU-bound consumers.
+//
+// Ordering: fn receives the hunks for one (commit, path) pair sequentially
+// in ascending line order. No order is guaranteed across files or commits.
+//
+// Hunk lines may be shared with internal caches and other deliveries of the
+// same content; fn must treat HunkAddition.Lines() as read-only.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
 	numWorkers := runtime.NumCPU()
 
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
+	// The tree memo only pays off while this walk resolves first-parent
+	// trees; dropping it here keeps the scanner's steady-state memory
+	// independent of history size.
+	defer hs.treeOIDs.Clear()
 
 	if err := hs.startProfiling(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
@@ -486,6 +506,12 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 		if !isBlobMode(mode) {
 			return nil
 		}
+		// Deletions (zero new OID) and identity pairs produce no added
+		// hunks; dropping them here saves a stage-2 hand-off and a
+		// permanent cache entry per distinct deleted blob.
+		if newH.IsZero() || newH == old {
+			return nil
+		}
 		select {
 		case <-stopCh:
 			return errScanAborted
@@ -532,10 +558,8 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 			continue
 		}
 
-		// Emit each hunk on its own; fusing a single hunk is a no-op
-		// (fuseHunks leaves slices shorter than 2 unchanged). Cross-hunk
-		// fusion, if ever wanted, must run over the whole per-file hunk
-		// slice instead.
+		// Emit each hunk exactly as computeAddedHunks produced it;
+		// adjacent hunks are not merged.
 		if err := fn(HunkAddition{
 			commit:    work.commit,
 			path:      filepath.ToSlash(work.path),

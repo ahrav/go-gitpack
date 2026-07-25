@@ -48,8 +48,8 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 	return orderCommitsParentFirst(out), nil
 }
 
-// walkCommitsFromRefs performs a ref-based reachable commit walk and calls visit
-// once per commit.
+// walkCommitsFromRefs performs a ref-based reachable commit walk and calls
+// visit once per commit, using one worker per CPU (capped at 16).
 //
 // The walk is a parallel BFS over the commit DAG: header inflation (a zlib
 // decompression per commit) dominates the cost and is embarrassingly
@@ -57,13 +57,31 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 // pipeline stages starve. Worker goroutines pop frontier OIDs from a shared
 // stack, inflate and parse headers concurrently, then push unseen parents.
 //
-// Ordering: visits happen in nondeterministic order. Both callers tolerate
-// this — DiffHistoryHunks processes commits independently, and loadFromRefs
-// re-establishes parent-first order via orderCommitsParentFirst.
+// Ordering: visits happen in nondeterministic order, so every caller must be
+// insensitive to it. loadFromRefs re-establishes parent-first order via
+// orderCommitsParentFirst, and DiffHistoryHunksFunc processes commits
+// independently. Callers whose output depends on visit order (first-wins
+// blob dedup in the scan planners) use walkCommitsFromRefsOrdered instead.
 //
 // visit is invoked under an internal mutex, so it may touch caller state
 // without additional locking, but it must not block indefinitely.
 func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) error {
+	return hs.walkCommitsFromRefsWorkers(min(runtime.NumCPU(), 16), visit)
+}
+
+// walkCommitsFromRefsOrdered performs the same reachable walk with a single
+// worker, which yields a deterministic depth-first visit order: ref tips
+// sorted by hash seed the stack, the last tip is explored first, and a
+// commit's parents are explored before remaining siblings. Callers that
+// attribute deduplicated results to the first commit visited rely on this
+// order being reproducible across runs.
+func (hs *HistoryScanner) walkCommitsFromRefsOrdered(visit func(commitInfo) error) error {
+	return hs.walkCommitsFromRefsWorkers(1, visit)
+}
+
+// walkCommitsFromRefsWorkers implements the reachable commit walk shared by
+// walkCommitsFromRefs and walkCommitsFromRefsOrdered.
+func (hs *HistoryScanner) walkCommitsFromRefsWorkers(numWorkers int, visit func(commitInfo) error) error {
 	if visit == nil {
 		return nil
 	}
@@ -75,8 +93,6 @@ func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) erro
 	if len(tips) == 0 {
 		return nil
 	}
-
-	numWorkers := min(runtime.NumCPU(), 16)
 
 	var (
 		mu       sync.Mutex // guards seen, stack, active, firstErr

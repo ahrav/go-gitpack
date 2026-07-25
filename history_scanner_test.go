@@ -624,3 +624,94 @@ func TestLoadAllCommits_SuperLargeRepo(t *testing.T) {
 
 	assert.Equal(t, 1, rootCommitCount, "Should have exactly one root commit")
 }
+
+// TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs proves that stage 1
+// of the hunk pipeline never dispatches blob pairs that cannot produce added
+// hunks: deletions (zero new OID) and identity pairs (old == new). Such
+// pairs would waste a stage-2 hand-off and leave a permanent zero-cost entry
+// in the pair cache for every distinct deleted blob.
+func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repo := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t",
+			"GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t",
+			"GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "git %v failed: %s", args, string(out))
+	}
+	write := func(name, content string) {
+		require.NoError(t, os.WriteFile(filepath.Join(repo, name), []byte(content), 0o644))
+	}
+
+	run("init", "--quiet")
+	write("a.txt", "gone soon\n")
+	write("b.txt", "keep\n")
+	run("add", "a.txt", "b.txt")
+	run("commit", "-m", "add", "--quiet")
+
+	run("rm", "--quiet", "a.txt")
+	write("b.txt", "keep\nchanged\n")
+	run("add", "b.txt")
+	run("commit", "-m", "delete a, change b", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+
+	var child commitInfo
+	for _, c := range commits {
+		if len(c.ParentOIDs) == 1 {
+			child = c
+		}
+	}
+	require.NotEqual(t, Hash{}, child.OID, "expected a commit with one parent")
+
+	parentTree, err := scanner.firstParentTree(child)
+	require.NoError(t, err)
+
+	blobs := make(chan blobPairWork, 64)
+	stopCh := make(chan struct{})
+	require.NoError(t, scanner.emitCommitBlobPairs(child, parentTree, blobs, stopCh))
+	close(blobs)
+
+	var paths []string
+	for work := range blobs {
+		paths = append(paths, work.path)
+		assert.False(t, work.newOID.IsZero(),
+			"deletion for %s must not be dispatched to stage 2", work.path)
+		assert.NotEqual(t, work.oldOID, work.newOID,
+			"identity pair for %s must not be dispatched to stage 2", work.path)
+	}
+	assert.Equal(t, []string{"b.txt"}, paths,
+		"only the modified file produces stage-2 work")
+}
+
+// TestDiffHistoryHunksFunc_ReleasesTreeMemo proves the commit->tree memo is
+// scoped to one scan. The memo only pays off while a walk is resolving
+// first-parent trees; keeping it on the long-lived scanner would hold
+// O(commit-count) memory after the scan returns.
+func TestDiffHistoryHunksFunc_ReleasesTreeMemo(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+	defer scanner.Close()
+
+	require.NoError(t, scanner.DiffHistoryHunksFunc(func(HunkAddition) error { return nil }))
+
+	entries := 0
+	scanner.treeOIDs.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	assert.Zero(t, entries, "tree memo must be released when the scan returns")
+}
