@@ -279,11 +279,19 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // The HunkAddition channel is deeply buffered so producer bursts (a single
 // commit can emit tens of thousands of hunks) do not stall on consumer
 // scheduling; a slow consumer still applies backpressure once the buffer
-// fills. A buffered hunk retains its own line bytes and nothing more (see
-// pairCache.add), so the buffer's footprint tracks the payload in flight
-// rather than the decompressed blobs the hunks were diffed from. The errC
-// channel is buffered to 1 so the producer goroutine can always send its
-// final error without blocking.
+// fills. A buffered hunk retains its own line bytes and nothing beyond them
+// (see pairCache.add), so the buffer pins the payload in flight rather than
+// the decompressed blobs the hunks were diffed from. The errC channel is
+// buffered to 1 so the producer goroutine can always send its final error
+// without blocking.
+//
+// Memory bound: the buffer is bounded in hunk COUNT, not in bytes. A single
+// hunk's payload is bounded only by MaxDiffSize, so a consumer slower than the
+// blob workers can pin buffer-depth many large payloads — a history that adds
+// many large files is the shape that reaches it, since a whole-file addition
+// carries the entire file as added lines. Callers that need a byte bound
+// should use DiffHistoryHunksFunc, where no queue sits between the worker and
+// the consumer, and apply their own accounting inside fn.
 //
 // Ordering: hunks for one (commit, path) pair are produced in ascending line
 // order by a single blob worker, but that worker's sends interleave with every
@@ -300,8 +308,10 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
 	// A deep output buffer decouples producer bursts (a whale commit can
 	// emit tens of thousands of hunks) from consumer scheduling and removes
-	// the futex traffic that a small buffer caused. The bound on what the
-	// buffer can pin is the sum of the buffered hunks' line bytes.
+	// the futex traffic that a small buffer caused. What the buffer can pin is
+	// the sum of the buffered hunks' line bytes, which this depth bounds only
+	// by count: see the memory-bound paragraph on the method for the byte
+	// consequence and for the API that avoids the queue entirely.
 	out := make(chan HunkAddition, 16384)
 	errC := make(chan error, 1)
 
