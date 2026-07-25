@@ -281,6 +281,12 @@ func isBinary(data []byte) bool {
 //
 // The returned slice is nil when there are no additions, or contains at least
 // one hunk (possibly a single placeholder line) in every other case.
+//
+// Line ownership: text lines are zero-copy views into the new blob (see
+// tokenize), a pure addition's lines therefore span the whole new blob, and a
+// binary result is a single hunk whose one line is the new blob verbatim.
+// pairCache.add reads that shape to decide when copying the lines out would
+// only retain the bytes they already alias.
 func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 	// Pure deletion (or nothing at all): no added-line side exists, so the
 	// blobs never need to be loaded. This matters for history walks where

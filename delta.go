@@ -163,9 +163,24 @@ const defaultDeltaArenaSize = 2 * 16 << 20
 // deltaArenaMaxRetained arenas.
 var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 
-// deltaArenaMaxRetained bounds how many idle arenas the free-list may retain
-// (32 × 32 MiB = 1 GiB worst case, but the steady-state population equals the
-// peak number of concurrent delta resolutions, typically NumCPU).
+// deltaArenaMaxRetained bounds how many idle arenas the free-list may retain,
+// capping retained arena memory at deltaArenaMaxRetained ×
+// defaultDeltaArenaSize (1 GiB).
+//
+// This ceiling is coupled to caller concurrency and must be read together
+// with it: a goroutine inside a multi-hop delta resolution holds one arena, so
+// the free-list's steady-state population equals the peak number of
+// simultaneous multi-hop resolutions — bounded above by the sum of the
+// concurrent stage widths of whatever drives the store (for
+// DiffHistoryHunksFunc: tree workers + blob workers + commit-walk workers),
+// and in practice well below it because only a fraction of those workers are
+// inside a resolution at any instant. While that peak stays under the ceiling
+// every arena is allocated once and reused for the process's lifetime. Past
+// it, putDeltaArena drops the overflow and the next getDeltaArena allocates
+// and zeroes a fresh 32 MiB arena, reinstating the memclr cost the free-list
+// exists to remove. Raising this constant only moves the ceiling and the
+// retained bytes with it; keeping caller concurrency in line with the ceiling
+// is the lever.
 const deltaArenaMaxRetained = 32
 
 // getDeltaArena retrieves a ping‑pong arena from the free-list or allocates

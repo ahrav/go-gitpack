@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
@@ -696,6 +697,69 @@ func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
 	}
 	assert.Equal(t, []string{"b.txt"}, paths,
 		"only the modified file produces stage-2 work")
+}
+
+// TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob proves a delivered
+// HunkAddition carries only its own line bytes. computeAddedHunks tokenizes the
+// new blob into zero-copy views, so delivering those views keeps the whole blob
+// alive for as long as any consumer holds the hunk — and DiffHistoryHunks
+// buffers 16384 hunks, one distinct blob apiece.
+//
+// The fixture's modification of main.go is the case that matters: its added
+// lines are a strict subset of the new blob, unlike a file addition or a binary
+// result, which carry the whole blob and are exempt from compaction by design
+// (see pairCache.add).
+func TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob(t *testing.T) {
+	scanner := createScannerForRepo(t, "with-merges")
+	defer scanner.Close()
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+
+	var (
+		work  blobPairWork
+		found bool
+	)
+	for _, c := range commits {
+		parentTree, err := scanner.firstParentTree(c)
+		require.NoError(t, err)
+
+		blobs := make(chan blobPairWork, 64)
+		stopCh := make(chan struct{})
+		require.NoError(t, scanner.emitCommitBlobPairs(c, parentTree, blobs, stopCh))
+		close(blobs)
+
+		for w := range blobs {
+			if !w.oldOID.IsZero() {
+				work, found = w, true
+			}
+		}
+	}
+	require.True(t, found, "fixture must contain a modification pair")
+
+	// Materialize the new blob first so the store serves computeAddedHunks the
+	// identical buffer from its cache; a second, independent inflation would
+	// give the hunks a different backing array and the check below would pass
+	// vacuously.
+	blob, _, err := scanner.store.get(work.newOID)
+	require.NoError(t, err)
+	require.NotEmpty(t, blob)
+
+	var delivered []HunkAddition
+	require.NoError(t, scanner.streamBlobPairHunks(work, func(h HunkAddition) error {
+		delivered = append(delivered, h)
+		return nil
+	}))
+	require.NotEmpty(t, delivered)
+
+	for i, h := range delivered {
+		require.False(t, h.IsBinary(), "hunk %d: fixture pair must be a text diff", i)
+		for j, line := range h.Lines() {
+			require.False(t, aliasesBuffer(line, blob),
+				"hunk %d line %d views the decompressed blob; a delivered hunk must own its bytes", i, j)
+		}
+	}
+	runtime.KeepAlive(blob)
 }
 
 // TestDiffHistoryHunksFunc_ReleasesTreeMemo proves the commit->tree memo is

@@ -268,8 +268,11 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // The HunkAddition channel is deeply buffered so producer bursts (a single
 // commit can emit tens of thousands of hunks) do not stall on consumer
 // scheduling; a slow consumer still applies backpressure once the buffer
-// fills. The errC channel is buffered to 1 so the producer goroutine can
-// always send its final error without blocking.
+// fills. A buffered hunk retains its own line bytes and nothing more (see
+// pairCache.add), so the buffer's footprint tracks the payload in flight
+// rather than the decompressed blobs the hunks were diffed from. The errC
+// channel is buffered to 1 so the producer goroutine can always send its
+// final error without blocking.
 //
 // Ordering: hunks for one (commit, path) pair arrive contiguously in
 // ascending line order. No order is guaranteed across files or commits.
@@ -280,9 +283,9 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
 	// A deep output buffer decouples producer bursts (a whale commit can
-	// emit tens of thousands of hunks) from consumer scheduling; at ~100
-	// bytes per HunkAddition header the buffer costs single-digit MiB and
-	// removes the futex traffic that a small buffer caused.
+	// emit tens of thousands of hunks) from consumer scheduling and removes
+	// the futex traffic that a small buffer caused. The bound on what the
+	// buffer can pin is the sum of the buffered hunks' line bytes.
 	out := make(chan HunkAddition, 16384)
 	errC := make(chan error, 1)
 
@@ -315,7 +318,21 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // Hunk lines may be shared with internal caches and other deliveries of the
 // same content; fn must treat HunkAddition.Lines() as read-only.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
-	numWorkers := runtime.NumCPU()
+	// Stage widths. Stage 2 gets one worker per CPU because it carries the
+	// expensive work (blob inflation plus line diff); stage 1 runs at half
+	// that. Two independent constraints set the stage-1 width and both point
+	// the same way. Tree diffing is cheap relative to blob diffing, so stage 1
+	// keeps stage 2 fed at a fraction of its width. And every worker that sits
+	// inside a multi-hop delta resolution holds a 32 MiB ping-pong arena:
+	// only a fraction of the workers are in that state at any instant, which
+	// is why the arena free-list can be smaller than the total worker count —
+	// but once the instantaneous holder count crosses deltaArenaMaxRetained the
+	// free-list drops arenas on release and re-allocates (and re-zeroes) one on
+	// the next acquisition, which is the cost that free-list exists to remove.
+	// Widening a stage therefore buys throughput with retained arena bytes and,
+	// past that ceiling, with allocation churn.
+	blobWorkers := runtime.NumCPU()
+	treeWorkers := max(2, blobWorkers/2)
 
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
 	// The tree memo only pays off while this walk resolves first-parent
@@ -340,10 +357,9 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// (cheap) and fans out per-file blob pairs; stage 2 computes hunks
 		// (expensive: inflation + line diff) at blob-pair granularity, which
 		// spreads a whale commit across every worker.
-		// workChan is deep because the commit-walk's visit callback sends
-		// here while holding the walk's internal visit mutex: if the send
-		// blocks, every walk worker serializes behind it. A few thousand
-		// commitInfo headers (~100 bytes each) buy full walk/tree-stage
+		// workChan is deep so that the walk's visit callback, which runs on
+		// a walk worker, hands off without waiting on the tree stage: a few
+		// thousand commitInfo headers (~100 bytes each) buy full walk/tree
 		// decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
 		blobChan := make(chan blobPairWork, 4096)
@@ -364,7 +380,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			})
 		}
 
-		for range numWorkers {
+		for range treeWorkers {
 			treeWG.Add(1)
 			go func() {
 				defer treeWG.Done()
@@ -396,7 +412,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			}()
 		}
 
-		for range numWorkers {
+		for range blobWorkers {
 			blobWG.Add(1)
 			go func() {
 				defer blobWG.Done()
@@ -529,12 +545,15 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 	pk := makePairKey(work.oldOID, work.newOID)
 	hunks, cached := hs.pairs.get(pk)
 	if !cached {
-		var err error
-		hunks, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
+		computed, err := computeAddedHunks(hs.store, work.oldOID, work.newOID)
 		if err != nil {
 			return fmt.Errorf("compute added hunks: %w", err)
 		}
-		hs.pairs.add(pk, hunks)
+		// Deliver what the cache hands back, not what computeAddedHunks
+		// produced: the computed Lines are zero-copy views into the whole
+		// decompressed new blob, so a HunkAddition built from them keeps
+		// that blob alive for as long as any consumer holds the hunk.
+		hunks = hs.pairs.add(pk, computed)
 	}
 
 	for _, hunk := range hunks {

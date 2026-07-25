@@ -45,7 +45,10 @@ type pairCacheEntry struct {
 
 // pairCache is safe for concurrent use. Entries are immutable once stored:
 // readers receive the shared []AddedHunk and MUST NOT modify the hunks or
-// their Lines. Eviction is approximate (map-order) like offsetCache.
+// their Lines. An entry's line bytes are owned by the entry unless they
+// already span the whole new blob (see add), in which case they view the
+// store's immutable object buffer. Eviction is approximate (map-order) like
+// offsetCache.
 type pairCache struct {
 	shards         [pairCacheShards]pairCacheShard
 	budgetPerShard int
@@ -81,14 +84,27 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 	return e.hunks, ok
 }
 
-// add stores a compacted deep copy of hunks under k.
+// add stores hunks under k and returns the slice that callers must hand out
+// to consumers.
 //
 // Lines produced by computeAddedHunks are zero-copy views (btostr) into the
-// entire decompressed new blob, so storing them verbatim would pin one full
-// blob per entry while the budget accounting saw only line lengths.
-// Compacting into a freshly allocated buffer makes the accounted size equal
-// the retained size and lets the source blob be collected.
-func (c *pairCache) add(k pairKey, hunks []AddedHunk) {
+// entire decompressed new blob, so anything holding one of those hunks keeps
+// that whole blob alive. Compacting into a freshly allocated buffer bounds
+// retention by the line bytes actually carried, which is what makes the
+// accounted size equal the retained size for a cache entry and what keeps an
+// in-flight HunkAddition (DiffHistoryHunks buffers 16384 of them) from
+// pinning one distinct blob apiece.
+//
+// Compaction is skipped when the added lines already cover the whole new
+// blob: the copy would then retain the same bytes it aliases while costing a
+// memcpy of up to MaxDiffSize. Both qualifying cases follow from
+// computeAddedHunks' contract rather than from a heuristic — a zero old OID
+// (a file addition) makes every line of the new blob an addition, and a
+// binary result carries the whole new blob as its single line. Blob buffers
+// are exact-sized allocations (readRawObject and applyDeltaStackCached both
+// return a slice whose capacity is the object size), so aliasing one retains
+// precisely the bytes the hunk reports.
+func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 	lineBytes := 0
 	for i := range hunks {
 		for _, l := range hunks[i].Lines {
@@ -96,11 +112,18 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) {
 		}
 	}
 	size := lineBytes + len(hunks)*pairCacheHunkOverhead + pairCacheEntryOverhead
-	if size > c.budgetPerShard/4 {
-		return // one giant diff must not evict a whole shard
+
+	stored := hunks
+	if !coversWholeNewBlob(&k, hunks) {
+		stored = compactHunks(hunks, lineBytes)
 	}
 
-	stored := compactHunks(hunks, lineBytes)
+	// One giant diff must not evict a whole shard, so it is not stored — but
+	// it is still compacted above and returned: the largest diffs are exactly
+	// the ones whose aliasing views pin the most memory per delivered hunk.
+	if size > c.budgetPerShard/4 {
+		return stored
+	}
 
 	s := c.shard(&k)
 	s.mu.Lock()
@@ -122,6 +145,21 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) {
 		}
 	}
 	s.mu.Unlock()
+	return stored
+}
+
+// coversWholeNewBlob reports whether hunks already carry (essentially) every
+// byte of the new blob their lines view, which makes compaction a copy that
+// retains what it aliases.
+//
+// A zero old OID marks a file addition, whose added lines are the whole new
+// blob minus its line terminators; a binary result is a single hunk holding
+// the new blob verbatim.
+func coversWholeNewBlob(k *pairKey, hunks []AddedHunk) bool {
+	if Hash(k[:hashSize]).IsZero() {
+		return true
+	}
+	return len(hunks) == 1 && hunks[0].IsBinary
 }
 
 // compactHunks deep-copies hunks so that no line aliases its source blob.
