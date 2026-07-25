@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -778,4 +779,31 @@ func TestDiffHistoryHunksFunc_ReleasesTreeMemo(t *testing.T) {
 		return true
 	})
 	assert.Zero(t, entries, "tree memo must be released when the scan returns")
+}
+
+// TestDiffHistoryHunksFunc_NilCallbackRejected proves a nil callback is
+// rejected as an error rather than reaching a worker.
+//
+// The blob workers call fn on the hot path without a nil check, so admitting
+// nil would surface as a nil-func call inside a worker goroutine — a panic no
+// caller can recover, since it unwinds a goroutine the caller does not own.
+// The repository used here produces added hunks, so a missing guard would
+// actually reach the call rather than finishing with nothing to deliver.
+func TestDiffHistoryHunksFunc_NilCallbackRejected(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+	defer scanner.Close()
+
+	// Establish that this repository does deliver hunks, so the nil case below
+	// is genuinely exercising the guard and not an empty walk. fn runs on every
+	// blob worker concurrently, so the counter must be atomic.
+	var delivered atomic.Int64
+	require.NoError(t, scanner.DiffHistoryHunksFunc(func(HunkAddition) error {
+		delivered.Add(1)
+		return nil
+	}))
+	require.Positive(t, delivered.Load(), "fixture must produce hunks for this test to mean anything")
+
+	err := scanner.DiffHistoryHunksFunc(nil)
+	require.Error(t, err, "a nil callback must be rejected, not dispatched to workers")
+	require.Contains(t, err.Error(), "must not be nil")
 }

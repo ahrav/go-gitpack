@@ -285,8 +285,13 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // channel is buffered to 1 so the producer goroutine can always send its
 // final error without blocking.
 //
-// Ordering: hunks for one (commit, path) pair arrive contiguously in
-// ascending line order. No order is guaranteed across files or commits.
+// Ordering: hunks for one (commit, path) pair are produced in ascending line
+// order by a single blob worker, but that worker's sends interleave with every
+// other worker's, so a pair's hunks are not contiguous in the stream. No order
+// is guaranteed across files or commits. A consumer that groups by
+// (commit, path) must key on the pair rather than flush on key change;
+// DiffHistoryHunksFunc delivers a pair's hunks back to back and is the API for
+// consumers that need that.
 //
 // Hunk lines may be shared with internal caches and other deliveries of the
 // same content; callers must treat Lines() as read-only.
@@ -328,7 +333,16 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 //
 // Hunk lines may be shared with internal caches and other deliveries of the
 // same content; fn must treat HunkAddition.Lines() as read-only.
+//
+// A nil fn is rejected before any worker starts. The workers call fn without
+// a nil check on the hot path, so admitting one would surface as a panic in a
+// worker goroutine — unrecoverable for the calling process — rather than as
+// this method's error return.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
+	if fn == nil {
+		return errors.New("DiffHistoryHunksFunc: fn must not be nil")
+	}
+
 	// Stage widths. Stage 2 gets one worker per CPU because it carries the
 	// expensive work (blob inflation plus line diff); stage 1 runs at half
 	// that. Two independent constraints set the stage-1 width and both point

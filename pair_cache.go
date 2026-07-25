@@ -10,18 +10,32 @@
 // contents, its result can be shared across those repeats.
 package objstore
 
-import "sync"
+import (
+	"sync"
+	"unsafe"
+)
 
 // pairCacheShards spreads pair lookups across independent locks.
 const pairCacheShards = 32
 
 // pairCacheBudget bounds the bytes retained across all shards. Entries are
-// compacted copies (see add), so the accounted size tracks actual retention.
+// compacted copies (see add) and every component of an entry's footprint —
+// text bytes, per-line string headers, per-hunk and per-entry overhead — is
+// charged, so the accounted size tracks actual retention.
 const pairCacheBudget = 128 << 20
 
 // pairCacheHunkOverhead approximates the per-hunk cost beyond line bytes:
 // the AddedHunk struct and its Lines slice header.
 const pairCacheHunkOverhead = 64
+
+// pairCacheLineOverhead is the per-line cost of a string header in a cached
+// hunk's Lines slice. Every stored hunk carries one []string sized to its
+// line count, so retention scales with the number of lines independently of
+// how many text bytes they hold: a diff of empty or very short lines retains
+// this much per line while contributing almost nothing to lineBytes. Charging
+// it stops a blank-line-heavy diff from being admitted as near-free and
+// keeps the accounted size within a small factor of the bytes retained.
+const pairCacheLineOverhead = int(unsafe.Sizeof(""))
 
 // pairCacheEntryOverhead approximates the fixed per-entry cost: the map key,
 // entry struct, and bucket bookkeeping. Charging it keeps entries with no
@@ -90,10 +104,15 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 // Lines produced by computeAddedHunks are zero-copy views (btostr) into the
 // entire decompressed new blob, so anything holding one of those hunks keeps
 // that whole blob alive. Compacting into a freshly allocated buffer bounds
-// retention by the line bytes actually carried, which is what makes the
-// accounted size equal the retained size for a cache entry and what keeps an
+// retention by the line bytes actually carried, which is what keeps an
 // in-flight HunkAddition (DiffHistoryHunks buffers 16384 of them) from
 // pinning one distinct blob apiece.
+//
+// The accounted size is text bytes plus the per-line string headers plus the
+// per-hunk and per-entry overheads. The header term is not a rounding
+// allowance: a hunk's Lines slice costs pairCacheLineOverhead per line no
+// matter how short the lines are, so a diff of many empty lines retains
+// mostly headers and would otherwise be admitted as near-free.
 //
 // Compaction is skipped when the added lines already cover the whole new
 // blob: the copy would then retain the same bytes it aliases while costing a
@@ -106,12 +125,15 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 // precisely the bytes the hunk reports.
 func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 	lineBytes := 0
+	lineCount := 0
 	for i := range hunks {
+		lineCount += len(hunks[i].Lines)
 		for _, l := range hunks[i].Lines {
 			lineBytes += len(l)
 		}
 	}
-	size := lineBytes + len(hunks)*pairCacheHunkOverhead + pairCacheEntryOverhead
+	size := lineBytes + lineCount*pairCacheLineOverhead +
+		len(hunks)*pairCacheHunkOverhead + pairCacheEntryOverhead
 
 	stored := hunks
 	if !coversWholeNewBlob(&k, hunks) {

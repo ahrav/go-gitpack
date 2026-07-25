@@ -240,3 +240,60 @@ func TestPairCacheAdd_OversizedEntryRejected(t *testing.T) {
 	_, ok := c.get(k)
 	require.False(t, ok, "entries larger than budgetPerShard/4 must be rejected")
 }
+
+// TestPairCacheAdd_ChargesLineHeaders proves the byte budget sees the string
+// headers a cached entry retains, not just its text.
+//
+// compactHunks allocates one []string per hunk sized to that hunk's line
+// count, so a diff made of empty lines retains pairCacheLineOverhead per line
+// while contributing zero text bytes. Charging only text would admit such an
+// entry as near-free: the pre-fix accounting billed this diff at the fixed
+// hunk plus entry overhead (under 256 bytes) while it pinned roughly 313 KiB
+// of headers, so a nominally 128 MiB cache could retain orders of magnitude
+// more. The line count stays under the budgetPerShard/4 admission cap so the
+// entry is actually stored and its charge observable.
+func TestPairCacheAdd_ChargesLineHeaders(t *testing.T) {
+	const lines = 20_000
+
+	blank := make([]string, lines)
+	c := newPairCache()
+	k := makePairKey(testPairHash(11), testPairHash(12))
+	c.add(k, []AddedHunk{{Lines: blank, StartLine: 1}})
+
+	_, ok := c.get(k)
+	require.True(t, ok, "entry must be admitted for its charge to be observable")
+
+	s := c.shard(&k)
+	s.mu.Lock()
+	used := s.used
+	s.mu.Unlock()
+
+	// The entry carries no text at all, so everything charged beyond the fixed
+	// overheads must come from the per-line headers it retains.
+	wantHeaders := lines * pairCacheLineOverhead
+	require.GreaterOrEqual(t, used, wantHeaders,
+		"a %d-line blank diff retains %d bytes of string headers but was "+
+			"charged only %d; per-line retention must be accounted",
+		lines, wantHeaders, used)
+}
+
+// TestPairCacheAdd_HeaderHeavyEntryHitsOversizedRejection proves the header
+// charge participates in admission, not only in the running total: a diff
+// whose retention is almost entirely headers must be rejected by the same
+// budgetPerShard/4 rule that rejects a text-heavy one.
+func TestPairCacheAdd_HeaderHeavyEntryHitsOversizedRejection(t *testing.T) {
+	c := &pairCache{budgetPerShard: 4 << 10}
+	for i := range c.shards {
+		c.shards[i].m = make(map[pairKey]pairCacheEntry, 8)
+	}
+
+	// (4 KiB / 4) / 16 bytes per header = 64 lines to cross the limit.
+	blank := make([]string, 256)
+	k := makePairKey(testPairHash(13), testPairHash(14))
+	c.add(k, []AddedHunk{{Lines: blank, StartLine: 1}})
+
+	_, ok := c.get(k)
+	require.False(t, ok,
+		"an entry whose retention is dominated by line headers must be "+
+			"rejected like any other oversized entry")
+}
