@@ -35,3 +35,29 @@ if err := scanner.Scan(nil, &myScanner{}); err != nil {
 }
 ```
 
+## Memory characteristics
+
+- **Per-scanner offset cache** — each `HistoryScanner` keeps a cache of
+  materialized pack objects (default budget 256 MiB) that accelerates
+  delta-chain resolution. Processes that open many repositories concurrently
+  should lower it with `objstore.WithOffsetCacheBudget(bytes)`; a budget
+  `<= 0` disables the cache. The memory is released on `Close`.
+- **Process-global delta arenas** — delta resolution reuses 32 MiB scratch
+  arenas from a bounded free-list sized from `GOMAXPROCS` (at most 8 arenas,
+  256 MiB). The reserve is retained for the process lifetime after peak
+  concurrency; bounding scan concurrency bounds it proportionally.
+
+## Environment variables
+
+Runtime overrides read once at process start — no rebuild or code change
+required:
+
+- `GOGITPACK_OFFSET_CACHE_BUDGET` — per-store offset-cache budget in bytes;
+  `<= 0` disables the cache. Overrides the compiled 256 MiB default (code
+  can still call `WithOffsetCacheBudget` per scanner).
+- `GOGITPACK_DELTA_ARENA_RETAIN` — maximum idle 32 MiB delta arenas retained
+  process-wide; `0` disables retention so arenas are released to the GC
+  after use.
+- `GOGITPACK_NOASM_INFLATE` — set to `1` to disable the amd64/arm64 assembly
+  inflate kernels and use the portable Go decoder (same effect as building
+  with the `purego` tag, without rebuilding).

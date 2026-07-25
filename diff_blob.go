@@ -18,7 +18,9 @@
 //   - <= LargeFileThreshold  (500 MB): addedHunksWithHashing — stores only
 //     64-bit FarmHash digests per line to limit memory.
 //   - > MaxDiffSize          (1 GB):   skipped entirely; a placeholder hunk is
-//     returned instead.
+//     returned instead. Enforced per side as each blob is lazily loaded; see
+//     the MaxDiffSize doc comment for the short-circuit paths that never
+//     consult the old blob.
 //
 // Tokenization is zero-copy: tokenize() creates string views into the original
 // byte slices via btostr (see unsafe.go). This means the returned strings share
@@ -27,7 +29,7 @@
 //
 // Cross-file dependencies:
 //   - btostr (unsafe.go): zero-copy []byte to string conversion.
-//   - store.get (store.go): used by loadBlobs to retrieve blob content.
+//   - store.get (store.go): used by loadBlob to retrieve blob content.
 
 package objstore
 
@@ -84,6 +86,29 @@ func packLineSlot(h uint64, pos int32, epoch uint32) uint64 {
 
 var lineIndexPool = sync.Pool{
 	New: func() any { return &lineIndex{} },
+}
+
+// maxPooledLineIndexBytes bounds the retained capacity of a lineIndex that
+// may be returned to lineIndexPool. build() only ever grows slots and next,
+// and sync.Pool holds objects across GC cycles, so without a cap every
+// pooled index ratchets to the largest file it has ever indexed (~20 MiB
+// for a 2^20-line file: 16 MiB of slots plus 4 MiB of next) — retained once
+// per scan worker. Oversized indexes are dropped instead of pooled: the
+// rebuild allocation is dwarfed by the cost of diffing a file that large,
+// and re-pooling them would also make every subsequent small diff probe a
+// huge, cache-cold table. 4 MiB keeps indexes for old sides up to ~200K
+// lines pooled (a 120K-line file of 4-byte lines needs ~2.5 MiB; dropping
+// at 2 MiB measurably regressed that shape) while excluding the degenerate
+// one-byte-per-line ratchet.
+const maxPooledLineIndexBytes = 4 << 20 // 4 MiB
+
+// putLineIndex returns ix to lineIndexPool unless its retained capacity
+// exceeds maxPooledLineIndexBytes, in which case it is dropped for the GC.
+func putLineIndex(ix *lineIndex) {
+	if cap(ix.slots)*8+cap(ix.next)*4 > maxPooledLineIndexBytes {
+		return
+	}
+	lineIndexPool.Put(ix)
 }
 
 // build indexes lines[from:]. Chains are threaded in ascending position
@@ -181,9 +206,21 @@ const (
 	// based algorithm, which stores only 64‑bit hashes of each line.
 	LargeFileThreshold = 500 << 20 // 500 MB
 
-	// MaxDiffSize is 1 GB (1 << 30). If either blob is larger than this limit
-	// computeAddedHunks skips the diff and returns a single placeholder hunk.
-	MaxDiffSize = 1 << 30 // 1 GB
+	// MaxDiffSize is 1 GB (1 << 30). If a blob consulted by computeAddedHunks
+	// is larger than this limit, the diff is skipped and a single placeholder
+	// hunk is returned instead.
+	//
+	// Because blobs are loaded lazily (new side first, old side only when a
+	// text diff is actually needed), the limit is enforced per side as each
+	// blob is loaded. Two short-circuit paths never consult the old blob and
+	// therefore never apply the limit to it:
+	//
+	//   - Pure deletions (zero new OID) return no hunks without loading
+	//     either blob.
+	//   - A binary new blob at or below the limit is returned as a single
+	//     binary hunk without loading the old blob, even if the old version
+	//     was larger than the limit.
+	MaxDiffSize = 1 << 30 // 1 GB
 )
 
 // AddedHunk represents a contiguous block of added lines in a diff.
@@ -273,7 +310,10 @@ func isBinary(data []byte) bool {
 //  1. Return nil for a pure deletion (newOID zero) or a mode-only change
 //     (oldOID == newOID); neither blob is loaded.
 //  2. Load the new blob. Emit a placeholder if it exceeds MaxDiffSize, or a
-//     single binary hunk if it is binary.
+//     single binary hunk if it is binary. In the binary case the old blob is
+//     never loaded, so an old version above MaxDiffSize does not produce a
+//     placeholder here — the size limit applies per side, as each blob is
+//     loaded.
 //  3. For a pure addition (oldOID zero), tokenize the new blob.
 //  4. Otherwise load the old blob: a placeholder if it exceeds MaxDiffSize,
 //     one binary hunk on a binary→text transition, else a size-selected
@@ -336,6 +376,14 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 		// checked-in binaries); newBytes comes from the object store whose
 		// buffers are immutable by contract, matching the zero-copy
 		// convention tokenize already uses for text.
+		//
+		// The old blob is intentionally not loaded (or size-checked) on
+		// this path: its bytes cannot change the output — the hunk carries
+		// only the new content — and checking its size would require
+		// inflating it, reinstating the redundant old-side inflation this
+		// lazy-load ordering exists to avoid. Consequently a >MaxDiffSize
+		// old version rewritten to a within-limit binary new version emits
+		// the binary hunk, not the "[File too large to diff]" placeholder.
 		hunk := AddedHunk{
 			StartLine: 1,
 			Lines:     []string{btostr(newBytes)},
@@ -400,31 +448,6 @@ func loadBlob(s *store, oid Hash) ([]byte, error) {
 	return b, err
 }
 
-// loadBlobs retrieves the raw contents of the provided object IDs from store.
-//
-// A zero Hash yields an empty slice.  Errors are wrapped with context.
-func loadBlobs(s *store, oldOID, newOID Hash) ([]byte, []byte, error) {
-	var (
-		oldB []byte
-		newB []byte
-		err  error
-	)
-
-	if !oldOID.IsZero() {
-		if oldB, _, err = s.get(oldOID); err != nil {
-			return nil, nil, fmt.Errorf("getting old blob: %w", err)
-		}
-	}
-
-	if !newOID.IsZero() {
-		if newB, _, err = s.get(newOID); err != nil {
-			return nil, nil, fmt.Errorf("getting new blob: %w", err)
-		}
-	}
-
-	return oldB, newB, nil
-}
-
 // addedHunksWithPos compares two byte slices and identifies contiguous blocks of added lines.
 // The function performs a line-by-line comparison between oldB and newB to find additions.
 // It groups consecutive added lines into hunks for efficient diff representation.
@@ -476,7 +499,7 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 	var oldIndex *lineIndex
 	defer func() {
 		if oldIndex != nil {
-			lineIndexPool.Put(oldIndex)
+			putLineIndex(oldIndex)
 		}
 	}()
 
