@@ -104,9 +104,8 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 // Lines produced by computeAddedHunks are zero-copy views (btostr) into the
 // entire decompressed new blob, so anything holding one of those hunks keeps
 // that whole blob alive. Compacting into a freshly allocated buffer bounds
-// retention by the line bytes actually carried, which is what keeps an
-// in-flight HunkAddition (DiffHistoryHunks buffers 16384 of them) from
-// pinning one distinct blob apiece.
+// retention by the line bytes actually carried, which is what keeps every
+// in-flight HunkAddition from pinning one distinct blob apiece.
 //
 // The accounted size is text bytes plus the per-line string headers plus the
 // per-hunk and per-entry overheads. The header term is not a rounding

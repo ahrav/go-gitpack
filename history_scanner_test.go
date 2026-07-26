@@ -191,6 +191,80 @@ func TestLoadAllCommits_BuildsGraphWhenMissing(t *testing.T) {
 	}
 }
 
+// TestDiffHistoryHunks_QueueDepthIsOnePerBlobWorker pins the returned queue's
+// capacity to the blob-worker count DiffHistoryHunksFunc uses. The depth is
+// derived from that width — one slot per worker and nothing more — so a change
+// to either side that breaks the derivation fails here rather than silently
+// changing how many hunk payloads the queue can pin.
+func TestDiffHistoryHunks_QueueDepthIsOnePerBlobWorker(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+	defer scanner.Close()
+
+	hunks, errC := scanner.DiffHistoryHunks()
+	assert.Equal(t, runtime.NumCPU(), cap(hunks), "queue depth must be one slot per blob worker")
+
+	for range hunks {
+	}
+	require.NoError(t, <-errC)
+}
+
+// TestDiffHistoryHunks_StalledConsumerStillCompletes proves a consumer that
+// lets the queue fill before it reads anything still finishes cleanly: the
+// blocked blob workers resume, both channels close, errC yields nil, and the
+// pipeline's goroutines exit.
+//
+// The queue holds one hunk per blob worker, so the stall is only reachable
+// while the fixture emits more hunks than the host has CPUs — the state in
+// which an abandoned or slow consumer would otherwise strand the worker pool.
+func TestDiffHistoryHunks_StalledConsumerStillCompletes(t *testing.T) {
+	// The fixture emits one hunk per commit. A host with enough CPUs to hold
+	// them all in the queue never reaches a full-queue stall, so the wait
+	// below would burn its timeout instead of observing anything.
+	const fixtureHunks = 1000
+	if 2*runtime.NumCPU() >= fixtureHunks {
+		t.Skipf("%d CPUs against a %d-hunk fixture: the queue cannot fill", runtime.NumCPU(), fixtureHunks)
+	}
+
+	scanner := createScannerForRepo(t, "very-large-repo-1k")
+	defer scanner.Close()
+
+	baseline := runtime.NumGoroutine()
+	hunks, errC := scanner.DiffHistoryHunks()
+
+	// Waiting for a full queue, rather than sleeping a fixed interval, is what
+	// makes the stall observable without depending on producer speed.
+	require.Eventually(t, func() bool { return len(hunks) == cap(hunks) },
+		30*time.Second, time.Millisecond, "producers must fill the queue while nothing drains it")
+
+	count := 0
+	for range hunks {
+		count++
+	}
+	require.NoError(t, <-errC)
+	require.Greater(t, count, cap(hunks), "fixture must produce more hunks than the queue holds")
+
+	_, open := <-hunks
+	assert.False(t, open, "hunk channel must be closed after the walk completes")
+	_, open = <-errC
+	assert.False(t, open, "errC must be closed after its single send")
+
+	// The walk joins its tree and blob workers before it returns, and the
+	// forwarding goroutine closes both channels as its last act, so the count
+	// settles back to the pre-scan baseline. Polling from this goroutine is
+	// deliberate: a condition evaluated in a spawned goroutine would count
+	// itself and never settle.
+	settled := false
+	for range 200 {
+		if runtime.NumGoroutine() <= baseline {
+			settled = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.True(t, settled, "pipeline goroutines must exit with the walk: %d goroutines, baseline %d",
+		runtime.NumGoroutine(), baseline)
+}
+
 // TestDiffHistoryHunks_WithoutCommitGraph verifies that the streaming hunk
 // pipeline still produces output when the fallback commit walker is active.
 func TestDiffHistoryHunks_WithoutCommitGraph(t *testing.T) {
@@ -703,8 +777,8 @@ func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
 // TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob proves a delivered
 // HunkAddition carries only its own line bytes. computeAddedHunks tokenizes the
 // new blob into zero-copy views, so delivering those views keeps the whole blob
-// alive for as long as any consumer holds the hunk — and DiffHistoryHunks
-// buffers 16384 hunks, one distinct blob apiece.
+// alive for as long as any consumer holds the hunk — and every hunk buffered by
+// DiffHistoryHunks or held by a blob worker would pin one distinct blob apiece.
 //
 // The fixture's modification of main.go is the case that matters: its added
 // lines are a strict subset of the new blob, unlike a file addition or a binary

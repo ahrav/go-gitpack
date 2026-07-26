@@ -15,6 +15,7 @@ package objstore
 import (
 	"bytes"
 	"fmt"
+	"sync"
 )
 
 // ScanMode selects the high-level scanning strategy used by HistoryScanner.Scan.
@@ -100,25 +101,27 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 
 // scanHunks implements the legacy hunk-based scanning mode.
 //
-// It calls DiffHistoryHunks, which produces hunks on a channel and sends
-// a single error on errC when the walk completes. The loop drains the hunks
-// channel to completion even after the first scan error, because the
-// producer goroutine blocks on sends and would leak if the consumer stopped
-// reading early.
+// It drives DiffHistoryHunksFunc, so no queue sits between a blob worker and
+// scanner.ScanBlob. DiffHistoryHunksFunc invokes the callback concurrently
+// from every blob worker, and one mutex serializes the whole per-hunk body.
+// Both halves need it: the payload buffer is reused across hunks, which
+// BlobScanner permits because an implementation may not retain the reader's
+// bytes past the call, and ScanBlob is handed one hunk at a time to match
+// every other ScanBlob call site in this package.
 //
-// Error precedence: a scan-side error (scanErr) takes priority over the
-// walk-side error (runErr) so the caller sees the first failure in the
-// scanning pipeline rather than a secondary channel-close error.
+// A scan error aborts the walk, and DiffHistoryHunksFunc returns the first
+// error observed, whether it came from a scan or from the walk itself.
 func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
-	hunks, errC := hs.DiffHistoryHunks()
+	var (
+		mu      sync.Mutex
+		payload bytes.Buffer
+	)
 
-	var scanErr error
-	for hunk := range hunks {
-		if scanErr != nil {
-			continue
-		}
+	return hs.DiffHistoryHunksFunc(func(hunk HunkAddition) error {
+		mu.Lock()
+		defer mu.Unlock()
 
-		var payload bytes.Buffer
+		payload.Reset()
 		for i, line := range hunk.lines {
 			if i > 0 {
 				payload.WriteByte('\n')
@@ -131,14 +134,9 @@ func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
 			Path:   hunk.path,
 		}
 		if err := scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta); err != nil {
-			scanErr = fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
+			return fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
 				hunk.commit, hunk.path, hunk.startLine, hunk.endLine, err)
 		}
-	}
-
-	runErr := <-errC
-	if scanErr != nil {
-		return scanErr
-	}
-	return runErr
+		return nil
+	})
 }

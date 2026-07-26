@@ -272,26 +272,34 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 //
 // Goroutine ownership: DiffHistoryHunks spawns a background goroutine that
 // owns the returned channels and closes them when the walk completes. The
-// caller MUST drain the HunkAddition channel to completion (or read until the
-// errC channel delivers a value) to avoid leaking goroutines. Failing to
-// drain will block the internal worker pool indefinitely.
+// caller MUST drain the HunkAddition channel to completion. Draining is what
+// lets the walk finish: the forwarding send has no escape from a full queue,
+// so errC delivers its single value only after every produced hunk has been
+// forwarded. Waiting on errC without draining the hunk channel deadlocks as
+// soon as the queue fills, and abandoning the drain blocks the internal worker
+// pool indefinitely.
 //
-// The HunkAddition channel is deeply buffered so producer bursts (a single
-// commit can emit tens of thousands of hunks) do not stall on consumer
-// scheduling; a slow consumer still applies backpressure once the buffer
-// fills. A buffered hunk retains its own line bytes and nothing beyond them
-// (see pairCache.add), so the buffer pins the payload in flight rather than
-// the decompressed blobs the hunks were diffed from. The errC channel is
-// buffered to 1 so the producer goroutine can always send its final error
-// without blocking.
+// The HunkAddition channel holds one slot per blob worker, so a worker can
+// deposit its current hunk and start its next diff without a rendezvous with
+// the consumer, and the queue buffers nothing beyond that. A buffered hunk
+// retains its own line bytes and nothing beyond them (see pairCache.add), so
+// the queue pins the payload in flight rather than the decompressed blobs the
+// hunks were diffed from. The errC channel is buffered to 1 so the producer
+// goroutine can always send its final error without blocking.
 //
-// Memory bound: the buffer is bounded in hunk COUNT, not in bytes. A single
-// hunk's payload is bounded only by MaxDiffSize, so a consumer slower than the
-// blob workers can pin buffer-depth many large payloads — a history that adds
-// many large files is the shape that reaches it, since a whole-file addition
-// carries the entire file as added lines. Callers that need a byte bound
-// should use DiffHistoryHunksFunc, where no queue sits between the worker and
-// the consumer, and apply their own accounting inside fn.
+// Memory bound: the queue is bounded in hunk COUNT, not in bytes. Worst-case
+// in-flight payload is approximately (queue depth + blobWorkers +
+// consumer-held) times the per-hunk payload ceiling, and that ceiling is
+// MaxDiffSize because a whole-file addition or a binary result carries the
+// entire blob as its payload. The queue is not the dominant term: a queue slot
+// holds one finished hunk, while each blob worker holds the hunks it just
+// produced plus the decompressed blobs it diffed them from.
+// DiffHistoryHunksFunc removes the queue term and only that term — the
+// blob-worker term follows from the pipeline width — so it is the API for
+// callers who want no queue between a worker and the consumer. Neither API
+// lets a caller measure a hunk's retained payload: compactHunks gives all
+// hunks of one pair a single shared backing array, so the lengths reported by
+// Lines() do not sum to the bytes retained.
 //
 // Ordering: hunks for one (commit, path) pair are produced in ascending line
 // order by a single blob worker, but that worker's sends interleave with every
@@ -306,13 +314,13 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 //
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
-	// A deep output buffer decouples producer bursts (a whale commit can
-	// emit tens of thousands of hunks) from consumer scheduling and removes
-	// the futex traffic that a small buffer caused. What the buffer can pin is
-	// the sum of the buffered hunks' line bytes, which this depth bounds only
-	// by count: see the memory-bound paragraph on the method for the byte
-	// consequence and for the API that avoids the queue entirely.
-	out := make(chan HunkAddition, 16384)
+	// One slot per blob worker: DiffHistoryHunksFunc runs runtime.NumCPU blob
+	// workers, and a slot each lets every worker deposit its current hunk and
+	// resume its next diff without a rendezvous with the consumer. The queue
+	// buffers nothing beyond that. What it can pin is the sum of the buffered
+	// hunks' retained line bytes; see the memory-bound paragraph on the method
+	// for the byte consequence and for the API that avoids the queue entirely.
+	out := make(chan HunkAddition, runtime.NumCPU())
 	errC := make(chan error, 1)
 
 	go func() {
