@@ -3,30 +3,28 @@
 // Measurement substrate for stage-1 fan-out (emitCommitBlobPairs) on
 // add-heavy commits.
 //
-// The rename-suppression change buffers every addition until the commit's
-// tree walk completes so it can match additions against same-commit
-// deletions by OID. Two costs follow, and both concentrate in the root
-// commit of a scan (where every file is an addition and no deletion can
-// exist):
+// Exact-OID suppression must know a commit's deletion counts before deciding
+// which additions to emit. Root commits cannot contain deletions and stream in
+// one pass. Non-root commits retain additions within a bounded record/path
+// budget and emit them after the first walk. If either limit is exceeded, they
+// discard that buffer and replay unmatched additions in a second walk.
+// With this fixture's short paths, 4096 additions exercise the bounded
+// single-walk path and 16384 additions cross the record limit and replay.
 //
-//   - stage-2 workers receive no work until the whole walk finishes, and
-//   - the buffered adds slice holds one blobPairWork per added file.
+// These benchmarks make the root fast path and the non-root time/allocation
+// tradeoff visible so implementations can be compared like for like:
 //
-// These benchmarks make both costs visible so the buffering change and any
-// later fast-path can be compared like for like:
-//
-//   - BenchmarkEmitCommitBlobPairs/RootCommit_* runs stage 1 alone against a
-//     drained channel and reports ns/op plus B/op (the buffering shows up as
-//     allocations) and "first-work-ns" (how long stage 2 waits for its first
-//     unit of work).
+//   - BenchmarkEmitCommitBlobPairs/RootCommit_* is the zero-parent control,
+//     where suppression is impossible.
+//   - BenchmarkEmitCommitBlobPairs/NonRootAddCommit_* is the target case: a
+//     non-root commit with many additions and no deletions. Both variants run
+//     stage 1 alone against a drained channel and report ns/op, B/op, and
+//     "first-work-ns" (how long stage 2 waits for its first unit of work).
 //   - BenchmarkDiffHistoryHunksColdRootHeavy runs the full pipeline on a
 //     fresh scanner per iteration and reports ns/op plus "first-hunk-ns".
 //
-// The fixture is deliberately add-only: a single root commit adding many
-// small distinct files, plus one trailing modification commit so histories
-// with more than one commit stay representative. File contents are unique
-// per path so no two adds share an OID and the pair memo cannot collapse
-// stage-2 work.
+// File contents are unique per path so no two additions share an OID and the
+// pair memo cannot collapse stage-2 work.
 package objstore
 
 import (
@@ -53,20 +51,7 @@ func rootHeavyRepo(tb testing.TB, fx *hunkBenchFixtures, fileCount, fileSize int
 	tb.Helper()
 	name := fmt.Sprintf("root-heavy-%dfiles-%dB", fileCount, fileSize)
 	return fx.repo(tb, name, func(tb testing.TB, work string) {
-		for i := range fileCount {
-			dir := filepath.Join(work, fmt.Sprintf("d%02d", i%64), fmt.Sprintf("e%02d", (i/64)%64))
-			if err := os.MkdirAll(dir, 0o755); err != nil {
-				tb.Fatalf("mkdir %s: %v", dir, err)
-			}
-			path := filepath.Join(dir, fmt.Sprintf("f%05d.txt", i))
-			var body strings.Builder
-			for line := 0; body.Len() < fileSize; line++ {
-				fmt.Fprintf(&body, "file %05d line %04d %s\n", i, line, textFiller)
-			}
-			if err := os.WriteFile(path, []byte(body.String()), 0o644); err != nil {
-				tb.Fatalf("write %s: %v", path, err)
-			}
-		}
+		writeAddHeavyFiles(tb, work, "", fileCount, fileSize)
 		gitTB(tb, work, "add", "--", ".")
 		date := "1700000000 +0000"
 		gitEnvTB(tb, work,
@@ -82,34 +67,99 @@ func rootHeavyRepo(tb testing.TB, fx *hunkBenchFixtures, fileCount, fileSize int
 	})
 }
 
+// nonRootAddHeavyRepo builds a two-commit repository: a one-file root commit
+// followed by a commit that adds fileCount files without modifying or deleting
+// any existing path. The second commit is the add-heavy non-root shape for
+// which exact-OID suppression remains possible in principle, even though this
+// fixture has no deletions to match.
+func nonRootAddHeavyRepo(tb testing.TB, fx *hunkBenchFixtures, fileCount, fileSize int) string {
+	tb.Helper()
+	name := fmt.Sprintf("non-root-add-heavy-%dfiles-%dB", fileCount, fileSize)
+	return fx.repo(tb, name, func(tb testing.TB, work string) {
+		const seed = "seed.txt"
+		if err := os.WriteFile(filepath.Join(work, seed), []byte("seed\n"), 0o644); err != nil {
+			tb.Fatalf("write seed: %v", err)
+		}
+		gitCommitTB(tb, work, seed, 0)
+
+		writeAddHeavyFiles(tb, work, "bulk", fileCount, fileSize)
+		gitCommitAllTB(tb, work, 1)
+	})
+}
+
+// writeAddHeavyFiles writes fileCount unique text files below prefix. Two
+// directory levels keep individual Git trees small while preserving stable
+// lexical ordering across fixture sizes.
+func writeAddHeavyFiles(tb testing.TB, work, prefix string, fileCount, fileSize int) {
+	tb.Helper()
+	for i := range fileCount {
+		dir := filepath.Join(work, prefix, fmt.Sprintf("d%02d", i%64), fmt.Sprintf("e%02d", (i/64)%64))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			tb.Fatalf("mkdir %s: %v", dir, err)
+		}
+		path := filepath.Join(dir, fmt.Sprintf("f%05d.txt", i))
+		var body strings.Builder
+		for line := 0; body.Len() < fileSize; line++ {
+			fmt.Fprintf(&body, "file %05d line %04d %s\n", i, line, textFiller)
+		}
+		if err := os.WriteFile(path, []byte(body.String()), 0o644); err != nil {
+			tb.Fatalf("write %s: %v", path, err)
+		}
+	}
+}
+
 // rootCommitOf returns the root commit of the fixture plus its (zero)
 // first-parent tree, so the unit benchmark can call emitCommitBlobPairs with
 // exactly the arguments the pipeline would use.
 func rootCommitOf(tb testing.TB, hs *HistoryScanner) (commitInfo, Hash) {
 	tb.Helper()
+	return commitWithParentCount(tb, hs, 0)
+}
+
+// nonRootCommitOf returns the fixture's sole non-root commit and its parent
+// tree, matching the arguments stage 1 receives from the full pipeline.
+func nonRootCommitOf(tb testing.TB, hs *HistoryScanner) (commitInfo, Hash) {
+	tb.Helper()
+	return commitWithParentCount(tb, hs, 1)
+}
+
+func commitWithParentCount(tb testing.TB, hs *HistoryScanner, parentCount int) (commitInfo, Hash) {
+	tb.Helper()
 	commits, err := hs.loadAllCommits()
 	if err != nil {
 		tb.Fatalf("load commits: %v", err)
 	}
+	var (
+		found commitInfo
+		ok    bool
+	)
 	for _, c := range commits {
-		if len(c.ParentOIDs) == 0 {
-			parentTree, err := hs.firstParentTree(c)
-			if err != nil {
-				tb.Fatalf("first-parent tree: %v", err)
-			}
-			return c, parentTree
+		if len(c.ParentOIDs) != parentCount {
+			continue
 		}
+		if ok {
+			tb.Fatalf("fixture has multiple commits with %d parents", parentCount)
+		}
+		found, ok = c, true
 	}
-	tb.Fatal("fixture has no root commit")
-	return commitInfo{}, Hash{}
+	if !ok {
+		tb.Fatalf("fixture has no commit with %d parents", parentCount)
+	}
+	parentTree, err := hs.firstParentTree(found)
+	if err != nil {
+		tb.Fatalf("first-parent tree: %v", err)
+	}
+	return found, parentTree
 }
 
-// BenchmarkEmitCommitBlobPairs measures stage 1 alone on a root commit.
+// BenchmarkEmitCommitBlobPairs measures stage 1 alone on root and non-root
+// add-heavy commits.
 //
 // A drain goroutine consumes the work channel and records the arrival time
 // of the first unit of work per iteration; the mean is reported as
-// "first-work-ns". Under streaming emission this is the cost of walking to
-// the first blob; under buffered emission it includes the entire tree walk.
+// "first-work-ns". For roots this is the cost of walking to the first blob.
+// For a non-root add-only commit it includes the complete first walk, followed
+// by either buffered emission or the walk to the first replayed addition.
 func BenchmarkEmitCommitBlobPairs(b *testing.B) {
 	fx := newHunkBenchFixtures(b.TempDir())
 
@@ -123,41 +173,67 @@ func BenchmarkEmitCommitBlobPairs(b *testing.B) {
 			defer hs.Close()
 
 			root, parentTree := rootCommitOf(b, hs)
-			stopCh := make(chan struct{})
-
-			var firstWorkTotal, iters int64
-			b.ReportAllocs()
-			for b.Loop() {
-				blobs := make(chan blobPairWork, 4096)
-				done := make(chan int64, 1)
-				start := time.Now()
-				go func() {
-					var first int64 = -1
-					n := 0
-					for range blobs {
-						if n == 0 {
-							first = int64(time.Since(start))
-						}
-						n++
-					}
-					if n != fileCount {
-						b.Errorf("emitted %d pairs, want %d", n, fileCount)
-					}
-					done <- first
-				}()
-				if err := hs.emitCommitBlobPairs(root, parentTree, blobs, stopCh); err != nil {
-					b.Fatalf("emitCommitBlobPairs: %v", err)
-				}
-				close(blobs)
-				if first := <-done; first >= 0 {
-					firstWorkTotal += first
-					iters++
-				}
-			}
-			if iters > 0 {
-				b.ReportMetric(float64(firstWorkTotal)/float64(iters), "first-work-ns")
-			}
+			runEmitCommitBlobPairsBench(b, hs, root, parentTree, fileCount)
 		})
+
+		b.Run(fmt.Sprintf("NonRootAddCommit_%dfiles", fileCount), func(b *testing.B) {
+			gitDir := nonRootAddHeavyRepo(b, fx, fileCount, 64)
+			hs, err := NewHistoryScanner(gitDir)
+			if err != nil {
+				b.Fatalf("open scanner: %v", err)
+			}
+			defer hs.Close()
+
+			addCommit, parentTree := nonRootCommitOf(b, hs)
+			runEmitCommitBlobPairsBench(b, hs, addCommit, parentTree, fileCount)
+		})
+	}
+}
+
+type emitDrainResult struct {
+	firstWork int64
+	count     int
+}
+
+func runEmitCommitBlobPairsBench(b *testing.B, hs *HistoryScanner, commit commitInfo, parentTree Hash, wantCount int) {
+	b.Helper()
+	stopCh := make(chan struct{})
+	var firstWorkTotal, iters int64
+	b.ReportAllocs()
+	for b.Loop() {
+		blobs := make(chan blobPairWork, 4096)
+		ready := make(chan struct{})
+		done := make(chan emitDrainResult, 1)
+		var start time.Time
+		go func() {
+			close(ready)
+			result := emitDrainResult{firstWork: -1}
+			for range blobs {
+				if result.count == 0 {
+					result.firstWork = int64(time.Since(start))
+				}
+				result.count++
+			}
+			done <- result
+		}()
+		<-ready
+		start = time.Now()
+		if err := hs.emitCommitBlobPairs(commit, parentTree, blobs, stopCh); err != nil {
+			b.Fatalf("emitCommitBlobPairs: %v", err)
+		}
+		close(blobs)
+		result := <-done
+		if result.count != wantCount {
+			b.Fatalf("emitted %d pairs, want %d", result.count, wantCount)
+		}
+		if result.firstWork < 0 {
+			b.Fatal("emitCommitBlobPairs produced no first-work latency")
+		}
+		firstWorkTotal += result.firstWork
+		iters++
+	}
+	if iters > 0 {
+		b.ReportMetric(float64(firstWorkTotal)/float64(iters), "first-work-ns")
 	}
 }
 
@@ -168,9 +244,8 @@ func BenchmarkEmitCommitBlobPairs(b *testing.B) {
 // hunk — the end-to-end view of the stage-2 stall.
 //
 // The matrix crosses file count with per-file size because stage-2 cost per
-// work unit decides which stage-1 emission strategy wins: tiny files make
-// stage 2 outrun the walk regardless of emission order, while larger files
-// make stage-2 idle time during a buffered walk unrecoverable.
+// work unit reveals whether streaming the root walk overlaps useful stage-2
+// work as per-file diff cost rises.
 func BenchmarkDiffHistoryHunksColdRootHeavy(b *testing.B) {
 	fx := newHunkBenchFixtures(b.TempDir())
 

@@ -246,15 +246,21 @@ func (h *HunkAddition) Path() string { return h.path }
 // IsBinary returns whether this hunk contains binary data.
 func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 
-// DiffHistoryHunks streams every added hunk from all commits, diffing each
-// commit against its first parent only (i.e. merge commits are treated as a
-// single diff against the first parent, matching `git log --first-parent`
-// semantics). This keeps output deterministic and avoids duplicate hunks from
-// merge base reconstruction.
+// DiffHistoryHunks streams added hunks from all commits, diffing each commit
+// against its first parent only (i.e. merge commits are treated as a single
+// diff against the first parent, matching `git log --first-parent` semantics).
+// This keeps output deterministic and avoids duplicate hunks from merge base
+// reconstruction.
+//
+// Exact-OID moves are suppressed: when a commit contains a pure addition whose
+// blob OID matches an unmatched deletion in that commit, the addition is
+// omitted because its content-addressed bytes are unchanged. Matching is
+// one-for-one, so each deletion suppresses at most one addition. No hunk is
+// emitted for the destination path or moving commit.
 //
 // It returns two buffered channels: one for HunkAddition values and one for a
-// single error. The function never blocks the caller; all writes to the
-// channels are non-blocking.
+// single error. The call returns immediately after starting the producer, but
+// internal sends can block when their bounded buffers fill.
 //
 // Goroutine ownership: DiffHistoryHunks spawns a background goroutine that
 // owns the returned channels and closes them when the walk completes. The
@@ -262,10 +268,10 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // errC channel delivers a value) to avoid leaking goroutines. Failing to
 // drain will block the internal worker pool indefinitely.
 //
-// The HunkAddition channel is buffered to runtime.NumCPU() to allow workers
-// to make progress without waiting for the consumer on every hunk. The errC
-// channel is buffered to 1 so the producer goroutine can always send its
-// final error without blocking.
+// The HunkAddition channel is deeply buffered to absorb producer bursts
+// without waiting for the consumer on every hunk. The errC channel is buffered
+// to 1 so the producer goroutine can always send its final error without
+// blocking.
 //
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
@@ -288,8 +294,9 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 	return out, errC
 }
 
-// DiffHistoryHunksFunc streams every added hunk from all commits to fn,
-// using the same first-parent semantics as DiffHistoryHunks.
+// DiffHistoryHunksFunc streams added hunks from all commits to fn, using the
+// same first-parent semantics and one-for-one exact-OID move suppression as
+// DiffHistoryHunks.
 //
 // fn is invoked CONCURRENTLY from multiple internal workers (up to
 // runtime.NumCPU simultaneous calls) and must be safe for concurrent use.
@@ -477,10 +484,25 @@ type blobPairWork struct {
 	newOID Hash
 }
 
+// Buffering these many additions and path bytes keeps the per-worker
+// record/path budget below 1 MiB while preserving a single tree walk for
+// ordinary commits. Commits beyond either limit replay additions instead.
+const (
+	maxBufferedBlobPairAdditions = 4096
+	maxBufferedBlobPairPathBytes = 512 << 10
+)
+
 // emitCommitBlobPairs walks the first-parent tree diff of a single commit and
-// fans out one blobPairWork per changed blob. Tree walking is cheap relative
-// to blob diffing, so this stage keeps the expensive stage-2 workers supplied
-// with fine-grained work even when one commit touches thousands of files.
+// fans out one blobPairWork per content-changing blob addition or modification.
+// It filters deletions, unchanged and mode-only entries, and pure additions
+// paired one-for-one with same-commit deletions of the same blob OID
+// (exact-OID moves). Tree walking is cheap relative to blob diffing, so this
+// stage keeps the expensive stage-2 workers supplied with fine-grained work
+// even when one commit touches thousands of files. Root and shallow-parent
+// commits stream in one pass. Non-root commits count deletions and emit
+// modifications in the first pass, retaining additions within a bounded
+// budget. They replay additions in a second walk only when that budget is
+// exceeded.
 func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- blobPairWork, stopCh <-chan struct{}) error {
 	emit := func(work blobPairWork) error {
 		select {
@@ -493,23 +515,35 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 
 	// A zero parent tree (root commit, shallow history) has no old side:
 	// every entry is an addition and no deletion can exist, so no rename is
-	// possible. Emitting immediately keeps stage-2 workers fed during the
-	// walk and avoids buffering one blobPairWork per file of what is often
-	// the largest commit in the repository (the initial import).
-	canRename := !parentTree.IsZero()
+	// possible. Emit during the walk to preserve channel backpressure and
+	// avoid retaining one work record per file.
+	if parentTree.IsZero() {
+		return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+			if !isBlobMode(mode) || old == newH || newH.IsZero() {
+				return nil
+			}
+			return emit(blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
+		})
+	}
 
 	var (
-		adds         []blobPairWork
-		deletesByOID map[Hash]int
+		adds              []blobPairWork
+		deletesByOID      map[Hash]int
+		retainedPathBytes int
+		replayAdds        bool
 	)
 	err := walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		select {
+		case <-stopCh:
+			return errScanAborted
+		default:
+		}
 		if !isBlobMode(mode) {
 			return nil
 		}
 		if old == newH {
 			return nil
 		}
-		work := blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH}
 		switch {
 		case newH.IsZero():
 			if deletesByOID == nil {
@@ -517,27 +551,64 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 			}
 			deletesByOID[old]++
 			return nil
-		case old.IsZero() && canRename:
-			adds = append(adds, work)
+		case old.IsZero():
+			if replayAdds {
+				return nil
+			}
+			if len(adds) >= maxBufferedBlobPairAdditions ||
+				len(path) > maxBufferedBlobPairPathBytes-retainedPathBytes {
+				clear(adds)
+				adds = nil
+				retainedPathBytes = 0
+				replayAdds = true
+				return nil
+			}
+			adds = append(adds, blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
+			retainedPathBytes += len(path)
 			return nil
 		default:
-			return emit(work)
+			return emit(blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
 		}
 	})
 	if err != nil {
 		return err
 	}
 
-	for i := range adds {
-		if n := deletesByOID[adds[i].newOID]; n > 0 {
-			deletesByOID[adds[i].newOID] = n - 1
-			continue // exact-OID rename: content-addressed bytes are unchanged.
+	if !replayAdds {
+		for i := range adds {
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
+			}
+			if n := deletesByOID[adds[i].newOID]; n > 0 {
+				deletesByOID[adds[i].newOID] = n - 1
+				continue // exact-OID rename: content-addressed bytes are unchanged.
+			}
+			if err := emit(adds[i]); err != nil {
+				return err
+			}
 		}
-		if err := emit(adds[i]); err != nil {
-			return err
-		}
+		return nil
 	}
-	return nil
+
+	// The bounded buffer was discarded. Replay only additions, consuming one
+	// deletion credit per matching OID and emitting unmatched additions inline.
+	return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		select {
+		case <-stopCh:
+			return errScanAborted
+		default:
+		}
+		if !isBlobMode(mode) || !old.IsZero() || newH.IsZero() {
+			return nil
+		}
+		if n := deletesByOID[newH]; n > 0 {
+			deletesByOID[newH] = n - 1
+			return nil // exact-OID rename: content-addressed bytes are unchanged.
+		}
+		return emit(blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
+	})
 }
 
 // streamBlobPairHunks computes the added hunks for one changed file and
