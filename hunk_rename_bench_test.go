@@ -210,46 +210,49 @@ func BenchmarkDiffHistoryHunksStage(b *testing.B) {
 
 // runHunkStageBench scans gitDir under both memo states.
 //
-// The two states vary the DIFF MEMO ONLY, which is why they are named for it.
-// NoMemo zeroes the pair-cache and offset-cache budgets, so every timed
-// iteration re-walks the trees and re-diffs every pair. The offset cache goes
-// with the pair memo because it holds materialized objects and would otherwise
-// serve these fixtures' blobs straight back.
+// Exactly one thing varies: the pair-cache budget. The offset cache, the ARC
+// and the delta window all keep their defaults in both arms, so the delta is
+// the diff memo and nothing else. An earlier version also zeroed the offset
+// cache, reasoning that it holds materialized objects and would otherwise serve
+// these fixtures' blobs back -- but that pursued a coldness this benchmark
+// cannot reach (see below) at the cost of a second variable, and on this
+// fixture the offset cache does not avoid inflation at all: the ARC and delta
+// window already do, leaving it as bookkeeping that moved the number in its own
+// right. Holding it fixed both matches the state names and sharpens the memo
+// signal (~15% on time here, against ~7% when the two budgets moved together).
 //
-// What the states do NOT vary is the store's OID-keyed object caches. The ARC
-// (16K entries) and the delta window (32 MiB over 64 shards) have no budget
-// option, both dwarf a 1000x2 KiB fixture, and both sit ahead of inflation in
-// store.get. The untimed priming scan below fills them, so NEITHER state
-// re-inflates: purging just the ARC between iterations makes the identical
-// NoMemo scan ~37% slower, which is only possible if it was reading through
-// that cache inside the timed region.
+// What no state varies is the store's OID-keyed object caches. The ARC (16K
+// entries) and the delta window (32 MiB over 64 shards) have no budget option,
+// both dwarf a 1000x2 KiB fixture, and both sit ahead of inflation in store.get.
+// The untimed priming scan below fills them, so NEITHER state re-inflates:
+// purging just the ARC between iterations makes the identical NoMemo scan ~37%
+// slower, which is only possible if it was reading through that cache inside the
+// timed region.
 //
 // That is deliberate, not an oversight. Holding inflation constant across both
-// arms is what makes the delta attributable to the memo alone, and it is the
-// reason a single scanner is reused: a fresh HistoryScanner per iteration would
-// pull index mapping into the timed region (~5x the allocations here) and swamp
-// the signal this benchmark exists to isolate. For a genuinely cold end-to-end
-// scan, including index mapping and real inflation, see
+// arms is what makes the delta attributable to the memo, and it is the reason a
+// single scanner is reused: a fresh HistoryScanner per iteration would pull
+// index mapping into the timed region (~5x the allocations here) and swamp the
+// signal this benchmark exists to isolate. For a genuinely cold end-to-end scan,
+// including index mapping and real inflation, see
 // BenchmarkDiffHistoryHunksColdRootHeavy and
 // BenchmarkDiffHistoryHunksColdNonRootAddHeavy in emit_blob_pairs_bench_test.go,
 // which do build a fresh scanner per iteration. Do not read a number from here
 // as a cold-cache cost.
 func runHunkStageBench(b *testing.B, gitDir string) {
 	states := []struct {
-		name         string
-		pairBudget   int
-		offsetBudget int
+		name       string
+		pairBudget int
 	}{
-		{name: "NoMemo", pairBudget: 0, offsetBudget: 0},
-		{name: "Memo", pairBudget: defaultPairCacheBudget, offsetBudget: defaultOffsetCacheBudget},
+		{name: "NoMemo", pairBudget: 0},
+		{name: "Memo", pairBudget: defaultPairCacheBudget},
 	}
 
 	for _, st := range states {
 		b.Run(st.name, func(b *testing.B) {
 			scanner, err := NewHistoryScanner(gitDir,
 				WithScanMode(ScanModeHunks),
-				WithPairCacheBudget(st.pairBudget),
-				WithOffsetCacheBudget(st.offsetBudget))
+				WithPairCacheBudget(st.pairBudget))
 			if err != nil {
 				b.Fatalf("NewHistoryScanner(%s): %v", gitDir, err)
 			}
