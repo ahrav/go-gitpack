@@ -4,12 +4,14 @@
 // add-heavy commits.
 //
 // Exact-OID suppression must know a commit's deletion counts before deciding
-// which additions to emit. Root commits cannot contain deletions and stream in
-// one pass. Non-root commits retain additions within a bounded record/path
-// budget and emit them after the first walk. If either limit is exceeded, they
-// discard that buffer and replay unmatched additions in a second walk.
-// With this fixture's short paths, 4096 additions exercise the bounded
-// single-walk path and 16384 additions cross the record limit and replay.
+// which entries to emit. Root commits cannot contain deletions and stream in
+// one pass. Non-root commits retain suppression candidates -- additions and
+// modifications alike -- within a bounded record/path budget and emit them
+// after the first walk. If either limit is exceeded, they discard that buffer
+// and replay unmatched candidates in a second walk.
+// This fixture's bulk child commit is pure additions with short paths, so 4096
+// files exercise the bounded single-walk path and 16384 cross the record limit
+// and replay.
 //
 // These benchmarks make the root fast path and the non-root time/allocation
 // tradeoff visible so implementations can be compared like for like:
@@ -162,7 +164,7 @@ func commitWithParentCount(tb testing.TB, hs *HistoryScanner, parentCount int) (
 // of the first unit of work per iteration; the mean is reported as
 // "first-work-ns". For roots this is the cost of walking to the first blob.
 // For a non-root add-only commit it includes the complete first walk, followed
-// by either buffered emission or the walk to the first replayed addition.
+// by either buffered emission or the walk to the first replayed candidate.
 func BenchmarkEmitCommitBlobPairs(b *testing.B) {
 	fx := newHunkBenchFixtures(b.TempDir())
 

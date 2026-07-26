@@ -123,6 +123,98 @@ func TestDiffHistoryHunks_ModificationStillEmitsAddedLine(t *testing.T) {
 	requireHunkLines(t, got[hunkAttribution{commit: modification, path: "modified.txt"}], "added line")
 }
 
+// A move onto an already-tracked path is reported by walkDiff as a modification
+// of the destination, not as an addition: the destination's old OID is its prior
+// content and its new OID is the moved blob. Suppression must still fire, because
+// every line the destination gains is a line of the deleted blob.
+func TestDiffHistoryHunks_ExactOIDMoveOntoTrackedPathIsSuppressed(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old.txt"), []byte("moved bytes\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "new.txt"), []byte("original dest\n"), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "add source and destination", "--quiet")
+
+	runGit(t, repo, "mv", "-f", "old.txt", "new.txt")
+	runGit(t, repo, "commit", "-m", "overwriting move", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	root, move := twoCommitHistoryOIDs(t, scanner)
+	got := collectAttributedHunks(t, scanner)
+
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "old.txt"}], "moved bytes")
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "new.txt"}], "original dest")
+	require.Empty(t, got[hunkAttribution{commit: move, path: "new.txt"}],
+		"a move onto a tracked path re-adds bytes the history already carries")
+	require.Len(t, got, 2, "expected only the two root additions")
+}
+
+// A regular file whose bytes are exactly a path string and a symlink pointing at
+// that path share one blob OID. Suppression keys on OID plus entry type, so the
+// deleted file must not silence the symlink that replaces it.
+func TestDiffHistoryHunks_SameOIDAcrossEntryTypesIsNotSuppressed(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	// No trailing newline: the blob is exactly the symlink target string, so
+	// both entries hash to the same OID.
+	const target = "target/path"
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "payload.txt"), []byte(target), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "add regular file", "--quiet")
+
+	require.NoError(t, os.Remove(filepath.Join(repo, "payload.txt")))
+	require.NoError(t, os.Symlink(target, filepath.Join(repo, "link")))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "replace the file with a symlink", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	root, swap := twoCommitHistoryOIDs(t, scanner)
+	got := collectAttributedHunks(t, scanner)
+
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "payload.txt"}], target)
+	requireHunkLines(t, got[hunkAttribution{commit: swap, path: "link"}], target)
+	require.Len(t, got, 2, "a blob-to-symlink type change is not an exact-OID move")
+}
+
+// Permission bits are not blob content, so flipping the exec bit across an
+// otherwise byte-identical move must not defeat suppression.
+func TestDiffHistoryHunks_ExactOIDMoveSuppressedAcrossPermissionChange(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old.sh"), []byte("moved bytes\n"), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	runGit(t, repo, "mv", "old.sh", "new.sh")
+	require.NoError(t, os.Chmod(filepath.Join(repo, "new.sh"), 0o755))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "move and make executable", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	root, move := twoCommitHistoryOIDs(t, scanner)
+	got := collectAttributedHunks(t, scanner)
+
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "old.sh"}], "moved bytes")
+	require.Empty(t, got[hunkAttribution{commit: move, path: "new.sh"}],
+		"an exec-bit change does not alter the blob's bytes")
+	require.Len(t, got, 1)
+}
+
 type hunkAttribution struct {
 	commit Hash
 	path   string

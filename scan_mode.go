@@ -32,14 +32,21 @@ const (
 	ScanModeBlob ScanMode = iota
 
 	// ScanModeHunks is the legacy scanning mode that computes parent-child
-	// diffs for every commit and yields added-line hunks. A pure addition is
-	// suppressed when the same commit has an unmatched deletion with the same
-	// blob OID; matching is one-for-one because the content-addressed bytes are
-	// unchanged. Consequently an exact-OID move has no hunk attributed to its
-	// destination path or moving commit. This mode exists for backward
-	// compatibility with callers that need line-level granularity. Prefer
-	// ScanModeBlob for new integrations because it avoids the overhead of diff
-	// computation and tree comparison.
+	// diffs for every commit and yields added-line hunks. An entry's added
+	// lines are suppressed when the same commit has an unmatched deletion of
+	// the same blob identity -- the blob OID plus the tree entry's type, so a
+	// regular file never pairs with a symlink; matching is one-for-one because
+	// the content-addressed bytes are unchanged. This covers both a pure
+	// addition and a move that overwrites a tracked destination, which git
+	// reports as a modification whose resulting blob is the deleted one.
+	// Consequently an exact-OID move has no hunk attributed to its destination
+	// path or moving commit. When one deletion has several same-identity
+	// candidates (a rename plus a copy of the same bytes), one is suppressed
+	// and the rest are emitted; which path survives follows tree order, so the
+	// bytes are reported once but the surviving path is not git's rename
+	// heuristic. This mode exists for backward compatibility with callers that
+	// need line-level granularity. Prefer ScanModeBlob for new integrations
+	// because it avoids the overhead of diff computation and tree comparison.
 	//
 	// Reader shape: a text hunk arrives as a *bytes.Reader over a buffer of
 	// its lines joined by '\n'. A binary hunk arrives as a *strings.Reader
