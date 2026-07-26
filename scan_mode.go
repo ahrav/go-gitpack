@@ -46,20 +46,36 @@ const (
 	// bytes are reported once but the surviving path is not git's rename
 	// heuristic.
 	//
-	// Known gap: only a DELETION creates a suppression credit. When a path is
+	// Known gap: the walk callback carries only the NEW entry's mode, and two
+	// consequences follow from that one omission.
+	//
+	// First, only a DELETION creates a suppression credit. When a path is
 	// changed in place rather than removed, walkDiff reports it as a single
-	// entry carrying both OIDs and the NEW mode, so the blob leaving that path
-	// is never credited. A move whose source path is simultaneously reoccupied
+	// entry carrying both OIDs, so the blob leaving that path is never
+	// credited. A move whose source path is simultaneously reoccupied
 	// therefore emits its destination as a full addition even though the bytes
 	// are unchanged -- whether the source is reoccupied by a symlink, by a
-	// directory, or by a regular file with different content. Closing this
-	// needs the old entry's mode, which the walk callback does not currently
-	// carry and which cannot be recovered from the object store (a blob and a
-	// symlink are both ObjBlob; only the tree entry mode distinguishes them).
-	// It also widens suppression from deletions to the old side of in-place
-	// changes, which has its own consequences -- a commit that swaps two files'
-	// contents would emit nothing -- so it is deliberately not part of this
-	// contract.
+	// directory, or by a regular file with different content.
+	//
+	// Second, a path that changes type in place while keeping its bytes (a
+	// regular file holding "target" replaced by a symlink to "target", one
+	// OID) is dropped by the unchanged-content filter, so no hunk marks the
+	// symlink's arrival. Cross-path, the same transition does emit, because
+	// there the deletion and addition are separate entries with separate
+	// identities -- so the two spellings of one edit disagree.
+	//
+	// Neither is closed here. Both need the old entry's mode, which the
+	// callback does not carry and which cannot be recovered from the object
+	// store (a blob and a symlink are both ObjBlob; only the tree entry mode
+	// distinguishes them), so adding it changes the walk signature for callers
+	// unrelated to hunk scanning. Each also needs a semantic decision beyond
+	// the plumbing: the first widens suppression from deletions to the old side
+	// of in-place changes, under which a commit that swaps two files' contents
+	// would emit nothing; the second cannot be fixed by relaxing the filter,
+	// because diffing one OID against itself yields no lines -- the entry would
+	// have to be synthesized as a pure addition, and permission-only mode
+	// changes would have to stay excluded, which is the distinction the missing
+	// old mode is needed for.
 	//
 	// This mode exists for backward compatibility with callers that
 	// need line-level granularity. Prefer ScanModeBlob for new integrations
