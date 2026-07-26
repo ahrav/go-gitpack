@@ -72,8 +72,12 @@ GOARM64=v8.4 go build -pgo=default.pgo ./...
 ```
 
 `default.pgo` is a CPU profile captured from a full-history `DiffHistoryHunks`
-scan; `go build` picks it up automatically when building this package as the
-main module.
+scan. Pass `-pgo=default.pgo` explicitly, as above; it is not applied
+automatically. The default `-pgo=auto` selects a `default.pgo` only from each
+*main package's own directory*, and this module's root is `package objstore` —
+a library, not a main package. Downstream binaries that import `objstore`
+therefore need the explicit flag, or a copy of this profile in the directory of
+the main package being built.
 
 ### Optional libdeflate backend (cgo)
 
@@ -87,9 +91,14 @@ cmake -S /tmp/libdeflate -B /tmp/libdeflate/build -DCMAKE_BUILD_TYPE=Release \
 cmake --build /tmp/libdeflate/build -j
 
 CGO_CFLAGS="-I/tmp/libdeflate" \
-CGO_LDFLAGS="/tmp/libdeflate/build/libdeflate.a" \
+CGO_LDFLAGS="-L/tmp/libdeflate/build" \
 GOARM64=v8.4 go build -tags gitpack_libdeflate -pgo=default.pgo ./...
 ```
+
+`CGO_LDFLAGS` must supply a `-L` search directory rather than the archive path
+alone: cgo *adds* these flags to the `#cgo LDFLAGS: -ldeflate` directive in
+`zlib_cgo.go` instead of replacing it, so the link still resolves `-ldeflate`
+and fails on a host with no system-wide libdeflate.
 
 Pack objects are always inflated to a size known in advance from the object
 header, which matches libdeflate's one-shot whole-buffer model exactly. On a
