@@ -629,7 +629,8 @@ func (s *store) getWithContextSkipCache(oid Hash, ctx *deltaContext) ([]byte, Ob
 // When VerifyCRC is true, the method validates object integrity using checksums.
 //
 // inflateFromPack returns the inflated object data, its type, and any error encountered.
-// The returned data is a fresh allocation safe for modification.
+// The returned storage may be retained by an object cache and must be treated
+// as read-only. Callers that need to modify it must first make a copy.
 func (s *store) inflateFromPack(params inflationParams) ([]byte, ObjectType, error) {
 	return s.inflateFromPackWithOptions(params, true, true)
 }

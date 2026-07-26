@@ -81,7 +81,7 @@ func testCoreFunctionality(t *testing.T) {
 		assert.False(t, ok, "acquire should return false for a non-existent object")
 	})
 
-	t.Run("Data Mutability", func(t *testing.T) {
+	t.Run("Add Does Not Copy Input", func(t *testing.T) {
 		w := newRefCountedDeltaWindow()
 		oid := makeHash("mutable")
 		originalData := []byte("original")
@@ -89,13 +89,15 @@ func testCoreFunctionality(t *testing.T) {
 		err := w.add(oid, originalData, ObjBlob)
 		require.NoError(t, err, "add should not fail")
 
+		// Deliberately violate add's ownership-transfer convention to prove the
+		// window retains the supplied buffer rather than making a defensive copy.
 		originalData[0] = 'X'
 
 		h, ok := w.acquire(oid)
 		require.True(t, ok, "acquire should succeed")
 		defer h.Release()
 
-		assert.Equal(t, []byte("Xriginal"), h.Data(), "cache data should reflect external changes to the source slice")
+		assert.Equal(t, []byte("Xriginal"), h.Data(), "add unexpectedly copied its input buffer")
 	})
 
 	// TestReleasedViewsAreNeverRecycled pins the never-recycle half of the

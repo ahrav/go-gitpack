@@ -282,11 +282,13 @@ func (h *Handle) Release() {
 
 // Data returns the cached object data associated with this handle.
 //
-// Lifetime: the returned slice aliases the entry's buffer, which is immutable
-// and is never written in place, pooled, or otherwise recycled. Eviction and
-// update only drop the window's reference, so a slice obtained from Data stays
-// valid and unchanged for as long as the caller holds it, kept alive by the
-// GC, even after Release. Release ends only this handle's eviction pin.
+// Lifetime: the returned slice aliases the entry's buffer. The window never
+// writes, pools, or recycles retained buffers; producers transfer ownership
+// when calling add and must not mutate the slice afterwards. Under that
+// ownership convention, eviction and update only drop the window's reference,
+// so a slice obtained from Data stays valid and unchanged for as long as the
+// caller holds it, kept alive by the GC, even after Release. Release ends only
+// this handle's eviction pin.
 //
 // Release does invalidate the Handle itself: the struct returns to a pool and
 // may already describe a different entry, so extract the slice first and call
@@ -324,6 +326,11 @@ func (w *refCountedDeltaWindow) acquire(oid Hash) (*Handle, bool) {
 }
 
 // add inserts or updates the cached entry for the given object hash.
+//
+// Calling add transfers ownership of buf. The caller must not mutate it
+// afterwards, regardless of the result, because Data returns aliases rather
+// than defensive copies and an update may retain buf before reporting an
+// over-budget error.
 //
 // If the OID already exists in the window, the entry's data, size, and type
 // are updated in-place without changing the reference count or creating a new
