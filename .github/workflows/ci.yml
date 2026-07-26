@@ -1,12 +1,23 @@
 # CI for go-gitpack.
 #
-# Three gates run on every push/PR:
-#   - test        default pure-Go flate backend, full suite
-#   - race        the same suite under the data-race detector (guards the
-#                 concurrent read path and the parallel commit walk)
-#   - libdeflate  the cgo libdeflate backend, which a plain `go test` never
-#                 compiles (it is gated behind the gitpack_libdeflate build
-#                 tag), so it would otherwise ship untested
+# Four gates run on every push/PR:
+#   - test        default pure-Go flate backend, full suite, plus the
+#                 cross-compile smoke matrix (make build-cross) that pins the
+#                 ARM64-assembly build-tag algebra across darwin/arm64,
+#                 windows/arm64, linux/amd64, and the purego + no-cgo
+#                 linux/arm64 legs
+#   - arm64       default backend and assembly fast path on native ARM64
+#   - race        the same suite under the data-race detector on both amd64
+#                 and native ARM64 (guards the concurrent read path and the
+#                 parallel commit walk). -race enables checkptr, so the ARM64
+#                 leg validates the asm wrapper's unsafe.Pointer conversions
+#                 while the amd64 leg keeps the generic decodeHuffmanGo fast
+#                 loop under checkptr with the full suite's input variety
+#   - libdeflate  the cgo libdeflate backend on both amd64 and ARM64 — a
+#                 plain `go test` never compiles it (gated behind the
+#                 gitpack_libdeflate build tag), and the ARM64 leg is the only
+#                 gate for the tag's asm-deselection arm, which build-cross
+#                 cannot reach because cross-compilation disables cgo
 #
 # Each job delegates to the Makefile targets (make build/vet/fmt-check/test/...)
 # so CI and local `make check` cannot drift. The test targets depend on `make
@@ -44,17 +55,48 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go-gitpack/go.mod
-      - name: fmt-check, vet, build, test
+      - name: fmt-check, vet, build, build-cross, test
         working-directory: go-gitpack
         run: |
           make fmt-check
           make vet
           make build
+          make build-cross
+          make test
+
+  arm64:
+    name: test (ARM64 assembly)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: go-gitpack
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go-gitpack/go.mod
+      - name: build, vet, test
+        working-directory: go-gitpack
+        run: |
+          make build
+          make vet
           make test
 
   race:
-    name: race detector
-    runs-on: ubuntu-latest
+    name: race detector (${{ matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'amd64' }})
+    # Both architectures matter under -race because -race enables checkptr:
+    #   - arm64: the assembly fast loop is the active path, so checkptr
+    #     validates the asm wrapper's unsafe.Pointer conversions
+    #     (inflate_fast_arm64.go).
+    #   - amd64: the generic decodeHuffmanGo fast loop (with its unchecked
+    #     word copies) is the active path for the FULL suite's input variety;
+    #     on arm64 that loop is reached only through a handful of direct
+    #     fixtures in inflate_fast_arm64_test.go.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -69,8 +111,16 @@ jobs:
         run: make test-race
 
   libdeflate:
-    name: cgo libdeflate backend
-    runs-on: ubuntu-latest
+    name: cgo libdeflate backend (${{ matrix.os == 'ubuntu-24.04-arm' && 'ARM64' || 'amd64' }})
+    # The arm64 leg is the only place the (cgo && gitpack_libdeflate) arm of
+    # the assembly build-tag expression is compiled: with the tag set on
+    # arm64, the tag ALONE must deselect inflate_fast_arm64.go and select the
+    # generic path. build-cross cannot pin this arm because cross-compilation
+    # forces CGO_ENABLED=0.
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

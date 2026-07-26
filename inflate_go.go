@@ -29,6 +29,8 @@ SOFTWARE.
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
+	"io"
 	"math/bits"
 	"sync"
 	"unsafe"
@@ -47,6 +49,11 @@ const (
 	maxOffsetSyms = 32
 	maxCodeLen    = 15
 
+	// maxOffsetExtraBits is the largest extra-bit count of any DEFLATE
+	// offset code (codes 28-29, RFC 1951 section 3.2.5). It must match
+	// the largest value in offsetExtraBits.
+	maxOffsetExtraBits = 13
+
 	// A fast iteration can emit two literals, a 258-byte match, and
 	// intentionally overwrite up to 39 bytes while copying whole words.
 	deflateFastInputMargin  = 25
@@ -62,9 +69,21 @@ const (
 )
 
 var (
-	errDeflateBadData       = errors.New("deflate: invalid data")
-	errDeflateShortOutput   = errors.New("deflate: output shorter than destination")
-	errDeflateOutputOverrun = errors.New("deflate: output exceeds destination")
+	errDeflateBadData = errors.New("deflate: invalid data")
+
+	// Truncation-class errors wrap io.ErrUnexpectedEOF so callers can
+	// separate exhausted input from structurally invalid data with
+	// errors.Is(err, io.ErrUnexpectedEOF). The invariant: every decode
+	// failure caused by the input ending early — a block header, stored
+	// block, dynamic-table field, codeword, or extra bits cut short —
+	// reports this identity, and structurally invalid data never does.
+	errDeflateTruncated   = fmt.Errorf("deflate: truncated input: %w", io.ErrUnexpectedEOF)
+	errDeflateShortOutput = fmt.Errorf("deflate: output shorter than destination: %w", io.ErrUnexpectedEOF)
+
+	// errDeflateOutputOverrun wraps errZlibStreamOverrun so the one-shot
+	// path and the fallback ensureZlibStreamEnd path report the same error
+	// class for streams that continue past the declared object size.
+	errDeflateOutputOverrun = fmt.Errorf("deflate: output exceeds destination: %w", errZlibStreamOverrun)
 )
 
 var lengthBases = [...]uint16{
@@ -266,7 +285,7 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 	for {
 		header, ok := r.read(3)
 		if !ok {
-			return 0, out, errDeflateBadData
+			return 0, out, errDeflateTruncated
 		}
 		final := header&1 != 0
 
@@ -274,20 +293,34 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 		case 0:
 			r.alignToByte()
 			if len(src)-r.pos < 4 {
-				return 0, out, errDeflateBadData
+				return 0, out, errDeflateTruncated
 			}
 			n := int(binary.LittleEndian.Uint16(src[r.pos:]))
 			nn := binary.LittleEndian.Uint16(src[r.pos+2:])
 			r.pos += 4
-			if uint16(n) != ^nn || n > len(src)-r.pos {
+			if uint16(n) != ^nn {
 				return 0, out, errDeflateBadData
 			}
-			if n > len(dst)-out {
+			// A block can be both truncated (LEN exceeds the remaining
+			// input) and overrunning (the payload crosses the remaining
+			// destination). Classify by the bytes actually present, like
+			// the streaming backends observe them: stored bytes already
+			// in the input that cross the declared size prove an overrun
+			// even when the block is also cut short, while a declared
+			// LEN whose bytes are absent stays a truncation. The
+			// available prefix of a truncated block is still copied, so
+			// the produced count reflects real output the way flate's
+			// streaming decode does.
+			take := min(n, len(src)-r.pos)
+			if take > len(dst)-out {
 				return 0, out, errDeflateOutputOverrun
 			}
-			copy(dst[out:out+n], src[r.pos:r.pos+n])
-			r.pos += n
-			out += n
+			copy(dst[out:out+take], src[r.pos:r.pos+take])
+			r.pos += take
+			out += take
+			if take < n {
+				return 0, out, errDeflateTruncated
+			}
 
 		case 1:
 			if !d.loadFixedTables() {
@@ -300,8 +333,8 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 			}
 
 		case 2:
-			if !d.loadDynamicTables(&r) {
-				return 0, out, errDeflateBadData
+			if err := d.loadDynamicTables(&r); err != nil {
+				return 0, out, err
 			}
 			var err error
 			out, err = d.decodeHuffman(&r, dst, out)
@@ -365,7 +398,7 @@ var precodeOrder = [...]uint8{
 	16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 }
 
-func (d *goInflater) loadDynamicTables(r *deflateBits) bool {
+func (d *goInflater) loadDynamicTables(r *deflateBits) error {
 	// A malformed dynamic block can fail after partially replacing either
 	// decode table. Invalidate the fixed-table cache before touching any
 	// scratch state so a pooled decoder can never reuse those partial tables.
@@ -373,17 +406,25 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) bool {
 
 	counts, ok := r.read(14)
 	if !ok {
-		return false
+		return errDeflateTruncated
 	}
 	numLitlen := 257 + int(counts&31)
 	numOffset := 1 + int((counts>>5)&31)
 	numPrecode := 4 + int((counts>>10)&15)
+	// RFC 1951 section 3.2.7: HLIT may encode at most 286 literal/length
+	// codes and HDIST at most 30 distance codes; the remaining field values
+	// are reserved. zlib and compress/flate (the differential-fuzz oracle)
+	// both reject them during header parsing, so accepting them here would
+	// let malformed pack data through on one backend only.
+	if numLitlen > 286 || numOffset > 30 {
+		return errDeflateBadData
+	}
 
 	clear(d.precodeLens[:])
 	for i := 0; i < numPrecode; i++ {
 		n, ok := r.read(3)
 		if !ok {
-			return false
+			return errDeflateTruncated
 		}
 		d.precodeLens[precodeOrder[i]] = uint8(n)
 	}
@@ -392,15 +433,15 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) bool {
 		d.precode[:], d.precodeLens[:], precodeTable, precodeTableBits, 7, false,
 	)
 	if !ok {
-		return false
+		return errDeflateBadData
 	}
 
 	total := numLitlen + numOffset
 	clear(d.lens[:total])
 	for i := 0; i < total; {
-		entry, _, ok := decodeTableEntry(r, d.precode[:], uint(preBits))
-		if !ok {
-			return false
+		entry, _, err := decodeTableEntry(r, d.precode[:], uint(preBits))
+		if err != nil {
+			return err
 		}
 		sym := int(entry >> 16)
 		switch {
@@ -410,15 +451,15 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) bool {
 
 		case sym == 16:
 			if i == 0 {
-				return false
+				return errDeflateBadData
 			}
 			extra, ok := r.read(2)
 			if !ok {
-				return false
+				return errDeflateTruncated
 			}
 			n := 3 + int(extra)
 			if n > total-i {
-				return false
+				return errDeflateBadData
 			}
 			v := d.lens[i-1]
 			for j := 0; j < n; j++ {
@@ -429,11 +470,11 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) bool {
 		case sym == 17:
 			extra, ok := r.read(3)
 			if !ok {
-				return false
+				return errDeflateTruncated
 			}
 			n := 3 + int(extra)
 			if n > total-i {
-				return false
+				return errDeflateBadData
 			}
 			clear(d.lens[i : i+n])
 			i += n
@@ -441,40 +482,40 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) bool {
 		case sym == 18:
 			extra, ok := r.read(7)
 			if !ok {
-				return false
+				return errDeflateTruncated
 			}
 			n := 11 + int(extra)
 			if n > total-i {
-				return false
+				return errDeflateBadData
 			}
 			clear(d.lens[i : i+n])
 			i += n
 
 		default:
-			return false
+			return errDeflateBadData
 		}
 	}
 
 	if d.lens[256] == 0 {
-		return false
+		return errDeflateBadData
 	}
 
 	offsetBits, ok := d.buildTable(
 		d.offset[:], d.lens[numLitlen:total], offsetTable, offsetTableBits, maxCodeLen, true,
 	)
 	if !ok {
-		return false
+		return errDeflateBadData
 	}
 	litlenBits, ok := d.buildTable(
 		d.litlen[:], d.lens[:numLitlen], litlenTable, litlenTableBits, maxCodeLen, false,
 	)
 	if !ok {
-		return false
+		return errDeflateBadData
 	}
 
 	d.offsetBits = uint8(offsetBits)
 	d.litlenBits = uint8(litlenBits)
-	return true
+	return nil
 }
 
 func (d *goInflater) decodeHuffmanGo(r *deflateBits, dst []byte, out int) (int, error) {
@@ -516,10 +557,10 @@ func (d *goInflater) decodeHuffmanGo(r *deflateBits, dst []byte, out int) (int, 
 		var saved uint64
 		if entry&huffSubtable != 0 {
 			r.buf, r.nbits, r.pos = bitbuf, nbits, pos
-			var ok bool
-			entry, saved, ok = decodeTableEntry(r, d.litlen[:], litlenBits)
-			if !ok {
-				return out, errDeflateBadData
+			var err error
+			entry, saved, err = decodeTableEntry(r, d.litlen[:], litlenBits)
+			if err != nil {
+				return out, err
 			}
 			bitbuf, nbits, pos = r.buf, r.nbits, r.pos
 		} else {
@@ -582,10 +623,10 @@ func (d *goInflater) decodeHuffmanGo(r *deflateBits, dst []byte, out int) (int, 
 		}
 		if entry&huffSubtable != 0 {
 			r.buf, r.nbits, r.pos = bitbuf, nbits, pos
-			var ok bool
-			entry, saved, ok = decodeTableEntry(r, d.offset[:], offsetBits)
-			if !ok {
-				return out, errDeflateBadData
+			var err error
+			entry, saved, err = decodeTableEntry(r, d.offset[:], offsetBits)
+			if err != nil {
+				return out, err
 			}
 			bitbuf, nbits, pos = r.buf, r.nbits, r.pos
 		} else {
@@ -656,21 +697,27 @@ func (d *goInflater) decodeHuffmanTail(r *deflateBits, dst []byte, out int) (int
 		}
 		entry := litlenTable[int(r.buf&litlenMask)]
 		if entry == 0 {
+			// An unassigned slot reached with fewer than litlenBits real
+			// bits is an incomplete codeword at end of input, not proof
+			// of an invalid code.
+			if r.nbits < litlenBits {
+				return out, errDeflateTruncated
+			}
 			return out, errDeflateBadData
 		}
 		var saved uint64
 		if entry&huffSubtable != 0 {
-			var ok bool
-			entry, saved, ok = decodeTableEntry(r, litlenTable, litlenBits)
-			if !ok {
-				return out, errDeflateBadData
+			var err error
+			entry, saved, err = decodeTableEntry(r, litlenTable, litlenBits)
+			if err != nil {
+				return out, err
 			}
 		} else {
 			n := uint(entry & huffBitCountMask)
 			if r.nbits < n {
 				r.refill()
 				if r.nbits < n {
-					return out, errDeflateBadData
+					return out, errDeflateTruncated
 				}
 			}
 			saved = r.buf
@@ -697,29 +744,29 @@ func (d *goInflater) decodeHuffmanTail(r *deflateBits, dst []byte, out int) (int
 		totalBits := uint(entry & huffBitCountMask)
 		length := int(entry >> 16)
 		length += int((saved &^ (^uint64(0) << totalBits)) >> codeBits)
-		if length > len(dst)-out {
-			return out, errDeflateOutputOverrun
-		}
 
 		if r.nbits < offsetBits {
 			r.refill()
 		}
 		entry = offsetTable[int(r.buf&offsetMask)]
 		if entry == 0 {
+			if r.nbits < offsetBits {
+				return out, errDeflateTruncated
+			}
 			return out, errDeflateBadData
 		}
 		if entry&huffSubtable != 0 {
-			var ok bool
-			entry, saved, ok = decodeTableEntry(r, offsetTable, offsetBits)
-			if !ok {
-				return out, errDeflateBadData
+			var err error
+			entry, saved, err = decodeTableEntry(r, offsetTable, offsetBits)
+			if err != nil {
+				return out, err
 			}
 		} else {
 			n := uint(entry & huffBitCountMask)
 			if r.nbits < n {
 				r.refill()
 				if r.nbits < n {
-					return out, errDeflateBadData
+					return out, errDeflateTruncated
 				}
 			}
 			saved = r.buf
@@ -736,25 +783,40 @@ func (d *goInflater) decodeHuffmanTail(r *deflateBits, dst []byte, out int) (int
 		if offset <= 0 || offset > out {
 			return out, errDeflateBadData
 		}
+		// Only a fully decoded, structurally valid match may classify as an
+		// overrun: a truncated or invalid distance must keep its own error
+		// class even when the destination is already full.
+		if length > len(dst)-out {
+			return out, errDeflateOutputOverrun
+		}
 
 		copyMatch(dst, out, offset, length)
 		out += length
 	}
 }
 
-func decodeTableEntry(r *deflateBits, table []uint32, tableBits uint) (uint32, uint64, bool) {
+// decodeTableEntry resolves one codeword against a two-level decode table.
+// A nil error means entry is valid and its bits were consumed. Failures
+// distinguish exhausted input (errDeflateTruncated: the remaining bits do
+// not complete a codeword, matching compress/flate's io.ErrUnexpectedEOF
+// classification) from codewords that resolve to no assigned symbol with
+// sufficient bits available (errDeflateBadData).
+func decodeTableEntry(r *deflateBits, table []uint32, tableBits uint) (uint32, uint64, error) {
 	if r.nbits < tableBits {
 		r.refill()
 	}
 	entry := table[int(r.buf&bitMask(tableBits))]
 	if entry == 0 {
-		return 0, 0, false
+		if r.nbits < tableBits {
+			return 0, 0, errDeflateTruncated
+		}
+		return 0, 0, errDeflateBadData
 	}
 
 	if entry&huffSubtable != 0 {
 		n := uint(entry & huffBitCountMask)
 		if r.nbits < n {
-			return 0, 0, false
+			return 0, 0, errDeflateTruncated
 		}
 		r.buf >>= n
 		r.nbits -= n
@@ -762,18 +824,21 @@ func decodeTableEntry(r *deflateBits, table []uint32, tableBits uint) (uint32, u
 		subBits := uint((entry >> 8) & 0x1f)
 		start := int(entry >> 16)
 		if subBits > maxCodeLen || start >= len(table) {
-			return 0, 0, false
+			return 0, 0, errDeflateBadData
 		}
 		if r.nbits < subBits {
 			r.refill()
 		}
 		index := start + int(r.buf&bitMask(subBits))
 		if index >= len(table) {
-			return 0, 0, false
+			return 0, 0, errDeflateBadData
 		}
 		entry = table[index]
 		if entry == 0 {
-			return 0, 0, false
+			if r.nbits < subBits {
+				return 0, 0, errDeflateTruncated
+			}
+			return 0, 0, errDeflateBadData
 		}
 	}
 
@@ -781,13 +846,13 @@ func decodeTableEntry(r *deflateBits, table []uint32, tableBits uint) (uint32, u
 	if r.nbits < n {
 		r.refill()
 		if r.nbits < n {
-			return 0, 0, false
+			return 0, 0, errDeflateTruncated
 		}
 	}
 	saved := r.buf
 	r.buf >>= n
 	r.nbits -= n
-	return entry, saved, true
+	return entry, saved, nil
 }
 
 func copyMatch(dst []byte, out, offset, length int) {

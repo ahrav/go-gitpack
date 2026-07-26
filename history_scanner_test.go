@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -187,6 +189,80 @@ func TestLoadAllCommits_BuildsGraphWhenMissing(t *testing.T) {
 		assert.Equal(t, scanner.graphData.Timestamps[i], c.Timestamp)
 		assert.Len(t, scanner.graphData.Parents[c.OID], len(c.ParentOIDs))
 	}
+}
+
+// TestDiffHistoryHunks_QueueDepthIsOnePerBlobWorker pins the returned queue's
+// capacity to the blob-worker count DiffHistoryHunksFunc uses. The depth is
+// derived from that width — one slot per worker and nothing more — so a change
+// to either side that breaks the derivation fails here rather than silently
+// changing how many hunk payloads the queue can pin.
+func TestDiffHistoryHunks_QueueDepthIsOnePerBlobWorker(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+	defer scanner.Close()
+
+	hunks, errC := scanner.DiffHistoryHunks()
+	assert.Equal(t, runtime.NumCPU(), cap(hunks), "queue depth must be one slot per blob worker")
+
+	for range hunks {
+	}
+	require.NoError(t, <-errC)
+}
+
+// TestDiffHistoryHunks_StalledConsumerStillCompletes proves a consumer that
+// lets the queue fill before it reads anything still finishes cleanly: the
+// blocked blob workers resume, both channels close, errC yields nil, and the
+// pipeline's goroutines exit.
+//
+// The queue holds one hunk per blob worker, so the stall is only reachable
+// while the fixture emits more hunks than the host has CPUs — the state in
+// which an abandoned or slow consumer would otherwise strand the worker pool.
+func TestDiffHistoryHunks_StalledConsumerStillCompletes(t *testing.T) {
+	// The fixture emits one hunk per commit. A host with enough CPUs to hold
+	// them all in the queue never reaches a full-queue stall, so the wait
+	// below would burn its timeout instead of observing anything.
+	const fixtureHunks = 1000
+	if 2*runtime.NumCPU() >= fixtureHunks {
+		t.Skipf("%d CPUs against a %d-hunk fixture: the queue cannot fill", runtime.NumCPU(), fixtureHunks)
+	}
+
+	scanner := createScannerForRepo(t, "very-large-repo-1k")
+	defer scanner.Close()
+
+	baseline := runtime.NumGoroutine()
+	hunks, errC := scanner.DiffHistoryHunks()
+
+	// Waiting for a full queue, rather than sleeping a fixed interval, is what
+	// makes the stall observable without depending on producer speed.
+	require.Eventually(t, func() bool { return len(hunks) == cap(hunks) },
+		30*time.Second, time.Millisecond, "producers must fill the queue while nothing drains it")
+
+	count := 0
+	for range hunks {
+		count++
+	}
+	require.NoError(t, <-errC)
+	require.Greater(t, count, cap(hunks), "fixture must produce more hunks than the queue holds")
+
+	_, open := <-hunks
+	assert.False(t, open, "hunk channel must be closed after the walk completes")
+	_, open = <-errC
+	assert.False(t, open, "errC must be closed after its single send")
+
+	// The walk joins its tree and blob workers before it returns, and the
+	// forwarding goroutine closes both channels as its last act, so the count
+	// settles back to the pre-scan baseline. Polling from this goroutine is
+	// deliberate: a condition evaluated in a spawned goroutine would count
+	// itself and never settle.
+	settled := false
+	for range 200 {
+		if runtime.NumGoroutine() <= baseline {
+			settled = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.True(t, settled, "pipeline goroutines must exit with the walk: %d goroutines, baseline %d",
+		runtime.NumGoroutine(), baseline)
 }
 
 // TestDiffHistoryHunks_WithoutCommitGraph verifies that the streaming hunk
@@ -623,4 +699,185 @@ func TestLoadAllCommits_SuperLargeRepo(t *testing.T) {
 	}
 
 	assert.Equal(t, 1, rootCommitCount, "Should have exactly one root commit")
+}
+
+// TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs proves that stage 1
+// of the hunk pipeline never dispatches blob pairs that cannot produce added
+// hunks: deletions (zero new OID) and identity pairs (old == new). Such
+// pairs would waste a stage-2 hand-off and leave a permanent zero-cost entry
+// in the pair cache for every distinct deleted blob.
+func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repo := t.TempDir()
+	run := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t",
+			"GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t",
+			"GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		out, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "git %v failed: %s", args, string(out))
+	}
+	write := func(name, content string) {
+		require.NoError(t, os.WriteFile(filepath.Join(repo, name), []byte(content), 0o644))
+	}
+
+	run("init", "--quiet")
+	write("a.txt", "gone soon\n")
+	write("b.txt", "keep\n")
+	run("add", "a.txt", "b.txt")
+	run("commit", "-m", "add", "--quiet")
+
+	run("rm", "--quiet", "a.txt")
+	write("b.txt", "keep\nchanged\n")
+	run("add", "b.txt")
+	run("commit", "-m", "delete a, change b", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+
+	var child commitInfo
+	for _, c := range commits {
+		if len(c.ParentOIDs) == 1 {
+			child = c
+		}
+	}
+	require.NotEqual(t, Hash{}, child.OID, "expected a commit with one parent")
+
+	parentTree, err := scanner.firstParentTree(child)
+	require.NoError(t, err)
+
+	blobs := make(chan blobPairWork, 64)
+	stopCh := make(chan struct{})
+	require.NoError(t, scanner.emitCommitBlobPairs(child, parentTree, blobs, stopCh))
+	close(blobs)
+
+	var paths []string
+	for work := range blobs {
+		paths = append(paths, work.path)
+		assert.False(t, work.newOID.IsZero(),
+			"deletion for %s must not be dispatched to stage 2", work.path)
+		assert.NotEqual(t, work.oldOID, work.newOID,
+			"identity pair for %s must not be dispatched to stage 2", work.path)
+	}
+	assert.Equal(t, []string{"b.txt"}, paths,
+		"only the modified file produces stage-2 work")
+}
+
+// TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob proves a delivered
+// HunkAddition carries only its own line bytes. computeAddedHunks tokenizes the
+// new blob into zero-copy views, so delivering those views keeps the whole blob
+// alive for as long as any consumer holds the hunk — and every hunk buffered by
+// DiffHistoryHunks or held by a blob worker would pin one distinct blob apiece.
+//
+// The fixture's modification of main.go is the case that matters: its added
+// lines are a strict subset of the new blob, unlike a file addition or a binary
+// result, which carry the whole blob and are exempt from compaction by design
+// (see pairCache.add).
+func TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob(t *testing.T) {
+	scanner := createScannerForRepo(t, "with-merges")
+	defer scanner.Close()
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+
+	var (
+		work  blobPairWork
+		found bool
+	)
+	for _, c := range commits {
+		parentTree, err := scanner.firstParentTree(c)
+		require.NoError(t, err)
+
+		blobs := make(chan blobPairWork, 64)
+		stopCh := make(chan struct{})
+		require.NoError(t, scanner.emitCommitBlobPairs(c, parentTree, blobs, stopCh))
+		close(blobs)
+
+		for w := range blobs {
+			if !w.oldOID.IsZero() {
+				work, found = w, true
+			}
+		}
+	}
+	require.True(t, found, "fixture must contain a modification pair")
+
+	// Materialize the new blob first so the store serves computeAddedHunks the
+	// identical buffer from its cache; a second, independent inflation would
+	// give the hunks a different backing array and the check below would pass
+	// vacuously.
+	blob, _, err := scanner.store.get(work.newOID)
+	require.NoError(t, err)
+	require.NotEmpty(t, blob)
+
+	var delivered []HunkAddition
+	require.NoError(t, scanner.streamBlobPairHunks(work, func(h HunkAddition) error {
+		delivered = append(delivered, h)
+		return nil
+	}))
+	require.NotEmpty(t, delivered)
+
+	for i, h := range delivered {
+		require.False(t, h.IsBinary(), "hunk %d: fixture pair must be a text diff", i)
+		for j, line := range h.Lines() {
+			require.False(t, aliasesBuffer(line, blob),
+				"hunk %d line %d views the decompressed blob; a delivered hunk must own its bytes", i, j)
+		}
+	}
+	runtime.KeepAlive(blob)
+}
+
+// TestDiffHistoryHunksFunc_ReleasesTreeMemo proves the commit->tree memo is
+// scoped to one scan. The memo only pays off while a walk is resolving
+// first-parent trees; keeping it on the long-lived scanner would hold
+// O(commit-count) memory after the scan returns.
+func TestDiffHistoryHunksFunc_ReleasesTreeMemo(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+	defer scanner.Close()
+
+	require.NoError(t, scanner.DiffHistoryHunksFunc(func(HunkAddition) error { return nil }))
+
+	entries := 0
+	scanner.treeOIDs.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	assert.Zero(t, entries, "tree memo must be released when the scan returns")
+}
+
+// TestDiffHistoryHunksFunc_NilCallbackRejected proves a nil callback is
+// rejected as an error rather than reaching a worker.
+//
+// The blob workers call fn on the hot path without a nil check, so admitting
+// nil would surface as a nil-func call inside a worker goroutine — a panic no
+// caller can recover, since it unwinds a goroutine the caller does not own.
+// The repository used here produces added hunks, so a missing guard would
+// actually reach the call rather than finishing with nothing to deliver.
+func TestDiffHistoryHunksFunc_NilCallbackRejected(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+	defer scanner.Close()
+
+	// Establish that this repository does deliver hunks, so the nil case below
+	// is genuinely exercising the guard and not an empty walk. fn runs on every
+	// blob worker concurrently, so the counter must be atomic.
+	var delivered atomic.Int64
+	require.NoError(t, scanner.DiffHistoryHunksFunc(func(HunkAddition) error {
+		delivered.Add(1)
+		return nil
+	}))
+	require.Positive(t, delivered.Load(), "fixture must produce hunks for this test to mean anything")
+
+	err := scanner.DiffHistoryHunksFunc(nil)
+	require.Error(t, err, "a nil callback must be rejected, not dispatched to workers")
+	require.Contains(t, err.Error(), "must not be nil")
 }

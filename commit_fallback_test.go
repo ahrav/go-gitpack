@@ -1,14 +1,19 @@
 // commit_fallback_test.go tests the graceful fallback behaviour when a
 // repository's HEAD or branch refs point to objects that do not exist in any
 // pack file. The scanner should return zero commits rather than an error,
-// allowing callers to handle repositories with dangling references.
+// allowing callers to handle repositories with dangling references. It also
+// pins the visit-concurrency contract of the two walk entry points, which
+// callers rely on to decide whether they need their own locking.
 package objstore
 
 import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -89,4 +94,94 @@ func TestReadRefHash_ChecksScannerError(t *testing.T) {
 	_, ok, err := readRefHash(gitDir, "refs/heads/nonexistent")
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+// TestWalkCommitsFromRefs_VisitsConcurrently proves the parallel walk does not
+// serialize visit. The barrier below is released only once two workers sit
+// inside visit at the same time, so it fails if the walk holds any lock across
+// the callback: DiffHistoryHunksFunc's visit is already concurrency-safe, and
+// funneling every visit through one mutex parks the walk workers instead of
+// inflating commit headers.
+func TestWalkCommitsFromRefs_VisitsConcurrently(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("the walk runs a single worker on a single-CPU machine")
+	}
+
+	// with-merges publishes two ref tips, so the frontier offers two commits
+	// from the first pop onward.
+	scanner := createScannerForRepo(t, "with-merges")
+	defer scanner.Close()
+
+	const wantInFlight = 2
+	var (
+		mu       sync.Mutex
+		inFlight int
+		gaveUp   atomic.Bool
+		once     sync.Once
+	)
+	reached := make(chan struct{})
+
+	err := scanner.walkCommitsFromRefs(func(commitInfo) error {
+		mu.Lock()
+		inFlight++
+		n := inFlight
+		mu.Unlock()
+
+		if n >= wantInFlight {
+			once.Do(func() { close(reached) })
+		}
+		if !gaveUp.Load() {
+			select {
+			case <-reached:
+			case <-time.After(10 * time.Second):
+				// Serialized visits can never reach the barrier. Stop waiting
+				// so the walk finishes and the assertion below reports it,
+				// rather than letting every commit burn the full deadline.
+				gaveUp.Store(true)
+			}
+		}
+
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return nil
+	})
+	require.NoError(t, err)
+
+	select {
+	case <-reached:
+	default:
+		t.Fatal("no two visits were in flight at once: the walk serializes visit")
+	}
+}
+
+// TestWalkCommitsFromRefsOrdered_VisitsSeriallyInStableOrder pins the contract
+// the scan planners depend on: a single worker never calls visit concurrently,
+// and the visit order is reproducible, so first-wins blob dedup attributes each
+// blob to the same commit on every run.
+func TestWalkCommitsFromRefsOrdered_VisitsSeriallyInStableOrder(t *testing.T) {
+	scanner := createScannerForRepo(t, "with-merges")
+	defer scanner.Close()
+
+	collect := func() []Hash {
+		var (
+			inVisit    atomic.Bool
+			overlapped atomic.Bool
+			order      []Hash
+		)
+		require.NoError(t, scanner.walkCommitsFromRefsOrdered(func(c commitInfo) error {
+			if !inVisit.CompareAndSwap(false, true) {
+				overlapped.Store(true)
+			}
+			order = append(order, c.OID)
+			inVisit.Store(false)
+			return nil
+		}))
+		require.False(t, overlapped.Load(), "the ordered walk invoked visit concurrently")
+		return order
+	}
+
+	first := collect()
+	require.Len(t, first, 5, "with-merges holds five commits")
+	require.Equal(t, first, collect(), "ordered visit order must be reproducible")
 }
