@@ -134,7 +134,11 @@ func testCoreFunctionality(t *testing.T) {
 		he.Release()
 
 		for i := range 64 {
-			_ = w2.add(makeHash(fmt.Sprintf("churn-%d", i)), bytes.Repeat([]byte{byte(i)}, 512), ObjBlob)
+			// add can only fail here by refusing the entry (over budget, or a
+			// full window with nothing evictable). Either would leave the
+			// evictee resident and make the checks below vacuous, so assert
+			// rather than discard.
+			require.NoError(t, w2.add(makeHash(fmt.Sprintf("churn-%d", i)), bytes.Repeat([]byte{byte(i)}, 512), ObjBlob))
 		}
 
 		assert.Equal(t, bytes.Repeat([]byte{0xAB}, 512), evictedView,
