@@ -110,6 +110,23 @@ func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
 		)
 	}
 
+	// Hand back a slice whose capacity is its length. io.ReadAll grows by
+	// append and commonly returns spare capacity, and callers treat an object
+	// buffer as costing exactly the bytes it reports: the offset cache admits
+	// on len(data), and pairCache.add aliases a whole-blob buffer instead of
+	// copying it precisely because a blob's capacity is its size. Slack here
+	// would be retained by both while being charged by neither.
+	//
+	// The read stays bounded by the bytes zlib actually produces rather than
+	// by the size the header declares, so a corrupt or hostile header cannot
+	// turn this into a large allocation; the copy happens only after the
+	// declared size is confirmed against what was read.
+	if cap(body) > len(body) {
+		exact := make([]byte, len(body))
+		copy(exact, body)
+		body = exact
+	}
+
 	return body, typ, nil
 }
 

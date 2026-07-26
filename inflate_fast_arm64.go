@@ -1,56 +1,31 @@
-//go:build arm64 && !purego && !gitpack_libdeflate
+//go:build arm64 && !purego && !(gitpack_libdeflate && cgo)
 
 package objstore
 
-import "unsafe"
+const (
+	// inflateFastWideCopyDistance is the minimum read distance for the
+	// 32-byte block-copy loop in the assembly kernel. Match copies with a
+	// shorter offset first grow the distance by chunked doubling: an
+	// 8-byte load that partially overlaps a recent store cannot
+	// store-to-load forward on Neoverse cores, and the measured stall
+	// (e.g. offset 9: 540µs vs 241µs for offset 8 on a 1 MiB
+	// period-repeat payload, Graviton3) dominates long-match decode.
+	// Reads at or beyond this distance trail every store still in
+	// flight, so the wide loop runs stall-free.
+	inflateFastWideCopyDistance = 64
 
-const inflateFastAsmEnabled = true
+	// inflateFastMinLitlenBits is this architecture's eligibility
+	// threshold for the shared decodeHuffman driver in
+	// inflate_fast_state.go. The arm64 kernel handles every table size,
+	// so the driver never routes to the Go decoder on table-size grounds.
+	inflateFastMinLitlenBits = 0
+)
 
 //go:noescape
 func inflateHuffmanFastArm64(state *inflateFastState)
 
-func (d *goInflater) decodeHuffman(r *deflateBits, dst []byte, out int) (int, error) {
-	if len(r.src)-r.pos <= deflateFastInputMargin ||
-		len(dst)-out <= deflateFastOutputMargin {
-		return d.decodeHuffmanTail(r, dst, out)
-	}
-
-	state := inflateFastState{
-		src:        unsafe.SliceData(r.src),
-		dst:        unsafe.SliceData(dst),
-		litlen:     &d.litlen[0],
-		offset:     &d.offset[0],
-		bitbuf:     r.buf,
-		nbits:      uint64(r.nbits),
-		pos:        uint64(r.pos),
-		out:        uint64(out),
-		inLimit:    uint64(len(r.src) - deflateFastInputMargin),
-		outLimit:   uint64(len(dst) - deflateFastOutputMargin),
-		litlenMask: bitMask(uint(d.litlenBits)),
-		offsetMask: bitMask(uint(d.offsetBits)),
-		yieldAt:    uint64(out + inflateFastYieldBytes),
-	}
-
-	for {
-		inflateHuffmanFastArm64(&state)
-		if state.status == inflateFastYield {
-			continue
-		}
-
-		r.buf = state.bitbuf
-		r.nbits = uint(state.nbits)
-		r.pos = int(state.pos)
-		out = int(state.out)
-
-		switch state.status {
-		case inflateFastTail:
-			return d.decodeHuffmanTail(r, dst, out)
-		case inflateFastBlockDone:
-			return out, nil
-		case inflateFastBadData:
-			return out, errDeflateBadData
-		default:
-			panic("invalid ARM64 inflate fast-loop status")
-		}
-	}
+// inflateHuffmanFastKernel adapts the shared decodeHuffman driver to the
+// arm64 assembly kernel.
+func inflateHuffmanFastKernel(state *inflateFastState) {
+	inflateHuffmanFastArm64(state)
 }
