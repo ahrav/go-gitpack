@@ -142,10 +142,21 @@ type ScanMeta struct {
 // state internally.
 //
 // Lifetime: the io.Reader passed to ScanBlob is only valid for the duration
-// of the call. Callers must not retain the Reader or its underlying buffer
-// after ScanBlob returns, because the buffer is recycled via a sync.Pool.
-// If the implementation needs to keep blob data beyond the call, it must copy
-// the bytes.
+// of the call, in every scan mode. Implementations must not retain the Reader
+// after ScanBlob returns, and must copy any bytes they need to keep.
+//
+// The reason differs by mode, so do not infer the rule from the mechanism:
+//
+//   - In blob mode (ScanModeBlob) the Reader is a pooled *bytes.Reader that is
+//     reset and re-pointed at another blob's data once ScanBlob returns, so a
+//     retained Reader silently reads unrelated content.
+//   - In hunks mode (ScanModeHunks) the Reader is allocated per hunk and is
+//     not pooled, but a binary hunk's Reader wraps object-store memory the
+//     consumer does not own.
+//
+// The no-retention rule holds in both cases regardless of the allocation
+// strategy behind it. See ScanModeHunks for the reader shapes that mode
+// delivers and their effect on io.Copy consumers.
 type BlobScanner interface {
 	ScanBlob(r io.Reader, meta ScanMeta) error
 }

@@ -35,6 +35,17 @@ const (
 	// for backward compatibility with callers that need line-level
 	// granularity. Prefer ScanModeBlob for new integrations because it
 	// avoids the overhead of diff computation and tree comparison.
+	//
+	// Reader shape: a text hunk arrives as a *bytes.Reader over a buffer of
+	// its lines joined by '\n'. A binary hunk arrives as a *strings.Reader
+	// over the whole payload with no intervening copy, so it aliases
+	// object-store memory. Both expose the same io method set, including
+	// io.WriterTo, but strings.Reader.WriteTo routes through io.WriteString:
+	// when an io.Copy destination does not implement io.StringWriter, the
+	// payload is converted with []byte(s), costing one full-size allocation
+	// and copy per binary hunk. Read-loop consumers and io.StringWriter
+	// sinks avoid that copy; io.Discard is such a sink, so measuring with it
+	// hides the conversion.
 	ScanModeHunks
 )
 

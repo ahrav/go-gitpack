@@ -282,10 +282,19 @@ func (h *Handle) Release() {
 
 // Data returns the cached object data associated with this handle.
 //
-// Lifetime: the returned slice is valid only as long as the Handle has not
-// been released. Once Release() is called, the underlying entry may be
-// evicted and its data buffer reused or garbage-collected. Callers that need
-// the data beyond the Handle's lifetime MUST copy the slice before releasing.
+// Lifetime: the returned slice aliases the entry's buffer, which is immutable
+// and is never written in place, pooled, or otherwise recycled. Eviction and
+// update only drop the window's reference, so a slice obtained from Data stays
+// valid and unchanged for as long as the caller holds it, kept alive by the
+// GC, even after Release. Release ends only this handle's eviction pin.
+//
+// Release does invalidate the Handle itself: the struct returns to a pool and
+// may already describe a different entry, so extract the slice first and call
+// Release afterwards. Never call Data on a released Handle.
+//
+// The zero-copy readers built on this contract depend on the never-recycle
+// half of it: store.get returns this slice to callers that turn it into
+// unsafe.String views (see btostr) and retain them for a whole scan.
 func (h *Handle) Data() []byte { return h.data }
 
 // acquire attempts to return a handle to the cached data for the given
@@ -352,6 +361,9 @@ func (w *refCountedDeltaWindow) add(oid Hash, buf []byte, objType ObjectType) er
 	if entry, ok := w.index[oid]; ok {
 		oldSize := entry.size
 
+		// Swap the pointer; never copy into the old buffer. Slices returned
+		// by earlier Data calls, and the unsafe.String views built on them,
+		// alias it and must stay stable. Leave the old buffer to the GC.
 		entry.data = buf
 		entry.size = len(buf)
 		entry.typ = objType
@@ -384,6 +396,11 @@ func (w *refCountedDeltaWindow) add(oid Hash, buf []byte, objType ObjectType) er
 		for entry := w.lru.back(); entry != nil; {
 			if entry.refCnt.Load() == 0 {
 				prev := entry.prev
+				// Eviction drops the reference only. entry.data MUST NOT be
+				// pooled or reused as storage: slices handed out by Data may
+				// still alias it, and consumers hold unsafe.String views over
+				// them with no tracking the window can see. Recycling here
+				// would corrupt those strings silently.
 				w.lru.remove(entry)
 				delete(w.index, entry.oid)
 

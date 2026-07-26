@@ -13,6 +13,7 @@
 package objstore
 
 import (
+	"bytes"
 	cryptorand "crypto/rand"
 	"fmt"
 	"math/rand/v2"
@@ -21,6 +22,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/stretchr/testify/assert"
@@ -60,8 +62,13 @@ func testCoreFunctionality(t *testing.T) {
 		require.True(t, ok, "acquire should succeed for a recently added object")
 		assert.Equal(t, data, h.Data(), "Data() should return the original data")
 
+		// Extract before releasing: the Handle returns to a pool on Release
+		// and may then describe another entry, so calling Data() on it is a
+		// race. The slice taken beforehand stays valid, which is the
+		// never-recycle half of the Data() contract.
+		view := h.Data()
 		h.Release()
-		assert.Equal(t, data, h.Data(), "Handle's data should remain valid after Release")
+		assert.Equal(t, data, view, "a slice taken from Data must stay valid after Release")
 
 		h2, ok := w.acquire(oid)
 		require.True(t, ok, "should be able to re-acquire object after release")
@@ -89,6 +96,56 @@ func testCoreFunctionality(t *testing.T) {
 		defer h.Release()
 
 		assert.Equal(t, []byte("Xriginal"), h.Data(), "cache data should reflect external changes to the source slice")
+	})
+
+	// TestReleasedViewsAreNeverRecycled pins the never-recycle half of the
+	// Data() contract. store.get returns a Data() slice to callers that build
+	// unsafe.String views over it (btostr) and keep them for a whole scan, so
+	// neither an update nor an eviction may write into or hand out a buffer a
+	// released view still aliases. Recycling evicted buffers is a tempting
+	// optimization -- deltaArenaFreeList already does it for arenas -- and it
+	// would corrupt those strings silently rather than failing loudly.
+	t.Run("Released Views Are Never Recycled", func(t *testing.T) {
+		w := newRefCountedDeltaWindow()
+
+		// An update must swap the pointer, not write through the old array.
+		stable := makeHash("stable")
+		require.NoError(t, w.add(stable, []byte("original-contents"), ObjBlob))
+		h, ok := w.acquire(stable)
+		require.True(t, ok, "acquire should succeed")
+		view := h.Data()
+		h.Release()
+
+		require.NoError(t, w.add(stable, []byte("updated!-contents"), ObjBlob))
+		assert.Equal(t, "original-contents", string(view),
+			"an in-place update mutated a buffer still aliased by a released view")
+
+		// An evicted buffer must never reappear as backing storage.
+		w2 := newRefCountedDeltaWindow()
+		w2.budget = 4096
+		evictee := makeHash("evictee")
+		require.NoError(t, w2.add(evictee, bytes.Repeat([]byte{0xAB}, 512), ObjBlob))
+		he, ok := w2.acquire(evictee)
+		require.True(t, ok, "acquire should succeed")
+		evictedView := he.Data()
+		evictedPtr := unsafe.SliceData(evictedView)
+		he.Release()
+
+		for i := range 64 {
+			_ = w2.add(makeHash(fmt.Sprintf("churn-%d", i)), bytes.Repeat([]byte{byte(i)}, 512), ObjBlob)
+		}
+
+		assert.Equal(t, bytes.Repeat([]byte{0xAB}, 512), evictedView,
+			"an evicted buffer was recycled and rewritten under a released view")
+
+		// Catches a free-list even before it writes. A recycler that hands
+		// buffers between windows would evade this but not the check above.
+		w2.mu.Lock()
+		for _, e := range w2.index {
+			assert.NotSame(t, evictedPtr, unsafe.SliceData(e.data),
+				"the window reused an evicted buffer as backing storage")
+		}
+		w2.mu.Unlock()
 	})
 }
 
