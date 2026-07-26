@@ -114,7 +114,9 @@ type HistoryScanner struct {
 
 	// treeOIDs memoizes commit OID -> root tree OID. Every commit header
 	// is otherwise inflated twice per scan: once when the walk visits the
-	// commit and once when its child resolves firstParentTree.
+	// commit and once when its child resolves firstParentTree. The memo is
+	// scoped to one walk: each scan entry point clears it on return so a
+	// long-lived scanner does not hold O(commit-count) memory.
 	treeOIDs sync.Map
 
 	// profiling holds optional profiling configuration.
@@ -159,6 +161,33 @@ func (e *ScanError) Error() string {
 // ErrCommitGraphRequired is kept for backward compatibility.
 // HistoryScanner now always builds commit metadata in memory from ref walks.
 var ErrCommitGraphRequired = errors.New("commit‑graph required but not found")
+
+// WithOffsetCacheBudget bounds the bytes of materialized pack objects the
+// scanner's (pack, offset) cache may retain (default 256 MiB). Each scanner
+// owns an independent cache, so processes that open many repositories
+// concurrently should lower the budget to bound aggregate memory growth.
+// A budget <= 0 disables the cache entirely.
+func WithOffsetCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.store.offCache.setBudget(bytes)
+	}
+}
+
+// WithPairCacheBudget bounds the bytes of computed diff hunks the scanner's
+// (oldOID, newOID) memo may retain (default 128 MiB). Each scanner owns an
+// independent cache, so processes that open many repositories concurrently
+// should lower the budget to bound aggregate memory growth. A budget <= 0
+// disables the memo entirely: every pair is recomputed.
+//
+// Disabling costs throughput on histories with merges — the memo exists
+// because ~1/3 of pair diffs in a typical walk are repeats — but it does not
+// change delivered hunks or their retention: a hunk's lines are compacted into
+// their own buffer whether or not the memo stores them.
+func WithPairCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.pairs.setBudget(bytes)
+	}
+}
 
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
@@ -228,6 +257,9 @@ func (h *HunkAddition) String() string {
 }
 
 // Lines returns all added lines without leading '+' markers.
+//
+// The returned slice and its strings are shared with internal caches and
+// other deliveries of the same content; callers must not modify them.
 func (h *HunkAddition) Lines() []string { return h.lines }
 
 // StartLine returns the first line number (1‑based) of the hunk.
@@ -249,31 +281,62 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // DiffHistoryHunks streams every added hunk from all commits, diffing each
 // commit against its first parent only (i.e. merge commits are treated as a
 // single diff against the first parent, matching `git log --first-parent`
-// semantics). This keeps output deterministic and avoids duplicate hunks from
-// merge base reconstruction.
+// semantics). This avoids duplicate hunks from merge base reconstruction.
 //
 // It returns two buffered channels: one for HunkAddition values and one for a
-// single error. The function never blocks the caller; all writes to the
-// channels are non-blocking.
+// single error.
 //
 // Goroutine ownership: DiffHistoryHunks spawns a background goroutine that
 // owns the returned channels and closes them when the walk completes. The
-// caller MUST drain the HunkAddition channel to completion (or read until the
-// errC channel delivers a value) to avoid leaking goroutines. Failing to
-// drain will block the internal worker pool indefinitely.
+// caller MUST drain the HunkAddition channel to completion. Draining is what
+// lets the walk finish: the forwarding send has no escape from a full queue,
+// so errC delivers its single value only after every produced hunk has been
+// forwarded. Waiting on errC without draining the hunk channel deadlocks as
+// soon as the queue fills, and abandoning the drain blocks the internal worker
+// pool indefinitely.
 //
-// The HunkAddition channel is buffered to runtime.NumCPU() to allow workers
-// to make progress without waiting for the consumer on every hunk. The errC
-// channel is buffered to 1 so the producer goroutine can always send its
-// final error without blocking.
+// The HunkAddition channel holds one slot per blob worker, so a worker can
+// deposit its current hunk and start its next diff without a rendezvous with
+// the consumer, and the queue buffers nothing beyond that. A buffered hunk
+// retains its own line bytes and nothing beyond them (see pairCache.add), so
+// the queue pins the payload in flight rather than the decompressed blobs the
+// hunks were diffed from. The errC channel is buffered to 1 so the producer
+// goroutine can always send its final error without blocking.
+//
+// Memory bound: the queue is bounded in hunk COUNT, not in bytes. Worst-case
+// in-flight payload is approximately (queue depth + blobWorkers +
+// consumer-held) times the per-hunk payload ceiling, and that ceiling is
+// MaxDiffSize because a whole-file addition or a binary result carries the
+// entire blob as its payload. The queue is not the dominant term: a queue slot
+// holds one finished hunk, while each blob worker holds the hunks it just
+// produced plus the decompressed blobs it diffed them from.
+// DiffHistoryHunksFunc removes the queue term and only that term — the
+// blob-worker term follows from the pipeline width — so it is the API for
+// callers who want no queue between a worker and the consumer. Neither API
+// lets a caller measure a hunk's retained payload: compactHunks gives all
+// hunks of one pair a single shared backing array, so the lengths reported by
+// Lines() do not sum to the bytes retained.
+//
+// Ordering: hunks for one (commit, path) pair are produced in ascending line
+// order by a single blob worker, but that worker's sends interleave with every
+// other worker's, so a pair's hunks are not contiguous in the stream. No order
+// is guaranteed across files or commits. A consumer that groups by
+// (commit, path) must key on the pair rather than flush on key change;
+// DiffHistoryHunksFunc delivers a pair's hunks back to back and is the API for
+// consumers that need that.
+//
+// Hunk lines may be shared with internal caches and other deliveries of the
+// same content; callers must treat Lines() as read-only.
 //
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
-	// A deep output buffer decouples producer bursts (a whale commit can
-	// emit tens of thousands of hunks) from consumer scheduling; at ~100
-	// bytes per HunkAddition header the buffer costs single-digit MiB and
-	// removes the futex traffic that a small buffer caused.
-	out := make(chan HunkAddition, 16384)
+	// One slot per blob worker: DiffHistoryHunksFunc runs runtime.NumCPU blob
+	// workers, and a slot each lets every worker deposit its current hunk and
+	// resume its next diff without a rendezvous with the consumer. The queue
+	// buffers nothing beyond that. What it can pin is the sum of the buffered
+	// hunks' retained line bytes; see the memory-bound paragraph on the method
+	// for the byte consequence and for the API that avoids the queue entirely.
+	out := make(chan HunkAddition, runtime.NumCPU())
 	errC := make(chan error, 1)
 
 	go func() {
@@ -298,10 +361,43 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // consumer goroutine, this eliminates the channel hand-off entirely and
 // lets hunk processing scale across every worker — the preferred API for
 // CPU-bound consumers.
+//
+// Ordering: fn receives the hunks for one (commit, path) pair sequentially
+// in ascending line order. No order is guaranteed across files or commits.
+//
+// Hunk lines may be shared with internal caches and other deliveries of the
+// same content; fn must treat HunkAddition.Lines() as read-only.
+//
+// A nil fn is rejected before any worker starts. The workers call fn without
+// a nil check on the hot path, so admitting one would surface as a panic in a
+// worker goroutine — unrecoverable for the calling process — rather than as
+// this method's error return.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
-	numWorkers := runtime.NumCPU()
+	if fn == nil {
+		return errors.New("DiffHistoryHunksFunc: fn must not be nil")
+	}
+
+	// Stage widths. Stage 2 gets one worker per CPU because it carries the
+	// expensive work (blob inflation plus line diff); stage 1 runs at half
+	// that. Two independent constraints set the stage-1 width and both point
+	// the same way. Tree diffing is cheap relative to blob diffing, so stage 1
+	// keeps stage 2 fed at a fraction of its width. And every worker that sits
+	// inside a multi-hop delta resolution holds a 32 MiB ping-pong arena:
+	// only a fraction of the workers are in that state at any instant, which
+	// is why the arena free-list can be smaller than the total worker count —
+	// but once the instantaneous holder count crosses deltaArenaMaxRetained the
+	// free-list drops arenas on release and re-allocates (and re-zeroes) one on
+	// the next acquisition, which is the cost that free-list exists to remove.
+	// Widening a stage therefore buys throughput with retained arena bytes and,
+	// past that ceiling, with allocation churn.
+	blobWorkers := runtime.NumCPU()
+	treeWorkers := max(2, blobWorkers/2)
 
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
+	// The tree memo only pays off while this walk resolves first-parent
+	// trees; dropping it here keeps the scanner's steady-state memory
+	// independent of history size.
+	defer hs.treeOIDs.Clear()
 
 	if err := hs.startProfiling(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
@@ -320,10 +416,9 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// (cheap) and fans out per-file blob pairs; stage 2 computes hunks
 		// (expensive: inflation + line diff) at blob-pair granularity, which
 		// spreads a whale commit across every worker.
-		// workChan is deep because the commit-walk's visit callback sends
-		// here while holding the walk's internal visit mutex: if the send
-		// blocks, every walk worker serializes behind it. A few thousand
-		// commitInfo headers (~100 bytes each) buy full walk/tree-stage
+		// workChan is deep so that the walk's visit callback, which runs on
+		// a walk worker, hands off without waiting on the tree stage: a few
+		// thousand commitInfo headers (~100 bytes each) buy full walk/tree
 		// decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
 		blobChan := make(chan blobPairWork, 4096)
@@ -344,7 +439,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			})
 		}
 
-		for range numWorkers {
+		for range treeWorkers {
 			treeWG.Add(1)
 			go func() {
 				defer treeWG.Done()
@@ -376,7 +471,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			}()
 		}
 
-		for range numWorkers {
+		for range blobWorkers {
 			blobWG.Add(1)
 			go func() {
 				defer blobWG.Done()
@@ -486,6 +581,12 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 		if !isBlobMode(mode) {
 			return nil
 		}
+		// Deletions (zero new OID) and identity pairs produce no added
+		// hunks; dropping them here saves a stage-2 hand-off and a
+		// permanent cache entry per distinct deleted blob.
+		if newH.IsZero() || newH == old {
+			return nil
+		}
 		select {
 		case <-stopCh:
 			return errScanAborted
@@ -503,12 +604,15 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 	pk := makePairKey(work.oldOID, work.newOID)
 	hunks, cached := hs.pairs.get(pk)
 	if !cached {
-		var err error
-		hunks, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
+		computed, err := computeAddedHunks(hs.store, work.oldOID, work.newOID)
 		if err != nil {
 			return fmt.Errorf("compute added hunks: %w", err)
 		}
-		hs.pairs.add(pk, hunks)
+		// Deliver what the cache hands back, not what computeAddedHunks
+		// produced: the computed Lines are zero-copy views into the whole
+		// decompressed new blob, so a HunkAddition built from them keeps
+		// that blob alive for as long as any consumer holds the hunk.
+		hunks = hs.pairs.add(pk, computed)
 	}
 
 	for _, hunk := range hunks {
@@ -532,10 +636,8 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 			continue
 		}
 
-		// Emit each hunk on its own; fusing a single hunk is a no-op
-		// (fuseHunks leaves slices shorter than 2 unchanged). Cross-hunk
-		// fusion, if ever wanted, must run over the whole per-file hunk
-		// slice instead.
+		// Emit each hunk exactly as computeAddedHunks produced it;
+		// adjacent hunks are not merged.
 		if err := fn(HunkAddition{
 			commit:    work.commit,
 			path:      filepath.ToSlash(work.path),
@@ -572,7 +674,16 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 
 // Close releases any mmap handles or file descriptors held by the scanner.
 // It is idempotent; subsequent calls are no‑ops.
-func (hs *HistoryScanner) Close() error { return hs.store.Close() }
+//
+// The pair cache is cleared as well. Callers may retain a HistoryScanner value
+// after Close, and a hunk scan leaves that cache holding up to its full budget
+// of hunk lines — plus, for whole-blob entries, the object buffers those lines
+// view — which would otherwise stay reachable until the scanner itself does.
+// This mirrors store.Close releasing the offset cache's object bytes.
+func (hs *HistoryScanner) Close() error {
+	hs.pairs.clear()
+	return hs.store.Close()
+}
 
 // CommitMetadata bundles the author identity and commit timestamp for a single
 // commit.
