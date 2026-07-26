@@ -650,6 +650,15 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 	// avoid retaining one work record per file.
 	if parentTree.IsZero() {
 		return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+			// Ahead of the filters, matching the non-root and replay
+			// callbacks: entries that fall out here never reach emit, so
+			// without this a tree of nothing but gitlinks would traverse to
+			// completion after another worker had already failed.
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
+			}
 			if !isBlobMode(mode) || old == newH || newH.IsZero() {
 				return nil
 			}

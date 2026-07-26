@@ -215,6 +215,47 @@ func TestDiffHistoryHunks_ExactOIDMoveSuppressedAcrossPermissionChange(t *testin
 	require.Len(t, got, 1)
 }
 
+// The root/shallow fast path emits during the walk, so its only channel send is
+// inside emit. An entry the mode filter rejects never reaches emit, which is why
+// the cancellation check has to sit ahead of that filter: a tree of nothing but
+// gitlinks would otherwise traverse to completion after another worker had
+// already failed. stopCh is closed before the call so this is deterministic
+// rather than a race.
+func TestEmitCommitBlobPairs_RootWalkAbortsOnNonBlobEntries(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	// A gitlink is the one entry kind that reaches the callback and is then
+	// rejected by isBlobMode; walkDiff recurses into trees rather than
+	// reporting them. Staged via plumbing so no real submodule is needed.
+	runGit(t, repo, "update-index", "--add", "--cacheinfo",
+		"160000,1111111111111111111111111111111111111111,sub")
+	runGit(t, repo, "commit", "-m", "gitlink-only root", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+	require.Len(t, commits, 1)
+	root := commits[0]
+	require.Empty(t, root.ParentOIDs, "fixture must be a root commit to take the zero-parent path")
+
+	stopCh := make(chan struct{})
+	close(stopCh)
+
+	// Buffered so a hypothetical emit could not block; the walk must abort
+	// before producing anything regardless.
+	blobs := make(chan blobPairWork, 8)
+	err = scanner.emitCommitBlobPairs(root, Hash{}, blobs, stopCh)
+
+	require.ErrorIs(t, err, errScanAborted,
+		"a cancelled root walk must abort even when every entry is filtered out")
+	require.Empty(t, blobs, "no work should be emitted after cancellation")
+}
+
 type hunkAttribution struct {
 	commit Hash
 	path   string

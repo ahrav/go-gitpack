@@ -287,9 +287,15 @@ func BenchmarkDiffHistoryHunksColdRootHeavy(b *testing.B) {
 				if err != nil {
 					b.Fatalf("scan: %v", err)
 				}
-				// fileCount adds in the root commit plus one modification.
-				if got := count.Load(); got < int64(tc.fileCount) {
-					b.Fatalf("saw %d hunks, want at least %d", got, tc.fileCount)
+				// The fixture is deterministic: fileCount additions in the
+				// root commit plus one hunk for the trailing modification.
+				// Assert the exact count -- a lower bound of fileCount would
+				// also accept fileCount, so a regression that dropped all
+				// non-root modification work would pass here while reporting
+				// an artificially faster number.
+				want := int64(tc.fileCount + 1)
+				if got := count.Load(); got != want {
+					b.Fatalf("saw %d hunks, want %d", got, want)
 				}
 				if first := firstHunk.Load(); first >= 0 {
 					firstHunkTotal += first

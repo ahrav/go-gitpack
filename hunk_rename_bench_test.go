@@ -21,12 +21,14 @@
 // cost of handling them is measured by none of them. The fixtures below supply
 // both, plus a modification-only control.
 //
-// Cache state brackets the answer instead of picking one number. A rename's
+// Memo state brackets the answer instead of picking one number. A rename's
 // added side carries the same (zero, newOID) pair key as the original addition
-// of that content, so a warm diff memo serves it and only the delivery remains,
-// while a cold memo pays the full inflate-and-tokenize. Cold is therefore the
-// upper bound on what stage-1 filtering can save and Warm the lower bound; a
-// real repository sits between them.
+// of that content, so a populated diff memo serves it and only the delivery
+// remains, while an empty memo pays the full tokenize-and-diff -- reading its
+// blobs back from the store's object caches, which stay warm in both states
+// (see runHunkStageBench, which explains why and what that excludes). NoMemo is
+// therefore the upper bound on what stage-1 filtering can save and Memo the
+// lower bound; a real repository sits between them.
 //
 // hunks/op and linebytes/op are reported next to time because the three classes
 // differ in how many hunks they emit. Two runs are a like-for-like speed
@@ -208,20 +210,38 @@ func BenchmarkDiffHistoryHunksStage(b *testing.B) {
 
 // runHunkStageBench scans gitDir under both memo states.
 //
-// Cold disables both memos, so every timed iteration re-walks, re-inflates and
-// re-diffs. Disabling the memos is preferred over building a fresh
-// HistoryScanner per iteration: that would put index mapping inside the timed
-// region, and b.Loop must not be mixed with manual StopTimer/StartTimer.
-// The offset cache has to go with it, since it holds materialized objects and
-// would otherwise serve these fixtures' blobs from memory.
+// The two states vary the DIFF MEMO ONLY, which is why they are named for it.
+// NoMemo zeroes the pair-cache and offset-cache budgets, so every timed
+// iteration re-walks the trees and re-diffs every pair. The offset cache goes
+// with the pair memo because it holds materialized objects and would otherwise
+// serve these fixtures' blobs straight back.
+//
+// What the states do NOT vary is the store's OID-keyed object caches. The ARC
+// (16K entries) and the delta window (32 MiB over 64 shards) have no budget
+// option, both dwarf a 1000x2 KiB fixture, and both sit ahead of inflation in
+// store.get. The untimed priming scan below fills them, so NEITHER state
+// re-inflates: purging just the ARC between iterations makes the identical
+// NoMemo scan ~37% slower, which is only possible if it was reading through
+// that cache inside the timed region.
+//
+// That is deliberate, not an oversight. Holding inflation constant across both
+// arms is what makes the delta attributable to the memo alone, and it is the
+// reason a single scanner is reused: a fresh HistoryScanner per iteration would
+// pull index mapping into the timed region (~5x the allocations here) and swamp
+// the signal this benchmark exists to isolate. For a genuinely cold end-to-end
+// scan, including index mapping and real inflation, see
+// BenchmarkDiffHistoryHunksColdRootHeavy and
+// BenchmarkDiffHistoryHunksColdNonRootAddHeavy in emit_blob_pairs_bench_test.go,
+// which do build a fresh scanner per iteration. Do not read a number from here
+// as a cold-cache cost.
 func runHunkStageBench(b *testing.B, gitDir string) {
 	states := []struct {
 		name         string
 		pairBudget   int
 		offsetBudget int
 	}{
-		{name: "Cold", pairBudget: 0, offsetBudget: 0},
-		{name: "Warm", pairBudget: defaultPairCacheBudget, offsetBudget: defaultOffsetCacheBudget},
+		{name: "NoMemo", pairBudget: 0, offsetBudget: 0},
+		{name: "Memo", pairBudget: defaultPairCacheBudget, offsetBudget: defaultOffsetCacheBudget},
 	}
 
 	for _, st := range states {
