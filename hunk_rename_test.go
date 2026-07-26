@@ -2,18 +2,14 @@ package objstore
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestDiffHistoryHunks_ExactOIDRenameDoesNotEmitAddition(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git executable not found in PATH")
-	}
+	requireGit(t)
 
 	repo := t.TempDir()
 	runGit(t, repo, "init", "--quiet")
@@ -27,12 +23,151 @@ func TestDiffHistoryHunks_ExactOIDRenameDoesNotEmitAddition(t *testing.T) {
 	require.NoError(t, err)
 	defer scanner.Close()
 
+	root, rename := twoCommitHistoryOIDs(t, scanner)
+	got := collectAttributedHunks(t, scanner)
+
+	require.Len(t, got, 1)
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "old.txt"}], "same bytes")
+	require.Empty(t, got[hunkAttribution{commit: rename, path: "new.txt"}],
+		"exact-OID rename should not become a full-file addition")
+}
+
+func TestDiffHistoryHunks_ExactOIDDeletionSuppressesOnlyOneAddition(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	content := []byte("same bytes\n")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "source.txt"), content, 0o644))
+	runGit(t, repo, "add", "source.txt")
+	runGit(t, repo, "commit", "-m", "add source", "--quiet")
+
+	require.NoError(t, os.Remove(filepath.Join(repo, "source.txt")))
+	for _, path := range []string{"copy-a.txt", "copy-b.txt"} {
+		require.NoError(t, os.WriteFile(filepath.Join(repo, path), content, 0o644))
+	}
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "rename and copy", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	root, renameAndCopy := twoCommitHistoryOIDs(t, scanner)
+	got := collectAttributedHunks(t, scanner)
+
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "source.txt"}], "same bytes")
+	require.Empty(t, got[hunkAttribution{commit: renameAndCopy, path: "source.txt"}])
+
+	survivors := 0
+	for _, path := range []string{"copy-a.txt", "copy-b.txt"} {
+		hunks := got[hunkAttribution{commit: renameAndCopy, path: path}]
+		if len(hunks) == 0 {
+			continue
+		}
+		requireHunkLines(t, hunks, "same bytes")
+		survivors++
+	}
+	require.Equal(t, 1, survivors, "one deletion must suppress exactly one same-OID addition")
+	require.Len(t, got, 2, "expected the root addition and one surviving copy addition")
+}
+
+func TestDiffHistoryHunks_DeletionOnlyDoesNotEmitHunk(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	path := filepath.Join(repo, "gone.txt")
+	require.NoError(t, os.WriteFile(path, []byte("removed later\n"), 0o644))
+	runGit(t, repo, "add", "gone.txt")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+	require.NoError(t, os.Remove(path))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "delete", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	root, deletion := twoCommitHistoryOIDs(t, scanner)
+	got := collectAttributedHunks(t, scanner)
+
+	require.Len(t, got, 1)
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "gone.txt"}], "removed later")
+	require.Empty(t, got[hunkAttribution{commit: deletion, path: "gone.txt"}],
+		"a deletion-only commit has no added hunk")
+}
+
+func TestDiffHistoryHunks_ModificationStillEmitsAddedLine(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	path := filepath.Join(repo, "modified.txt")
+	require.NoError(t, os.WriteFile(path, []byte("existing line\n"), 0o644))
+	runGit(t, repo, "add", "modified.txt")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+	require.NoError(t, os.WriteFile(path, []byte("existing line\nadded line\n"), 0o644))
+	runGit(t, repo, "add", "modified.txt")
+	runGit(t, repo, "commit", "-m", "modify", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	root, modification := twoCommitHistoryOIDs(t, scanner)
+	got := collectAttributedHunks(t, scanner)
+
+	require.Len(t, got, 2)
+	requireHunkLines(t, got[hunkAttribution{commit: root, path: "modified.txt"}], "existing line")
+	requireHunkLines(t, got[hunkAttribution{commit: modification, path: "modified.txt"}], "added line")
+}
+
+type hunkAttribution struct {
+	commit Hash
+	path   string
+}
+
+func collectAttributedHunks(t *testing.T, scanner *HistoryScanner) map[hunkAttribution][]HunkAddition {
+	t.Helper()
 	hunks, errC := scanner.DiffHistoryHunks()
-	paths := make(map[string]int)
-	for h := range hunks {
-		paths[h.Path()]++
+	got := make(map[hunkAttribution][]HunkAddition)
+	for hunk := range hunks {
+		key := hunkAttribution{commit: hunk.Commit(), path: hunk.Path()}
+		got[key] = append(got[key], hunk)
 	}
 	require.NoError(t, <-errC)
-	assert.Equal(t, 1, paths["old.txt"], "root add should still be reported")
-	assert.Zero(t, paths["new.txt"], "exact-OID rename should not become a full-file addition")
+	return got
+}
+
+func twoCommitHistoryOIDs(t *testing.T, scanner *HistoryScanner) (root, child Hash) {
+	t.Helper()
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+	require.Len(t, commits, 2)
+
+	var childParent Hash
+	for _, commit := range commits {
+		switch len(commit.ParentOIDs) {
+		case 0:
+			require.True(t, root.IsZero(), "history has multiple root commits")
+			root = commit.OID
+		case 1:
+			require.True(t, child.IsZero(), "history has multiple non-root commits")
+			child = commit.OID
+			childParent = commit.ParentOIDs[0]
+		default:
+			t.Fatalf("commit %s has %d parents, want at most one", commit.OID, len(commit.ParentOIDs))
+		}
+	}
+	require.False(t, root.IsZero(), "root commit not found")
+	require.False(t, child.IsZero(), "child commit not found")
+	require.Equal(t, root, childParent, "non-root commit does not descend from root")
+	return root, child
+}
+
+func requireHunkLines(t *testing.T, hunks []HunkAddition, want ...string) {
+	t.Helper()
+	require.Len(t, hunks, 1)
+	require.Equal(t, want, hunks[0].Lines())
 }

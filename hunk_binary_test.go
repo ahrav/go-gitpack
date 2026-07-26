@@ -35,16 +35,34 @@ func TestScanHunks_BinaryPayloadIsPassedIntact(t *testing.T) {
 	assert.True(t, bytes.Equal(want, rec.items[0].data), "binary hunk payload changed")
 }
 
+func TestRunGitIgnoresHostileGlobalCommitSigning(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	home := t.TempDir()
+	missingGPG := filepath.Join(home, "missing-gpg")
+	globalConfig := []byte("[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = " + missingGPG + "\n")
+	require.NoError(t, os.WriteFile(filepath.Join(home, ".gitconfig"), globalConfig, 0o644))
+	hostileEnv := []string{"HOME=" + home, "XDG_CONFIG_HOME=" + home}
+
+	repo := t.TempDir()
+	runGitEnv(t, repo, hostileEnv, "init", "--quiet")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "file.txt"), []byte("content\n"), 0o644))
+	runGitEnv(t, repo, hostileEnv, "add", "file.txt")
+	runGitEnv(t, repo, hostileEnv, "commit", "-m", "must not sign", "--quiet")
+}
+
 func runGit(t *testing.T, repo string, args ...string) {
+	t.Helper()
+	runGitEnv(t, repo, nil, args...)
+}
+
+func runGitEnv(t *testing.T, repo string, extraEnv []string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = repo
-	cmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=t",
-		"GIT_AUTHOR_EMAIL=t@example.com",
-		"GIT_COMMITTER_NAME=t",
-		"GIT_COMMITTER_EMAIL=t@example.com",
-	)
+	cmd.Env = append(gitFixtureEnv(), extraEnv...)
 	out, err := cmd.CombinedOutput()
 	require.NoErrorf(t, err, "git %v failed: %s", args, string(out))
 }
