@@ -18,11 +18,14 @@ import (
 // pairCacheShards spreads pair lookups across independent locks.
 const pairCacheShards = 32
 
-// pairCacheBudget bounds the bytes retained across all shards. Entries are
-// compacted copies (see add) and every component of an entry's footprint —
-// text bytes, per-line string headers, per-hunk and per-entry overhead — is
-// charged, so the accounted size tracks actual retention.
-const pairCacheBudget = 128 << 20
+// defaultPairCacheBudget bounds the bytes retained across all shards of one
+// scanner's pair cache. Entries are compacted copies (see add) and every
+// component of an entry's footprint — text bytes, per-line string headers,
+// per-hunk and per-entry overhead — is charged, so the accounted size tracks
+// actual retention. Each scanner owns an independent cache, so processes that
+// open many repositories concurrently should lower the budget via
+// WithPairCacheBudget to bound aggregate growth.
+const defaultPairCacheBudget = 128 << 20
 
 // pairCacheHunkOverhead approximates the per-hunk cost beyond line bytes:
 // the AddedHunk struct and its Lines slice header.
@@ -62,18 +65,82 @@ type pairCacheEntry struct {
 // their Lines. An entry's line bytes are owned by the entry unless they
 // already span the whole new blob (see add), in which case they view the
 // store's immutable object buffer. Eviction is approximate (map-order) like
-// offsetCache.
+// offsetCache. A zero budgetPerShard turns the memo off without changing what
+// add hands back to callers.
 type pairCache struct {
 	shards         [pairCacheShards]pairCacheShard
 	budgetPerShard int
 }
 
 func newPairCache() *pairCache {
-	c := &pairCache{budgetPerShard: pairCacheBudget / pairCacheShards}
+	c := &pairCache{}
 	for i := range c.shards {
 		c.shards[i].m = make(map[pairKey]pairCacheEntry, 128)
 	}
+	// Route through setBudget so the default shares the exact rounding and
+	// disable semantics of WithPairCacheBudget.
+	c.setBudget(defaultPairCacheBudget)
 	return c
+}
+
+// setBudget adjusts the total byte budget across all shards and enforces the
+// new bound before returning: when the budget drops, retained entries are
+// evicted until every shard fits.
+//
+// A budget <= 0 disables the cache: existing entries are dropped and later
+// adds store nothing (gets simply miss). Disabling does not change what a
+// caller receives — add still compacts and returns the owned hunks, because
+// the aliasing views computeAddedHunks produces would otherwise pin a whole
+// blob per delivered hunk whether or not the memo is on.
+//
+// Enforcement here is eager rather than deferred to add because add rejects
+// any entry costing more than a quarter of the per-shard budget. After a large
+// reduction that gate can reject every subsequent entry, so add's eviction loop
+// would never run and a shard could stay above its configured budget for the
+// life of the cache — the one thing a memory bound must not do.
+//
+// budgetPerShard is written without synchronization, so setBudget must run
+// before the cache is visible to concurrent readers and writers —
+// WithPairCacheBudget satisfies this by running during scanner construction.
+// Concurrent callers must synchronize externally.
+func (c *pairCache) setBudget(total int) {
+	if c == nil {
+		return
+	}
+	per := total / pairCacheShards
+	if total <= 0 {
+		per = 0
+	} else if per == 0 {
+		// A positive budget too small to divide across shards still admits
+		// the smallest entries rather than silently disabling the cache.
+		per = 1
+	}
+	c.budgetPerShard = per
+	if per == 0 {
+		// Replacing the maps is cheaper than evicting key by key and drops
+		// the buckets themselves, not just the entries.
+		c.clear()
+		return
+	}
+	c.evictToBudget()
+}
+
+// evictToBudget drops entries from every over-budget shard until it fits.
+// Victim choice is map-order like add's eviction, which is what the cache's
+// approximate-replacement contract already promises.
+func (c *pairCache) evictToBudget() {
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		for key, v := range s.m {
+			if s.used <= c.budgetPerShard {
+				break
+			}
+			delete(s.m, key)
+			s.used -= v.size
+		}
+		s.mu.Unlock()
+	}
 }
 
 func makePairKey(oldOID, newOID Hash) pairKey {
@@ -139,6 +206,12 @@ func (c *pairCache) clear() {
 // and applyDeltaStackCached return a slice whose capacity is the object size,
 // and readLooseObject trims the spare capacity io.ReadAll leaves — so aliasing
 // one retains precisely the bytes the hunk reports.
+//
+// Compaction happens before any admission decision, so a rejected or disabled
+// cache still returns hunks that own their bytes. Callers deliver the returned
+// slice unconditionally; making the copy contingent on admission would let a
+// zero budget — the setting chosen to cap memory — pin one whole blob per
+// in-flight hunk instead.
 func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 	lineBytes := 0
 	lineCount := 0
@@ -156,10 +229,15 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 		stored = compactHunks(hunks, lineBytes)
 	}
 
-	// One giant diff must not evict a whole shard, so it is not stored — but
-	// it is still compacted above and returned: the largest diffs are exactly
-	// the ones whose aliasing views pin the most memory per delivered hunk.
-	if size > c.budgetPerShard/4 {
+	// A disabled cache stores nothing. One giant diff must not evict a whole
+	// shard, so it is not stored either — but both are still compacted above
+	// and returned: the largest diffs are exactly the ones whose aliasing
+	// views pin the most memory per delivered hunk. size is at least
+	// pairCacheEntryOverhead, so a zero budget rejects every entry here even
+	// before the explicit guard, which keeps empty-hunk transitions (nil
+	// results from deletions and mode-only changes) from growing the map
+	// uncharged.
+	if c.budgetPerShard <= 0 || size > c.budgetPerShard/4 {
 		return stored
 	}
 

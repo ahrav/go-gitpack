@@ -173,6 +173,22 @@ func WithOffsetCacheBudget(bytes int) ScannerOption {
 	}
 }
 
+// WithPairCacheBudget bounds the bytes of computed diff hunks the scanner's
+// (oldOID, newOID) memo may retain (default 128 MiB). Each scanner owns an
+// independent cache, so processes that open many repositories concurrently
+// should lower the budget to bound aggregate memory growth. A budget <= 0
+// disables the memo entirely: every pair is recomputed.
+//
+// Disabling costs throughput on histories with merges — the memo exists
+// because ~1/3 of pair diffs in a typical walk are repeats — but it does not
+// change delivered hunks or their retention: a hunk's lines are compacted into
+// their own buffer whether or not the memo stores them.
+func WithPairCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.pairs.setBudget(bytes)
+	}
+}
+
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
 //
