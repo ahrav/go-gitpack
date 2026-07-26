@@ -658,7 +658,16 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 
 // Close releases any mmap handles or file descriptors held by the scanner.
 // It is idempotent; subsequent calls are no‑ops.
-func (hs *HistoryScanner) Close() error { return hs.store.Close() }
+//
+// The pair cache is cleared as well. Callers may retain a HistoryScanner value
+// after Close, and a hunk scan leaves that cache holding up to its full budget
+// of hunk lines — plus, for whole-blob entries, the object buffers those lines
+// view — which would otherwise stay reachable until the scanner itself does.
+// This mirrors store.Close releasing the offset cache's object bytes.
+func (hs *HistoryScanner) Close() error {
+	hs.pairs.clear()
+	return hs.store.Close()
+}
 
 // CommitMetadata bundles the author identity and commit timestamp for a single
 // commit.

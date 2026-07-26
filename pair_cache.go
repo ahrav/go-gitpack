@@ -98,6 +98,22 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 	return e.hunks, ok
 }
 
+// clear drops every cached entry, releasing the retained hunk lines — and the
+// whole-blob buffers the aliasing entries view — to the GC. The cache remains
+// usable afterwards.
+func (c *pairCache) clear() {
+	if c == nil {
+		return
+	}
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		s.m = make(map[pairKey]pairCacheEntry, 128)
+		s.used = 0
+		s.mu.Unlock()
+	}
+}
+
 // add stores hunks under k and returns the slice that callers must hand out
 // to consumers.
 //
@@ -119,9 +135,10 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 // computeAddedHunks' contract rather than from a heuristic — a zero old OID
 // (a file addition) makes every line of the new blob an addition, and a
 // binary result carries the whole new blob as its single line. Blob buffers
-// are exact-sized allocations (readRawObject and applyDeltaStackCached both
-// return a slice whose capacity is the object size), so aliasing one retains
-// precisely the bytes the hunk reports.
+// are exact-sized allocations on every path that produces one — readRawObject
+// and applyDeltaStackCached return a slice whose capacity is the object size,
+// and readLooseObject trims the spare capacity io.ReadAll leaves — so aliasing
+// one retains precisely the bytes the hunk reports.
 func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 	lineBytes := 0
 	lineCount := 0

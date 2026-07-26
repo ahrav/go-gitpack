@@ -8,6 +8,7 @@ package objstore
 
 import (
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
@@ -296,4 +297,107 @@ func TestPairCacheAdd_HeaderHeavyEntryHitsOversizedRejection(t *testing.T) {
 	require.False(t, ok,
 		"an entry whose retention is dominated by line headers must be "+
 			"rejected like any other oversized entry")
+}
+
+// pairCacheEntries counts live entries across every shard.
+func pairCacheEntries(c *pairCache) int {
+	n := 0
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		n += len(s.m)
+		s.mu.Unlock()
+	}
+	return n
+}
+
+// pairCacheUsed sums the accounted bytes across every shard.
+func pairCacheUsed(c *pairCache) int {
+	total := 0
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		total += s.used
+		s.mu.Unlock()
+	}
+	return total
+}
+
+// TestPairCacheClear_DropsEntriesAndUsage covers the reset semantics Close
+// depends on: entries go away, the running total returns to zero, and the cache
+// still accepts writes afterwards.
+func TestPairCacheClear_DropsEntriesAndUsage(t *testing.T) {
+	c := newPairCache()
+	for i := 0; i < 16; i++ {
+		k := makePairKey(testPairHash(byte(i)), testPairHash(byte(i+1)))
+		c.add(k, []AddedHunk{{StartLine: 1, Lines: []string{"line"}}})
+	}
+	if got := pairCacheEntries(c); got == 0 {
+		t.Fatalf("fixture stored nothing")
+	}
+	if got := pairCacheUsed(c); got == 0 {
+		t.Fatalf("fixture charged nothing")
+	}
+
+	c.clear()
+
+	if got := pairCacheEntries(c); got != 0 {
+		t.Errorf("entries after clear = %d, want 0", got)
+	}
+	if got := pairCacheUsed(c); got != 0 {
+		t.Errorf("used after clear = %d, want 0", got)
+	}
+
+	// Still usable: clear replaces the maps rather than nilling them.
+	k := makePairKey(testPairHash(200), testPairHash(201))
+	c.add(k, []AddedHunk{{StartLine: 1, Lines: []string{"after clear"}}})
+	if _, ok := c.get(k); !ok {
+		t.Error("cache did not accept an entry after clear")
+	}
+
+	// A nil cache is a no-op, so Close on a zero-value scanner cannot panic.
+	var nilCache *pairCache
+	nilCache.clear()
+}
+
+// TestHistoryScannerClose_ClearsPairCache asserts Close releases the pair
+// cache. The cache lives for the scanner's lifetime and a hunk scan fills it
+// with hunk lines — plus, for whole-blob entries, the object buffers those
+// lines view — so a caller that retains a closed scanner would otherwise pin
+// up to the full budget indefinitely. store.Close already does this for the
+// offset cache's object bytes.
+func TestHistoryScannerClose_ClearsPairCache(t *testing.T) {
+	scanner := createScannerForRepo(t, "simple-linear")
+
+	// DiffHistoryHunksFunc calls fn concurrently from every blob worker, so
+	// the counter has to be atomic.
+	var hunks atomic.Int64
+	if err := scanner.DiffHistoryHunksFunc(func(HunkAddition) error {
+		hunks.Add(1)
+		return nil
+	}); err != nil {
+		t.Fatalf("DiffHistoryHunksFunc: %v", err)
+	}
+	if hunks.Load() == 0 {
+		t.Fatal("fixture produced no hunks, so the cache was never populated")
+	}
+	if got := pairCacheEntries(scanner.pairs); got == 0 {
+		t.Fatal("expected the hunk scan to populate the pair cache")
+	}
+
+	if err := scanner.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if got := pairCacheEntries(scanner.pairs); got != 0 {
+		t.Errorf("pair cache entries after Close = %d, want 0", got)
+	}
+	if got := pairCacheUsed(scanner.pairs); got != 0 {
+		t.Errorf("pair cache used after Close = %d, want 0", got)
+	}
+
+	// Close is documented as idempotent.
+	if err := scanner.Close(); err != nil {
+		t.Errorf("second Close: %v", err)
+	}
 }

@@ -99,6 +99,28 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 	}
 }
 
+// maxReusedHunkPayloadBytes bounds the capacity scanHunks carries from one
+// hunk to the next. Reuse is what makes the buffer worth having — a history
+// of small hunks assembles every payload into the same array — but a single
+// whole-file or binary hunk can reach MaxDiffSize (1 GiB), and Reset keeps the
+// grown array. Without a cap, one large hunk early in a scan pins its payload
+// until the scan returns, which the per-hunk buffer this replaced did not do.
+// Past the cap the buffer is dropped for the GC: re-allocating for the next
+// hunk is dwarfed by the cost of having diffed a file that large. 4 MiB
+// matches maxPooledLineIndexBytes and the store's maxCacheableSize.
+const maxReusedHunkPayloadBytes = 4 << 20 // 4 MiB
+
+// releaseOversizedPayload drops payload's backing array when it has grown past
+// maxReusedHunkPayloadBytes, reporting whether it did. Callers must have
+// finished reading the assembled bytes: this abandons them to the GC.
+func releaseOversizedPayload(payload *bytes.Buffer) bool {
+	if payload.Cap() <= maxReusedHunkPayloadBytes {
+		return false
+	}
+	*payload = bytes.Buffer{}
+	return true
+}
+
 // scanHunks implements the legacy hunk-based scanning mode.
 //
 // It drives DiffHistoryHunksFunc, so no queue sits between a blob worker and
@@ -108,6 +130,9 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 // BlobScanner permits because an implementation may not retain the reader's
 // bytes past the call, and ScanBlob is handed one hunk at a time to match
 // every other ScanBlob call site in this package.
+//
+// Retention is one payload, not the largest payload the scan has seen: a
+// buffer grown past maxReusedHunkPayloadBytes is released rather than carried.
 //
 // A scan error aborts the walk, and DiffHistoryHunksFunc returns the first
 // error observed, whether it came from a scan or from the walk itself.
@@ -133,7 +158,13 @@ func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
 			Commit: hunk.commit,
 			Path:   hunk.path,
 		}
-		if err := scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta); err != nil {
+		err := scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta)
+
+		// Release an oversized array now that ScanBlob has returned; the
+		// reader handed to it does not outlive the call.
+		releaseOversizedPayload(&payload)
+
+		if err != nil {
 			return fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
 				hunk.commit, hunk.path, hunk.startLine, hunk.endLine, err)
 		}
