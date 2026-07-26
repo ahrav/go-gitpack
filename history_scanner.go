@@ -491,6 +491,13 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 		}
 	}
 
+	// A zero parent tree (root commit, shallow history) has no old side:
+	// every entry is an addition and no deletion can exist, so no rename is
+	// possible. Emitting immediately keeps stage-2 workers fed during the
+	// walk and avoids buffering one blobPairWork per file of what is often
+	// the largest commit in the repository (the initial import).
+	canRename := !parentTree.IsZero()
+
 	var (
 		adds         []blobPairWork
 		deletesByOID map[Hash]int
@@ -510,7 +517,7 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 			}
 			deletesByOID[old]++
 			return nil
-		case old.IsZero():
+		case old.IsZero() && canRename:
 			adds = append(adds, work)
 			return nil
 		default:
