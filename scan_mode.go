@@ -6,10 +6,11 @@
 //   - ScanModeBlob  (default) -- iterates every unique blob introduced across
 //     the commit history in pack-file offset order, yielding the full blob
 //     body exactly once per OID. This is the recommended and fastest path.
-//   - ScanModeHunks (legacy)  -- computes per-commit diffs and yields only the
-//     added-line hunks. Retained for backward compatibility with callers that
-//     require line-level attribution, but significantly slower because it must
-//     diff every parent-child commit pair.
+//   - ScanModeHunks (legacy)  -- computes per-commit diffs and yields added-line
+//     hunks, except for exact-OID moves whose bytes are unchanged. Retained for
+//     backward compatibility with callers that require line-level attribution,
+//     but significantly slower because it must diff every parent-child commit
+//     pair.
 package objstore
 
 import (
@@ -30,10 +31,14 @@ const (
 	ScanModeBlob ScanMode = iota
 
 	// ScanModeHunks is the legacy scanning mode that computes parent-child
-	// diffs for every commit and yields only the added-line hunks. It exists
-	// for backward compatibility with callers that need line-level
-	// granularity. Prefer ScanModeBlob for new integrations because it
-	// avoids the overhead of diff computation and tree comparison.
+	// diffs for every commit and yields added-line hunks. A pure addition is
+	// suppressed when the same commit has an unmatched deletion with the same
+	// blob OID; matching is one-for-one because the content-addressed bytes are
+	// unchanged. Consequently an exact-OID move has no hunk attributed to its
+	// destination path or moving commit. This mode exists for backward
+	// compatibility with callers that need line-level granularity. Prefer
+	// ScanModeBlob for new integrations because it avoids the overhead of diff
+	// computation and tree comparison.
 	//
 	// Reader shape: a text hunk arrives as a *bytes.Reader over a buffer of
 	// its lines joined by '\n'. A binary hunk arrives as a *strings.Reader
@@ -93,8 +98,10 @@ func (hs *HistoryScanner) SetScanMode(mode ScanMode) {
 // scanning. It visits every unique blob exactly once, in pack-offset order,
 // and passes its full content to scanner.ScanBlob.
 //
-// Hunk mode (ScanModeHunks) diffs each commit against its parent and yields
-// only the added lines. It is retained for backward compatibility.
+// Hunk mode (ScanModeHunks) diffs each commit against its first parent and
+// yields added lines. It applies ScanModeHunks' one-for-one exact-OID move
+// suppression, so unchanged bytes are not re-attributed to the destination
+// path or moving commit. It is retained for backward compatibility.
 func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 	if scanner == nil {
 		return fmt.Errorf("scanner is nil")
