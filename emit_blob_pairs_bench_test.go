@@ -22,6 +22,9 @@
 //     "first-work-ns" (how long stage 2 waits for its first unit of work).
 //   - BenchmarkDiffHistoryHunksColdRootHeavy runs the full pipeline on a
 //     fresh scanner per iteration and reports ns/op plus "first-hunk-ns".
+//   - BenchmarkDiffHistoryHunksColdNonRootAddHeavy runs the bounded and replay
+//     non-root cases through the full pipeline and reports
+//     "bulk-first-hunk-ns" for the add-heavy child commit.
 //
 // File contents are unique per path so no two additions share an OID and the
 // pair memo cannot collapse stage-2 work.
@@ -296,6 +299,76 @@ func BenchmarkDiffHistoryHunksColdRootHeavy(b *testing.B) {
 			}
 			if iters > 0 {
 				b.ReportMetric(float64(firstHunkTotal)/float64(iters), "first-hunk-ns")
+			}
+		})
+	}
+}
+
+// BenchmarkDiffHistoryHunksColdNonRootAddHeavy adjudicates the full-pipeline
+// time, allocation, and target-commit latency tradeoff between the bounded
+// single-walk path (4096 additions) and replay (16384 additions). Each timed
+// iteration uses a fresh scanner so pair and tree caches cannot carry over.
+//
+// The fixture's seed root also emits a hunk. "bulk-first-hunk-ns" therefore
+// waits specifically for the first concurrent callback attributed to the bulk
+// child commit instead of measuring whichever commit happens to emit first.
+func BenchmarkDiffHistoryHunksColdNonRootAddHeavy(b *testing.B) {
+	fx := newHunkBenchFixtures(b.TempDir())
+
+	for _, fileCount := range []int{4096, 16384} {
+		b.Run(fmt.Sprintf("%dfiles_64B", fileCount), func(b *testing.B) {
+			gitDir := nonRootAddHeavyRepo(b, fx, fileCount, 64)
+
+			setupScanner, err := NewHistoryScanner(gitDir)
+			if err != nil {
+				b.Fatalf("open setup scanner: %v", err)
+			}
+			bulkCommit, _ := nonRootCommitOf(b, setupScanner)
+			if err := setupScanner.Close(); err != nil {
+				b.Fatalf("close setup scanner: %v", err)
+			}
+			bulkOID := bulkCommit.OID
+
+			var bulkFirstHunkTotal, iters int64
+			b.ReportAllocs()
+			for b.Loop() {
+				hs, err := NewHistoryScanner(gitDir)
+				if err != nil {
+					b.Fatalf("open scanner: %v", err)
+				}
+
+				var count atomic.Int64
+				var bulkSeen atomic.Bool
+				var bulkFirstHunk atomic.Int64
+				start := time.Now()
+				scanErr := hs.DiffHistoryHunksFunc(func(h HunkAddition) error {
+					count.Add(1)
+					if h.Commit() == bulkOID &&
+						!bulkSeen.Load() && bulkSeen.CompareAndSwap(false, true) {
+						bulkFirstHunk.Store(int64(time.Since(start)))
+					}
+					return nil
+				})
+				closeErr := hs.Close()
+				if scanErr != nil {
+					b.Fatalf("scan: %v", scanErr)
+				}
+				if closeErr != nil {
+					b.Fatalf("close scanner: %v", closeErr)
+				}
+
+				want := int64(fileCount + 1) // seed root plus one hunk per bulk file.
+				if got := count.Load(); got != want {
+					b.Fatalf("saw %d hunks, want %d", got, want)
+				}
+				if !bulkSeen.Load() {
+					b.Fatalf("saw no hunk from bulk commit %s", bulkOID)
+				}
+				bulkFirstHunkTotal += bulkFirstHunk.Load()
+				iters++
+			}
+			if iters > 0 {
+				b.ReportMetric(float64(bulkFirstHunkTotal)/float64(iters), "bulk-first-hunk-ns")
 			}
 		})
 	}
