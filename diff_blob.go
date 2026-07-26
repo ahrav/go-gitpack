@@ -289,49 +289,6 @@ func tokenize(src []byte) []string {
 	return lines
 }
 
-// fuseHunks merges consecutive AddedHunks when the number of untouched lines
-// between them is less than or equal to 2*ctx + inter.
-//
-// ctx specifies the amount of ordinary "context" you intend to display around
-// each hunk, while inter represents an additional "inter-hunk" allowance
-// (equivalent to Git's --inter-hunk-context flag).
-// The function never inserts the untouched lines into the resulting hunks; it
-// only extends the range metadata and concatenates the added lines.
-//
-// EndLine() semantics caveat: the gap between two hunks is computed as
-//
-//	hunks[i].StartLine - cur.EndLine() - 1
-//
-// Because fuseHunks concatenates Lines from the merged hunk into cur without
-// inserting the skipped (untouched) lines, cur.EndLine() after a merge will be
-// less than hunks[i+1].StartLine by the number of omitted lines. This means
-// the merged hunk's EndLine() no longer reflects the true last line number in
-// the new file -- it reflects StartLine + len(Lines) - 1, which undercounts
-// when untouched lines were elided. Callers that need accurate final line
-// numbers should recompute them from StartLine and the actual line count.
-func fuseHunks(hunks []AddedHunk, ctx, inter int) []AddedHunk {
-	if len(hunks) < 2 {
-		return hunks
-	}
-	maxGap := 2*ctx + inter
-	out := make([]AddedHunk, 0, len(hunks))
-	cur := hunks[0]
-
-	for i := 1; i < len(hunks); i++ {
-		gap := int(hunks[i].StartLine) - int(cur.EndLine()) - 1
-		if gap <= maxGap {
-			// Merge – we *do not* insert the untouched lines into Lines,
-			// we just extend the range & byte count.
-			cur.Lines = append(cur.Lines, hunks[i].Lines...)
-		} else {
-			out = append(out, cur)
-			cur = hunks[i]
-		}
-	}
-	out = append(out, cur)
-	return out
-}
-
 // isBinary reports whether the first 8 KiB of data contains a null byte,
 // which is a strong indicator that the blob is a binary file.
 //
@@ -364,6 +321,12 @@ func isBinary(data []byte) bool {
 //
 // The returned slice is nil when there are no additions, or contains at least
 // one hunk (possibly a single placeholder line) in every other case.
+//
+// Line ownership: text lines are zero-copy views into the new blob (see
+// tokenize), a pure addition's lines therefore span the whole new blob, and a
+// binary result is a single hunk whose one line is the new blob verbatim.
+// pairCache.add reads that shape to decide when copying the lines out would
+// only retain the bytes they already alias.
 func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 	// Pure deletion (or nothing at all): no added-line side exists, so the
 	// blobs never need to be loaded. This matters for history walks where

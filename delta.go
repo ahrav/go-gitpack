@@ -174,11 +174,25 @@ const defaultDeltaArenaSize = 2 * 16 << 20
 var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
 
 // deltaArenaMaxRetained bounds how many idle arenas the free-list may retain.
-// The steady-state population equals the peak number of concurrent delta
-// resolutions, so the cap is derived from GOMAXPROCS at startup: hosts with
-// fewer CPUs cannot productively use more concurrent arenas, and sizing the
-// list to the parallelism budget keeps the idle reserve proportional to the
-// machine. The upper cap limits retained arenas to 256 MiB on large hosts.
+// The cap is derived from GOMAXPROCS at startup: hosts with fewer CPUs cannot
+// productively use more concurrent arenas, and sizing the list to the
+// parallelism budget keeps the idle reserve proportional to the machine. The
+// upper cap limits retained arenas to 256 MiB on large hosts.
+//
+// The ceiling is coupled to caller concurrency and must be read together with
+// it: a goroutine inside a multi-hop delta resolution holds one arena, so the
+// free-list's steady-state population equals the peak number of simultaneous
+// multi-hop resolutions — bounded above by the sum of the concurrent stage
+// widths of whatever drives the store (for DiffHistoryHunksFunc: tree workers
+// + blob workers + commit-walk workers), and in practice well below it because
+// only a fraction of those workers are inside a resolution at any instant.
+// That sum can exceed the derived ceiling on a wide host, so a scan's peak can
+// outrun the free-list: putDeltaArena drops the overflow and the next
+// getDeltaArena allocates and zeroes a fresh 32 MiB arena, reinstating the
+// memclr cost the free-list exists to remove. Bounding resident memory instead
+// of that cost is the point of the derived cap;
+// GOGITPACK_DELTA_ARENA_RETAIN is the lever for callers whose scan width
+// justifies a larger reserve.
 //
 // The GOGITPACK_DELTA_ARENA_RETAIN environment variable overrides the
 // derived cap with an explicit arena count (each arena is 32 MiB; 0 disables

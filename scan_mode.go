@@ -15,6 +15,7 @@ package objstore
 import (
 	"bytes"
 	"fmt"
+	"sync"
 )
 
 // ScanMode selects the high-level scanning strategy used by HistoryScanner.Scan.
@@ -54,6 +55,14 @@ func WithScanMode(mode ScanMode) ScannerOption {
 	}
 }
 
+// WithSkipMergeDiffs makes hunk scans emit no diffs for merge commits,
+// matching `git log -p` semantics. See HistoryScanner.skipMergeDiffs.
+func WithSkipMergeDiffs(skip bool) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.skipMergeDiffs = skip
+	}
+}
+
 // ScanMode returns the scanner's currently configured scan mode.
 func (hs *HistoryScanner) ScanMode() ScanMode {
 	return hs.scanMode
@@ -90,27 +99,54 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 	}
 }
 
+// maxReusedHunkPayloadBytes bounds the capacity scanHunks carries from one
+// hunk to the next. Reuse is what makes the buffer worth having — a history
+// of small hunks assembles every payload into the same array — but a single
+// whole-file or binary hunk can reach MaxDiffSize (1 GiB), and Reset keeps the
+// grown array. Without a cap, one large hunk early in a scan pins its payload
+// until the scan returns, which the per-hunk buffer this replaced did not do.
+// Past the cap the buffer is dropped for the GC: re-allocating for the next
+// hunk is dwarfed by the cost of having diffed a file that large. 4 MiB
+// matches maxPooledLineIndexBytes and the store's maxCacheableSize.
+const maxReusedHunkPayloadBytes = 4 << 20 // 4 MiB
+
+// releaseOversizedPayload drops payload's backing array when it has grown past
+// maxReusedHunkPayloadBytes, reporting whether it did. Callers must have
+// finished reading the assembled bytes: this abandons them to the GC.
+func releaseOversizedPayload(payload *bytes.Buffer) bool {
+	if payload.Cap() <= maxReusedHunkPayloadBytes {
+		return false
+	}
+	*payload = bytes.Buffer{}
+	return true
+}
+
 // scanHunks implements the legacy hunk-based scanning mode.
 //
-// It calls DiffHistoryHunks, which produces hunks on a channel and sends
-// a single error on errC when the walk completes. The loop drains the hunks
-// channel to completion even after the first scan error, because the
-// producer goroutine blocks on sends and would leak if the consumer stopped
-// reading early.
+// It drives DiffHistoryHunksFunc, so no queue sits between a blob worker and
+// scanner.ScanBlob. DiffHistoryHunksFunc invokes the callback concurrently
+// from every blob worker, and one mutex serializes the whole per-hunk body.
+// Both halves need it: the payload buffer is reused across hunks, which
+// BlobScanner permits because an implementation may not retain the reader's
+// bytes past the call, and ScanBlob is handed one hunk at a time to match
+// every other ScanBlob call site in this package.
 //
-// Error precedence: a scan-side error (scanErr) takes priority over the
-// walk-side error (runErr) so the caller sees the first failure in the
-// scanning pipeline rather than a secondary channel-close error.
+// Retention is one payload, not the largest payload the scan has seen: a
+// buffer grown past maxReusedHunkPayloadBytes is released rather than carried.
+//
+// A scan error aborts the walk, and DiffHistoryHunksFunc returns the first
+// error observed, whether it came from a scan or from the walk itself.
 func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
-	hunks, errC := hs.DiffHistoryHunks()
+	var (
+		mu      sync.Mutex
+		payload bytes.Buffer
+	)
 
-	var scanErr error
-	for hunk := range hunks {
-		if scanErr != nil {
-			continue
-		}
+	return hs.DiffHistoryHunksFunc(func(hunk HunkAddition) error {
+		mu.Lock()
+		defer mu.Unlock()
 
-		var payload bytes.Buffer
+		payload.Reset()
 		for i, line := range hunk.lines {
 			if i > 0 {
 				payload.WriteByte('\n')
@@ -122,15 +158,16 @@ func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
 			Commit: hunk.commit,
 			Path:   hunk.path,
 		}
-		if err := scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta); err != nil {
-			scanErr = fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
+		err := scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta)
+
+		// Release an oversized array now that ScanBlob has returned; the
+		// reader handed to it does not outlive the call.
+		releaseOversizedPayload(&payload)
+
+		if err != nil {
+			return fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
 				hunk.commit, hunk.path, hunk.startLine, hunk.endLine, err)
 		}
-	}
-
-	runErr := <-errC
-	if scanErr != nil {
-		return scanErr
-	}
-	return runErr
+		return nil
+	})
 }
