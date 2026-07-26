@@ -15,6 +15,7 @@ package objstore
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -102,7 +103,7 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 // maxReusedHunkPayloadBytes bounds the capacity scanHunks carries from one
 // hunk to the next. Reuse is what makes the buffer worth having — a history
 // of small hunks assembles every payload into the same array — but a single
-// whole-file or binary hunk can reach MaxDiffSize (1 GiB), and Reset keeps the
+// whole-file text hunk can reach MaxDiffSize (1 GiB), and Reset keeps the
 // grown array. Without a cap, one large hunk early in a scan pins its payload
 // until the scan returns, which the per-hunk buffer this replaced did not do.
 // Past the cap the buffer is dropped for the GC: re-allocating for the next
@@ -134,6 +135,11 @@ func releaseOversizedPayload(payload *bytes.Buffer) bool {
 // Retention is one payload, not the largest payload the scan has seen: a
 // buffer grown past maxReusedHunkPayloadBytes is released rather than carried.
 //
+// A binary hunk bypasses the buffer entirely. Its single line already holds the
+// whole new blob, so it is streamed straight to ScanBlob instead of being
+// copied into the payload — the case that would otherwise grow the buffer to
+// MaxDiffSize on every checked-in binary.
+//
 // A scan error aborts the walk, and DiffHistoryHunksFunc returns the first
 // error observed, whether it came from a scan or from the walk itself.
 func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
@@ -146,23 +152,32 @@ func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
 		mu.Lock()
 		defer mu.Unlock()
 
-		payload.Reset()
-		for i, line := range hunk.lines {
-			if i > 0 {
-				payload.WriteByte('\n')
-			}
-			payload.WriteString(line)
-		}
-
 		meta := ScanMeta{
 			Commit: hunk.commit,
 			Path:   hunk.path,
 		}
-		err := scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta)
 
-		// Release an oversized array now that ScanBlob has returned; the
-		// reader handed to it does not outlive the call.
-		releaseOversizedPayload(&payload)
+		var err error
+		if hunk.isBinary && len(hunk.lines) == 1 {
+			// A binary hunk carries the whole new blob as its single line, a
+			// zero-copy view of the store's buffer. Assembling it into payload
+			// would copy the entire file and then immediately release the
+			// grown array; reading the string directly skips both.
+			err = scanner.ScanBlob(strings.NewReader(hunk.lines[0]), meta)
+		} else {
+			payload.Reset()
+			for i, line := range hunk.lines {
+				if i > 0 {
+					payload.WriteByte('\n')
+				}
+				payload.WriteString(line)
+			}
+			err = scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta)
+
+			// Release an oversized array now that ScanBlob has returned; the
+			// reader handed to it does not outlive the call.
+			releaseOversizedPayload(&payload)
+		}
 
 		if err != nil {
 			return fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
