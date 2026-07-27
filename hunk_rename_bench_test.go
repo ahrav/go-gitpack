@@ -212,14 +212,12 @@ func BenchmarkDiffHistoryHunksStage(b *testing.B) {
 //
 // Exactly one thing varies: the pair-cache budget. The offset cache, the ARC
 // and the delta window all keep their defaults in both arms, so the delta is
-// the diff memo and nothing else. An earlier version also zeroed the offset
-// cache, reasoning that it holds materialized objects and would otherwise serve
-// these fixtures' blobs back -- but that pursued a coldness this benchmark
-// cannot reach (see below) at the cost of a second variable, and on this
-// fixture the offset cache does not avoid inflation at all: the ARC and delta
-// window already do, leaving it as bookkeeping that moved the number in its own
-// right. Holding it fixed both matches the state names and sharpens the memo
-// signal (~15% on time here, against ~7% when the two budgets moved together).
+// the diff memo and nothing else. Zeroing the offset cache alongside it buys no
+// coldness on this fixture -- the ARC and the delta window sit ahead of
+// inflation and already serve these blobs back (see below) -- while its own
+// bookkeeping moves the number in its own right, so a second varying budget
+// would leave the state names describing something other than what differs
+// between the arms.
 //
 // What no state varies is the store's OID-keyed object caches. The ARC (16K
 // entries) and the delta window (32 MiB over 64 shards) have no budget option,

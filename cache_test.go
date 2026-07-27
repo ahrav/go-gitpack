@@ -473,28 +473,34 @@ func testConcurrency(t *testing.T) {
 			go func() {
 				defer wg.Done()
 				for {
+					if h, ok := w.acquire(oid); ok {
+						// Yield between the acquire and the reads so an
+						// update lands inside the handle's lifetime, which is
+						// the interleaving the copies exist to survive.
+						runtime.Gosched()
+						data, typ := h.Data(), h.Type()
+						h.Release()
+
+						reads.Add(1)
+						if want, known := generation[typ]; !known || !bytes.Equal(data, want) {
+							mixed.Add(1)
+							once.Do(func() {
+								example = fmt.Sprintf("type %v with %d bytes", typ, len(data))
+							})
+						}
+					}
+					// Read first, then test for the writer's exit, so every
+					// reader records at least one read and reads > 0 holds by
+					// construction rather than by the scheduler starting a
+					// reader before the writer's bounded loop retires. The
+					// entry is resident for the whole test -- add updates this
+					// OID in place and never removes it, and one payload is
+					// far below the window budget -- so that first acquire
+					// cannot miss.
 					select {
 					case <-stop:
 						return
 					default:
-					}
-					h, ok := w.acquire(oid)
-					if !ok {
-						continue
-					}
-					// Yield between the acquire and the reads so an update
-					// lands inside the handle's lifetime, which is the
-					// interleaving the copies exist to survive.
-					runtime.Gosched()
-					data, typ := h.Data(), h.Type()
-					h.Release()
-
-					reads.Add(1)
-					if want, known := generation[typ]; !known || !bytes.Equal(data, want) {
-						mixed.Add(1)
-						once.Do(func() {
-							example = fmt.Sprintf("type %v with %d bytes", typ, len(data))
-						})
 					}
 				}
 			}()
