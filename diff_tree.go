@@ -50,7 +50,30 @@ func joinPath(prefix, name string) string {
 // contents lazily through `TreeIter`, which keeps peak memory usage constant
 // and enables diffing arbitrarily large repositories.
 //
-// For every *file* that has changed, `fn` is invoked exactly once.
+// For every changed file, `fn` is invoked once — an addition, a deletion, or a
+// same-type modification is one event carrying whichever OIDs exist, and a
+// permission-only change stays a single event — as long as the merge-join
+// pairs the two sides' entries that share a name. Two cases split one file
+// across two events.
+//
+// The first is a path whose entry type changes in place. Nothing is carried
+// across a type change, so that yields a deletion followed by an addition. Git
+// renders such a change the same way in patch form, and `git diff-tree -r`
+// splits a file/directory conversion into a deletion and an addition of its
+// own; its raw spelling of a *same-path* type change is instead one `T` entry
+// carrying both OIDs, which one callback here cannot express because it would
+// have to carry two modes.
+//
+// The second is a same-name tree pair the merge-join never reaches: names are
+// compared as plain strings, while the iterators yield Git's order, in which a
+// tree named "foo" sorts as "foo/". A sibling whose name falls between those
+// two spellings — "foo.c", because '.' < '/' — and exists on only one side
+// leaves the cursors out of step, so the "foo" pair never meets and is not
+// recursed into. Each side's subtree is enumerated whole instead, the new one
+// as additions and the old one as deletions, so a same-type modification
+// inside it surfaces as an addition plus a deletion at one path. Two events at
+// one path therefore do not imply a type change.
+//
 // Directories are handled transparently: additions or deletions of a directory
 // cause `walkDiff` to recurse so that the callback is still issued per file,
 // never for the directory objects themselves.
@@ -60,8 +83,11 @@ func joinPath(prefix, name string) string {
 //   - the path relative to the walk root (always Unix-style slashes),
 //   - the object ID in the old tree (zero if the file was just created),
 //   - the object ID in the new tree (zero if the file was deleted), and
-//   - the file mode that is recorded in the *new* tree (or the old mode if the
-//     file vanished).
+//   - the mode of the side the event describes: the new mode for an addition
+//     or a modification, the old mode for a deletion. The two modes behind a
+//     single modification event share a type nibble, so that one mode
+//     identifies the entry's type on both sides. A file split across two
+//     events carries each side's own mode, and those two may differ in type.
 //
 // Error semantics
 //   - Any error returned by `TreeIter.Next` other than io.EOF is propagated
@@ -184,16 +210,33 @@ func walkDiff(
 				); err != nil {
 					return err
 				}
+			case modeOld&modeTypeMask != modeNew&modeTypeMask:
+				// The name survives but its entry type does not: any of a
+				// blob, a symlink, a gitlink, and a tree can stand where
+				// another stood. Nothing is carried between the two sides —
+				// the old object leaves the tree and a new one arrives — so
+				// the transition is reported as a deletion of the old entry
+				// followed by an addition of the new one, which is how git
+				// renders it in patch form.
+				//
+				// Routing each side through handleDel/handleAdd also gets
+				// the recursion right: a replaced directory is enumerated
+				// file by file, and a directory that replaces a file has its
+				// contents reported instead of a single tree-mode event that
+				// every blob-filtering caller would discard. A single merged
+				// event cannot do either, because it has room for only one
+				// mode and only one recursion decision.
+				if err := handleDel(tc, prefix, oln, oidOld, modeOld, fn); err != nil {
+					return err
+				}
+				if err := handleAdd(tc, prefix, nln, oidNew, modeNew, fn); err != nil {
+					return err
+				}
 			default:
-				// Type transition or mode change. This covers cases such as:
-				//   - A regular file replaced by a symlink (mode change).
-				//   - A file replaced by a directory, or vice versa. When a
-				//     file is replaced by a directory (or the reverse), the
-				//     entry name is the same on both sides but the modes
-				//     differ in their type bits. We report this as a single
-				//     callback with both old and new OIDs rather than a
-				//     delete + add pair, letting the caller decide how to
-				//     interpret the transition.
+				// Same entry type on both sides: the object ID and/or the
+				// permission bits changed. One event describes the whole
+				// change, and the new mode's type nibble equals the old
+				// one's.
 				if err := fn(
 					joinPath(prefix, nln),
 					oidOld,
