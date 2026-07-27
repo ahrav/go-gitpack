@@ -10,8 +10,8 @@
 //   - Gitlink (submodule) entries treated as opaque, non-recursive changes.
 //   - Recursive descent with a path prefix.
 //   - Every in-place entry-type transition, reported as a deletion of the old
-//     entry followed by an addition of the new one.
-//   - A conversion whose merge-join cursors never pair, because a sibling name
+//     entry and an addition of the new one.
+//   - A conversion whose change set must not depend on a sibling name that
 //     sorts between the two spellings of the converted name.
 //   - Error propagation from the emit callback.
 //   - Cache misses on tree resolution.
@@ -180,6 +180,97 @@ func treeEntryNames(t *testing.T, tc *store, oid Hash) []string {
 			return names
 		}
 		names = append(names, name)
+	}
+}
+
+// TestCompareTreeEntryNames pins the order Git stores tree entries in, which is
+// the order walkDiff's merge-join must advance its two cursors by.
+//
+// The load-bearing byte is the one just past the shorter name: '/' for a tree,
+// absent for every other entry type. Since '.' (0x2E) sorts below '/' (0x2F) and
+// '0' (0x30) above it, whether a sibling blob precedes or follows the tree it
+// shadows turns on a single byte, so both directions are pinned. Two non-tree
+// entries sharing a name must compare equal, which is what keeps walkDiff's
+// in-place type-change branch reachable.
+//
+// Every case is also checked in reverse: the comparator is antisymmetric, or a
+// merge-join driven by it could advance both cursors past each other.
+func TestCompareTreeEntryNames(t *testing.T) {
+	const (
+		modeFile = 0100644
+		modeExec = 0100755
+		modeLink = 0120000
+		modeSub  = 0160000
+		modeDir  = 040000
+	)
+
+	// sign normalizes a comparator result so the cases pin the ordering the
+	// contract states -- negative, zero, positive -- and not an encoding.
+	sign := func(c int) int {
+		switch {
+		case c < 0:
+			return -1
+		case c > 0:
+			return 1
+		default:
+			return 0
+		}
+	}
+
+	cases := []struct {
+		name  string
+		name1 string
+		mode1 uint32
+		name2 string
+		mode2 uint32
+		want  int
+	}{
+		{name: "EqualBlobNames", name1: "pkg", mode1: modeFile, name2: "pkg", mode2: modeFile, want: 0},
+		{name: "PermissionBitsDoNotOrder", name1: "pkg", mode1: modeExec, name2: "pkg", mode2: modeFile, want: 0},
+		{name: "DifferingPrefixByte", name1: "abc", mode1: modeFile, name2: "abd", mode2: modeFile, want: -1},
+		{name: "ShorterNameIsAPrefix", name1: "foo", mode1: modeFile, name2: "foobar", mode2: modeFile, want: -1},
+		{name: "LongerNameExtendsAPrefix", name1: "foobar", mode1: modeFile, name2: "foo", mode2: modeFile, want: 1},
+
+		// A tree's implied '/' is the only difference between these names.
+		{name: "TreeAfterBlobAtEqualName", name1: "p", mode1: modeDir, name2: "p", mode2: modeFile, want: 1},
+		{name: "SymlinkBeforeTreeAtEqualName", name1: "p", mode1: modeLink, name2: "p", mode2: modeDir, want: -1},
+		{name: "GitlinkBeforeTreeAtEqualName", name1: "p", mode1: modeSub, name2: "p", mode2: modeDir, want: -1},
+		{name: "TwoTreesAtEqualName", name1: "p", mode1: modeDir, name2: "p", mode2: modeDir, want: 0},
+
+		// Non-tree pairs at one name: equal, so the type-change branch runs.
+		{name: "BlobAndSymlinkAtEqualName", name1: "p", mode1: modeFile, name2: "p", mode2: modeLink, want: 0},
+		{name: "BlobAndGitlinkAtEqualName", name1: "p", mode1: modeFile, name2: "p", mode2: modeSub, want: 0},
+		{name: "SymlinkAndGitlinkAtEqualName", name1: "p", mode1: modeLink, name2: "p", mode2: modeSub, want: 0},
+
+		// Bytes straddling '/', which is where a plain string comparison and
+		// Git's order disagree.
+		{name: "DotSiblingBeforeTree", name1: "pkg.go", mode1: modeFile, name2: "pkg", mode2: modeDir, want: -1},
+		{name: "DashSiblingBeforeTree", name1: "mod-old.txt", mode1: modeFile, name2: "mod", mode2: modeDir, want: -1},
+		{name: "SpaceSiblingBeforeTree", name1: "pkg file", mode1: modeFile, name2: "pkg", mode2: modeDir, want: -1},
+		{name: "BangSiblingBeforeTree", name1: "pkg!", mode1: modeFile, name2: "pkg", mode2: modeDir, want: -1},
+		{name: "DigitSiblingAfterTree", name1: "pkg0", mode1: modeFile, name2: "pkg", mode2: modeDir, want: 1},
+		{name: "LetterSiblingAfterTree", name1: "pkga", mode1: modeFile, name2: "pkg", mode2: modeDir, want: 1},
+		{name: "DotSiblingAfterBlob", name1: "pkg.go", mode1: modeFile, name2: "pkg", mode2: modeFile, want: 1},
+
+		// One-byte and empty names: the comparator is total, and an absent
+		// name is still shorter than the '/' a tree implies.
+		{name: "SingleByteNames", name1: "a", mode1: modeFile, name2: "b", mode2: modeFile, want: -1},
+		{name: "SingleByteTreeAfterDotSibling", name1: "a", mode1: modeDir, name2: "a.", mode2: modeFile, want: 1},
+		{name: "EmptyNameFirst", name1: "", mode1: modeFile, name2: "a", mode2: modeFile, want: -1},
+		{name: "EmptyTreeAfterEmptyBlob", name1: "", mode1: modeDir, name2: "", mode2: modeFile, want: 1},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			got := compareTreeEntryNames(tt.name1, tt.mode1, tt.name2, tt.mode2)
+			assert.Equal(t, tt.want, sign(got),
+				"compare(%q/%o, %q/%o) = %d", tt.name1, tt.mode1, tt.name2, tt.mode2, got)
+
+			back := compareTreeEntryNames(tt.name2, tt.mode2, tt.name1, tt.mode1)
+			assert.Equal(t, -tt.want, sign(back),
+				"reversed compare(%q/%o, %q/%o) = %d is not antisymmetric",
+				tt.name2, tt.mode2, tt.name1, tt.mode1, back)
+		})
 	}
 }
 
@@ -444,16 +535,16 @@ func TestWalkDiff_FileDirConversions(t *testing.T) {
 }
 
 // TestWalkDiff_ConversionIsAlignmentIndependent pins that a conversion produces
-// the same logical change set whether or not the merge-join cursors ever meet
-// on the converted name.
+// the same logical change set with and without a sibling whose name sorts
+// between the two spellings of the converted one.
 //
-// Git compares a tree's name as if it ended in '/', so a sibling can sort
-// between the two spellings of one name: with "foo" a blob on the old side and
-// a tree on the new side, the old tree yields "foo" then "foo.c" while the new
-// tree yields "foo.c" then "foo". The cursors never sit on the same name, and
-// the conversion reaches the callback through the deletion and addition
-// branches rather than the equal-name branch. Cursor alignment is an artifact
-// of a neighbour's name, so it must not change what the diff means.
+// Git compares a tree's name as if it ended in '/', so such a sibling exists:
+// with "foo" a blob on the old side and a tree on the new side, the old tree
+// yields "foo" then "foo.c" while the new tree yields "foo.c" then "foo". The
+// two sides of the conversion are two names to the merge-join and reach the
+// callback through the deletion and addition branches; the sibling is one name
+// on both sides and pairs with itself, emitting nothing. Neither the sibling's
+// presence nor the cursor offset it creates may change what the diff means.
 func TestWalkDiff_ConversionIsAlignmentIndependent(t *testing.T) {
 	var (
 		oldTree = Hash{1}
@@ -477,20 +568,20 @@ func TestWalkDiff_ConversionIsAlignmentIndependent(t *testing.T) {
 
 	cases := []struct {
 		name           string
-		pairedOld      []treeEntry
-		pairedNew      []treeEntry
-		unpairedOld    []treeEntry
-		unpairedNew    []treeEntry
+		soloOld        []treeEntry
+		soloNew        []treeEntry
+		siblingOld     []treeEntry
+		siblingNew     []treeEntry
 		wantOldOrder   []string
 		wantNewOrder   []string
 		wantConversion []change
 	}{
 		{
 			name:         "FileToDir",
-			pairedOld:    []treeEntry{fooFile},
-			pairedNew:    []treeEntry{fooDir},
-			unpairedOld:  []treeEntry{fooFile, sibling},
-			unpairedNew:  []treeEntry{fooDir, sibling},
+			soloOld:      []treeEntry{fooFile},
+			soloNew:      []treeEntry{fooDir},
+			siblingOld:   []treeEntry{fooFile, sibling},
+			siblingNew:   []treeEntry{fooDir, sibling},
 			wantOldOrder: []string{"foo", "foo.c"},
 			wantNewOrder: []string{"foo.c", "foo"},
 			wantConversion: []change{
@@ -500,10 +591,10 @@ func TestWalkDiff_ConversionIsAlignmentIndependent(t *testing.T) {
 		},
 		{
 			name:         "DirToFile",
-			pairedOld:    []treeEntry{fooDir},
-			pairedNew:    []treeEntry{fooFile},
-			unpairedOld:  []treeEntry{fooDir, sibling},
-			unpairedNew:  []treeEntry{fooFile, sibling},
+			soloOld:      []treeEntry{fooDir},
+			soloNew:      []treeEntry{fooFile},
+			siblingOld:   []treeEntry{fooDir, sibling},
+			siblingNew:   []treeEntry{fooFile, sibling},
 			wantOldOrder: []string{"foo.c", "foo"},
 			wantNewOrder: []string{"foo", "foo.c"},
 			wantConversion: []change{
@@ -515,34 +606,41 @@ func TestWalkDiff_ConversionIsAlignmentIndependent(t *testing.T) {
 
 	for _, tt := range cases {
 		t.Run(tt.name, func(t *testing.T) {
-			paired, err := collect(newStore(tt.pairedOld, tt.pairedNew), oldTree, newTree, "")
+			solo, err := collect(newStore(tt.soloOld, tt.soloNew), oldTree, newTree, "")
 			assert.NoError(t, err)
-			assert.True(t, equalChanges(paired, tt.wantConversion),
-				"paired conversion mismatch\nwant %+v\ngot  %+v", tt.wantConversion, paired)
+			assert.True(t, equalChanges(solo, tt.wantConversion),
+				"conversion mismatch without the sibling\nwant %+v\ngot  %+v", tt.wantConversion, solo)
 
-			tc := newStore(tt.unpairedOld, tt.unpairedNew)
-			// The fixture only exercises the unpaired route while the sibling
-			// really does sort between the two spellings of "foo", so assert
-			// the order the merge-join will see rather than assuming it.
+			tc := newStore(tt.siblingOld, tt.siblingNew)
+			// The fixture is a window shape only while the sibling really does
+			// sort between the two spellings of "foo", so assert the order the
+			// merge-join will see rather than assuming it.
 			assert.Equal(t, tt.wantOldOrder, treeEntryNames(t, tc, oldTree))
 			assert.Equal(t, tt.wantNewOrder, treeEntryNames(t, tc, newTree))
 
-			unpaired, err := collect(tc, oldTree, newTree, "")
+			windowed, err := collect(tc, oldTree, newTree, "")
 			assert.NoError(t, err)
-			// The unchanged sibling emits nothing, so the two alignments must
-			// agree on the whole change set.
-			assert.True(t, equalChanges(unpaired, tt.wantConversion),
-				"unpaired conversion mismatch\nwant %+v\ngot  %+v", tt.wantConversion, unpaired)
+			// The unchanged sibling emits nothing, so both trees must agree on
+			// the whole change set.
+			assert.True(t, equalChanges(windowed, tt.wantConversion),
+				"conversion mismatch with the sibling\nwant %+v\ngot  %+v", tt.wantConversion, windowed)
 		})
 	}
 }
 
 // TestWalkDiff_TypeTransitionMatrix walks every in-place entry-type transition
 // and pins the per-side shape: a deletion carrying the old mode and the old
-// OID, then an addition carrying the new mode and the new OID, with a zero OID
+// OID, and an addition carrying the new mode and the new OID, with a zero OID
 // on the side where the entry is absent. A transition that keeps one OID still
 // splits, because the two sides are different kinds of object. The
 // permission-only case is the control that must stay a single event.
+//
+// A transition between two non-tree types is one name in the merge-join, so its
+// deletion precedes its addition. A transition involving a tree is two names:
+// the tree sorts as if a '/' followed its name, the non-tree side stops one byte
+// earlier, and an absent byte sorts below '/'. The non-tree side therefore comes
+// first, so "X→Dir" reports the departure before the arriving directory's files
+// while "Dir→X" reports the arrival before the departing directory's files.
 //
 // The gitlink cases name a commit OID that is absent from the store, which is
 // what a submodule looks like from the superproject: a walk that recursed into
@@ -661,8 +759,8 @@ func TestWalkDiff_TypeTransitionMatrix(t *testing.T) {
 			oldEntry: treeEntry{modeDir, "p", dirOID},
 			newEntry: treeEntry{modeSub, "p", subOID},
 			want: []change{
-				{"p/bar", nestedOID, Hash{}, modeFile},
 				{"p", Hash{}, subOID, modeSub},
+				{"p/bar", nestedOID, Hash{}, modeFile},
 			},
 		},
 		{
@@ -679,8 +777,8 @@ func TestWalkDiff_TypeTransitionMatrix(t *testing.T) {
 			oldEntry: treeEntry{modeDir, "p", dirOID},
 			newEntry: treeEntry{modeLink, "p", altOID},
 			want: []change{
-				{"p/bar", nestedOID, Hash{}, modeFile},
 				{"p", Hash{}, altOID, modeLink},
+				{"p/bar", nestedOID, Hash{}, modeFile},
 			},
 		},
 		{
@@ -697,8 +795,8 @@ func TestWalkDiff_TypeTransitionMatrix(t *testing.T) {
 			oldEntry: treeEntry{modeDir, "p", dirOID},
 			newEntry: treeEntry{modeFile, "p", blobOID},
 			want: []change{
-				{"p/bar", nestedOID, Hash{}, modeFile},
 				{"p", Hash{}, blobOID, modeFile},
+				{"p/bar", nestedOID, Hash{}, modeFile},
 			},
 		},
 		{

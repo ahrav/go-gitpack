@@ -10,15 +10,16 @@
 // *not* plain lexicographic order. Directories are compared as if their name
 // had a trailing '/' appended (e.g. "foo" < "foo-bar" < "foo.c" < "foo/"
 // when "foo" is a tree). The TreeIter returned by store.treeIter MUST yield
-// entries in this canonical order for the merge-join comparisons (oln < nln,
-// oln == nln) to be correct. Violating this precondition will produce
-// incorrect diffs silently.
+// entries in this canonical order, which is the order compareTreeEntryNames
+// implements and the merge-join advances its two cursors by. Violating this
+// precondition will produce incorrect diffs silently.
 package objstore
 
 import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 )
 
 // joinPath builds a Git-style forward-slash path by simple string
@@ -42,6 +43,81 @@ func joinPath(prefix, name string) string {
 	return prefix + "/" + name
 }
 
+// compareTreeEntryNames orders two tree entries the way Git orders the entries
+// of a tree, which is the order they are stored in and therefore the order
+// TreeIter yields them. It returns a negative number, zero, or a positive
+// number as the first entry sorts before, with, or after the second.
+//
+// Git's base_name_compare treats a tree's name as if the separator that would
+// follow the directory were part of it: the byte just past the shorter name is
+// '/' for a tree and absent (0) for every other entry type. Because
+// '.' (0x2E) < '/' (0x2F) < '0' (0x30), a sibling blob "pkg.go" sorts before
+// the tree "pkg" while "pkg0" sorts after it, and a blob and a tree that share
+// a name do not compare equal. Comparing the names as plain strings puts "pkg"
+// first in both cases, which steps the merge-join's two cursors out of order
+// and leaves same-name entries unpaired.
+//
+// The ordering is total over valid Git entry names, which carry neither '/' nor
+// NUL. A name that does carry '/' collides with the tree whose name it extends,
+// because both sides then compare '/' at that offset: compareTreeEntryNames
+// answers 0 for the blob "pkg/x" against the tree "pkg", and the relation is a
+// preorder rather than an order — "pkg/y" and "pkg/x" both compare equal to
+// "pkg" while "pkg/y" sorts after "pkg/x". Only a corrupt tree reaches that,
+// since TreeIter parses names without rejecting '/', and base_name_compare
+// answers the same way, so such a diff still matches what git shows for the
+// same objects; breaking the tie here instead would make this walk disagree
+// with git on input git itself reads. The cost is bounded: the merge-join pairs
+// the colliding entries and enumerates each side whole, so a '/'-bearing name
+// shadowing a 1024-file subtree reports 2049 changes for one real addition —
+// the amplification an ordinary directory deletion already pays, with no
+// recursion across the two sides and no unbounded walk.
+func compareTreeEntryNames(name1 string, mode1 uint32, name2 string, mode2 uint32) int {
+	if len(name1) == len(name2) {
+		// Neither name reaches past the other, so the two implied bytes are
+		// what meet and no name byte is read: the names decide unless they are
+		// identical. This is where a merge-join spends most of its
+		// comparisons, because most of a tree's entries pair with the other
+		// side's.
+		if c := strings.Compare(name1, name2); c != 0 {
+			return c
+		}
+		return int(impliedNameByte(mode1)) - int(impliedNameByte(mode2))
+	}
+
+	shared := min(len(name1), len(name2))
+	if c := strings.Compare(name1[:shared], name2[:shared]); c != 0 {
+		return c
+	}
+	c1, c2 := entryNameByteAt(name1, mode1, shared), entryNameByteAt(name2, mode2, shared)
+	switch {
+	case c1 < c2:
+		return -1
+	case c1 > c2:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// entryNameByteAt returns the byte Git compares at offset i of a tree entry
+// whose name is at most i bytes long: the name's own byte when it extends that
+// far, otherwise the byte the entry implies past its name.
+func entryNameByteAt(name string, mode uint32, i int) byte {
+	if len(name) > i {
+		return name[i]
+	}
+	return impliedNameByte(mode)
+}
+
+// impliedNameByte returns the byte Git compares just past an entry's name: the
+// separator that would follow a directory, and none for every other type.
+func impliedNameByte(mode uint32) byte {
+	if isTreeMode(mode) {
+		return '/'
+	}
+	return 0
+}
+
 // walkDiff streams the differences between two Git trees.
 //
 // walkDiff performs a *merge-like* traversal over the **sorted** directory
@@ -50,29 +126,26 @@ func joinPath(prefix, name string) string {
 // contents lazily through `TreeIter`, which keeps peak memory usage constant
 // and enables diffing arbitrarily large repositories.
 //
+// The two cursors advance by compareTreeEntryNames, the order the entries are
+// stored in, so the sides of a valid name that exists in both trees always meet
+// on the same iteration and are compared as one pair.
+//
 // For every changed file, `fn` is invoked once — an addition, a deletion, or a
 // same-type modification is one event carrying whichever OIDs exist, and a
-// permission-only change stays a single event — as long as the merge-join
-// pairs the two sides' entries that share a name. Two cases split one file
-// across two events.
+// permission-only change stays a single event. One case splits a file across
+// two events: a path whose entry type changes in place. Nothing is carried
+// across a type change, so that yields a deletion of the old entry and an
+// addition of the new one. Git renders such a change the same way in patch
+// form, and `git diff-tree -r` splits a file/directory conversion into a
+// deletion and an addition of its own; its raw spelling of a *same-path* type
+// change is instead one `T` entry carrying both OIDs, which one callback here
+// cannot express because it would have to carry two modes.
 //
-// The first is a path whose entry type changes in place. Nothing is carried
-// across a type change, so that yields a deletion followed by an addition. Git
-// renders such a change the same way in patch form, and `git diff-tree -r`
-// splits a file/directory conversion into a deletion and an addition of its
-// own; its raw spelling of a *same-path* type change is instead one `T` entry
-// carrying both OIDs, which one callback here cannot express because it would
-// have to carry two modes.
-//
-// The second is a same-name tree pair the merge-join never reaches: names are
-// compared as plain strings, while the iterators yield Git's order, in which a
-// tree named "foo" sorts as "foo/". A sibling whose name falls between those
-// two spellings — "foo.c", because '.' < '/' — and exists on only one side
-// leaves the cursors out of step, so the "foo" pair never meets and is not
-// recursed into. Each side's subtree is enumerated whole instead, the new one
-// as additions and the old one as deletions, so a same-type modification
-// inside it surfaces as an addition plus a deletion at one path. Two events at
-// one path therefore do not imply a type change.
+// The order of that pair follows the entry order the merge-join walks. A
+// transition between two non-tree types is one name on both sides, so its
+// deletion precedes its addition. A transition involving a tree is two names —
+// a tree sorts as if its name ended in '/' — so the non-tree side, which sorts
+// first, is reported before the files of the tree side.
 //
 // Directories are handled transparently: additions or deletions of a directory
 // cause `walkDiff` to recurse so that the callback is still issued per file,
@@ -195,78 +268,96 @@ func walkDiff(
 				return err
 			}
 
-		case oln == nln: // possible modify / recurse / no-op
-			switch {
-			case oidOld == oidNew && modeOld == modeNew:
-				// Identical entry → skip.
-			case isTreeMode(modeOld) && isTreeMode(modeNew):
-				// Directory exists on both sides → recurse.
-				if err := walkDiff(
-					tc,
-					oidOld,
-					oidNew,
-					joinPath(prefix, nln),
-					fn,
-				); err != nil {
+		// Both cursors hold an entry, which is the only state in which their
+		// order is defined; cmp is scoped to this arm so it cannot be read
+		// against an exhausted cursor's leftover name and mode.
+		default:
+			switch cmp := compareTreeEntryNames(oln, modeOld, nln, modeNew); {
+			case cmp == 0: // possible modify / recurse / no-op
+				switch {
+				case oidOld == oidNew && modeOld == modeNew:
+					// Identical entry → skip.
+				case isTreeMode(modeOld) && isTreeMode(modeNew):
+					// Directory exists on both sides → recurse.
+					if err := walkDiff(
+						tc,
+						oidOld,
+						oidNew,
+						joinPath(prefix, nln),
+						fn,
+					); err != nil {
+						return err
+					}
+				case modeOld&modeTypeMask != modeNew&modeTypeMask:
+					// The name survives but its entry type does not: a blob, a
+					// symlink, and a gitlink can each stand where one of the
+					// others stood. For valid names those are the only three
+					// types here, because a tree sorts as if its name ended in
+					// '/' and so does not compare equal to a non-tree entry; a
+					// corrupt name carrying '/' collides with the tree it
+					// extends and does reach this arm, which stays correct
+					// because handleDel and handleAdd each recurse on a tree
+					// mode and each side keeps its own name.
+					//
+					// Nothing is carried between the two sides: the old object
+					// leaves the tree and a new one arrives, so the transition
+					// is reported as a deletion of the old entry followed by
+					// an addition of the new one, which is how git renders it
+					// in patch form. One merged event cannot express it,
+					// because it has room for only one mode.
+					if err := handleDel(tc, prefix, oln, oidOld, modeOld, fn); err != nil {
+						return err
+					}
+					if err := handleAdd(tc, prefix, nln, oidNew, modeNew, fn); err != nil {
+						return err
+					}
+				default:
+					// Same entry type on both sides: the object ID and/or the
+					// permission bits changed. One event describes the whole
+					// change, and the new mode's type nibble equals the old
+					// one's.
+					if err := fn(
+						joinPath(prefix, nln),
+						oidOld,
+						oidNew,
+						modeNew,
+					); err != nil {
+						return err
+					}
+				}
+				if err := nextOld(); err != nil {
 					return err
 				}
-			case modeOld&modeTypeMask != modeNew&modeTypeMask:
-				// The name survives but its entry type does not: any of a
-				// blob, a symlink, a gitlink, and a tree can stand where
-				// another stood. Nothing is carried between the two sides —
-				// the old object leaves the tree and a new one arrives — so
-				// the transition is reported as a deletion of the old entry
-				// followed by an addition of the new one, which is how git
-				// renders it in patch form.
-				//
-				// Routing each side through handleDel/handleAdd also gets
-				// the recursion right: a replaced directory is enumerated
-				// file by file, and a directory that replaces a file has its
-				// contents reported instead of a single tree-mode event that
-				// every blob-filtering caller would discard. A single merged
-				// event cannot do either, because it has room for only one
-				// mode and only one recursion decision.
+				if err := nextNew(); err != nil {
+					return err
+				}
+
+			case cmp < 0: // deletion
+				// The old entry sorts first, so no entry on the new side
+				// shares its place in the order and it is gone from the tree.
+				// handleDel recurses into a tree, which keeps the callback
+				// per-file and is also the route the departing half of a
+				// tree/non-tree conversion takes: a tree and a non-tree entry
+				// of one valid name sort as two distinct names and never meet
+				// as a pair.
 				if err := handleDel(tc, prefix, oln, oidOld, modeOld, fn); err != nil {
 					return err
 				}
+				if err := nextOld(); err != nil {
+					return err
+				}
+
+			default: // the new entry sorts first → addition
+				// The mirror image: handleAdd recurses into an arriving tree,
+				// so a directory that takes a name over reports the files it
+				// brings rather than one tree-mode event every blob-filtering
+				// caller would discard.
 				if err := handleAdd(tc, prefix, nln, oidNew, modeNew, fn); err != nil {
 					return err
 				}
-			default:
-				// Same entry type on both sides: the object ID and/or the
-				// permission bits changed. One event describes the whole
-				// change, and the new mode's type nibble equals the old
-				// one's.
-				if err := fn(
-					joinPath(prefix, nln),
-					oidOld,
-					oidNew,
-					modeNew,
-				); err != nil {
+				if err := nextNew(); err != nil {
 					return err
 				}
-			}
-			if err := nextOld(); err != nil {
-				return err
-			}
-			if err := nextNew(); err != nil {
-				return err
-			}
-
-		case oln < nln: // deletion
-			if err := handleDel(tc, prefix, oln, oidOld, modeOld, fn); err != nil {
-				return err
-			}
-			if err := nextOld(); err != nil {
-				return err
-			}
-
-		default: // nln < oln → addition
-			if err := handleAdd(tc, prefix, nln, oidNew, modeNew, fn); err != nil {
-				return err
-			}
-			if err := nextNew(); err != nil {
-				return err
 			}
 		}
 	}

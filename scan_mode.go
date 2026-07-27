@@ -51,10 +51,9 @@ const (
 	// other even when they share one OID -- a regular file holding "target"
 	// replaced by a symlink to "target" reports the symlink's target. The
 	// arriving side is still an ordinary candidate for the one-for-one rule
-	// above: a deletion elsewhere in the same commit that matches its identity,
-	// including one minted by a whole-subtree enumeration that walkDiff's
-	// plain-name merge join failed to pair, can claim it, and tree order
-	// decides which candidate that credit silences.
+	// above: a deletion elsewhere in the same commit that matches its identity
+	// can claim it, and tree order decides which candidate that credit
+	// silences.
 	//
 	// Known gap: only a DELETION mints a suppression credit -- an entry that
 	// leaves the tree, which includes the old side of a type transition
