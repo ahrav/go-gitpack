@@ -417,6 +417,94 @@ func testConcurrency(t *testing.T) {
 			assert.Equal(t, int32(0), cnt, "no leaked reference counts should remain")
 		}
 	})
+
+	// A Handle's Data and Type must describe one generation of an entry while
+	// add repeatedly replaces that entry's data, size, and type as a group.
+	// Both values are copied out under mu by acquire; reading either one
+	// through the shared entry instead both races with the update and lets the
+	// pair straddle two generations.
+	t.Run("Handle Reports One Generation During Update", func(t *testing.T) {
+		t.Parallel()
+
+		w := newRefCountedDeltaWindow()
+		oid := makeHash("generation-swap")
+
+		// The two payloads stand for whole generations: a Handle may only ever
+		// report one of these (payload, type) pairs. Distinct lengths and fill
+		// bytes make any mixture visible without the race detector.
+		generation := map[ObjectType][]byte{
+			ObjBlob: bytes.Repeat([]byte{'b'}, 512),
+			ObjTree: bytes.Repeat([]byte{'t'}, 256),
+		}
+		require.NoError(t, w.add(oid, generation[ObjBlob], ObjBlob))
+
+		var (
+			wg      sync.WaitGroup
+			reads   atomic.Int64
+			mixed   atomic.Int64
+			once    sync.Once
+			example string
+		)
+		stop := make(chan struct{})
+
+		// The writer's iteration count bounds the whole test: it closes stop on
+		// the way out, so the work done does not vary with wall-clock
+		// scheduling the way a sleep would.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(stop)
+			const updates = 20_000
+			for i := range updates {
+				typ := ObjBlob
+				if i%2 == 1 {
+					typ = ObjTree
+				}
+				// Handing the same buffers to add repeatedly respects the
+				// ownership transfer: neither payload is ever mutated, so a
+				// copy an earlier handle took stays intact.
+				_ = w.add(oid, generation[typ], typ)
+			}
+		}()
+
+		readers := max(2, runtime.GOMAXPROCS(0))
+		for range readers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					select {
+					case <-stop:
+						return
+					default:
+					}
+					h, ok := w.acquire(oid)
+					if !ok {
+						continue
+					}
+					// Yield between the acquire and the reads so an update
+					// lands inside the handle's lifetime, which is the
+					// interleaving the copies exist to survive.
+					runtime.Gosched()
+					data, typ := h.Data(), h.Type()
+					h.Release()
+
+					reads.Add(1)
+					if want, known := generation[typ]; !known || !bytes.Equal(data, want) {
+						mixed.Add(1)
+						once.Do(func() {
+							example = fmt.Sprintf("type %v with %d bytes", typ, len(data))
+						})
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		assert.Zero(t, mixed.Load(), "handle mixed two generations (%s)", example)
+		assert.Positive(t, reads.Load(), "readers never acquired the entry")
+	})
 }
 
 // Benchmark configuration.
