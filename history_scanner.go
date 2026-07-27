@@ -278,10 +278,18 @@ func (h *HunkAddition) Path() string { return h.path }
 // IsBinary returns whether this hunk contains binary data.
 func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 
-// DiffHistoryHunks streams every added hunk from all commits, diffing each
+// DiffHistoryHunks streams added hunks from all commits, diffing each
 // commit against its first parent only (i.e. merge commits are treated as a
 // single diff against the first parent, matching `git log --first-parent`
 // semantics). This avoids duplicate hunks from merge base reconstruction.
+//
+// Exact-OID moves are suppressed: when a commit's entry produces bytes whose
+// blob identity -- the OID plus the tree entry's type -- matches an unmatched
+// deletion in that commit, its added lines are omitted because those
+// content-addressed bytes are unchanged. This covers a pure addition and a move
+// that overwrites a tracked destination alike. Matching is one-for-one, so each
+// deletion suppresses at most one entry. No hunk is emitted for the destination
+// path or moving commit.
 //
 // It returns two buffered channels: one for HunkAddition values and one for a
 // single error.
@@ -351,8 +359,9 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 	return out, errC
 }
 
-// DiffHistoryHunksFunc streams every added hunk from all commits to fn,
-// using the same first-parent semantics as DiffHistoryHunks.
+// DiffHistoryHunksFunc streams added hunks from all commits to fn, using the
+// same first-parent semantics and one-for-one exact-OID move suppression as
+// DiffHistoryHunks.
 //
 // fn is invoked CONCURRENTLY from multiple internal workers (up to
 // runtime.NumCPU simultaneous calls) and must be safe for concurrent use.
@@ -572,27 +581,191 @@ type blobPairWork struct {
 	newOID Hash
 }
 
+// blobIdentity names the content a tree entry contributes: the blob OID plus
+// the entry's type nibble. Suppression pairs entries by identity rather than
+// by OID alone because an OID match is not a content match across types. A
+// regular file whose bytes are exactly a path string hashes identically to a
+// symlink pointing at that path, so keying on the OID alone lets a deleted
+// regular file suppress an added symlink and drop that symlink's target from
+// hunk output. Permission bits are masked off: they are not blob content, so
+// an exec-bit change does not defeat a move whose bytes are unchanged.
+type blobIdentity struct {
+	oid  Hash
+	kind uint32
+}
+
+func makeBlobIdentity(oid Hash, mode uint32) blobIdentity {
+	return blobIdentity{oid: oid, kind: mode & modeTypeMask}
+}
+
+// blobPairCandidate is one buffered suppression candidate: the stage-2 work
+// record plus the type nibble of the entry that produced it. Only the nibble is
+// retained rather than a whole blobIdentity because the record already carries
+// newOID, and the deletion pool is consulted once per candidate.
+type blobPairCandidate struct {
+	work blobPairWork
+	kind uint32
+}
+
+// identity names the bytes this candidate introduces. kind is already masked to
+// the type nibble, so this does not re-mask.
+func (c blobPairCandidate) identity() blobIdentity {
+	return blobIdentity{oid: c.work.newOID, kind: c.kind}
+}
+
+// Buffering these many suppression candidates and path bytes keeps the
+// per-worker record/path budget below 1 MiB while preserving a single tree
+// walk for ordinary commits. Commits beyond either limit replay candidates
+// instead.
+const (
+	maxBufferedBlobPairCandidates = 4096
+	maxBufferedBlobPairPathBytes  = 512 << 10
+)
+
 // emitCommitBlobPairs walks the first-parent tree diff of a single commit and
-// fans out one blobPairWork per changed blob. Tree walking is cheap relative
-// to blob diffing, so this stage keeps the expensive stage-2 workers supplied
-// with fine-grained work even when one commit touches thousands of files.
+// fans out one blobPairWork per content-changing blob entry. It filters
+// deletions, unchanged and mode-only entries, and entries whose resulting bytes
+// are paired one-for-one with a same-commit deletion of the same blob identity
+// (exact-OID moves). Both pure additions and modifications are suppression
+// candidates: a move that overwrites a tracked destination surfaces as a
+// modification whose resulting blob is the deleted blob. Tree walking is cheap
+// relative to blob diffing, so this stage keeps the expensive stage-2 workers
+// supplied with fine-grained work even when one commit touches thousands of
+// files. Root and shallow-parent commits stream in one pass. Non-root commits
+// count deletions in the first pass and retain candidates within a bounded
+// budget, replaying them in a second walk only when that budget is exceeded.
 func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- blobPairWork, stopCh <-chan struct{}) error {
-	return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
-		if !isBlobMode(mode) {
-			return nil
-		}
-		// Deletions (zero new OID) and identity pairs produce no added
-		// hunks; dropping them here saves a stage-2 hand-off and a
-		// permanent cache entry per distinct deleted blob.
-		if newH.IsZero() || newH == old {
-			return nil
-		}
+	emit := func(work blobPairWork) error {
 		select {
 		case <-stopCh:
 			return errScanAborted
-		case blobs <- blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH}:
+		case blobs <- work:
 			return nil
 		}
+	}
+
+	// A zero parent tree (root commit, shallow history) has no old side:
+	// every entry is an addition and no deletion can exist, so no rename is
+	// possible. Emit during the walk to preserve channel backpressure and
+	// avoid retaining one work record per file.
+	if parentTree.IsZero() {
+		return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+			// Ahead of the filters, matching the non-root and replay
+			// callbacks: entries that fall out here never reach emit, so
+			// without this a tree of nothing but gitlinks would traverse to
+			// completion after another worker had already failed.
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
+			}
+			if !isBlobMode(mode) || old == newH || newH.IsZero() {
+				return nil
+			}
+			return emit(blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
+		})
+	}
+
+	var (
+		candidates        []blobPairCandidate
+		deletesByIdentity map[blobIdentity]int
+		retainedPathBytes int
+		replayCandidates  bool
+	)
+	err := walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		select {
+		case <-stopCh:
+			return errScanAborted
+		default:
+		}
+		if !isBlobMode(mode) {
+			return nil
+		}
+		if old == newH {
+			return nil
+		}
+		if newH.IsZero() {
+			// walkDiff reports a deletion with the deleted entry's own mode,
+			// so this identity describes the bytes that left the tree.
+			if deletesByIdentity == nil {
+				deletesByIdentity = make(map[blobIdentity]int, 4)
+			}
+			deletesByIdentity[makeBlobIdentity(old, mode)]++
+			return nil
+		}
+		// Every surviving entry contributes new bytes at this path and is a
+		// suppression candidate, including a modification: when a move
+		// overwrites a tracked destination the destination's resulting blob is
+		// byte-identical to the blob deleted in the same commit, so its added
+		// lines are bytes the history already carries. Neither kind can be
+		// judged until the walk has seen every deletion, so both defer.
+		if replayCandidates {
+			return nil
+		}
+		if len(candidates) >= maxBufferedBlobPairCandidates ||
+			len(path) > maxBufferedBlobPairPathBytes-retainedPathBytes {
+			clear(candidates)
+			candidates = nil
+			retainedPathBytes = 0
+			replayCandidates = true
+			return nil
+		}
+		candidates = append(candidates, blobPairCandidate{
+			work: blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH},
+			kind: mode & modeTypeMask,
+		})
+		retainedPathBytes += len(path)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	// suppress reports whether the bytes identified by id are already accounted
+	// for by an unmatched deletion in this commit, consuming that deletion's
+	// credit when they are. Matching is one-for-one, so each deletion silences
+	// at most one candidate.
+	suppress := func(id blobIdentity) bool {
+		n := deletesByIdentity[id]
+		if n == 0 {
+			return false
+		}
+		deletesByIdentity[id] = n - 1
+		return true
+	}
+
+	if !replayCandidates {
+		for i := range candidates {
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
+			}
+			if suppress(candidates[i].identity()) {
+				continue // exact-OID move: content-addressed bytes are unchanged.
+			}
+			if err := emit(candidates[i].work); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// The bounded buffer was discarded. Replay only the candidates, consuming
+	// one deletion credit per matching identity and emitting the rest inline.
+	return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		select {
+		case <-stopCh:
+			return errScanAborted
+		default:
+		}
+		if !isBlobMode(mode) || newH.IsZero() || old == newH {
+			return nil
+		}
+		if suppress(makeBlobIdentity(newH, mode)) {
+			return nil // exact-OID move: content-addressed bytes are unchanged.
+		}
+		return emit(blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
 	})
 }
 

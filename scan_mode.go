@@ -6,10 +6,11 @@
 //   - ScanModeBlob  (default) -- iterates every unique blob introduced across
 //     the commit history in pack-file offset order, yielding the full blob
 //     body exactly once per OID. This is the recommended and fastest path.
-//   - ScanModeHunks (legacy)  -- computes per-commit diffs and yields only the
-//     added-line hunks. Retained for backward compatibility with callers that
-//     require line-level attribution, but significantly slower because it must
-//     diff every parent-child commit pair.
+//   - ScanModeHunks (legacy)  -- computes per-commit diffs and yields added-line
+//     hunks, except for exact-OID moves whose bytes are unchanged. Retained for
+//     backward compatibility with callers that require line-level attribution,
+//     but significantly slower because it must diff every parent-child commit
+//     pair.
 package objstore
 
 import (
@@ -31,10 +32,48 @@ const (
 	ScanModeBlob ScanMode = iota
 
 	// ScanModeHunks is the legacy scanning mode that computes parent-child
-	// diffs for every commit and yields only the added-line hunks. It exists
-	// for backward compatibility with callers that need line-level
-	// granularity. Prefer ScanModeBlob for new integrations because it
-	// avoids the overhead of diff computation and tree comparison.
+	// diffs for every commit and yields added-line hunks. An entry's added
+	// lines are suppressed when the same commit has an unmatched deletion of
+	// the same blob identity -- the blob OID plus the tree entry's type, so a
+	// regular file never pairs with a symlink; matching is one-for-one because
+	// the content-addressed bytes are unchanged. This covers both a pure
+	// addition and a move that overwrites a tracked destination, which git
+	// reports as a modification whose resulting blob is the deleted one.
+	// Consequently an exact-OID move has no hunk attributed to its destination
+	// path or moving commit. When one deletion has several same-identity
+	// candidates (a rename plus a copy of the same bytes), one is suppressed
+	// and the rest are emitted; which path survives follows tree order, so the
+	// bytes are reported once but the surviving path is not git's rename
+	// heuristic.
+	//
+	// A type change at one path is a deletion plus an addition, and their
+	// identities differ in the type nibble, so the two sides never cancel each
+	// other even when they share one OID -- a regular file holding "target"
+	// replaced by a symlink to "target" reports the symlink's target. The
+	// arriving side is still an ordinary candidate for the one-for-one rule
+	// above: a deletion elsewhere in the same commit that matches its identity
+	// can claim it, and tree order decides which candidate that credit
+	// silences.
+	//
+	// Known gap: only a DELETION mints a suppression credit -- an entry that
+	// leaves the tree, which includes the old side of a type transition
+	// because walkDiff splits that into a deletion plus an addition. An
+	// in-place overwrite mints nothing: it is a single entry carrying both
+	// OIDs, so the blob it displaces is never credited. A move whose source
+	// path is simultaneously reoccupied by an entry of the SAME type
+	// therefore still emits its destination as a full addition even though
+	// the bytes are unchanged -- a commit that writes dst.txt with src.txt's
+	// exact bytes while overwriting src.txt with different content reports
+	// dst.txt's whole content as added lines.
+	//
+	// Widening credits to the old side of same-type modifications is a
+	// deliberate non-goal, not an omission: under that rule a commit that
+	// swaps two files' contents would emit nothing at all, because each
+	// path's new bytes match the bytes the other path displaced.
+	//
+	// This mode exists for backward compatibility with callers that
+	// need line-level granularity. Prefer ScanModeBlob for new integrations
+	// because it avoids the overhead of diff computation and tree comparison.
 	//
 	// Reader shape: a text hunk arrives as a *bytes.Reader over a buffer of
 	// its lines joined by '\n'. A binary hunk arrives as a *strings.Reader
@@ -94,8 +133,10 @@ func (hs *HistoryScanner) SetScanMode(mode ScanMode) {
 // scanning. It visits every unique blob exactly once, in pack-offset order,
 // and passes its full content to scanner.ScanBlob.
 //
-// Hunk mode (ScanModeHunks) diffs each commit against its parent and yields
-// only the added lines. It is retained for backward compatibility.
+// Hunk mode (ScanModeHunks) diffs each commit against its first parent and
+// yields added lines. It applies ScanModeHunks' one-for-one exact-OID move
+// suppression, so unchanged bytes are not re-attributed to the destination
+// path or moving commit. It is retained for backward compatibility.
 func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 	if scanner == nil {
 		return fmt.Errorf("scanner is nil")
