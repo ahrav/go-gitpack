@@ -215,28 +215,6 @@ func (s *lineFingerprintSet) markNew(fp uint64) bool {
 	}
 }
 
-// has reports whether fp is already in the set, without inserting it.
-// After saturation it reports false for every fingerprint so verdicts stay
-// fail-open (hunks are emitted rather than suppressed), mirroring markNew.
-func (s *lineFingerprintSet) has(fp uint64) bool {
-	if s.saturated {
-		return false
-	}
-	if fp == 0 {
-		fp = dedupZeroFingerprint
-	}
-	i := fp & s.mask
-	for {
-		switch s.slots[i] {
-		case fp:
-			return true
-		case 0:
-			return false
-		}
-		i = (i + 1) & s.mask
-	}
-}
-
 // dedupHunkEmission decides whether one hunk survives dedup, marking every
 // line in set as a side effect. It reports true iff at least one line was
 // unseen when the hunk was reached; if every line was already seen the hunk
@@ -244,11 +222,30 @@ func (s *lineFingerprintSet) has(fp uint64) bool {
 // verdict, so hunks-emitted-intact is structural: this function cannot
 // return a modified hunk, and hunks are never split.
 //
-// Verdicts for all lines are computed against the set state as of the start
-// of the hunk (probe first, mark after), so duplicate lines inside one hunk
-// cannot suppress each other or affect this hunk's verdict: a block whose
-// closing line repeats an earlier line of the same hunk — armored key
-// blocks sharing an END marker — still counts every occurrence as new.
+// Duplicate lines inside one hunk cannot suppress each other or affect this
+// hunk's verdict: a block whose closing line repeats an earlier line of the
+// same hunk — armored key blocks sharing an END marker — still counts every
+// occurrence as new.
+//
+// That holds even though each line is marked as it is examined, which is what
+// lets one pass settle the verdict and so hashes each line once rather than
+// twice. Let S be the set state at hunk entry. Deciding against S alone means
+// "∃ line ∉ S"; deciding while marking means "∃ line at i ∉ S ∪ {lines before
+// i}". The two agree: if any line is absent from S then the FIRST such line
+// has every predecessor already in S, so the union adds nothing and that line
+// is absent either way; conversely the union contains S, so absence from the
+// union implies absence from S.
+//
+// The loop must not break early: the verdict is settled by the first unseen
+// line, but every line still has to be marked for later hunks.
+//
+// That argument reads markNew's result as "was absent", which a saturated
+// table breaks, so saturation is covered separately. Saturated at entry:
+// markNew reports true for every line, so any non-empty text hunk is
+// emitted. Saturation reached partway through a hunk: the insertion that
+// tripped it reported absence, so the verdict is already true. A hunk whose
+// lines are all present inserts nothing and so cannot begin saturation.
+// Every case therefore agrees with a verdict taken against S alone.
 //
 // Binary hunks bypass dedup entirely: they always survive and never mark
 // the set.
@@ -259,13 +256,13 @@ func dedupHunkEmission(h HunkAddition, set *lineFingerprintSet) bool {
 
 	anyNew := false
 	for _, line := range h.lines {
-		if !set.has(lineFingerprint(line)) {
+		// markNew both reports absence and inserts, in a single probe and a
+		// single hash of the line. It is the only mutator here, so the insert
+		// sequence — and with it the growth and saturation points — is fixed
+		// by the line order alone.
+		if set.markNew(lineFingerprint(line)) {
 			anyNew = true
-			break
 		}
-	}
-	for _, line := range h.lines {
-		set.markNew(lineFingerprint(line))
 	}
 	return anyNew
 }
