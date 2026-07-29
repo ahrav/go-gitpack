@@ -271,9 +271,14 @@ func (h *Handle) Release() {
 	w := h.w
 	entry := h.entry
 
-	// Clear handle fields before returning to pool.
+	// Clear handle fields before returning to pool. data and typ are part of
+	// that: a pooled Handle that still held data would pin the entry's buffer
+	// for as long as it sat in handlePool, and Type() reads its snapshot
+	// without a guard, so a stale typ would outlive the handle's validity.
 	h.entry = nil
 	h.w = nil
+	h.data = nil
+	h.typ = ObjBad
 
 	w.mu.Lock()
 	newCount := entry.refCnt.Add(-1)

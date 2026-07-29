@@ -1,8 +1,10 @@
-// store_test_helpers.go provides test helpers for accessing unexported store functionality.
+// store_test_helpers_test.go provides test helpers for accessing unexported
+// store functionality.
 //
 // This file contains functions that are only intended for use in tests to access
-// the unexported store type and open function. These helpers should not be used
-// in production code.
+// the unexported store type and open function. The _test.go suffix keeps them —
+// and the os/exec, testing, and testify dependencies they pull in — out of the
+// library build, so consumers never inherit them.
 
 package objstore
 

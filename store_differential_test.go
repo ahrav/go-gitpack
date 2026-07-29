@@ -5,8 +5,8 @@
 // The oracle is `git cat-file`: for every object in a repository whose pack has
 // been repacked into deep delta chains, the bytes produced by the store must be
 // byte-identical to the bytes Git produces. This exercises, on real Git-authored
-// data (real copy+insert delta commands, deep ofs-delta chains, the ping-pong
-// arena and its grow path, and the offset-cache short-circuit):
+// data (real copy+insert delta commands, multi-hop ofs-delta chains, the
+// ping-pong arena, and the offset-cache short-circuit):
 //
 //   - inflateDeltaChainStreaming   (via getMaterialized, cacheResult=true)
 //   - inflateDeltaChainBorrowed    (via getPackedObjectNoCache, cacheResult=false)
@@ -65,9 +65,12 @@ func buildDeltaHeavyRepo(t *testing.T) (repoDir, packDir string) {
 	// Content shapes chosen to exercise distinct materialization paths:
 	//
 	//   a.txt  strict-append growth. Each version is a superset of the prior
-	//          one, which is exactly what Git's delta selector chains deeply —
-	//          this produces multi-hop chains (chain length >= 2) that drive
-	//          the ping-pong arena and offset-cache short-circuit.
+	//          one, which is exactly what Git's delta selector chains — this
+	//          produces the multi-hop chains (requireHasDeltas enforces a
+	//          deepest chain of at least 2 hops) that drive the ping-pong arena
+	//          and the offset-cache short-circuit. The fixture blobs stay a few
+	//          KiB, far below the 16 MiB arena half, so the arena grow path is
+	//          not covered here.
 	//   b.txt  wholesale-rewritten line file. Copy+insert delta commands.
 	//   c.bin  wholesale-rewritten binary blob. Non-delta / insert-heavy.
 	//
@@ -198,10 +201,10 @@ func TestStore_DifferentialAgainstGit(t *testing.T) {
 	require.Positive(t, checkedPacked, "expected packed objects to compare")
 }
 
-// requireHasDeltas fails the test unless the pack contains delta objects, so a
-// repack that produced no deltas cannot give a false green. It parses the
-// chain-length histogram that `git verify-pack -v` prints and logs the deepest
-// chain, which indicates whether the multi-hop ping-pong path was exercised.
+// requireHasDeltas fails the test unless the pack contains delta objects and at
+// least one multi-hop chain, so a repack that produced no deltas — or only
+// single-hop ones, which never reach the ping-pong arena — cannot give a false
+// green. It parses the chain-length histogram that `git verify-pack -v` prints.
 func requireHasDeltas(t *testing.T, packDir string) {
 	t.Helper()
 	idxs, err := filepath.Glob(filepath.Join(packDir, "*.idx"))
@@ -213,6 +216,8 @@ func requireHasDeltas(t *testing.T, packDir string) {
 
 	totalDeltas, maxChain := parseVerifyPackDeltaStats(out)
 	require.Positive(t, totalDeltas, "repacked pack contains no delta objects")
+	require.GreaterOrEqual(t, maxChain, 2,
+		"repack produced no multi-hop chains; this test no longer covers the ping-pong path")
 	t.Logf("pack contains %d delta objects, deepest chain = %d hops", totalDeltas, maxChain)
 }
 
