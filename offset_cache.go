@@ -109,7 +109,7 @@ func (c *offsetCache) get(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, 
 // add stores a materialized object under (pack, off). The cache takes shared
 // ownership of data; callers must treat it as immutable afterwards.
 func (c *offsetCache) add(pack *mmap.ReaderAt, off uint64, data []byte, typ ObjectType) {
-	if c == nil || c.budgetPerShard <= 0 || len(data) > maxCacheableSize || len(data) > c.budgetPerShard {
+	if !c.canAdd(len(data)) {
 		return
 	}
 	s := c.shard(off)
@@ -133,4 +133,8 @@ func (c *offsetCache) add(pack *mmap.ReaderAt, off uint64, data []byte, typ Obje
 		}
 	}
 	s.mu.Unlock()
+}
+
+func (c *offsetCache) canAdd(size int) bool {
+	return c != nil && c.budgetPerShard > 0 && size <= maxCacheableSize && size <= c.budgetPerShard
 }
