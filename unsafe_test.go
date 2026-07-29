@@ -1,7 +1,7 @@
 // unsafe_test.go pins the safety-critical invariants of the zero-copy
-// conversion helpers in unsafe.go (introduced with the mmap/zero-copy inflate
-// optimization in 4f9f796). These helpers bypass Go's copy semantics, so the
-// invariants they promise — exact aliasing, correct length, and value
+// conversion helpers in unsafe.go, which let pack reads alias the mmap'd file
+// instead of copying out of it. These helpers bypass Go's copy semantics, so
+// the invariants they promise — exact aliasing, correct length, and value
 // equality — must be asserted directly rather than left to indirect coverage.
 
 package objstore

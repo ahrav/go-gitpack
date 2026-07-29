@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"unsafe"
@@ -721,6 +722,23 @@ func BenchmarkDeltaArenaGetPut(b *testing.B) {
 	})
 
 	b.Run("Parallel", func(b *testing.B) {
+		// RunParallel starts one worker per GOMAXPROCS, and each worker holds
+		// an arena between its get and its put. More workers than the
+		// free-list can retain therefore guarantees steady-state misses, and a
+		// miss allocates and zeroes a real DeltaArenaSize arena inside the
+		// measured loop — the cost this benchmark is seeded to exclude. On a
+		// host with more CPUs than deltaArenaMaxRetained that turned the
+		// pooled round trip into a measurement of allocation instead
+		// (2182 B/op at GOMAXPROCS=64 against 0 B/op at 32), with up to
+		// (workers - limit) concurrent 32 MiB allocations live at once.
+		//
+		// Capping GOMAXPROCS for the duration caps the worker count to the
+		// seeded population, so every iteration stays on the hit path.
+		if procs := runtime.GOMAXPROCS(0); procs > deltaArenaMaxRetained {
+			defer runtime.GOMAXPROCS(procs)
+			runtime.GOMAXPROCS(deltaArenaMaxRetained)
+		}
+
 		setDeltaArenaRetainLimitForTest(b, deltaArenaMaxRetained)
 		putTestDeltaArenas(deltaArenaMaxRetained)
 

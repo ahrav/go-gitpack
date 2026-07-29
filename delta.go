@@ -375,8 +375,15 @@ const DeltaArenaSize = defaultDeltaArenaSize
 //
 // The free-list is process-wide, not per-scanner: this call affects every
 // HistoryScanner and every other user of the package in the process, and it
-// stays in effect until changed again. Pass the returned value back to restore
-// the previous budget.
+// stays in effect until changed again.
+//
+// The budget is last-writer-wins, and the returned value is a plain snapshot
+// rather than an ownership token. Passing it back restores the previous budget
+// only if nothing else set one in the meantime; with two independent callers
+// interleaved, a restore reinstates a budget the other caller has already
+// replaced. Treat this the way the runtime's own process-wide knobs are
+// treated — set it once during startup, or from a test that owns the process
+// for the duration — not as a composable scoped override.
 func SetDeltaArenaBudget(bytes int) (previous int) {
 	return setDeltaArenaRetainLimit(bytes/DeltaArenaSize) * DeltaArenaSize
 }

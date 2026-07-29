@@ -43,19 +43,23 @@ func buildRefDeltaChainPack(t *testing.T, levels int) (packDir string, contents 
 	packPath := filepath.Join(packDir, "chain.pack")
 	idxPath := filepath.Join(packDir, "chain.idx")
 
-	// Distinct, non-trivial content per level so a wrong hop is caught. The
-	// shared test helper (buildSelfContainedDelta) encodes each delta as a
-	// single insert whose size is one byte, so every level's target must stay
-	// <= 127 bytes; the content below tops out near 70 bytes for levels<=12.
+	// Level 0 is a plain blob; every level above it is derived from its base by
+	// makeChainHop, which returns the content and the delta that rebuilds it
+	// from one description so the two cannot drift apart.
 	contents = make([][]byte, levels+1)
 	oids = make([]Hash, levels+1)
-	for i := 0; i <= levels; i++ {
-		var b bytes.Buffer
-		fmt.Fprintf(&b, "L%02d:", i)
-		// Vary length and bytes per level; include 0x00 and high bytes.
-		b.Write(bytes.Repeat([]byte{byte(i), 0x00, 0xa8, byte(255 - i)}, 10+i))
-		contents[i] = b.Bytes()
-		require.LessOrEqual(t, len(contents[i]), 127, "level content must fit single-byte insert")
+	deltas := make([][]byte, levels+1)
+
+	var base bytes.Buffer
+	base.WriteString("L00:")
+	// Vary the bytes, including 0x00 and high bytes, so a byte-swapped or
+	// truncated hop is visible in the comparison.
+	base.Write(bytes.Repeat([]byte{0x00, 0xa8, 0xff, 0x41}, 12))
+	contents[0] = base.Bytes()
+	oids[0] = calculateHash(ObjBlob, contents[0])
+
+	for i := 1; i <= levels; i++ {
+		contents[i], deltas[i] = makeChainHop(t, contents[i-1], i)
 		oids[i] = calculateHash(ObjBlob, contents[i])
 	}
 
@@ -75,9 +79,9 @@ func buildRefDeltaChainPack(t *testing.T, levels int) (packDir string, contents 
 	// references oids[i-1] as its base.
 	for i := 1; i <= levels; i++ {
 		offsets[i] = uint64(pack.Len())
-		obj, err := createRefDeltaObject(oids[i-1], contents[i], contents[i-1])
-		require.NoError(t, err)
-		pack.Write(obj)
+		pack.Write(encodeObjHeader(uint8(ObjRefDelta), uint64(len(deltas[i]))))
+		pack.Write(oids[i-1][:])
+		pack.Write(zlibCompress(t, deltas[i]))
 	}
 
 	trailer := sha1.Sum(pack.Bytes())
@@ -97,6 +101,97 @@ func zlibCompress(t *testing.T, data []byte) []byte {
 	require.NoError(t, err)
 	require.NoError(t, zw.Close())
 	return buf.Bytes()
+}
+
+// makeChainHop derives one chain level's content from its base and returns it
+// together with the delta payload that rebuilds it. Both come out of a single
+// description, so the declared content and the instructions can never disagree.
+//
+// Every hop emits at least one copy command, which is the point. The shared
+// buildSelfContainedDelta helper encodes a delta as one insert of the entire
+// target, so each hop's output depends only on its base's *length*: a resolver
+// that fed the next hop a corrupted intermediate buffer of the right size would
+// still reconstruct the correct final bytes, and the chain assertions would pass
+// while proving nothing about intermediate materialization. Copying from the
+// base makes each hop read what the previous hop actually produced, so a
+// corrupted or misaligned arena hand-off propagates into the result.
+//
+// The two shapes alternate so both copy-operand cases are covered: a copy at
+// offset 0 (no offset operand bytes at all) and a copy at a non-zero offset.
+func makeChainHop(t *testing.T, base []byte, level int) (target, delta []byte) {
+	t.Helper()
+	require.Greater(t, len(base), chainHopCopySkip, "base too short to copy from")
+
+	marker := []byte(fmt.Sprintf("|L%02d|", level))
+
+	var instructions []byte
+	if level%2 == 0 {
+		// target = base ++ marker; copy starts at offset 0.
+		target = append(append([]byte(nil), base...), marker...)
+		instructions = appendDeltaCopy(t, instructions, 0, len(base))
+		instructions = appendDeltaInsert(t, instructions, marker)
+	} else {
+		// target = marker ++ base[skip:]; copy starts at a non-zero offset.
+		target = append(append([]byte(nil), marker...), base[chainHopCopySkip:]...)
+		instructions = appendDeltaInsert(t, instructions, marker)
+		instructions = appendDeltaCopy(t, instructions,
+			chainHopCopySkip, len(base)-chainHopCopySkip)
+	}
+
+	var d bytes.Buffer
+	writeVarInt(&d, uint64(len(base)))
+	writeVarInt(&d, uint64(len(target)))
+	d.Write(instructions)
+	return target, d.Bytes()
+}
+
+// chainHopCopySkip is the non-zero copy offset used by odd chain levels.
+const chainHopCopySkip = 3
+
+// appendDeltaCopy appends a Git delta copy command for base[off:off+size].
+//
+// The command byte's low 7 bits say which operand bytes follow: bits 0-3 select
+// bytes of the offset, bits 4-6 bytes of the size, little-endian, and an omitted
+// byte decodes as zero. Only non-zero bytes are emitted, matching what Git
+// writes. A size of zero is not encodable — the format reads it back as
+// 0x10000 — so it is rejected rather than silently emitted.
+func appendDeltaCopy(t *testing.T, dst []byte, off, size int) []byte {
+	t.Helper()
+	require.Positive(t, size, "copy size 0 encodes as 0x10000")
+	require.LessOrEqual(t, size, 0xffffff, "copy size exceeds the 3-byte operand")
+	require.GreaterOrEqual(t, off, 0)
+	require.LessOrEqual(t, off, 0xffffffff, "copy offset exceeds the 4-byte operand")
+
+	cmd := byte(0x80)
+	var ops []byte
+	for shift, bit := 0, byte(0x01); shift < 32; shift, bit = shift+8, bit<<1 {
+		if b := byte(off >> shift); b != 0 {
+			cmd |= bit
+			ops = append(ops, b)
+		}
+	}
+	for shift, bit := 0, byte(0x10); shift < 24; shift, bit = shift+8, bit<<1 {
+		if b := byte(size >> shift); b != 0 {
+			cmd |= bit
+			ops = append(ops, b)
+		}
+	}
+	return append(append(dst, cmd), ops...)
+}
+
+// appendDeltaInsert appends Git delta insert commands carrying lit verbatim.
+// One command holds at most 127 bytes (the command byte is the length and must
+// keep its high bit clear), so longer literals are split across commands.
+func appendDeltaInsert(t *testing.T, dst []byte, lit []byte) []byte {
+	t.Helper()
+	require.NotEmpty(t, lit, "insert of 0 bytes is not encodable")
+	for len(lit) > 0 {
+		n := min(len(lit), 127)
+		dst = append(dst, byte(n))
+		dst = append(dst, lit[:n]...)
+		lit = lit[n:]
+	}
+	return dst
 }
 
 // TestMultiHopRefDeltaChain_BorrowedAndStreaming resolves a deep ref-delta chain
@@ -124,7 +219,9 @@ func TestMultiHopRefDeltaChain_BorrowedAndStreaming(t *testing.T) {
 	})
 
 	// Every level must materialize to its exact content via the streaming
-	// (cached) path, which also validates intermediate chain lengths 1..N.
+	// (cached) path, reading ascending on one warm store — the repeated-read
+	// pattern a real scan produces. Chain depths 1..N are covered by
+	// streaming_cold_per_level below, not here; see the note there.
 	t.Run("streaming_all_levels", func(t *testing.T) {
 		st, err := OpenForTesting(packDir)
 		require.NoError(t, err)
@@ -135,6 +232,32 @@ func TestMultiHopRefDeltaChain_BorrowedAndStreaming(t *testing.T) {
 			require.NoErrorf(t, err, "level %d", i)
 			require.Equalf(t, ObjBlob, typ, "level %d type", i)
 			require.Equalf(t, contents[i], got, "level %d content mismatch", i)
+		}
+	})
+
+	// The same levels again, each on its own store, so the streaming path
+	// performs a genuine i-hop climb at every level.
+	//
+	// streaming_all_levels above shares one store and reads ascending, so by
+	// the time level i is requested its base is already published under its
+	// pack offset: walkUpDeltaChain short-circuits after one hop and every
+	// level resolves through the single-hop fast path. That covers depth 1
+	// repeatedly, not depths 1..N. A cold store per level is what makes the
+	// streaming path build a multi-entry stack, which is also the only way to
+	// reach the intermediate-publication branch of applyDeltaStackCached
+	// (non-nil cache with more than one hop remaining) — the borrowed path
+	// walks with a nil cache and can never enter it.
+	t.Run("streaming_cold_per_level", func(t *testing.T) {
+		for i := 1; i <= levels; i++ {
+			st, err := OpenForTesting(packDir)
+			require.NoError(t, err)
+
+			got, typ, err := st.getMaterialized(oids[i])
+			require.NoErrorf(t, err, "level %d", i)
+			require.Equalf(t, ObjBlob, typ, "level %d type", i)
+			require.Equalf(t, contents[i], got, "level %d content mismatch", i)
+
+			require.NoError(t, st.Close())
 		}
 	})
 
