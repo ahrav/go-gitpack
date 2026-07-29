@@ -287,6 +287,185 @@ func TestDedupHunkEmission_PropertyOracle(t *testing.T) {
 	}
 }
 
+// fillToSaturation inserts distinct lines until set saturates, returning the
+// lines it actually inserted. Every returned line is therefore "seen", so a
+// hunk built from them would be suppressed under the unsaturated rule.
+func fillToSaturation(t *testing.T, set *lineFingerprintSet) []string {
+	t.Helper()
+	var inserted []string
+	for i := 0; !set.saturated; i++ {
+		if i > 1<<20 {
+			t.Fatalf("set did not saturate after %d inserts", i)
+		}
+		l := fmt.Sprintf("fill-%d", i)
+		if set.markNew(lineFingerprint(l)) {
+			inserted = append(inserted, l)
+		}
+	}
+	return inserted
+}
+
+// TestDedupHunkEmission_SaturatedSetFailsOpen pins the security-critical
+// direction of saturation at hunk granularity: once the fingerprint table
+// can no longer record lines, dedup must stop suppressing.
+//
+// The hunk here is built entirely from lines the set already contains, so the
+// ordinary rule would suppress it. Saturation must flip that to emission.
+// Failing closed instead would silently drop every hunk once a large
+// repository fills the table — that is, report no secrets at all — so this
+// asserts emission rather than merely "some verdict".
+func TestDedupHunkEmission_SaturatedSetFailsOpen(t *testing.T) {
+	set := newLineFingerprintSet(4) // 16 slots => saturates after 11 inserts
+	inserted := fillToSaturation(t, set)
+	require.True(t, set.saturated, "precondition: set must be saturated")
+	require.GreaterOrEqual(t, len(inserted), 3, "need at least 3 seen lines")
+
+	seen := mkTestHunk(1, inserted[0], inserted[1], inserted[2])
+	require.True(t, dedupHunkEmission(seen, set),
+		"a saturated set must emit an all-seen hunk (fail open), not suppress it")
+
+	// Repeat observations stay open; saturation is terminal, not a one-shot.
+	require.True(t, dedupHunkEmission(seen, set),
+		"fail-open must hold on every subsequent hunk")
+}
+
+// TestDedupHunkEmission_SaturationBoundary covers the three ways a hunk can
+// meet the load-factor bound. Marking each line as it is examined means the
+// bound can now be reached partway through a hunk, so each case pins both the
+// verdict and the resulting set state.
+func TestDedupHunkEmission_SaturationBoundary(t *testing.T) {
+	// oneShortOfBound returns a 16-slot set (bound 11) holding 10 distinct
+	// lines, so exactly one insert remains before saturation.
+	oneShortOfBound := func(t *testing.T) (*lineFingerprintSet, []string) {
+		t.Helper()
+		set := newLineFingerprintSet(4)
+		var seen []string
+		for i := 0; len(seen) < 10; i++ {
+			l := fmt.Sprintf("pre-%d", i)
+			if set.markNew(lineFingerprint(l)) {
+				seen = append(seen, l)
+			}
+		}
+		require.False(t, set.saturated, "10 inserts must stay below the bound of 11")
+		require.Equal(t, 10, set.count)
+		return set, seen
+	}
+
+	t.Run("bound reached partway through a hunk still emits", func(t *testing.T) {
+		set, seen := oneShortOfBound(t)
+		// seen[0] inserts nothing; "new-a" is the 11th insert and trips the
+		// bound; "new-b" then arrives at a saturated set.
+		h := mkTestHunk(1, seen[0], "new-a", "new-b")
+
+		require.True(t, dedupHunkEmission(h, set),
+			"a hunk containing an unseen line must emit")
+		require.True(t, set.saturated, "the 11th insert must trip the bound")
+		require.Equal(t, 11, set.count,
+			"lines after saturation must not be inserted")
+	})
+
+	t.Run("all-seen hunk cannot reach the bound", func(t *testing.T) {
+		set, seen := oneShortOfBound(t)
+		h := mkTestHunk(1, seen[0], seen[1], seen[2])
+
+		require.False(t, dedupHunkEmission(h, set),
+			"every line was seen and the set is not saturated, so suppress")
+		require.False(t, set.saturated,
+			"a hunk that inserts nothing cannot begin saturation")
+		require.Equal(t, 10, set.count, "no line may be inserted twice")
+	})
+
+	t.Run("suppression still possible right up to the bound", func(t *testing.T) {
+		set, seen := oneShortOfBound(t)
+		// Consume the last slot with an unrelated hunk, then confirm the
+		// verdict for an all-seen hunk flips from suppress to emit exactly
+		// at the boundary.
+		require.False(t, dedupHunkEmission(mkTestHunk(1, seen[0]), set),
+			"seen line before the bound is suppressed")
+		require.True(t, dedupHunkEmission(mkTestHunk(2, "tips-it"), set),
+			"the unseen line that trips the bound emits")
+		require.True(t, set.saturated)
+		require.True(t, dedupHunkEmission(mkTestHunk(3, seen[0]), set),
+			"the same seen line emits once the bound is reached")
+	})
+}
+
+// saturatingOracle is the reference for the whole-hunk rule INCLUDING
+// fail-open. It keeps the probe-all-then-mark-all shape — a deliberately
+// different formulation from the implementation's single marking pass — and
+// tracks only a budget counter, with no open addressing, probing, or growth.
+type saturatingOracle struct {
+	seen      map[string]bool
+	remaining int
+	saturated bool
+}
+
+// verdict reports whether the hunk survives, and marks its lines.
+//
+// A saturated oracle can no longer prove any line was seen, so it emits. Below
+// the bound it decides against the pre-hunk state, then marks. That differs in
+// shape from marking in place, and the two agree: a hunk holding a line absent
+// from the pre-hunk state emits under both, and a hunk holding no such line
+// inserts nothing and so cannot reach the bound mid-hunk.
+func (o *saturatingOracle) verdict(lines []string) bool {
+	if o.saturated {
+		return len(lines) > 0
+	}
+	anyNew := false
+	for _, ln := range lines {
+		if !o.seen[ln] {
+			anyNew = true
+		}
+	}
+	for _, ln := range lines {
+		if o.seen[ln] {
+			continue
+		}
+		o.seen[ln] = true
+		o.remaining--
+		if o.remaining <= 0 {
+			o.saturated = true
+		}
+	}
+	return anyNew
+}
+
+// TestDedupHunkEmission_PropertyOracleAcrossSaturation is the saturating
+// counterpart to TestDedupHunkEmission_PropertyOracle, which draws from a
+// 120-value domain into a 65536-slot table and therefore never approaches the
+// bound (it settles at 120 of 45875 inserts). This one uses a 64-slot table
+// and a wider domain so the run crosses saturation and keeps going.
+func TestDedupHunkEmission_PropertyOracleAcrossSaturation(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	set := newLineFingerprintSet(6) // 64 slots => bound of 44 inserts, never grows
+	oracle := &saturatingOracle{seen: make(map[string]bool), remaining: set.remaining}
+
+	sawUnsaturated, sawSaturated := false, false
+	for hunkIdx := range 400 {
+		n := 1 + rng.Intn(12)
+		lines := make([]string, n)
+		for i := range lines {
+			lines[i] = fmt.Sprintf("ln-%d", rng.Intn(200))
+		}
+
+		if set.saturated {
+			sawSaturated = true
+		} else {
+			sawUnsaturated = true
+		}
+
+		want := oracle.verdict(lines)
+		require.Equalf(t, want, dedupHunkEmission(mkTestHunk(1+rng.Intn(500), lines...), set),
+			"hunk %d: verdict diverged from the saturation-aware oracle", hunkIdx)
+		require.Equalf(t, oracle.saturated, set.saturated,
+			"hunk %d: saturation state diverged, so the insert counts differ", hunkIdx)
+	}
+
+	// Without both regimes the comparison would prove much less than it looks.
+	require.True(t, sawUnsaturated, "run must cover the unsaturated regime")
+	require.True(t, sawSaturated, "run must cross saturation, or the table is too large")
+}
+
 // --- repository fixtures ---
 
 // dedupRepoBuilder scripts a git repository with strictly increasing commit
