@@ -6,16 +6,18 @@
 //   - ScanModeBlob  (default) -- iterates every unique blob introduced across
 //     the commit history in pack-file offset order, yielding the full blob
 //     body exactly once per OID. This is the recommended and fastest path.
-//   - ScanModeHunks (legacy)  -- computes per-commit diffs and yields only the
-//     added-line hunks. Retained for backward compatibility with callers that
-//     require line-level attribution, but significantly slower because it must
-//     diff every parent-child commit pair.
+//   - ScanModeHunks (legacy)  -- computes per-commit diffs and yields added-line
+//     hunks, except for exact-OID moves whose bytes are unchanged. Retained for
+//     backward compatibility with callers that require line-level attribution,
+//     but significantly slower because it must diff every parent-child commit
+//     pair.
 package objstore
 
 import (
 	"bytes"
 	"fmt"
 	"strings"
+	"sync"
 )
 
 // ScanMode selects the high-level scanning strategy used by HistoryScanner.Scan.
@@ -30,10 +32,48 @@ const (
 	ScanModeBlob ScanMode = iota
 
 	// ScanModeHunks is the legacy scanning mode that computes parent-child
-	// diffs for every commit and yields only the added-line hunks. It exists
-	// for backward compatibility with callers that need line-level
-	// granularity. Prefer ScanModeBlob for new integrations because it
-	// avoids the overhead of diff computation and tree comparison.
+	// diffs for every commit and yields added-line hunks. An entry's added
+	// lines are suppressed when the same commit has an unmatched deletion of
+	// the same blob identity -- the blob OID plus the tree entry's type, so a
+	// regular file never pairs with a symlink; matching is one-for-one because
+	// the content-addressed bytes are unchanged. This covers both a pure
+	// addition and a move that overwrites a tracked destination, which git
+	// reports as a modification whose resulting blob is the deleted one.
+	// Consequently an exact-OID move has no hunk attributed to its destination
+	// path or moving commit. When one deletion has several same-identity
+	// candidates (a rename plus a copy of the same bytes), one is suppressed
+	// and the rest are emitted; which path survives follows tree order, so the
+	// bytes are reported once but the surviving path is not git's rename
+	// heuristic.
+	//
+	// A type change at one path is a deletion plus an addition, and their
+	// identities differ in the type nibble, so the two sides never cancel each
+	// other even when they share one OID -- a regular file holding "target"
+	// replaced by a symlink to "target" reports the symlink's target. The
+	// arriving side is still an ordinary candidate for the one-for-one rule
+	// above: a deletion elsewhere in the same commit that matches its identity
+	// can claim it, and tree order decides which candidate that credit
+	// silences.
+	//
+	// Known gap: only a DELETION mints a suppression credit -- an entry that
+	// leaves the tree, which includes the old side of a type transition
+	// because walkDiff splits that into a deletion plus an addition. An
+	// in-place overwrite mints nothing: it is a single entry carrying both
+	// OIDs, so the blob it displaces is never credited. A move whose source
+	// path is simultaneously reoccupied by an entry of the SAME type
+	// therefore still emits its destination as a full addition even though
+	// the bytes are unchanged -- a commit that writes dst.txt with src.txt's
+	// exact bytes while overwriting src.txt with different content reports
+	// dst.txt's whole content as added lines.
+	//
+	// Widening credits to the old side of same-type modifications is a
+	// deliberate non-goal, not an omission: under that rule a commit that
+	// swaps two files' contents would emit nothing at all, because each
+	// path's new bytes match the bytes the other path displaced.
+	//
+	// This mode exists for backward compatibility with callers that
+	// need line-level granularity. Prefer ScanModeBlob for new integrations
+	// because it avoids the overhead of diff computation and tree comparison.
 	//
 	// Reader shape: a text hunk arrives as a *bytes.Reader over a buffer of
 	// its lines joined by '\n'. A binary hunk arrives as a *strings.Reader
@@ -93,8 +133,10 @@ func (hs *HistoryScanner) SetScanMode(mode ScanMode) {
 // scanning. It visits every unique blob exactly once, in pack-offset order,
 // and passes its full content to scanner.ScanBlob.
 //
-// Hunk mode (ScanModeHunks) diffs each commit against its parent and yields
-// only the added lines. It is retained for backward compatibility.
+// Hunk mode (ScanModeHunks) diffs each commit against its first parent and
+// yields added lines. It applies ScanModeHunks' one-for-one exact-OID move
+// suppression, so unchanged bytes are not re-attributed to the destination
+// path or moving commit. It is retained for backward compatibility.
 func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 	if scanner == nil {
 		return fmt.Errorf("scanner is nil")
@@ -110,35 +152,72 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 	}
 }
 
+// maxReusedHunkPayloadBytes bounds the capacity scanHunks carries from one
+// hunk to the next. Reuse is what makes the buffer worth having — a history
+// of small hunks assembles every payload into the same array — but a single
+// whole-file text hunk can reach MaxDiffSize (1 GiB), and Reset keeps the
+// grown array. Without a cap, one large hunk early in a scan pins its payload
+// until the scan returns, which the per-hunk buffer this replaced did not do.
+// Past the cap the buffer is dropped for the GC: re-allocating for the next
+// hunk is dwarfed by the cost of having diffed a file that large. 4 MiB
+// matches maxPooledLineIndexBytes and the store's maxCacheableSize.
+const maxReusedHunkPayloadBytes = 4 << 20 // 4 MiB
+
+// releaseOversizedPayload drops payload's backing array when it has grown past
+// maxReusedHunkPayloadBytes, reporting whether it did. Callers must have
+// finished reading the assembled bytes: this abandons them to the GC.
+func releaseOversizedPayload(payload *bytes.Buffer) bool {
+	if payload.Cap() <= maxReusedHunkPayloadBytes {
+		return false
+	}
+	*payload = bytes.Buffer{}
+	return true
+}
+
 // scanHunks implements the legacy hunk-based scanning mode.
 //
-// It calls DiffHistoryHunks, which produces hunks on a channel and sends
-// a single error on errC when the walk completes. The loop drains the hunks
-// channel to completion even after the first scan error, because the
-// producer goroutine blocks on sends and would leak if the consumer stopped
-// reading early.
+// It drives DiffHistoryHunksFunc, so no queue sits between a blob worker and
+// scanner.ScanBlob. DiffHistoryHunksFunc invokes the callback concurrently
+// from every blob worker, and one mutex serializes the whole per-hunk body.
+// Both halves need it: the payload buffer is reused across hunks, which
+// BlobScanner permits because an implementation may not retain the reader's
+// bytes past the call, and ScanBlob is handed one hunk at a time to match
+// every other ScanBlob call site in this package.
 //
-// Error precedence: a scan-side error (scanErr) takes priority over the
-// walk-side error (runErr) so the caller sees the first failure in the
-// scanning pipeline rather than a secondary channel-close error.
+// Retention is one payload, not the largest payload the scan has seen: a
+// buffer grown past maxReusedHunkPayloadBytes is released rather than carried.
+//
+// A binary hunk bypasses the buffer entirely. Its single line already holds the
+// whole new blob, so it is streamed straight to ScanBlob instead of being
+// copied into the payload — the case that would otherwise grow the buffer to
+// MaxDiffSize on every checked-in binary.
+//
+// A scan error aborts the walk, and DiffHistoryHunksFunc returns the first
+// error observed, whether it came from a scan or from the walk itself.
 func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
-	hunks, errC := hs.DiffHistoryHunks()
+	var (
+		mu      sync.Mutex
+		payload bytes.Buffer
+	)
 
-	var scanErr error
-	for hunk := range hunks {
-		if scanErr != nil {
-			continue
-		}
+	return hs.DiffHistoryHunksFunc(func(hunk HunkAddition) error {
+		mu.Lock()
+		defer mu.Unlock()
 
 		meta := ScanMeta{
 			Commit: hunk.commit,
 			Path:   hunk.path,
 		}
+
 		var err error
 		if hunk.isBinary && len(hunk.lines) == 1 {
+			// A binary hunk carries the whole new blob as its single line, a
+			// zero-copy view of the store's buffer. Assembling it into payload
+			// would copy the entire file and then immediately release the
+			// grown array; reading the string directly skips both.
 			err = scanner.ScanBlob(strings.NewReader(hunk.lines[0]), meta)
 		} else {
-			var payload bytes.Buffer
+			payload.Reset()
 			for i, line := range hunk.lines {
 				if i > 0 {
 					payload.WriteByte('\n')
@@ -146,16 +225,16 @@ func (hs *HistoryScanner) scanHunks(scanner BlobScanner) error {
 				payload.WriteString(line)
 			}
 			err = scanner.ScanBlob(bytes.NewReader(payload.Bytes()), meta)
+
+			// Release an oversized array now that ScanBlob has returned; the
+			// reader handed to it does not outlive the call.
+			releaseOversizedPayload(&payload)
 		}
+
 		if err != nil {
-			scanErr = fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
+			return fmt.Errorf("scan hunk %s:%s:%d-%d: %w",
 				hunk.commit, hunk.path, hunk.startLine, hunk.endLine, err)
 		}
-	}
-
-	runErr := <-errC
-	if scanErr != nil {
-		return scanErr
-	}
-	return runErr
+		return nil
+	})
 }
