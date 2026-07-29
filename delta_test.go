@@ -555,17 +555,19 @@ func TestDeltaArenaPooling(t *testing.T) {
 	})
 }
 
+// TestDeltaArenaRetainLimitDropsIdleExcess offers more arenas than the limit
+// permits and expects the surplus to be dropped rather than retained.
+//
+// Token arenas are enough: the bound counts arenas, not bytes, and
+// putDeltaArena's decision reads only cap(data) via prepareDeltaArenaForPool.
+// Getting three real arenas from a drained free-list would allocate and zero
+// ~96 MiB to observe a count. The real-arena round trip is covered by
+// TestDeltaArenaRetentionDisabled, and pool eligibility by the
+// prepareDeltaArenaForPool cases above.
 func TestDeltaArenaRetainLimitDropsIdleExcess(t *testing.T) {
 	setDeltaArenaRetainLimitForTest(t, 2)
 
-	arenas := []*deltaArena{
-		getDeltaArena(),
-		getDeltaArena(),
-		getDeltaArena(),
-	}
-	for _, arena := range arenas {
-		putDeltaArena(arena)
-	}
+	putTestDeltaArenas(3)
 	if got := idleDeltaArenas(); got != 2 {
 		t.Fatalf("delta arena free-list retained %d arenas, want 2", got)
 	}

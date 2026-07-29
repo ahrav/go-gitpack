@@ -130,11 +130,18 @@ func requireLibdeflateMatches(t *testing.T, want, compressed []byte) {
 	consumed, err := inflateZlibOneShot(compressed, dst)
 	require.NoError(t, err)
 	require.Equal(t, want, dst, "libdeflate output differs from pure-Go oracle")
-	if len(want) > 0 {
-		require.Positive(t, consumed, "consumed byte count should be positive for non-empty output")
-		require.LessOrEqual(t, consumed, len(compressed))
-	}
+	require.Equal(t, len(compressed)-adler32TrailerSize, consumed,
+		"must consume the zlib header and deflate payload but stop before the adler32 trailer")
 }
+
+// adler32TrailerSize is the width of the adler32 checksum that closes a zlib
+// stream. inflateZlibOneShot deliberately does not consume or verify it, so for
+// a well-formed fixture the consumed count is exactly the stream length minus
+// this. Asserting the exact boundary rather than a range is what pins that
+// contract: a decoder that swallowed the trailer would still satisfy
+// "positive and not past the end", and the pure-Go backend agrees on the
+// same boundary for every payload shape tested here.
+const adler32TrailerSize = 4
 
 // TestLibdeflate_DifferentialAgainstPureGo verifies that the libdeflate backend
 // agrees with the pure-Go backend across payload shapes that stress different
@@ -179,8 +186,8 @@ func TestLibdeflate_EmptyOutputContract(t *testing.T) {
 	compressed := zlibDeflate(t, nil)
 	n, err := inflateZlibOneShot(compressed, nil)
 	require.NoError(t, err)
-	require.Positive(t, n)
-	require.LessOrEqual(t, n, len(compressed))
+	require.Equal(t, len(compressed)-adler32TrailerSize, n,
+		"an empty payload still consumes the header and the empty deflate block, and no trailer")
 
 	_, err = inflateZlibOneShot([]byte{0x78, 0x9c}, nil)
 	require.Error(t, err, "truncated empty stream must be rejected")
