@@ -6,17 +6,9 @@
 // and the os/exec, testing, and testify dependencies they pull in — out of the
 // library build, so consumers never inherit them.
 //
-// The _test.go suffix also removes OpenForTesting from the package's exported
-// surface, which is intentional and not a side effect of the file rename.
-// OpenForTesting returns *store, an unexported type, so it never offered an
-// external caller anything beyond an opaque handle and the three exported store
-// methods; the package exports no other constructor for it. Keeping a wrapper in
-// a library file is not an available compromise: a non-test file cannot
-// reference an identifier declared in a _test.go file, so preserving the symbol
-// for external importers means moving the helper — and testing, testify, and
-// os/exec with it — back into every consumer's dependency graph. In-tree callers
-// are the only callers; anything outside this package must go through the
-// package's own exported API.
+// Everything here is therefore visible only to this package's tests, including
+// OpenForTesting: it is not part of the package's exported surface. Callers
+// outside this package use the package's own exported API.
 
 package objstore
 

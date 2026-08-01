@@ -279,6 +279,16 @@ func TestMultiHopRefDeltaChain_BorrowedAndStreaming(t *testing.T) {
 			st, err := OpenForTesting(packDir)
 			require.NoError(t, err)
 
+			// Pin the offset-cache budget instead of inheriting whatever
+			// newOffsetCache derived from GOGITPACK_OFFSET_CACHE_BUDGET. That
+			// override is a supported control: <= 0 disables publication
+			// outright, and a small value makes admits() reject these entries.
+			// Under either setting the store is behaving correctly while the
+			// assertions below would fail, so the budget has to be established
+			// rather than assumed. Set before any read, so no concurrent reader
+			// can observe the change (setBudget is not synchronized).
+			st.offCache.setBudget(defaultOffsetCacheBudget)
+
 			got, typ, err := st.getMaterialized(oids[i])
 			require.NoErrorf(t, err, "level %d", i)
 			require.Equalf(t, ObjBlob, typ, "level %d type", i)

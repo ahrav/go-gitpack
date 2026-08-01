@@ -149,14 +149,17 @@ func listGitObjects(t *testing.T, repoDir string) []gitObject {
 // tests walk every object in a 120-commit repository twice over — enough
 // subprocess churn to dominate a default `go test` run.
 //
-// The reported type is checked against the enumerated one as a side effect.
-// Both readings come from git itself but from separate invocations with
-// different enumeration semantics: `cat-file --batch-all-objects
-// --batch-check` in listGitObjects walks every object in the object database,
-// while the `cat-file --batch` here reports the type of each OID it is asked
-// about. A disagreement therefore means the fixture shifted between the two
-// calls, not that an independent oracle contradicted git — the type is not
-// derived from a source outside git, and nothing here relies on it being.
+// The reported type is checked against the enumerated one as a side effect, as
+// a consistency check between two git responses rather than an independent
+// oracle: `cat-file --batch-all-objects --batch-check` in listGitObjects and the
+// `cat-file --batch` here are both git. The check cannot fail from the fixture
+// changing under the test — an object's type is part of the bytes hashed into
+// its OID, so a given OID can never report a different type, and an object that
+// disappeared yields a two-field `<oid> missing` record that trips the
+// three-field header assertion first. It fails only if the two readings of the
+// same OID disagree, which would mean git contradicted itself or this parser
+// misread a record. Nothing here depends on the type being sourced from outside
+// git; the load-bearing oracle is the content comparison.
 func gitCatFileBatch(t *testing.T, repoDir string, objs []gitObject) map[Hash][]byte {
 	t.Helper()
 

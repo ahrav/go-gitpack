@@ -23,6 +23,7 @@
 package objstore
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 
@@ -58,19 +59,29 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 		coldWaves      = 8
 	)
 
-	// runConcurrently releases `workers` goroutines simultaneously and fails the
-	// test if any reports an error. read is invoked with the worker index and
+	// noCacheWorkers bounds the subtest below, where every read holds a 32 MiB
+	// ping-pong arena for the duration of its reconstruction. Releasing all 32
+	// workers there would pin ~1 GiB of live scratch while the free-list retains
+	// only min(8, max(2, GOMAXPROCS)) arenas, so the surplus is discarded and
+	// re-allocated — and re-zeroed — on nearly every iteration, which turns a
+	// race gate into allocator churn and risks OOM on a small runner. Matching
+	// the free-list's own sizing keeps every concurrent holder serviceable from
+	// the pool while still contending for it.
+	noCacheWorkers := min(8, max(2, runtime.GOMAXPROCS(0)))
+
+	// runConcurrently releases `n` goroutines simultaneously and fails the test
+	// if any reports an error. read is invoked with the worker index and
 	// iteration so callers can spread work across the chain deterministically.
-	runConcurrently := func(t *testing.T, iters int, read func(worker, iter int) error) {
+	runConcurrently := func(t *testing.T, n, iters int, read func(worker, iter int) error) {
 		t.Helper()
 		var (
 			start   = make(chan struct{})
 			wg      sync.WaitGroup
-			errs    = make(chan error, workers)
+			errs    = make(chan error, n)
 			pending sync.WaitGroup
 		)
-		pending.Add(workers)
-		for w := range workers {
+		pending.Add(n)
+		for w := range n {
 			wg.Add(1)
 			go func(seed int) {
 				defer wg.Done()
@@ -122,7 +133,7 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 			// spending it on cache hits; cold_waves proves contention during
 			// first materialization, and no_cache below covers sustained
 			// full-chain concurrency.
-			runConcurrently(t, 4, func(seed, it int) error {
+			runConcurrently(t, workers, 4, func(seed, it int) error {
 				// Rotate across all levels, deepest included, so different
 				// workers climb overlapping chains at the same time.
 				return checkOID(st, oids[(seed+it)%len(oids)])
@@ -134,18 +145,27 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 
 	// Sustained full-chain concurrency. getPackedObjectNoCache takes the
 	// borrowed path, which neither consults nor publishes the offset cache and
-	// never writes the delta window (see inflateDeltaChainBorrowed), so every
-	// one of these reads performs a real multi-hop walk plus a full ping-pong
-	// reconstruction no matter how many reads preceded it. That makes the arena
-	// free-list and the walk-up path contended for the whole run rather than
-	// only until the caches warm.
+	// never writes the delta window (see inflateDeltaChainBorrowed), so these
+	// reads perform a real multi-hop walk plus a full ping-pong reconstruction
+	// no matter how many reads preceded them. That makes the arena free-list and
+	// the walk-up path contended for the whole run rather than only until the
+	// caches warm.
+	//
+	// Selection starts at level 2 deliberately: level 0 is a plain blob that
+	// never enters the delta code, and level 1 resolves through the single-hop
+	// exact-buffer fast path in applyDeltaStackCached, which borrows no arena.
+	// Including either would leave iterations that do not exercise the path this
+	// subtest exists to sustain.
 	t.Run("no_cache", func(t *testing.T) {
 		st, err := OpenForTesting(packDir)
 		require.NoError(t, err)
 		defer st.Close()
 
-		runConcurrently(t, itersPerWorker, func(seed, it int) error {
-			oid := oids[(seed+it)%len(oids)]
+		multiHop := oids[2:]
+		require.NotEmpty(t, multiHop, "need at least one multi-hop level")
+
+		runConcurrently(t, noCacheWorkers, itersPerWorker, func(seed, it int) error {
+			oid := multiHop[(seed+it)%len(multiHop)]
 			p, off, ok := st.findPackedObject(oid)
 			if !ok {
 				return errConcurrentMismatch(oid)
