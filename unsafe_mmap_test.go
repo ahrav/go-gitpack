@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/exp/mmap"
 
@@ -36,6 +37,23 @@ func TestMmapData_AliasesMappedRegion(t *testing.T) {
 	got := mmapData(r)
 	require.Equal(t, len(want), r.Len(), "sanity: mmap reports file length")
 	require.Equal(t, len(want), len(got), "mmapData length must equal file size")
+
+	// Aliasing is the promise in this test's name, and the value comparisons
+	// below cannot see it: a mmapData that returned a copy would satisfy every
+	// one of them. Only backing-pointer identity separates the two.
+	//
+	// The expected pointer is re-derived through the same layout cast mmapData
+	// uses, which makes this a copy oracle and deliberately NOT a layout
+	// oracle — a changed field offset would move both sides together. The
+	// layout axis is covered by the value assertions here (a wrong offset
+	// yields garbage, not the file's bytes) and by checkMmapLayout /
+	// TestCheckMmapLayout.
+	mapped := (*struct{ data []byte })(unsafe.Pointer(r)).data
+	require.Equal(t,
+		uintptr(unsafe.Pointer(unsafe.SliceData(mapped))),
+		uintptr(unsafe.Pointer(unsafe.SliceData(got))),
+		"mmapData must return the mapped slice without copying")
+
 	require.Equal(t, want, got, "mmapData must expose the file's bytes")
 
 	// Cross-check a byte read through the public API matches the aliased slice.
