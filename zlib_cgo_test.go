@@ -7,18 +7,27 @@
 //	go test -tags gitpack_libdeflate ./...
 //
 // Two complementary proofs live here. The error-class tests pin the
-// cross-backend contract by calling inflatePackZlibGo directly, so the same
-// malformed stream must classify identically under errors.Is regardless of
-// build tag. The differential tests use the pure-Go klauspost zlib reader as
-// an output oracle: for every input, libdeflate's whole-buffer decode must
-// produce byte-identical output. Because the two backends are selected at
-// build time, a single build can only reach one through the store; these
-// tests invoke both directly and compare them.
+// cross-backend contract by calling inflatePackZlibGo directly, for the two
+// classes the backends genuinely agree on: output overrun (the stream continues
+// past the declared size) and short output (a valid stream ending before the
+// declared size). Both must classify identically under errors.Is regardless of
+// build tag. Parity is NOT claimed for every malformed stream: libdeflate
+// reports BAD_DATA for truncated and structurally invalid input alike, so those
+// two collapse into errLibdeflateBadData, while the pure-Go decoder can still
+// distinguish them and surface io.ErrUnexpectedEOF (see the failure-mapping
+// comment in zlib_cgo.go). The differential tests use the pure-Go klauspost
+// zlib reader as an output oracle: for every input, libdeflate's whole-buffer
+// decode must produce byte-identical output. Because the two backends are
+// selected at build time, a single build can only reach one through the store;
+// these tests invoke both directly and compare them.
 //
-// The klauspost reader is aliased as kpzlib because it is the library the
-// default backend actually uses, which is what makes it a faithful oracle
-// rather than a second opinion; stdlib compress/zlib writes the fixtures for
-// the error-class tests.
+// The klauspost reader is aliased as kpzlib to mark it as an independent
+// reference decoder, not the code under test. The default build's one-shot path
+// is zlib_purego.go delegating to this package's own inflatePackZlibGo
+// (inflate_go.go), which drives a hand-rolled bit reader rather than klauspost's
+// reader — so kpzlib is a genuinely separate implementation, which is what makes
+// it worth comparing against. Stdlib compress/zlib writes the fixtures for the
+// error-class tests.
 
 package objstore
 
@@ -50,10 +59,12 @@ func TestInflateZlibOneShotValidatesEmptyOutput(t *testing.T) {
 }
 
 // TestInflateZlibOneShotErrorClassesMatchPureGo pins the cross-backend error
-// contract: the same malformed pack must classify identically under
-// errors.Is regardless of build tag. A stream continuing past the declared
-// size is the overrun class; a stream ending before the declared size is the
-// short-output (unexpected-EOF) class.
+// contract for the two classes both backends can distinguish: a stream
+// continuing past the declared size is the overrun class, and a stream ending
+// before the declared size is the short-output (unexpected-EOF) class. Each must
+// classify identically under errors.Is regardless of build tag. Truncated versus
+// structurally-invalid input is deliberately not covered — libdeflate cannot
+// separate them (see the file header).
 func TestInflateZlibOneShotErrorClassesMatchPureGo(t *testing.T) {
 	payload := []byte("hello world hello world")
 	var encoded bytes.Buffer

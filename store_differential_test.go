@@ -149,9 +149,14 @@ func listGitObjects(t *testing.T, repoDir string) []gitObject {
 // tests walk every object in a 120-commit repository twice over — enough
 // subprocess churn to dominate a default `go test` run.
 //
-// The reported type is checked against the enumerated one as a side effect: the
-// two come from different Git invocations (cat-file here, rev-list --objects in
-// listGitObjects), so a disagreement means the fixture shifted under the test.
+// The reported type is checked against the enumerated one as a side effect.
+// Both readings come from git itself but from separate invocations with
+// different enumeration semantics: `cat-file --batch-all-objects
+// --batch-check` in listGitObjects walks every object in the object database,
+// while the `cat-file --batch` here reports the type of each OID it is asked
+// about. A disagreement therefore means the fixture shifted between the two
+// calls, not that an independent oracle contradicted git — the type is not
+// derived from a source outside git, and nothing here relies on it being.
 func gitCatFileBatch(t *testing.T, repoDir string, objs []gitObject) map[Hash][]byte {
 	t.Helper()
 
