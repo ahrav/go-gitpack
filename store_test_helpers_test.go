@@ -1,8 +1,14 @@
-// store_test_helpers.go provides test helpers for accessing unexported store functionality.
+// store_test_helpers_test.go provides test helpers for accessing unexported
+// store functionality.
 //
 // This file contains functions that are only intended for use in tests to access
-// the unexported store type and open function. These helpers should not be used
-// in production code.
+// the unexported store type and open function. The _test.go suffix keeps them —
+// and the os/exec, testing, and testify dependencies they pull in — out of the
+// library build, so consumers never inherit them.
+//
+// Everything here is therefore visible only to this package's tests, including
+// OpenForTesting: it is not part of the package's exported surface. Callers
+// outside this package use the package's own exported API.
 
 package objstore
 
@@ -15,12 +21,24 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 )
+
+// gitTestCommand disables detached maintenance while a fixture is being built.
+// Fixtures perform explicit repacks once their object graph is complete.
+func gitTestCommand(repoDir string, args ...string) *exec.Cmd {
+	gitArgs := []string{
+		"-c", "maintenance.auto=false",
+		"-c", "gc.auto=0",
+		"-C", repoDir,
+	}
+	return exec.Command("git", append(gitArgs, args...)...)
+}
 
 // createTempFileWithData creates a temporary file with the given data.
 func createTempFileWithData(t *testing.T, data []byte) string {

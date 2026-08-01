@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/exp/mmap"
 )
@@ -151,82 +152,128 @@ type deltaArena struct{ data []byte }
 // two 16 MiB halves = 32 MiB total.
 const defaultDeltaArenaSize = 2 * 16 << 20
 
-// deltaArenaFreeList is a bounded free-list of ping-pong arenas.
-//
-// A buffered channel is used instead of sync.Pool because sync.Pool is
-// emptied on every GC cycle. Bulk scans allocate gigabytes per second, so GC
-// runs every few milliseconds and a sync.Pool would shed its 32 MiB arenas
-// constantly — each miss re-allocates (and zeroes) 32 MiB, which showed up as
-// ~45% of all allocated bytes and ~5% of CPU in memclr. The channel retains
-// arenas across GC cycles; capacity bounds worst-case retained memory to
-// deltaArenaMaxRetained arenas.
-//
-// Deliberate trade-off: unlike sync.Pool, the free-list is never drained, so
-// after a burst of concurrent multi-hop delta resolutions the process
-// permanently retains up to deltaArenaMaxRetained x 32 MiB (256 MiB on
-// >= 8-CPU hosts) of idle arena memory. This is process-global and shared by
-// every open store; it is the steady-state working set of the bulk-scan
-// workload this library targets, not a leak. Long-lived embedders that are
-// memory-constrained should bound scan concurrency (or GOMAXPROCS), which
-// proportionally bounds the retained reserve — or set the
-// GOGITPACK_DELTA_ARENA_RETAIN environment variable (see
-// deltaArenaMaxRetained) to cap or disable retention without a code change.
-var deltaArenaFreeList = make(chan *deltaArena, deltaArenaMaxRetained)
+// deltaArenaMaxRetained is the hard ceiling on the retain limit: 32 arenas =
+// 1 GiB of idle arenas.
+const deltaArenaMaxRetained = 32
 
-// deltaArenaMaxRetained bounds how many idle arenas the free-list may retain.
-// The cap is derived from GOMAXPROCS at startup: hosts with fewer CPUs cannot
-// productively use more concurrent arenas, and sizing the list to the
-// parallelism budget keeps the idle reserve proportional to the machine. The
-// upper cap limits retained arenas to 256 MiB on large hosts.
+// defaultDeltaArenaRetained is the retain limit installed at startup, in
+// arenas. It is derived from GOMAXPROCS: hosts with fewer CPUs cannot
+// productively use more concurrent arenas, so sizing the initial free-list to
+// the parallelism budget keeps the idle reserve proportional to the machine.
 //
-// The ceiling is coupled to caller concurrency and must be read together with
+// The default is coupled to caller concurrency and must be read together with
 // it: a goroutine inside a multi-hop delta resolution holds one arena, so the
 // free-list's steady-state population equals the peak number of simultaneous
 // multi-hop resolutions — bounded above by the sum of the concurrent stage
 // widths of whatever drives the store (for DiffHistoryHunksFunc: tree workers
 // + blob workers + commit-walk workers), and in practice well below it because
 // only a fraction of those workers are inside a resolution at any instant.
-// That sum can exceed the derived ceiling on a wide host, so a scan's peak can
+// That sum can exceed the derived default on a wide host, so a scan's peak can
 // outrun the free-list: putDeltaArena drops the overflow and the next
 // getDeltaArena allocates and zeroes a fresh 32 MiB arena, reinstating the
 // memclr cost the free-list exists to remove. Bounding resident memory instead
-// of that cost is the point of the derived cap;
-// GOGITPACK_DELTA_ARENA_RETAIN is the lever for callers whose scan width
+// of that cost is the point of the derived default; the environment variable
+// below and SetDeltaArenaBudget are the levers for callers whose scan width
 // justifies a larger reserve.
 //
-// The GOGITPACK_DELTA_ARENA_RETAIN environment variable overrides the
-// derived cap with an explicit arena count (each arena is 32 MiB; 0 disables
-// retention entirely so every arena is released to the GC after use). This
-// is the no-rebuild control for memory-constrained, long-lived embedders.
-// Read once at process start; malformed or negative values fall back to the
-// derived default.
-var deltaArenaMaxRetained = func() int {
+// GOGITPACK_DELTA_ARENA_RETAIN overrides the derived default with an explicit
+// arena count (each arena is DeltaArenaSize; 0 disables retention entirely so
+// every arena is released to the GC after use). This is the no-rebuild control
+// for memory-constrained, long-lived embedders. It is read once at process
+// start; malformed or negative values fall back to the derived default, and
+// any value is clamped to deltaArenaMaxRetained, so the ceiling holds for the
+// environment and for SetDeltaArenaBudget alike.
+var defaultDeltaArenaRetained = func() int {
 	if v := os.Getenv("GOGITPACK_DELTA_ARENA_RETAIN"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			return n
+			return min(n, deltaArenaMaxRetained)
 		}
 	}
 	return min(8, max(2, runtime.GOMAXPROCS(0)))
+}()
+
+// deltaArenaFreeList holds the arenas idle under one retain limit.
+//
+// A buffered channel is used instead of sync.Pool because sync.Pool is
+// emptied on every GC cycle. Bulk scans allocate gigabytes per second, so GC
+// runs every few milliseconds and a sync.Pool would shed its 32 MiB arenas
+// constantly — each miss re-allocates (and zeroes) 32 MiB, which showed up as
+// ~45% of all allocated bytes and ~5% of CPU in memclr. The channel retains
+// arenas across GC cycles instead.
+//
+// Unlike sync.Pool the free-list is never drained, so after a burst of
+// concurrent multi-hop resolutions the process retains up to its current
+// retain limit in idle arena memory. That reserve is process-global and shared
+// by every open store; it is the steady-state working set of the bulk-scan
+// workload this library targets, not a leak. SetDeltaArenaBudget and
+// GOGITPACK_DELTA_ARENA_RETAIN cap or disable it.
+//
+// cap(idle) *is* the retain limit, which is what makes the bound exact rather
+// than approximate: putDeltaArena only ever sends non-blockingly, so the
+// runtime itself refuses the send once cap(idle) arenas are buffered, however
+// many putters race. A checked-then-sent counter cannot promise that, because
+// every racing putter can read the same under-limit count and then send.
+//
+// A nil idle channel disables retention outright: neither a send to nor a
+// receive from a nil channel can ever proceed, so every put drops its arena
+// and every get allocates.
+type deltaArenaFreeList struct{ idle chan *deltaArena }
+
+// newDeltaArenaFreeList returns a free-list that retains at most limit arenas.
+// limit must already be clamped to [0, deltaArenaMaxRetained].
+func newDeltaArenaFreeList(limit int) *deltaArenaFreeList {
+	if limit <= 0 {
+		return &deltaArenaFreeList{}
+	}
+	return &deltaArenaFreeList{idle: make(chan *deltaArena, limit)}
+}
+
+// deltaArenaFreeListRef publishes the live free-list. Changing the retain limit
+// swaps in a whole new free-list rather than editing a limit beside a
+// fixed-capacity channel, so the capacity that enforces the bound and the
+// configured limit can never disagree.
+//
+// The seeding runs as this variable's own initializer rather than in an init
+// function because a nil reference is unusable: getDeltaArena and putDeltaArena
+// dereference the loaded free-list. Go runs every package-level variable
+// initializer before any init function, and it orders those initializers by
+// dependency, so any other package-level variable in this package whose
+// initializer reaches the arena helpers depends on this variable and is
+// therefore sequenced after the free-list exists. Seeding from an init function
+// leaves that window open, because init functions run only after all variable
+// initializers have.
+//
+// The variable holds *atomic.Pointer rather than atomic.Pointer because
+// atomic.Pointer embeds noCopy and there is no exported way to build a non-zero
+// one: a value-typed initializer would have to copy the atomic out of the
+// constructing function, which go vet's copylocks check rejects. Call sites are
+// unaffected — selectors auto-dereference the pointer.
+var deltaArenaFreeListRef = func() *atomic.Pointer[deltaArenaFreeList] {
+	var ref atomic.Pointer[deltaArenaFreeList]
+	ref.Store(newDeltaArenaFreeList(defaultDeltaArenaRetained))
+	return &ref
 }()
 
 // getDeltaArena retrieves a ping‑pong arena from the free-list or allocates
 // a fresh one when the list is empty.
 func getDeltaArena() *deltaArena {
 	select {
-	case arena := <-deltaArenaFreeList:
+	case arena := <-deltaArenaFreeListRef.Load().idle:
 		return arena
 	default:
 		return &deltaArena{data: make([]byte, defaultDeltaArenaSize)}
 	}
 }
 
-// prepareDeltaArenaForPool reports whether arena may be returned to the pool,
-// restoring its full length in place when it may. Arenas that were grown
-// beyond the default pool size during dynamic resizing are ineligible (and
-// left untouched) so the pool is never polluted with oversized allocations.
+// prepareDeltaArenaForPool reports whether arena has a shape the free-list
+// accepts, restoring its full length in place when it does. Arenas that were
+// grown beyond the default pool size during dynamic resizing are ineligible
+// (and left untouched) so the pool is never polluted with oversized
+// allocations. Eligibility is not admission: the free-list capacity decides
+// whether an eligible arena is actually retained.
 //
 // Split from putDeltaArena so the reset/discard decision is testable before
-// ownership transfers to the pool: once Put runs, another goroutine may
+// ownership transfers to the pool: once the send runs, another goroutine may
 // legitimately retrieve and mutate the arena, so no caller (test or
 // otherwise) may inspect it afterwards.
 func prepareDeltaArenaForPool(arena *deltaArena) bool {
@@ -238,16 +285,107 @@ func prepareDeltaArenaForPool(arena *deltaArena) bool {
 }
 
 // putDeltaArena returns arena to the free-list when it is pool-eligible (see
-// prepareDeltaArenaForPool). If the free-list is full the arena is dropped for
-// the GC. The arena must not be touched after this call.
+// prepareDeltaArenaForPool). The send never blocks, so an arena that would push
+// the idle population past the retain limit — or any arena at all while
+// retention is disabled — is dropped for the GC. The arena must not be touched
+// after this call.
 func putDeltaArena(arena *deltaArena) {
 	if !prepareDeltaArenaForPool(arena) {
 		return
 	}
 	select {
-	case deltaArenaFreeList <- arena:
+	case deltaArenaFreeListRef.Load().idle <- arena:
 	default:
 	}
+}
+
+// deltaArenaLimitMu serializes retain-limit changes so that reading the old
+// free-list, publishing the new one, and moving arenas between them is one
+// step. Only setters take it; getDeltaArena and putDeltaArena never do.
+var deltaArenaLimitMu sync.Mutex
+
+// setDeltaArenaRetainLimit publishes a free-list that retains at most limit
+// arenas and returns the previous limit. limit is clamped to
+// [0, deltaArenaMaxRetained]; zero disables retention.
+//
+// Arenas already idle move into the new free-list until it is full and the
+// remainder is dropped, so raising the limit keeps warm arenas and lowering it
+// sheds the idle excess.
+//
+// A putter or getter that loaded the old free-list before the swap keeps
+// operating on it. That is safe: the old free-list is an ordinary bounded
+// channel, and an arena left in it is unreachable from the pool, so it becomes
+// garbage once the last in-flight caller drops its reference. Each such caller
+// re-reads the reference on its next call, so at most one late arena arrives per
+// in-flight putter and the migration below terminates.
+func setDeltaArenaRetainLimit(limit int) int {
+	if limit < 0 {
+		limit = 0
+	}
+	if limit > deltaArenaMaxRetained {
+		limit = deltaArenaMaxRetained
+	}
+
+	deltaArenaLimitMu.Lock()
+	defer deltaArenaLimitMu.Unlock()
+
+	old := deltaArenaFreeListRef.Load()
+	previous := cap(old.idle)
+	if limit == previous {
+		return previous
+	}
+
+	next := newDeltaArenaFreeList(limit)
+	deltaArenaFreeListRef.Store(next)
+
+	for {
+		select {
+		case arena := <-old.idle:
+			select {
+			case next.idle <- arena:
+			default:
+			}
+		default:
+			return previous
+		}
+	}
+}
+
+// DeltaArenaSize is the size in bytes of one delta ping-pong arena. Budgets
+// passed to SetDeltaArenaBudget are whole multiples of it.
+const DeltaArenaSize = defaultDeltaArenaSize
+
+// SetDeltaArenaBudget bounds the memory held idle by the delta arena free-list
+// and returns the budget that was in effect before the call, in bytes.
+//
+// Multi-hop delta reconstruction borrows DeltaArenaSize ping-pong arenas from a
+// free-list that deliberately survives GC, because re-allocating (and zeroing)
+// an arena per resolution costs ~45% of a bulk scan's allocated bytes. The
+// budget caps only the idle population: an in-flight resolution still allocates
+// the arena it works in, so it bounds the floor, not the peak.
+//
+// The budget is rounded DOWN to a whole number of DeltaArenaSize arenas, so any
+// budget below DeltaArenaSize — like a plain 1<<20 — disables idle retention
+// entirely and makes every multi-hop resolution pay for a fresh arena. It is
+// also clamped to 1 GiB. Compute budgets as a multiple of DeltaArenaSize.
+//
+// The startup budget is derived from GOMAXPROCS and can be set without code by
+// GOGITPACK_DELTA_ARENA_RETAIN (see defaultDeltaArenaRetained); this call
+// overrides whichever of those is in effect.
+//
+// The free-list is process-wide, not per-scanner: this call affects every
+// HistoryScanner and every other user of the package in the process, and it
+// stays in effect until changed again.
+//
+// The budget is last-writer-wins, and the returned value is a plain snapshot
+// rather than an ownership token. Passing it back restores the previous budget
+// only if nothing else set one in the meantime; with two independent callers
+// interleaved, a restore reinstates a budget the other caller has already
+// replaced. Treat this the way the runtime's own process-wide knobs are
+// treated — set it once during startup, or from a test that owns the process
+// for the duration — not as a composable scoped override.
+func SetDeltaArenaBudget(bytes int) (previous int) {
+	return setDeltaArenaRetainLimit(bytes/DeltaArenaSize) * DeltaArenaSize
 }
 
 // errDeltaOutputTooSmall reports that the caller-provided output buffer cannot

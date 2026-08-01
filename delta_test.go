@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"unsafe"
@@ -554,6 +555,247 @@ func TestDeltaArenaPooling(t *testing.T) {
 	})
 }
 
+// TestDeltaArenaRetainLimitDropsIdleExcess offers more arenas than the limit
+// permits and expects the surplus to be dropped rather than retained.
+//
+// Token arenas are enough: the bound counts arenas, not bytes, and
+// putDeltaArena's decision reads only cap(data) via prepareDeltaArenaForPool.
+// Getting three real arenas from a drained free-list would allocate and zero
+// ~96 MiB to observe a count. The real-arena round trip is covered by
+// TestDeltaArenaRetentionDisabled, and pool eligibility by the
+// prepareDeltaArenaForPool cases above.
+func TestDeltaArenaRetainLimitDropsIdleExcess(t *testing.T) {
+	setDeltaArenaRetainLimitForTest(t, 2)
+
+	putTestDeltaArenas(3)
+	if got := idleDeltaArenas(); got != 2 {
+		t.Fatalf("delta arena free-list retained %d arenas, want 2", got)
+	}
+}
+
+// TestDeltaArenaRetainLimitBoundsConcurrentPutters pins the retention bound
+// against the race that a check-then-send admission test loses: every putter
+// reads the same under-limit idle count, every putter passes, and every putter
+// sends. Each round starts from an empty free-list so the whole limit is up for
+// grabs, and all putters are released from one barrier so they contend.
+//
+// The count after a round is exact rather than a range: nothing receives during
+// the round, so the first `limit` sends fill the free-list and every later one
+// is refused.
+//
+// This is sampled evidence — a green run says no round of this many contending
+// putters exceeded the bound, not that none can. The bound itself rests on
+// cap(idle): a non-blocking send cannot overfill a channel.
+func TestDeltaArenaRetainLimitBoundsConcurrentPutters(t *testing.T) {
+	const (
+		limit   = 8
+		putters = 64
+		rounds  = 200
+	)
+	setDeltaArenaRetainLimitForTest(t, limit)
+
+	for round := range rounds {
+		var release, done sync.WaitGroup
+		release.Add(1)
+
+		for range putters {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				arena := newTestDeltaArena()
+				release.Wait()
+				putDeltaArena(arena)
+			}()
+		}
+
+		release.Done()
+		done.Wait()
+
+		require.Equalf(t, limit, idleDeltaArenas(),
+			"round %d: %d contending putters retained more than the limit", round, putters)
+		drainDeltaArenaFreeList()
+	}
+}
+
+// TestDeltaArenaRetainLimitRuntimeChange covers the two directions of a budget
+// change: the new limit must bound the idle population immediately, and warm
+// arenas that still fit must survive the swap.
+func TestDeltaArenaRetainLimitRuntimeChange(t *testing.T) {
+	t.Run("LoweringShedsIdleExcess", func(t *testing.T) {
+		setDeltaArenaRetainLimitForTest(t, 6)
+		putTestDeltaArenas(6)
+		require.Equal(t, 6, idleDeltaArenas(), "free-list should be full at the initial limit")
+
+		require.Equal(t, 6, setDeltaArenaRetainLimit(2), "previous limit")
+		require.Equal(t, 2, idleDeltaArenas(), "lowering the limit must shed the idle excess")
+	})
+
+	t.Run("RaisingPermitsMoreRetention", func(t *testing.T) {
+		setDeltaArenaRetainLimitForTest(t, 2)
+		putTestDeltaArenas(4)
+		require.Equal(t, 2, idleDeltaArenas(), "the initial limit must bound retention")
+
+		require.Equal(t, 2, setDeltaArenaRetainLimit(6), "previous limit")
+		require.Equal(t, 2, idleDeltaArenas(), "raising the limit must keep the warm arenas")
+
+		putTestDeltaArenas(6)
+		require.Equal(t, 6, idleDeltaArenas(), "the raised limit must permit more retention")
+	})
+}
+
+// TestDeltaArenaRetentionDisabled verifies that a non-positive limit turns idle
+// retention off entirely rather than falling back to a single arena.
+func TestDeltaArenaRetentionDisabled(t *testing.T) {
+	for _, limit := range []int{0, -5} {
+		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
+			setDeltaArenaRetainLimitForTest(t, limit)
+
+			putTestDeltaArenas(4)
+			require.Zero(t, idleDeltaArenas(), "a disabled free-list must retain nothing")
+
+			arena := getDeltaArena()
+			require.Equal(t, defaultDeltaArenaSize, cap(arena.data),
+				"a get against a disabled free-list must allocate a standard arena")
+			putDeltaArena(arena)
+			require.Zero(t, idleDeltaArenas(), "a disabled free-list must retain nothing")
+		})
+	}
+}
+
+// TestSetDeltaArenaBudget covers the byte-denominated public budget: the
+// previous value it reports and the whole-arena rounding its documentation
+// promises.
+func TestSetDeltaArenaBudget(t *testing.T) {
+	ambient := SetDeltaArenaBudget(4 * DeltaArenaSize)
+	t.Cleanup(func() {
+		drainDeltaArenaFreeList()
+		SetDeltaArenaBudget(ambient)
+	})
+	drainDeltaArenaFreeList()
+
+	require.Equal(t, 4*DeltaArenaSize, SetDeltaArenaBudget(2*DeltaArenaSize),
+		"SetDeltaArenaBudget must report the budget it replaced")
+
+	// Setting the same budget twice reports the effective budget: the second
+	// call replaces what the first installed.
+	tests := []struct {
+		name      string
+		budget    int
+		effective int
+	}{
+		{"whole arenas", 4 * DeltaArenaSize, 4 * DeltaArenaSize},
+		{"partial arena is not charged", 3*DeltaArenaSize + DeltaArenaSize/2, 3 * DeltaArenaSize},
+		{"one byte short of an arena disables retention", DeltaArenaSize - 1, 0},
+		{"zero disables retention", 0, 0},
+		{"negative disables retention", -DeltaArenaSize, 0},
+		{
+			"clamped to the hard ceiling",
+			(deltaArenaMaxRetained + 8) * DeltaArenaSize,
+			deltaArenaMaxRetained * DeltaArenaSize,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			SetDeltaArenaBudget(tc.budget)
+			require.Equal(t, tc.effective, SetDeltaArenaBudget(tc.budget),
+				"effective budget for %d bytes", tc.budget)
+		})
+	}
+
+	// The rounding is not cosmetic: a sub-arena budget really retains nothing.
+	SetDeltaArenaBudget(DeltaArenaSize - 1)
+	putTestDeltaArenas(2)
+	require.Zero(t, idleDeltaArenas(), "a sub-arena budget must retain nothing")
+}
+
+// BenchmarkDeltaArenaGetPut measures the get/put round-trip the retention bound
+// sits on: one atomic load of the live free-list plus one non-blocking channel
+// operation each way. The free-list is seeded to capacity so a miss's 32 MiB
+// allocation does not dominate the measurement.
+func BenchmarkDeltaArenaGetPut(b *testing.B) {
+	b.Run("Serial", func(b *testing.B) {
+		setDeltaArenaRetainLimitForTest(b, deltaArenaMaxRetained)
+		putTestDeltaArenas(deltaArenaMaxRetained)
+
+		b.ReportAllocs()
+		for b.Loop() {
+			putDeltaArena(getDeltaArena())
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		// RunParallel starts one worker per GOMAXPROCS, and each worker holds
+		// an arena between its get and its put. More workers than the
+		// free-list can retain therefore guarantees steady-state misses, and a
+		// miss allocates and zeroes a real DeltaArenaSize arena inside the
+		// measured loop — the cost this benchmark is seeded to exclude. On a
+		// host with more CPUs than deltaArenaMaxRetained that turned the
+		// pooled round trip into a measurement of allocation instead
+		// (2182 B/op at GOMAXPROCS=64 against 0 B/op at 32), with up to
+		// (workers - limit) concurrent 32 MiB allocations live at once.
+		//
+		// Capping GOMAXPROCS for the duration caps the worker count to the
+		// seeded population, so every iteration stays on the hit path.
+		if procs := runtime.GOMAXPROCS(0); procs > deltaArenaMaxRetained {
+			defer runtime.GOMAXPROCS(procs)
+			runtime.GOMAXPROCS(deltaArenaMaxRetained)
+		}
+
+		setDeltaArenaRetainLimitForTest(b, deltaArenaMaxRetained)
+		putTestDeltaArenas(deltaArenaMaxRetained)
+
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				putDeltaArena(getDeltaArena())
+			}
+		})
+	})
+}
+
+// setDeltaArenaRetainLimitForTest installs limit as the process-wide retain
+// limit against an empty free-list and restores the previous limit afterwards.
+// Both edges drain because these tests count the idle population and seed it
+// with token arenas, neither of which may leak into another test.
+func setDeltaArenaRetainLimitForTest(tb testing.TB, limit int) {
+	tb.Helper()
+	previous := setDeltaArenaRetainLimit(limit)
+	tb.Cleanup(func() {
+		drainDeltaArenaFreeList()
+		setDeltaArenaRetainLimit(previous)
+	})
+	drainDeltaArenaFreeList()
+}
+
+// newTestDeltaArena returns a pool-eligible arena with a token backing array.
+// The retention bound counts arenas, not bytes, so the retention tests skip the
+// 32 MiB allocation a real arena carries; setDeltaArenaRetainLimitForTest
+// drains the free-list on both edges so an undersized arena can never reach a
+// real delta resolution.
+func newTestDeltaArena() *deltaArena { return &deltaArena{data: make([]byte, 64)} }
+
+// putTestDeltaArenas offers n token arenas to the free-list.
+func putTestDeltaArenas(n int) {
+	for range n {
+		putDeltaArena(newTestDeltaArena())
+	}
+}
+
+// idleDeltaArenas reports how many arenas the live free-list holds.
+func idleDeltaArenas() int { return len(deltaArenaFreeListRef.Load().idle) }
+
+func drainDeltaArenaFreeList() {
+	idle := deltaArenaFreeListRef.Load().idle
+	for {
+		select {
+		case <-idle:
+			continue
+		default:
+		}
+		break
+	}
+}
+
 // TestDeltaArenaPoolOversizeDiscard verifies that arenas grown beyond the
 // default pool size during dynamic resizing are not returned to the pool.
 // Without the size guard in putDeltaArena, an oversized arena pollutes the
@@ -562,9 +804,7 @@ func TestDeltaArenaPoolOversizeDiscard(t *testing.T) {
 	const defaultArenaSize = 2 * 16 << 20 // 32 MiB — matches deltaArenaPool.New
 
 	// Drain the pool so we get a fresh arena from New.
-	for range 16 {
-		getDeltaArena()
-	}
+	drainDeltaArenaFreeList()
 
 	arena := getDeltaArena()
 	assert.Equal(t, defaultArenaSize, cap(arena.data), "fresh arena should be 32 MiB")
