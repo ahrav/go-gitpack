@@ -54,20 +54,32 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 	}
 
 	const (
-		workers        = 32
 		itersPerWorker = 200
-		coldWaves      = 8
+		coldWaves      = 16
 	)
 
-	// noCacheWorkers bounds the subtest below, where every read holds a 32 MiB
-	// ping-pong arena for the duration of its reconstruction. Releasing all 32
-	// workers there would pin ~1 GiB of live scratch while the free-list retains
-	// only min(8, max(2, GOMAXPROCS)) arenas, so the surplus is discarded and
-	// re-allocated — and re-zeroed — on nearly every iteration, which turns a
-	// race gate into allocator churn and risks OOM on a small runner. Matching
-	// the free-list's own sizing keeps every concurrent holder serviceable from
-	// the pool while still contending for it.
-	noCacheWorkers := min(8, max(2, runtime.GOMAXPROCS(0)))
+	// Every in-flight multi-hop read holds one 32 MiB ping-pong arena for the
+	// duration of its reconstruction, so the worker count must not exceed what
+	// the free-list can retain: surplus holders allocate — and zero — a fresh
+	// 32 MiB arena per read, turning a race gate into allocator churn and an OOM
+	// risk on a small runner.
+	//
+	// Deriving that count from defaultDeltaArenaRetained would only restate a
+	// default. The live limit is process-wide and externally settable, via
+	// GOGITPACK_DELTA_ARENA_RETAIN and SetDeltaArenaBudget, and 0 and 1 are both
+	// supported values; under either, a worker count assuming the default
+	// reintroduces exactly that churn. So pin the limit for this test (restored
+	// on cleanup, free-list drained on both edges) and take the worker count
+	// from the pool that was actually installed, which makes "no worker can
+	// outrun the pool" true by construction rather than by assumption.
+	//
+	// The GOMAXPROCS term bounds peak scratch on small hosts; the readback is
+	// what makes the invariant hold regardless of what it produces.
+	arenaHolders := min(8, max(2, runtime.GOMAXPROCS(0)))
+	setDeltaArenaRetainLimitForTest(t, arenaHolders)
+	workers := cap(deltaArenaFreeListRef.Load().idle)
+	require.Equal(t, arenaHolders, workers,
+		"pinned retain limit must be the installed free-list capacity")
 
 	// runConcurrently releases `n` goroutines simultaneously and fails the test
 	// if any reports an error. read is invoked with the worker index and
@@ -132,7 +144,9 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 			// Short waves keep the run inside the cold window rather than
 			// spending it on cache hits; cold_waves proves contention during
 			// first materialization, and no_cache below covers sustained
-			// full-chain concurrency.
+			// full-chain concurrency. Cold reads take the arena path too, so
+			// this subtest is bounded by the same pinned pool — the wave count
+			// is what restores the number of cold-window observations.
 			runConcurrently(t, workers, 4, func(seed, it int) error {
 				// Rotate across all levels, deepest included, so different
 				// workers climb overlapping chains at the same time.
@@ -164,7 +178,7 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 		multiHop := oids[2:]
 		require.NotEmpty(t, multiHop, "need at least one multi-hop level")
 
-		runConcurrently(t, noCacheWorkers, itersPerWorker, func(seed, it int) error {
+		runConcurrently(t, workers, itersPerWorker, func(seed, it int) error {
 			oid := multiHop[(seed+it)%len(multiHop)]
 			p, off, ok := st.findPackedObject(oid)
 			if !ok {
