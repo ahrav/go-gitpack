@@ -1412,6 +1412,10 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 //     single binary hunk, a shape chosen by the guessed half. It says nothing
 //     about this file, and its one line passes any similarity threshold, so it
 //     must be rejected rather than measured.
+//   - Either side over SmallFileThreshold: computeAddedHunks used the line-set
+//     or hashing algorithm, which is a set-membership test rather than a
+//     multiplicity-aware diff, so its added-line count cannot be turned into a
+//     similarity score. Rejected rather than measured.
 //   - Both sides small text: a real line diff, which the similarity test below
 //     can measure.
 //
@@ -1441,6 +1445,22 @@ func (hs *HistoryScanner) gateInferredRenameHunks(oldOID, newOID Hash, hunks []A
 	if int64(len(oldBytes)) > maxDiffSize || isBinary(oldBytes) {
 		// The pair diff was shaped by the guessed side, so it cannot be
 		// measured. Report the file on its own terms.
+		return hs.pairAddedHunks(Hash{}, newOID)
+	}
+	if int64(len(oldBytes)) > SmallFileThreshold || int64(len(newBytes)) > SmallFileThreshold {
+		// Past SmallFileThreshold computeAddedHunks switches to the line-set
+		// and hashing algorithms, which are set-membership tests: one
+		// occurrence of a line in the old blob marks EVERY occurrence of it in
+		// the new blob as not added. `added` is then an undercount and the
+		// `common` derived from it an overcount, so the similarity test below
+		// cannot be trusted here — a one-line old file paired with a megabyte
+		// of that same line repeated scores as fully common and the whole new
+		// file would be suppressed. Measuring it properly needs a
+		// multiplicity-aware common-line count over both blobs, which is a
+		// second full diff; until then an unmeasurable pairing is rejected the
+		// same way an oversized or binary one is. The cost is that an inferred
+		// rename of a file over 1 MB is always reported whole rather than as
+		// its added lines.
 		return hs.pairAddedHunks(Hash{}, newOID)
 	}
 

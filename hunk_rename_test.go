@@ -539,6 +539,8 @@ func TestDiffHistoryHunks_DroppedDeletePathsStillSuppressExactMoves(t *testing.T
 	requireGit(t)
 
 	// Small enough that the fixture's handful of deleted paths overruns it.
+	// maxRetainedDeletePathBytes is package-global, so this test must stay
+	// serial (no t.Parallel()); see its doc comment.
 	restore := maxRetainedDeletePathBytes
 	maxRetainedDeletePathBytes = 8
 	t.Cleanup(func() { maxRetainedDeletePathBytes = restore })
@@ -619,4 +621,23 @@ func TestDiffHistoryHunks_InferredRenameAcrossEntryTypesReportsSymlink(t *testin
 	// The anchors are genuine exact-OID moves and stay suppressed.
 	assert.Empty(t, linesByPath["new/a.txt"])
 	assert.Empty(t, linesByPath["new/b.txt"])
+}
+
+// TestDiffHistoryHunks_InferredRenameOfLargeFileReportsTextLines covers the
+// lossy-algorithm escape hatch in gateInferredRenameHunks. Past
+// SmallFileThreshold computeAddedHunks switches to set-membership diffing, where
+// one occurrence of a line in the old blob marks every occurrence in the new
+// blob as not added. A one-line old file paired with a megabyte of that same
+// line therefore produces zero added lines, and a gate that trusted that count
+// would suppress the entire new file.
+func TestDiffHistoryHunks_InferredRenameOfLargeFileReportsTextLines(t *testing.T) {
+	const lines = 600_000 // ~1.2 MB, past SmallFileThreshold
+	gitDir := buildInferredRenameRepo(t,
+		[]byte("x\n"), []byte(strings.Repeat("x\n", lines)))
+
+	linesByPath, binaryByPath := scanHunksByPath(t, gitDir)
+
+	assert.Len(t, linesByPath["new/data"], lines,
+		"a pairing the gate cannot measure must fall back to the whole-file addition")
+	assert.False(t, binaryByPath["new/data"])
 }
