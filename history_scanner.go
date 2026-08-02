@@ -933,7 +933,7 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 	}
 
 	if work.inferredRename {
-		hunks, err = hs.gateInferredRenameHunks(work.newOID, hunks)
+		hunks, err = hs.gateInferredRenameHunks(work.oldOID, work.newOID, hunks)
 		if err != nil {
 			return err
 		}
@@ -1003,32 +1003,54 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 // the pair is kept only when at least half of the new file's lines are common
 // with the old file; otherwise the file is reported as a whole-file addition.
 //
-// Binary and oversized-placeholder diffs pass through untouched: for those,
-// computeAddedHunks already emits the entire new content (or a placeholder)
-// regardless of the old side, so a pure-add fallback would be identical.
-func (hs *HistoryScanner) gateInferredRenameHunks(newOID Hash, hunks []AddedHunk) ([]AddedHunk, error) {
+// The decision is made from the two blobs rather than from the hunks, because
+// computeAddedHunks has three outcomes and only one of them describes this
+// file's added lines:
+//
+//   - New side oversized or binary: the whole new content is emitted without
+//     consulting the old blob at all, so the guess cannot have shaped it and a
+//     pure-add fallback would be identical. Kept as-is.
+//   - Old side oversized or binary: the result is a size placeholder or a
+//     single binary hunk, a shape chosen by the guessed half. It says nothing
+//     about this file, and its one line passes any similarity threshold, so it
+//     must be rejected rather than measured.
+//   - Both sides small text: a real line diff, which the similarity test below
+//     can measure.
+func (hs *HistoryScanner) gateInferredRenameHunks(oldOID, newOID Hash, hunks []AddedHunk) ([]AddedHunk, error) {
 	if len(hunks) == 0 {
 		// Identical or near-identical content; the pairing is trustworthy.
 		return hunks, nil
 	}
-	added := 0
-	for i := range hunks {
-		if hunks[i].IsBinary {
-			return hunks, nil
-		}
-		added += len(hunks[i].Lines)
+	if oldOID.IsZero() {
+		// Not actually a pairing: nothing was guessed.
+		return hunks, nil
 	}
 
 	newBytes, err := loadBlob(hs.store, newOID)
 	if err != nil {
 		return nil, fmt.Errorf("load new blob for rename gate: %w", err)
 	}
-	if int64(len(newBytes)) > MaxDiffSize {
-		return hunks, nil // Placeholder hunk; no line-based similarity exists.
+	if int64(len(newBytes)) > maxDiffSize || isBinary(newBytes) {
+		return hunks, nil // New-side-determined; old blob was never consulted.
 	}
+
+	oldBytes, err := loadBlob(hs.store, oldOID)
+	if err != nil {
+		return nil, fmt.Errorf("load old blob for rename gate: %w", err)
+	}
+	if int64(len(oldBytes)) > maxDiffSize || isBinary(oldBytes) {
+		// The pair diff was shaped by the guessed side, so it cannot be
+		// measured. Report the file on its own terms.
+		return hs.pairAddedHunks(Hash{}, newOID)
+	}
+
 	total := bytes.Count(newBytes, nlByte)
 	if len(newBytes) > 0 && newBytes[len(newBytes)-1] != '\n' {
 		total++ // Trailing line without a newline, matching tokenize.
+	}
+	added := 0
+	for i := range hunks {
+		added += len(hunks[i].Lines)
 	}
 
 	// Similarity gate: common = total - added. Keep the pairing only when

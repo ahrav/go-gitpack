@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -162,4 +163,100 @@ func TestDiffHistoryHunks_DirectoryRenameDoesNotPairUnrelatedContent(t *testing.
 		"unrelated replacement must be reported as a whole-file addition")
 	assert.Empty(t, linesByPath["new/same-a.txt"])
 	assert.Empty(t, linesByPath["new/same-b.txt"])
+}
+
+// buildInferredRenameRepo creates a repo whose second commit renames old/ ->
+// new/ with two exact-OID renames — enough evidence for directory-rename
+// inference — while replacing old/data with newData at new/data. The add at
+// new/data is therefore paired against the deleted old/data blob purely from
+// path structure, which is the guess gateInferredRenameHunks must validate.
+func buildInferredRenameRepo(t *testing.T, oldData, newData []byte) string {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.Mkdir(filepath.Join(repo, "old"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "data"), oldData, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "same-a.txt"), []byte("same a\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "same-b.txt"), []byte("same b\n"), 0o644))
+	runGit(t, repo, "add", "old")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	require.NoError(t, os.Rename(filepath.Join(repo, "old"), filepath.Join(repo, "new")))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "new", "data"), newData, 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "rename dir, replace data", "--quiet")
+
+	return filepath.Join(repo, ".git")
+}
+
+// scanHunksByPath drains DiffHistoryHunks into per-path lines and per-path
+// binary flags.
+func scanHunksByPath(t *testing.T, gitDir string) (map[string][]string, map[string]bool) {
+	t.Helper()
+	scanner, err := NewHistoryScanner(gitDir)
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	hunks, errC := scanner.DiffHistoryHunks()
+	linesByPath := make(map[string][]string)
+	binaryByPath := make(map[string]bool)
+	for h := range hunks {
+		linesByPath[h.Path()] = append(linesByPath[h.Path()], h.Lines()...)
+		if h.IsBinary() {
+			binaryByPath[h.Path()] = true
+		}
+	}
+	require.NoError(t, <-errC)
+	return linesByPath, binaryByPath
+}
+
+// TestDiffHistoryHunks_InferredRenameFromBinaryOldBlobReportsTextLines covers
+// the binary escape hatch in gateInferredRenameHunks. When the guessed old
+// blob is binary, computeAddedHunks reports the whole new file as one binary
+// hunk — a shape decided entirely by the old side. Accepting that on an
+// inferred pairing loses the new text file's line structure, and any consumer
+// that skips binary hunks loses the file's content outright.
+func TestDiffHistoryHunks_InferredRenameFromBinaryOldBlobReportsTextLines(t *testing.T) {
+	// NUL bytes make isBinary report true for the deleted blob.
+	oldData := []byte("\x00\x01\x02binary payload\x00")
+	gitDir := buildInferredRenameRepo(t, oldData, []byte("one\ntwo\nthree\n"))
+
+	linesByPath, binaryByPath := scanHunksByPath(t, gitDir)
+
+	assert.False(t, binaryByPath["new/data"],
+		"a text file must not be reported as binary because its guessed predecessor was binary")
+	assert.ElementsMatch(t, []string{"one", "two", "three"}, linesByPath["new/data"],
+		"new text file must be reported as a whole-file addition")
+}
+
+// TestDiffHistoryHunks_InferredRenameFromOversizedOldBlobReportsTextLines
+// covers the oversized escape hatch in gateInferredRenameHunks. When only the
+// guessed old blob exceeds the diff limit, computeAddedHunks returns its
+// "[File too large to diff]" placeholder. That placeholder carries one line,
+// which satisfies the >= 50%-common similarity test for any new file with two
+// or more lines, so the pairing is kept and the placeholder becomes the file's
+// only output — the new content never reaches the stream.
+func TestDiffHistoryHunks_InferredRenameFromOversizedOldBlobReportsTextLines(t *testing.T) {
+	// Shrink the limit rather than materialize a gigabyte. Safe because this
+	// test is serial; see the maxDiffSize doc comment.
+	restore := maxDiffSize
+	maxDiffSize = 64
+	t.Cleanup(func() { maxDiffSize = restore })
+
+	oldData := []byte(strings.Repeat("filler line\n", 20)) // 240 bytes > 64
+	newData := []byte("one\ntwo\nthree\n")                 // 14 bytes <= 64
+	gitDir := buildInferredRenameRepo(t, oldData, newData)
+
+	linesByPath, _ := scanHunksByPath(t, gitDir)
+
+	assert.ElementsMatch(t, []string{"one", "two", "three"}, linesByPath["new/data"],
+		"new content must be reported even when the guessed predecessor is too large to diff")
+	for _, line := range linesByPath["new/data"] {
+		assert.NotContains(t, line, "File too large to diff",
+			"an inferred pairing must not substitute a placeholder for the new file's lines")
+	}
 }
