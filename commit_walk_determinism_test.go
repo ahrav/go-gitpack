@@ -5,13 +5,15 @@
 // is that the *observable* result — the ordered commit slice — is independent
 // of worker scheduling.
 //
-// These tests build a branching/merging DAG with no commit-graph (forcing the
-// ref-walk fallback) and assert:
+// These tests build a branching/merging DAG (removing any auto-written
+// commit-graph as defense-in-depth; the entry points under test always walk
+// refs) and assert:
 //
 //   - repeated walks on the same and fresh scanners produce byte-identical
 //     ordered results (determinism under whatever scheduling occurs);
-//   - a single-threaded walk (GOMAXPROCS=1) and a multi-threaded walk agree
-//     (parallelism does not change the result);
+//   - the ordered result is stable between a constrained schedule (one P,
+//     GOMAXPROCS=1) and an unconstrained one (scheduling freedom does not
+//     change the result);
 //   - the completeness/shape invariants (all parents resolvable, one root)
 //     hold; and
 //   - DiffHistoryHunks emits a deterministic multiset of hunks across runs.
@@ -31,9 +33,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// buildMergeRepo creates a repository with a branching, merging commit DAG and
-// NO commit-graph, so the scanner is forced onto the parallel ref-walk
-// fallback. It returns the repo's .git directory.
+// buildMergeRepo creates a repository with a branching, merging commit DAG
+// and returns the repo's .git directory. Any commit-graph is removed: the
+// entry points under test walk refs unconditionally, so the removal is
+// defense-in-depth ensuring the fixture never carries a commit-graph that a
+// future graph-consuming path could silently pick up.
 func buildMergeRepo(t *testing.T) string {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -41,27 +45,19 @@ func buildMergeRepo(t *testing.T) string {
 	}
 
 	repoDir := t.TempDir()
+	// A fixed committer date makes timestamps collide, which forces the
+	// ordering's OID tie-breaker to do real work — exactly the code most
+	// sensitive to nondeterministic visit order.
+	env := gitFixtureEnvPinned("2005-04-07T22:13:13 +0000")
 	git := func(args ...string) {
 		t.Helper()
-		cmd := gitTestCommand(repoDir, args...)
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
-			"GIT_AUTHOR_DATE=2005-04-07T22:13:13 +0000",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
-			// A fixed committer date makes timestamps collide, which forces the
-			// ordering's OID tie-breaker to do real work — exactly the code
-			// most sensitive to nondeterministic visit order.
-			"GIT_COMMITTER_DATE=2005-04-07T22:13:13 +0000",
-		)
-		out, err := cmd.CombinedOutput()
-		require.NoErrorf(t, err, "git %s: %s", strings.Join(args, " "), out)
+		runGitEnv(t, repoDir, env, args...)
 	}
 	commit := func(msg string) {
 		git("commit", "-q", "--allow-empty", "-m", msg)
 	}
 
 	git("init", "-q", "-b", "main")
-	git("config", "commit.gpgsign", "false")
 	commit("root")
 
 	// Interleave linear commits with side branches that merge back, producing
@@ -84,11 +80,12 @@ func buildMergeRepo(t *testing.T) string {
 		}
 	}
 
-	// Repack so commit-header reads exercise the pack path. We then remove any
-	// commit-graph so both loadFromRefs (called directly below) and
-	// DiffHistoryHunks take the parallel ref-walk fallback — the code under
-	// test. Some git configurations auto-write a commit-graph, so delete it
-	// defensively rather than assuming its absence.
+	// Repack so commit-header reads exercise the pack path. loadFromRefs
+	// (called directly below) and DiffHistoryHunks walk refs unconditionally —
+	// NewHistoryScanner never reads on-disk commit-graph files — so deleting
+	// any commit-graph that a git configuration auto-wrote is defense-in-depth:
+	// the fixture must not carry one that a future graph-consuming path could
+	// silently pick up.
 	git("repack", "-a", "-d")
 
 	gitDir := filepath.Join(repoDir, ".git")
@@ -155,10 +152,13 @@ func TestParallelCommitWalk_Deterministic(t *testing.T) {
 	}
 }
 
-// TestParallelCommitWalk_GOMAXPROCSInvariant asserts the ordered result is the
-// same whether the walk runs on a single OS thread or many. Serializing the
-// scheduler is the strongest cheap probe for a result that secretly depends on
-// visit order.
+// TestParallelCommitWalk_GOMAXPROCSInvariant asserts the ordered result is
+// stable between a constrained scheduler and an unconstrained one.
+// GOMAXPROCS=1 serializes the walk's worker pool — sized off runtime.NumCPU,
+// which GOMAXPROCS does not affect — onto a single P: the same goroutines run
+// without parallelism but still interleave at blocking points. Constraining
+// the schedule this way is a cheap probe for a result that secretly depends
+// on visit order.
 func TestParallelCommitWalk_GOMAXPROCSInvariant(t *testing.T) {
 	gitDir := buildMergeRepo(t)
 
@@ -191,8 +191,12 @@ func TestDiffHistoryHunks_DeterministicMultiset(t *testing.T) {
 		hunks, errC := s.DiffHistoryHunks()
 		var lines []string
 		for h := range hunks {
-			lines = append(lines, fmt.Sprintf("%s|%s|%d-%d|%d",
-				h.commit.String(), h.Path(), h.StartLine(), h.EndLine(), len(h.Lines())))
+			// Line CONTENTS, not just the count: a pairing that changes which
+			// old blob an add is diffed against can yield the same path, range,
+			// and line count while emitting different text, which is exactly
+			// the divergence this test exists to catch.
+			lines = append(lines, fmt.Sprintf("%s|%s|%d-%d|%q",
+				h.commit.String(), h.Path(), h.StartLine(), h.EndLine(), h.Lines()))
 		}
 		require.NoError(t, <-errC)
 		// The emission ORDER is intentionally nondeterministic; compare as a

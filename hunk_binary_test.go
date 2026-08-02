@@ -35,20 +35,6 @@ func TestScanHunks_BinaryPayloadIsPassedIntact(t *testing.T) {
 	assert.True(t, bytes.Equal(want, rec.items[0].data), "binary hunk payload changed")
 }
 
-func runGit(t *testing.T, repo string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = repo
-	cmd.Env = append(os.Environ(),
-		"GIT_AUTHOR_NAME=t",
-		"GIT_AUTHOR_EMAIL=t@example.com",
-		"GIT_COMMITTER_NAME=t",
-		"GIT_COMMITTER_EMAIL=t@example.com",
-	)
-	out, err := cmd.CombinedOutput()
-	require.NoErrorf(t, err, "git %v failed: %s", args, string(out))
-}
-
 type capturingBlobScanner struct {
 	items []capturedBlob
 }
