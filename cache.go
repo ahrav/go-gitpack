@@ -235,6 +235,24 @@ func newRefCountedDeltaWindow() *refCountedDeltaWindow {
 
 // Handle represents an active reference to cached object data and ensures
 // the underlying entry cannot be evicted while the handle exists.
+//
+// data and typ are copies that acquire takes from the entry under w.mu, not
+// live views of it. Two properties rest on that:
+//
+//   - Handle reads take no lock, so reading either field through h.entry
+//     would race with add updating an existing entry.
+//
+//   - add's update branch replaces an entry's data, size, and typ as one
+//     group, which gives an entry generations. Copying data and typ together
+//     binds a handle to a single generation; copying one and reading the
+//     other live would let a handle report one generation's bytes alongside
+//     another generation's type.
+//
+// entry doubles as the validity marker for both copies. Release clears the
+// marker instead of clearing each copy, which keeps every field a handle
+// exposes assigned in one place (acquire) and makes the single nil check in
+// Type enough to report ObjBad for a pooled or never-acquired handle. Data
+// carries no such check and rests on the caller contract stated below.
 type Handle struct {
 	data  []byte
 	typ   ObjectType
@@ -242,16 +260,14 @@ type Handle struct {
 	w     *refCountedDeltaWindow
 }
 
-// Type returns the Git ObjectType associated with the cached data.
-//
-// The type is snapshotted into the Handle under the window lock at acquire
-// time (like Data), so reading it here requires no lock and cannot race with a
-// concurrent in-place add() that rewrites the shared entry's fields. Because
-// Git objects are content-addressed, any concurrent re-add of the same OID
-// carries an identical (data, typ) pair, so the snapshot is always consistent
-// with Data().
+// Type returns the Git ObjectType of the data this handle describes. The value
+// comes from the same acquire-time copy as Data, so the two always describe one
+// generation of the entry. A pooled or never-acquired handle reports ObjBad.
 func (h *Handle) Type() ObjectType {
-	return h.typ
+	if h.entry != nil {
+		return h.typ
+	}
+	return ObjBad
 }
 
 // Release decrements the reference count for this handle's entry and
@@ -285,13 +301,16 @@ func (h *Handle) Release() {
 	w.handlePool.Put(h)
 }
 
-// Data returns the cached object data associated with this handle.
+// Data returns the cached object data associated with this handle, paired with
+// the type Type reports (see Handle).
 //
-// Lifetime: the returned slice aliases the entry's buffer, which is immutable
-// and is never written in place, pooled, or otherwise recycled. Eviction and
-// update only drop the window's reference, so a slice obtained from Data stays
-// valid and unchanged for as long as the caller holds it, kept alive by the
-// GC, even after Release. Release ends only this handle's eviction pin.
+// Lifetime: the returned slice aliases the entry's buffer. The window never
+// writes, pools, or recycles retained buffers; producers transfer ownership
+// when calling add and must not mutate the slice afterwards. Under that
+// ownership convention, eviction and update only drop the window's reference,
+// so a slice obtained from Data stays valid and unchanged for as long as the
+// caller holds it, kept alive by the GC, even after Release. Release ends only
+// this handle's eviction pin.
 //
 // Release does invalidate the Handle itself: the struct returns to a pool and
 // may already describe a different entry, so extract the slice first and call
@@ -304,6 +323,10 @@ func (h *Handle) Data() []byte { return h.data }
 
 // acquire attempts to return a handle to the cached data for the given
 // object hash, incrementing its reference count to prevent eviction.
+//
+// This is the only place that fills a handle's data and type copies, and it
+// takes both under mu, so a handle describes one generation of the entry and
+// its lock-free reads never touch mutable shared state; see Handle.
 func (w *refCountedDeltaWindow) acquire(oid Hash) (*Handle, bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -331,12 +354,18 @@ func (w *refCountedDeltaWindow) acquire(oid Hash) (*Handle, bool) {
 
 // add inserts or updates the cached entry for the given object hash.
 //
+// Calling add transfers ownership of buf. The caller must not mutate it
+// afterwards, regardless of the result, because Data returns aliases rather
+// than defensive copies and an update may retain buf before reporting an
+// over-budget error.
+//
 // If the OID already exists in the window, the entry's data, size, and type
 // are updated in-place without changing the reference count or creating a new
 // entry node. The memory accounting (w.used) is adjusted by the size delta,
 // and the entry is promoted to MRU position. This in-place update avoids
 // dangling Handle references that would occur if the old entry were evicted
-// and a new one inserted.
+// and a new one inserted. Handles that already reference the entry keep
+// describing the generation they copied at acquire time.
 //
 // If the OID is new, the eviction algorithm proceeds as follows:
 //

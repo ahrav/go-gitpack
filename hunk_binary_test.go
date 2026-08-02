@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 
@@ -13,9 +12,7 @@ import (
 )
 
 func TestScanHunks_BinaryPayloadIsPassedIntact(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git executable not found in PATH")
-	}
+	requireGit(t)
 
 	repo := t.TempDir()
 	want := []byte("PK\x03\x04\x00binary\x00payload")

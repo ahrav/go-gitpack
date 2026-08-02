@@ -1,12 +1,12 @@
-// store_differential_test.go cross-checks the optimized object-materialization
-// paths (delta-chain rework in 23cbe7b, zero-copy inflate in 4f9f796) against
-// the authoritative Git implementation.
+// store_differential_test.go cross-checks the object-materialization paths —
+// iterative delta-chain resolution and zero-copy inflation out of the mmap'd
+// pack — against the authoritative Git implementation.
 //
 // The oracle is `git cat-file`: for every object in a repository whose pack has
 // been repacked into deep delta chains, the bytes produced by the store must be
 // byte-identical to the bytes Git produces. This exercises, on real Git-authored
-// data (real copy+insert delta commands, deep ofs-delta chains, the ping-pong
-// arena and its grow path, and the offset-cache short-circuit):
+// data (real copy+insert delta commands, multi-hop ofs-delta chains, the
+// ping-pong arena, and the offset-cache short-circuit):
 //
 //   - inflateDeltaChainStreaming   (via getMaterialized, cacheResult=true)
 //   - inflateDeltaChainBorrowed    (via getPackedObjectNoCache, cacheResult=false)
@@ -22,6 +22,7 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,9 +58,12 @@ func buildDeltaHeavyRepo(t *testing.T) (repoDir, packDir string) {
 	// Content shapes chosen to exercise distinct materialization paths:
 	//
 	//   a.txt  strict-append growth. Each version is a superset of the prior
-	//          one, which is exactly what Git's delta selector chains deeply —
-	//          this produces multi-hop chains (chain length >= 2) that drive
-	//          the ping-pong arena and offset-cache short-circuit.
+	//          one, which is exactly what Git's delta selector chains — this
+	//          produces the multi-hop chains (requireHasDeltas enforces a
+	//          deepest chain of at least 2 hops) that drive the ping-pong arena
+	//          and the offset-cache short-circuit. The fixture blobs stay a few
+	//          KiB, far below the 16 MiB arena half, so the arena grow path is
+	//          not covered here.
 	//   b.txt  wholesale-rewritten line file. Copy+insert delta commands.
 	//   c.bin  wholesale-rewritten binary blob. Non-delta / insert-heavy.
 	//
@@ -129,13 +133,75 @@ func listGitObjects(t *testing.T, repoDir string) []gitObject {
 	return objs
 }
 
-// gitCatFile returns the raw, authoritative bytes of an object's content
-// (no "<type> <size>\0" header), matching what the store materializes.
-func gitCatFile(t *testing.T, repoDir, typ string, oid Hash) []byte {
+// gitCatFileBatch returns the raw, authoritative bytes of every object's
+// content (no "<type> <size>\0" header), matching what the store materializes.
+//
+// One `git cat-file --batch` process serves the whole object list. Spawning a
+// process per object instead would cost one fork+exec per object, and these
+// tests walk every object in a 120-commit repository twice over — enough
+// subprocess churn to dominate a default `go test` run.
+//
+// The reported type is checked against the enumerated one as a side effect, as
+// a consistency check between two git responses rather than an independent
+// oracle: `cat-file --batch-all-objects --batch-check` in listGitObjects and the
+// `cat-file --batch` here are both git. The check cannot fail from the fixture
+// changing under the test — an object's type is part of the bytes hashed into
+// its OID, so a given OID can never report a different type, and an object that
+// disappeared yields a two-field `<oid> missing` record that trips the
+// three-field header assertion first. It fails only if the two readings of the
+// same OID disagree, which would mean git contradicted itself or this parser
+// misread a record. Nothing here depends on the type being sourced from outside
+// git; the load-bearing oracle is the content comparison.
+func gitCatFileBatch(t *testing.T, repoDir string, objs []gitObject) map[Hash][]byte {
 	t.Helper()
-	out, err := exec.Command("git", "-C", repoDir, "cat-file", typ, oid.String()).Output()
-	require.NoErrorf(t, err, "git cat-file %s %s", typ, oid)
-	return out
+
+	var stdin bytes.Buffer
+	for _, o := range objs {
+		fmt.Fprintln(&stdin, o.oid.String())
+	}
+
+	cmd := gitTestCommand(repoDir, "cat-file", "--batch")
+	cmd.Stdin = &stdin
+	out, err := cmd.Output()
+	require.NoError(t, err, "git cat-file --batch")
+
+	want := make(map[Hash]string, len(objs))
+	for _, o := range objs {
+		want[o.oid] = o.typ
+	}
+
+	// Each record is "<oid> SP <type> SP <size> LF", then exactly <size> content
+	// bytes, then a trailing LF. Content is binary, so it must be read by length
+	// rather than scanned for a delimiter.
+	br := bufio.NewReader(bytes.NewReader(out))
+	contents := make(map[Hash][]byte, len(objs))
+	for range objs {
+		header, err := br.ReadString('\n')
+		require.NoError(t, err, "reading cat-file record header")
+
+		fields := strings.Fields(strings.TrimSuffix(header, "\n"))
+		require.Lenf(t, fields, 3, "unexpected cat-file record header %q", header)
+
+		oid, err := ParseHash(fields[0])
+		require.NoError(t, err)
+		require.Equalf(t, want[oid], fields[1], "cat-file type disagrees for %s", oid)
+
+		size, err := strconv.Atoi(fields[2])
+		require.NoError(t, err)
+
+		body := make([]byte, size)
+		_, err = io.ReadFull(br, body)
+		require.NoErrorf(t, err, "reading %d content bytes for %s", size, oid)
+
+		delim, err := br.ReadByte()
+		require.NoError(t, err)
+		require.Equalf(t, byte('\n'), delim, "missing record terminator for %s", oid)
+
+		contents[oid] = body
+	}
+
+	require.Len(t, contents, len(objs), "every requested object must be returned")
+	return contents
 }
 
 // TestStore_DifferentialAgainstGit is the primary regression guard for the
@@ -155,30 +221,51 @@ func TestStore_DifferentialAgainstGit(t *testing.T) {
 
 	objs := listGitObjects(t, repoDir)
 	require.NotEmpty(t, objs)
+	want := gitCatFileBatch(t, repoDir, objs)
 
 	var checkedPacked, checkedLoose int
 	for _, o := range objs {
-		want := gitCatFile(t, repoDir, o.typ, o.oid)
+		want := want[o.oid]
 
 		// Streaming path (getMaterialized): full body, cached, commit
 		// fast-path disabled.
-		gotStream, _, err := st.getMaterialized(o.oid)
+		gotStream, streamType, err := st.getMaterialized(o.oid)
 		require.NoErrorf(t, err, "getMaterialized %s (%s)", o.oid, o.typ)
 		require.Equalf(t, want, gotStream,
 			"streaming mismatch for %s (%s)", o.oid, o.typ)
+		// The type travels with the bytes: callers branch on it, so returning
+		// the right body under the wrong type is a regression the byte
+		// comparison alone cannot see.
+		require.Equalf(t, o.typ, streamType.String(),
+			"streaming type mismatch for %s", o.oid)
 
 		// Determinism: a second read (now cache-warm) must be identical.
-		gotWarm, _, err := st.getMaterialized(o.oid)
+		gotWarm, warmType, err := st.getMaterialized(o.oid)
 		require.NoError(t, err)
 		require.Equalf(t, want, gotWarm, "warm-cache mismatch for %s (%s)", o.oid, o.typ)
+		require.Equalf(t, o.typ, warmType.String(),
+			"warm-cache type mismatch for %s", o.oid)
 
 		// Borrowed path (getPackedObjectNoCache): only meaningful for packed
 		// objects, since it takes an explicit (pack, offset).
+		//
+		// This path is what guarantees the multi-hop ping-pong arena is
+		// actually reached. inflateDeltaChainBorrowed passes a nil offset
+		// cache, so its walk never short-circuits on a hop some earlier
+		// iteration materialized; an object at chain depth d therefore always
+		// builds a d-entry stack here. requireHasDeltas asserts a deepest
+		// chain of at least 2, so at least one object in this loop resolves
+		// through the arena rather than the single-hop fast path. The
+		// streaming reads above cannot carry that guarantee: they share one
+		// store, so ascending enumeration order leaves each object's base
+		// already published under its pack offset.
 		if p, off, ok := st.findPackedObject(o.oid); ok {
-			gotBorrowed, _, err := st.getPackedObjectNoCache(p, off, o.oid)
+			gotBorrowed, borrowedType, err := st.getPackedObjectNoCache(p, off, o.oid)
 			require.NoErrorf(t, err, "getPackedObjectNoCache %s (%s)", o.oid, o.typ)
 			require.Equalf(t, want, gotBorrowed,
 				"borrowed mismatch for %s (%s)", o.oid, o.typ)
+			require.Equalf(t, o.typ, borrowedType.String(),
+				"borrowed type mismatch for %s", o.oid)
 			checkedPacked++
 		} else {
 			checkedLoose++
@@ -190,10 +277,10 @@ func TestStore_DifferentialAgainstGit(t *testing.T) {
 	require.Positive(t, checkedPacked, "expected packed objects to compare")
 }
 
-// requireHasDeltas fails the test unless the pack contains delta objects, so a
-// repack that produced no deltas cannot give a false green. It parses the
-// chain-length histogram that `git verify-pack -v` prints and logs the deepest
-// chain, which indicates whether the multi-hop ping-pong path was exercised.
+// requireHasDeltas fails the test unless the pack contains delta objects and at
+// least one multi-hop chain, so a repack that produced no deltas — or only
+// single-hop ones, which never reach the ping-pong arena — cannot give a false
+// green. It parses the chain-length histogram that `git verify-pack -v` prints.
 func requireHasDeltas(t *testing.T, packDir string) {
 	t.Helper()
 	idxs, err := filepath.Glob(filepath.Join(packDir, "*.idx"))
@@ -205,6 +292,8 @@ func requireHasDeltas(t *testing.T, packDir string) {
 
 	totalDeltas, maxChain := parseVerifyPackDeltaStats(out)
 	require.Positive(t, totalDeltas, "repacked pack contains no delta objects")
+	require.GreaterOrEqual(t, maxChain, 2,
+		"repack produced no multi-hop chains; this test no longer covers the ping-pong path")
 	t.Logf("pack contains %d delta objects, deepest chain = %d hops", totalDeltas, maxChain)
 }
 
@@ -265,10 +354,12 @@ func TestStore_DifferentialUnderGOMAXPROCS1(t *testing.T) {
 	require.NoError(t, err)
 	defer st.Close()
 
-	for _, o := range listGitObjects(t, repoDir) {
-		want := gitCatFile(t, repoDir, o.typ, o.oid)
-		got, _, err := st.getMaterialized(o.oid)
+	objs := listGitObjects(t, repoDir)
+	want := gitCatFileBatch(t, repoDir, objs)
+	for _, o := range objs {
+		got, typ, err := st.getMaterialized(o.oid)
 		require.NoError(t, err)
-		require.Equalf(t, want, got, "mismatch for %s (%s)", o.oid, o.typ)
+		require.Equalf(t, want[o.oid], got, "mismatch for %s (%s)", o.oid, o.typ)
+		require.Equalf(t, o.typ, typ.String(), "type mismatch for %s", o.oid)
 	}
 }

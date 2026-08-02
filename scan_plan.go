@@ -1381,11 +1381,20 @@ func (e *streamingPackExecutor) scanLoose(rec blobRecord) error {
 	return nil
 }
 
+// walkBlobCandidates visits one blobRecord per changed blob discovered by a
+// first-parent diff of every reachable commit.
+//
+// The walk is ordered (walkCommitsFromRefsOrdered) so callers that dedupe
+// blobs first-wins attribute each blob to the same commit and path on every
+// run.
 func (hs *HistoryScanner) walkBlobCandidates(visit func(blobRecord) error) error {
 	if visit == nil {
 		return nil
 	}
-	return hs.walkCommitsFromRefs(func(c commitInfo) error {
+	// The tree memo only pays off within this walk; drop it on return so a
+	// long-lived scanner does not hold O(commit-count) memory.
+	defer hs.treeOIDs.Clear()
+	return hs.walkCommitsFromRefsOrdered(func(c commitInfo) error {
 		parentTree, err := hs.firstParentTree(c)
 		if err != nil {
 			return err
@@ -1626,11 +1635,17 @@ func (hs *HistoryScanner) scanBlobsStreaming(seen SeenSet, scanner BlobScanner) 
 
 // planScanJobs builds pack-sorted blob scan jobs with per-run OID dedupe.
 // It is internal and only used by package tests/benchmarks.
+//
+// The walk is ordered (walkCommitsFromRefsOrdered) so the first-wins blob
+// dedupe attributes each blob to the same commit and path on every run.
 func (hs *HistoryScanner) planScanJobs(seen SeenSet) (map[*mmap.ReaderAt][]ScanJob, error) {
 	jobsByPack := make(map[*mmap.ReaderAt][]ScanJob, 16)
 	scheduled := make(map[Hash]struct{}, 1024)
 
-	err := hs.walkCommitsFromRefs(func(c commitInfo) error {
+	// The tree memo only pays off within this walk; drop it on return so a
+	// long-lived scanner does not hold O(commit-count) memory.
+	defer hs.treeOIDs.Clear()
+	err := hs.walkCommitsFromRefsOrdered(func(c commitInfo) error {
 		parentTree, err := hs.firstParentTree(c)
 		if err != nil {
 			return err

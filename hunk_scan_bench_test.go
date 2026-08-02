@@ -40,9 +40,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -341,15 +341,6 @@ func pseudoBinary(size int, seed uint64) []byte {
 	return buf
 }
 
-// requireGit skips the caller unless the git CLI is available, matching the
-// convention in hunk_binary_test.go.
-func requireGit(tb testing.TB) {
-	tb.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		tb.Skip("git executable not found in PATH")
-	}
-}
-
 // gitCommitTB stages file and commits it with a timestamp derived from rev.
 //
 // Pinning the timestamps keeps commit OIDs, and therefore pack layout,
@@ -382,7 +373,18 @@ func gitCommitTB(tb testing.TB, dir, file string, rev int) {
 // variant raises the budget for exactly that reason — see
 // TestScanHunksBench_DefaultPairCacheRefusesLargeBinaryHunks.
 func warmPairCacheBudget(hunkBytes int) int {
-	return 8 * pairCacheShards * hunkBytes
+	// int64 math: on a 32-bit build 8*pairCacheShards*(16<<20) is exactly 2^32
+	// and would wrap to 0, silently disabling the very cache this warms. Clamp
+	// instead. A 32-bit build cannot express the budget a 16 MiB hunk needs
+	// (4*pairCacheShards*hunkBytes already exceeds max int), so the warm
+	// variant degrades to a refused entry there rather than to no cache at all.
+	// No supported target is 32-bit; this keeps the helper honest if one is
+	// added or a fixture grows.
+	want := 8 * int64(pairCacheShards) * int64(hunkBytes)
+	if want > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(want)
 }
 
 // pairCacheLen reports how many diff results the memo currently holds.

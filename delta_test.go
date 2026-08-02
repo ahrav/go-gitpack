@@ -6,11 +6,12 @@
 package objstore
 
 import (
-	"bufio"
 	"bytes"
+	"compress/zlib"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"unsafe"
@@ -20,35 +21,30 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
-// TestReadVarIntFromReader validates the Git-style variable-length integer
-// decoder, covering single-byte values, multi-byte continuation sequences,
-// and the empty-input error case.
-// NOTE: consider adding a "name" field to each test case for clearer subtest output.
-func TestReadVarIntFromReader(t *testing.T) {
+// TestDecodeVarInt validates the Git-style variable-length integer decoder,
+// covering single-byte values, multi-byte continuation sequences, the
+// empty-input case, and the 9-byte corruption bound.
+func TestDecodeVarInt(t *testing.T) {
 	tests := []struct {
-		data        []byte
-		expected    uint64
-		consumed    int
-		expectError bool
+		data     []byte
+		expected uint64
+		consumed int // 0 means truncated/over-long input was rejected
 	}{
-		{[]byte{0x00}, 0, 1, false},
-		{[]byte{0x7f}, 127, 1, false},
-		{[]byte{0x80, 0x01}, 128, 2, false},
-		{[]byte{0xff, 0x7f}, 16383, 2, false},
-		{[]byte{0x80, 0x80, 0x01}, 16384, 3, false},
-		{[]byte{}, 0, -1, true}, // empty buffer now returns error
+		{[]byte{0x00}, 0, 1},
+		{[]byte{0x7f}, 127, 1},
+		{[]byte{0x80, 0x01}, 128, 2},
+		{[]byte{0xff, 0x7f}, 16383, 2},
+		{[]byte{0x80, 0x80, 0x01}, 16384, 3},
+		{[]byte{}, 0, 0},     // empty buffer is rejected
+		{[]byte{0x80}, 0, 0}, // truncated continuation is rejected
+		{[]byte{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}, 0, 0}, // >9 bytes rejected
 	}
 
 	for _, test := range tests {
-		reader := bufio.NewReader(bytes.NewReader(test.data))
-		value, consumed, err := readVarIntFromReader(reader)
-
-		if test.expectError {
-			assert.Error(t, err)
-		} else {
-			assert.NoError(t, err)
-			assert.Equal(t, test.expected, value)
-			assert.Equal(t, test.consumed, consumed)
+		value, consumed := decodeVarInt(test.data)
+		assert.Equal(t, test.consumed, consumed, "input %x", test.data)
+		if test.consumed > 0 {
+			assert.Equal(t, test.expected, value, "input %x", test.data)
 		}
 	}
 }
@@ -559,29 +555,240 @@ func TestDeltaArenaPooling(t *testing.T) {
 	})
 }
 
+// TestDeltaArenaRetainLimitDropsIdleExcess offers more arenas than the limit
+// permits and expects the surplus to be dropped rather than retained.
+//
+// Token arenas are enough: the bound counts arenas, not bytes, and
+// putDeltaArena's decision reads only cap(data) via prepareDeltaArenaForPool.
+// Getting three real arenas from a drained free-list would allocate and zero
+// ~96 MiB to observe a count. The real-arena round trip is covered by
+// TestDeltaArenaRetentionDisabled, and pool eligibility by the
+// prepareDeltaArenaForPool cases above.
 func TestDeltaArenaRetainLimitDropsIdleExcess(t *testing.T) {
-	oldLimit := setDeltaArenaRetainLimit(2)
-	defer setDeltaArenaRetainLimit(oldLimit)
+	setDeltaArenaRetainLimitForTest(t, 2)
 
-	drainDeltaArenaFreeList()
-
-	arenas := []*deltaArena{
-		getDeltaArena(),
-		getDeltaArena(),
-		getDeltaArena(),
-	}
-	for _, arena := range arenas {
-		putDeltaArena(arena)
-	}
-	if got := len(deltaArenaFreeList); got != 2 {
+	putTestDeltaArenas(3)
+	if got := idleDeltaArenas(); got != 2 {
 		t.Fatalf("delta arena free-list retained %d arenas, want 2", got)
 	}
 }
 
+// TestDeltaArenaRetainLimitBoundsConcurrentPutters pins the retention bound
+// against the race that a check-then-send admission test loses: every putter
+// reads the same under-limit idle count, every putter passes, and every putter
+// sends. Each round starts from an empty free-list so the whole limit is up for
+// grabs, and all putters are released from one barrier so they contend.
+//
+// The count after a round is exact rather than a range: nothing receives during
+// the round, so the first `limit` sends fill the free-list and every later one
+// is refused.
+//
+// This is sampled evidence — a green run says no round of this many contending
+// putters exceeded the bound, not that none can. The bound itself rests on
+// cap(idle): a non-blocking send cannot overfill a channel.
+func TestDeltaArenaRetainLimitBoundsConcurrentPutters(t *testing.T) {
+	const (
+		limit   = 8
+		putters = 64
+		rounds  = 200
+	)
+	setDeltaArenaRetainLimitForTest(t, limit)
+
+	for round := range rounds {
+		var release, done sync.WaitGroup
+		release.Add(1)
+
+		for range putters {
+			done.Add(1)
+			go func() {
+				defer done.Done()
+				arena := newTestDeltaArena()
+				release.Wait()
+				putDeltaArena(arena)
+			}()
+		}
+
+		release.Done()
+		done.Wait()
+
+		require.Equalf(t, limit, idleDeltaArenas(),
+			"round %d: %d contending putters retained more than the limit", round, putters)
+		drainDeltaArenaFreeList()
+	}
+}
+
+// TestDeltaArenaRetainLimitRuntimeChange covers the two directions of a budget
+// change: the new limit must bound the idle population immediately, and warm
+// arenas that still fit must survive the swap.
+func TestDeltaArenaRetainLimitRuntimeChange(t *testing.T) {
+	t.Run("LoweringShedsIdleExcess", func(t *testing.T) {
+		setDeltaArenaRetainLimitForTest(t, 6)
+		putTestDeltaArenas(6)
+		require.Equal(t, 6, idleDeltaArenas(), "free-list should be full at the initial limit")
+
+		require.Equal(t, 6, setDeltaArenaRetainLimit(2), "previous limit")
+		require.Equal(t, 2, idleDeltaArenas(), "lowering the limit must shed the idle excess")
+	})
+
+	t.Run("RaisingPermitsMoreRetention", func(t *testing.T) {
+		setDeltaArenaRetainLimitForTest(t, 2)
+		putTestDeltaArenas(4)
+		require.Equal(t, 2, idleDeltaArenas(), "the initial limit must bound retention")
+
+		require.Equal(t, 2, setDeltaArenaRetainLimit(6), "previous limit")
+		require.Equal(t, 2, idleDeltaArenas(), "raising the limit must keep the warm arenas")
+
+		putTestDeltaArenas(6)
+		require.Equal(t, 6, idleDeltaArenas(), "the raised limit must permit more retention")
+	})
+}
+
+// TestDeltaArenaRetentionDisabled verifies that a non-positive limit turns idle
+// retention off entirely rather than falling back to a single arena.
+func TestDeltaArenaRetentionDisabled(t *testing.T) {
+	for _, limit := range []int{0, -5} {
+		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
+			setDeltaArenaRetainLimitForTest(t, limit)
+
+			putTestDeltaArenas(4)
+			require.Zero(t, idleDeltaArenas(), "a disabled free-list must retain nothing")
+
+			arena := getDeltaArena()
+			require.Equal(t, defaultDeltaArenaSize, cap(arena.data),
+				"a get against a disabled free-list must allocate a standard arena")
+			putDeltaArena(arena)
+			require.Zero(t, idleDeltaArenas(), "a disabled free-list must retain nothing")
+		})
+	}
+}
+
+// TestSetDeltaArenaBudget covers the byte-denominated public budget: the
+// previous value it reports and the whole-arena rounding its documentation
+// promises.
+func TestSetDeltaArenaBudget(t *testing.T) {
+	ambient := SetDeltaArenaBudget(4 * DeltaArenaSize)
+	t.Cleanup(func() {
+		drainDeltaArenaFreeList()
+		SetDeltaArenaBudget(ambient)
+	})
+	drainDeltaArenaFreeList()
+
+	require.Equal(t, 4*DeltaArenaSize, SetDeltaArenaBudget(2*DeltaArenaSize),
+		"SetDeltaArenaBudget must report the budget it replaced")
+
+	// Setting the same budget twice reports the effective budget: the second
+	// call replaces what the first installed.
+	tests := []struct {
+		name      string
+		budget    int
+		effective int
+	}{
+		{"whole arenas", 4 * DeltaArenaSize, 4 * DeltaArenaSize},
+		{"partial arena is not charged", 3*DeltaArenaSize + DeltaArenaSize/2, 3 * DeltaArenaSize},
+		{"one byte short of an arena disables retention", DeltaArenaSize - 1, 0},
+		{"zero disables retention", 0, 0},
+		{"negative disables retention", -DeltaArenaSize, 0},
+		{
+			"clamped to the hard ceiling",
+			(deltaArenaMaxRetained + 8) * DeltaArenaSize,
+			deltaArenaMaxRetained * DeltaArenaSize,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			SetDeltaArenaBudget(tc.budget)
+			require.Equal(t, tc.effective, SetDeltaArenaBudget(tc.budget),
+				"effective budget for %d bytes", tc.budget)
+		})
+	}
+
+	// The rounding is not cosmetic: a sub-arena budget really retains nothing.
+	SetDeltaArenaBudget(DeltaArenaSize - 1)
+	putTestDeltaArenas(2)
+	require.Zero(t, idleDeltaArenas(), "a sub-arena budget must retain nothing")
+}
+
+// BenchmarkDeltaArenaGetPut measures the get/put round-trip the retention bound
+// sits on: one atomic load of the live free-list plus one non-blocking channel
+// operation each way. The free-list is seeded to capacity so a miss's 32 MiB
+// allocation does not dominate the measurement.
+func BenchmarkDeltaArenaGetPut(b *testing.B) {
+	b.Run("Serial", func(b *testing.B) {
+		setDeltaArenaRetainLimitForTest(b, deltaArenaMaxRetained)
+		putTestDeltaArenas(deltaArenaMaxRetained)
+
+		b.ReportAllocs()
+		for b.Loop() {
+			putDeltaArena(getDeltaArena())
+		}
+	})
+
+	b.Run("Parallel", func(b *testing.B) {
+		// RunParallel starts one worker per GOMAXPROCS, and each worker holds
+		// an arena between its get and its put. More workers than the
+		// free-list can retain therefore guarantees steady-state misses, and a
+		// miss allocates and zeroes a real DeltaArenaSize arena inside the
+		// measured loop — the cost this benchmark is seeded to exclude. On a
+		// host with more CPUs than deltaArenaMaxRetained that turned the
+		// pooled round trip into a measurement of allocation instead
+		// (2182 B/op at GOMAXPROCS=64 against 0 B/op at 32), with up to
+		// (workers - limit) concurrent 32 MiB allocations live at once.
+		//
+		// Capping GOMAXPROCS for the duration caps the worker count to the
+		// seeded population, so every iteration stays on the hit path.
+		if procs := runtime.GOMAXPROCS(0); procs > deltaArenaMaxRetained {
+			defer runtime.GOMAXPROCS(procs)
+			runtime.GOMAXPROCS(deltaArenaMaxRetained)
+		}
+
+		setDeltaArenaRetainLimitForTest(b, deltaArenaMaxRetained)
+		putTestDeltaArenas(deltaArenaMaxRetained)
+
+		b.ReportAllocs()
+		b.RunParallel(func(pb *testing.PB) {
+			for pb.Next() {
+				putDeltaArena(getDeltaArena())
+			}
+		})
+	})
+}
+
+// setDeltaArenaRetainLimitForTest installs limit as the process-wide retain
+// limit against an empty free-list and restores the previous limit afterwards.
+// Both edges drain because these tests count the idle population and seed it
+// with token arenas, neither of which may leak into another test.
+func setDeltaArenaRetainLimitForTest(tb testing.TB, limit int) {
+	tb.Helper()
+	previous := setDeltaArenaRetainLimit(limit)
+	tb.Cleanup(func() {
+		drainDeltaArenaFreeList()
+		setDeltaArenaRetainLimit(previous)
+	})
+	drainDeltaArenaFreeList()
+}
+
+// newTestDeltaArena returns a pool-eligible arena with a token backing array.
+// The retention bound counts arenas, not bytes, so the retention tests skip the
+// 32 MiB allocation a real arena carries; setDeltaArenaRetainLimitForTest
+// drains the free-list on both edges so an undersized arena can never reach a
+// real delta resolution.
+func newTestDeltaArena() *deltaArena { return &deltaArena{data: make([]byte, 64)} }
+
+// putTestDeltaArenas offers n token arenas to the free-list.
+func putTestDeltaArenas(n int) {
+	for range n {
+		putDeltaArena(newTestDeltaArena())
+	}
+}
+
+// idleDeltaArenas reports how many arenas the live free-list holds.
+func idleDeltaArenas() int { return len(deltaArenaFreeListRef.Load().idle) }
+
 func drainDeltaArenaFreeList() {
+	idle := deltaArenaFreeListRef.Load().idle
 	for {
 		select {
-		case <-deltaArenaFreeList:
+		case <-idle:
 			continue
 		default:
 		}
@@ -762,7 +969,7 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 		pack, err := mmap.Open(path)
 		require.NoError(t, err)
 
-		typ, hdrLen, err := peekObjectType(pack, 0)
+		typ, _, err := peekObjectType(pack, 0)
 		require.NoError(t, err)
 		require.Equal(t, ObjRefDelta, typ)
 
@@ -771,7 +978,6 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 					pack:   pack,
 					offset: 0,
 					typ:    typ,
-					hdrLen: hdrLen,
 				},
 			}, func() {
 				require.NoError(t, pack.Close())
@@ -783,12 +989,12 @@ func TestApplyDeltaStackBorrowedResultLifetime(t *testing.T) {
 	stackB, closeB := makeStack("b", targetB)
 	defer closeB()
 
-	first, typ, err := applyDeltaStack(stackA, base, ObjBlob, 0, true)
+	first, typ, err := applyDeltaStackCached(nil, stackA, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	require.Equal(t, ObjBlob, typ)
 	require.Equal(t, targetA, first)
 
-	second, typ, err := applyDeltaStack(stackB, base, ObjBlob, 0, true)
+	second, typ, err := applyDeltaStackCached(nil, stackB, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	require.Equal(t, ObjBlob, typ)
 	require.Equal(t, targetB, second)
@@ -814,20 +1020,125 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	require.NoError(t, err)
 	defer pack.Close()
 
-	typ, hdrLen, err := peekObjectType(pack, 0)
+	typ, _, err := peekObjectType(pack, 0)
 	require.NoError(t, err)
 	require.Equal(t, ObjRefDelta, typ)
 
 	// Call with the WRONG base (different length) to trigger size mismatch.
 	wrongBase := []byte("short")
 	out := make([]byte, 0, 4096)
-	_, err = applyDeltaStreaming(pack, 0, typ, hdrLen, wrongBase, out, false)
+	_, err = applyDeltaStreaming(pack, 0, typ, wrongBase, out, false, 0)
 	require.Error(t, err)
 
 	// After fix: the error message includes both sizes, not just "delta base size mismatch".
 	assert.Contains(t, err.Error(), "mismatch")
 	assert.Contains(t, err.Error(), fmt.Sprintf("header=%d", len(base)))
 	assert.Contains(t, err.Error(), fmt.Sprintf("actual=%d", len(wrongBase)))
+}
+
+func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
+	openPayload := func(t *testing.T, payload []byte, declaredSize uint64) (*mmap.ReaderAt, ObjectType) {
+		t.Helper()
+		if declaredSize == 0 {
+			declaredSize = uint64(len(payload))
+		}
+
+		var obj bytes.Buffer
+		obj.Write(encodeObjHeader(uint8(ObjRefDelta), declaredSize))
+		obj.Write(make([]byte, len(Hash{})))
+		zw := zlib.NewWriter(&obj)
+		_, err := zw.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, zw.Close())
+
+		path := filepath.Join(t.TempDir(), "delta.packobj")
+		require.NoError(t, os.WriteFile(path, obj.Bytes(), 0o644))
+		pack, err := mmap.Open(path)
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, pack.Close()) })
+		return pack, ObjRefDelta
+	}
+
+	t.Run("payload exceeds configured limit", func(t *testing.T) {
+		pack, typ := openPayload(t, nil, 1024)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("payload cannot inflate from remaining pack bytes", func(t *testing.T) {
+		// A corrupt header can advertise a payload the pack cannot
+		// physically supply (DEFLATE expands at most 1032:1). Without the
+		// feasibility check, a few header bytes force getDeltaScratch to
+		// materialize the full advertised amount before any compressed
+		// byte is read — here 1 GiB, and with maxObjectSize=0 the 8× bound
+		// is disabled entirely, so this check is the only allocation guard.
+		pack, typ := openPayload(t, nil, 1<<30)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 0)
+		require.ErrorContains(t, err, "cannot inflate")
+	})
+
+	t.Run("payload overhead above target limit is accepted", func(t *testing.T) {
+		// A literal-heavy delta for a target AT the limit necessarily has a
+		// payload LARGER than the limit (varints + insert command bytes).
+		// The payload bound must account for that overhead: rejecting on
+		// payload > maxObjectSize would fail valid deltas whose
+		// reconstructed target is within the documented bound.
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)  // base size
+		writeVarInt(&payload, 64) // target size == limit
+		payload.WriteByte(0x40)   // insert 64 literal bytes
+		payload.Write(bytes.Repeat([]byte{'x'}, 64))
+		require.Greater(t, payload.Len(), 64, "test premise: payload exceeds the target limit")
+
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		out, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.NoError(t, err)
+		require.Equal(t, bytes.Repeat([]byte{'x'}, 64), out)
+	})
+
+	t.Run("target exceeds configured limit", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 65)
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
+	})
+
+	t.Run("unproducible target size with limit disabled", func(t *testing.T) {
+		// With maxObjectSize=0 the configurable limit is off, so the
+		// admissibility bound (no instruction stream emits more than
+		// 0x10000 bytes per payload byte) is the only guard between the
+		// attacker-controlled target varint and make(). Without it, a
+		// 2^62 target panics make ("len out of range") instead of
+		// returning an error.
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 1<<62)
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 0)
+		require.ErrorContains(t, err, "not producible")
+	})
+
+	t.Run("copy exceeds declared target", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 2)
+		writeVarInt(&payload, 1)
+		payload.Write([]byte{0x90, 0x02}) // Copy two bytes into a one-byte target.
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, []byte("ab"), nil, true, 64)
+		require.ErrorContains(t, err, "exceeds declared target")
+	})
+
+	t.Run("insert exceeds declared target", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, 0)
+		writeVarInt(&payload, 1)
+		payload.Write([]byte{0x02, 'a', 'b'})
+		pack, typ := openPayload(t, payload.Bytes(), 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		require.ErrorContains(t, err, "exceeds declared target")
+	})
 }
 
 // TestReadOfsDeltaOffset_PropagatesReadError verifies that readOfsDeltaOffset
@@ -843,24 +1154,24 @@ func TestReadOfsDeltaOffset_PropagatesReadError(t *testing.T) {
 	defer pack.Close()
 
 	// Reading at any offset beyond the file should return an error.
-	_, err = readOfsDeltaOffset(pack, 100)
+	_, _, err = readOfsDeltaOffset(pack, 100)
 	require.Error(t, err, "expected error when reading beyond EOF, got nil")
 }
 
-// TestReadOfsDeltaOffset_ValidData verifies that readOfsDeltaOffset correctly
-// decodes a valid single-byte offset (no continuation bit set).
+// TestReadOfsDeltaOffset_ValidData verifies that readOfsDeltaOffset decodes
+// the offset and reports the exact number of bytes consumed.
 func TestReadOfsDeltaOffset_ValidData(t *testing.T) {
-	// A single byte with value 0x42 (continuation bit not set) should decode to 0x42.
 	path := filepath.Join(t.TempDir(), "valid.pack")
-	require.NoError(t, os.WriteFile(path, []byte{0x42}, 0o644))
+	require.NoError(t, os.WriteFile(path, []byte{0x80, 0x00, 0xff}, 0o644))
 
 	pack, err := mmap.Open(path)
 	require.NoError(t, err)
 	defer pack.Close()
 
-	offset, err := readOfsDeltaOffset(pack, 0)
+	offset, consumed, err := readOfsDeltaOffset(pack, 0)
 	require.NoError(t, err)
-	assert.Equal(t, uint64(0x42), offset)
+	assert.Equal(t, uint64(128), offset)
+	assert.Equal(t, 2, consumed)
 }
 
 // testDelta represents delta information for testing.
@@ -931,13 +1242,13 @@ func TestApplyDeltaStack_BorrowedVsCopy(t *testing.T) {
 
 	// For empty stack, borrowed=true returns baseData directly (no arena).
 	base := []byte("hello world")
-	result, typ, err := applyDeltaStack(nil, base, ObjBlob, 0, true)
+	result, typ, err := applyDeltaStackCached(nil, nil, base, ObjBlob, 0, true)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, base, result)
 
 	// For empty stack, borrowed=false returns a COPY.
-	result2, _, err := applyDeltaStack(nil, base, ObjBlob, 0, false)
+	result2, _, err := applyDeltaStackCached(nil, nil, base, ObjBlob, 0, false)
 	require.NoError(t, err)
 	// Modify original; copy should be independent.
 	base[0] = 'H'
@@ -950,11 +1261,11 @@ func TestDeltaArenaOverflowProtection(t *testing.T) {
 	maxObj := uint64(512 << 20)
 	base := []byte("base")
 
-	_, _, err := applyDeltaStack(nil, base, ObjBlob, maxObj, false)
+	_, _, err := applyDeltaStackCached(nil, nil, base, ObjBlob, maxObj, false)
 	assert.NoError(t, err, "empty stack with maxObjectSize should succeed")
 
 	hugeBase := make([]byte, 1)
-	_, _, err = applyDeltaStack(nil, hugeBase, ObjBlob, 0, false)
+	_, _, err = applyDeltaStackCached(nil, nil, hugeBase, ObjBlob, 0, false)
 	assert.NoError(t, err, "empty stack should always succeed regardless of base size")
 }
 
