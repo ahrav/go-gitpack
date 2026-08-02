@@ -325,16 +325,7 @@ func TestDiffHistoryHunks_DirectoryRenameEditPairsAgainstOldPath(t *testing.T) {
 	runGit(t, repo, "add", "-A")
 	runGit(t, repo, "commit", "-m", "rename edit", "--quiet")
 
-	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
-	require.NoError(t, err)
-	defer scanner.Close()
-
-	hunks, errC := scanner.DiffHistoryHunks()
-	linesByPath := make(map[string][]string)
-	for h := range hunks {
-		linesByPath[h.Path()] = append(linesByPath[h.Path()], h.Lines()...)
-	}
-	require.NoError(t, <-errC)
+	linesByPath, _ := scanHunksByPath(t, filepath.Join(repo, ".git"))
 
 	assert.Equal(t, []string{"secret"}, linesByPath["new/edited.txt"])
 	assert.Empty(t, linesByPath["new/same-a.txt"])
@@ -409,16 +400,7 @@ func TestDiffHistoryHunks_DirectoryRenameDoesNotPairUnrelatedContent(t *testing.
 	runGit(t, repo, "add", "-A")
 	runGit(t, repo, "commit", "-m", "rename dir, replace notes", "--quiet")
 
-	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
-	require.NoError(t, err)
-	defer scanner.Close()
-
-	hunks, errC := scanner.DiffHistoryHunks()
-	linesByPath := make(map[string][]string)
-	for h := range hunks {
-		linesByPath[h.Path()] = append(linesByPath[h.Path()], h.Lines()...)
-	}
-	require.NoError(t, <-errC)
+	linesByPath, _ := scanHunksByPath(t, filepath.Join(repo, ".git"))
 
 	// The replacement file is < 50% similar to the deleted one, so every one
 	// of its lines — including the coincidentally-shared line — is new.
@@ -579,16 +561,7 @@ func TestDiffHistoryHunks_DroppedDeletePathsStillSuppressExactMoves(t *testing.T
 	runGit(t, repo, "add", "-A")
 	runGit(t, repo, "commit", "-m", "move dir", "--quiet")
 
-	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
-	require.NoError(t, err)
-	defer scanner.Close()
-
-	hunks, errC := scanner.DiffHistoryHunks()
-	linesByPath := make(map[string][]string)
-	for h := range hunks {
-		linesByPath[h.Path()] = append(linesByPath[h.Path()], h.Lines()...)
-	}
-	require.NoError(t, <-errC)
+	linesByPath, _ := scanHunksByPath(t, filepath.Join(repo, ".git"))
 
 	// Suppression is unaffected: both exact moves stay silent.
 	assert.Empty(t, linesByPath["new/a.txt"], "an exact-OID move must stay suppressed without delete paths")
@@ -601,4 +574,49 @@ func TestDiffHistoryHunks_DroppedDeletePathsStillSuppressExactMoves(t *testing.T
 		[]string{"keep one", "keep two", "keep three", "keep four", "brand new"},
 		linesByPath["new/edited.txt"],
 		"without delete paths the edited file must still report every line")
+}
+
+// TestDiffHistoryHunks_InferredRenameAcrossEntryTypesReportsSymlink covers the
+// entry-type half of directory-rename inference. A regular file whose bytes are
+// exactly a path string and a symlink to that path share a blob OID, so pairing
+// them from path structure alone yields a pair diff whose old side equals its
+// new side: no hunk at all, and the symlink's target silently leaves the
+// stream. Exact-OID suppression already refuses that conflation by keying on
+// blob identity rather than OID; inference must refuse it too.
+func TestDiffHistoryHunks_InferredRenameAcrossEntryTypesReportsSymlink(t *testing.T) {
+	requireGit(t)
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.Mkdir(filepath.Join(repo, "old"), 0o755))
+	// No trailing newline: the blob is exactly the symlink target string, so
+	// the regular file and the symlink hash identically.
+	const target = "target/path"
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "payload"), []byte(target), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "a.txt"), []byte("anchor a\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "b.txt"), []byte("anchor b\n"), 0o644))
+	runGit(t, repo, "add", "old")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	// Move old/ -> new/. a.txt and b.txt move byte-identical, which is the two
+	// anchors inference needs; payload arrives at the corresponding new path as
+	// a SYMLINK rather than a regular file.
+	require.NoError(t, os.Mkdir(filepath.Join(repo, "new"), 0o755))
+	for _, name := range []string{"a.txt", "b.txt"} {
+		require.NoError(t, os.Rename(
+			filepath.Join(repo, "old", name), filepath.Join(repo, "new", name)))
+	}
+	require.NoError(t, os.Remove(filepath.Join(repo, "old", "payload")))
+	require.NoError(t, os.Remove(filepath.Join(repo, "old")))
+	require.NoError(t, os.Symlink(target, filepath.Join(repo, "new", "payload")))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "move dir, file becomes symlink", "--quiet")
+
+	linesByPath, _ := scanHunksByPath(t, filepath.Join(repo, ".git"))
+
+	assert.Equal(t, []string{target}, linesByPath["new/payload"],
+		"a blob-to-symlink type change must not be silenced by an inferred rename")
+	// The anchors are genuine exact-OID moves and stay suppressed.
+	assert.Empty(t, linesByPath["new/a.txt"])
+	assert.Empty(t, linesByPath["new/b.txt"])
 }

@@ -1001,7 +1001,8 @@ func pairCommitRenames(
 			continue
 		}
 		deleteIdx, ok := matchDirectoryRename(
-			unmatched[i].work.path, dirRenames, unusedDeletesByPath, used)
+			unmatched[i].work.path, unmatched[i].kind,
+			dirRenames, deletes, unusedDeletesByPath, used)
 		if !ok {
 			continue
 		}
@@ -1237,7 +1238,21 @@ func inferDirectoryRenames(evidence []exactRenameEvidence) directoryRenameIndex 
 // index instead of scanning every candidate; applicable candidates are then
 // tried in global priority order, preserving the first-match-wins semantics
 // of a linear scan over the ordered slice.
-func matchDirectoryRename(addPath string, renames directoryRenameIndex, deletesByPath map[string]int, used []bool) (int, bool) {
+//
+// A delete only reconstructs the add if its entry TYPE matches kind as well as
+// its path. Path alone would let a deleted regular file whose bytes are a path
+// string be paired with an added symlink to that path: the two share a blob
+// OID, so the resulting pair diff is old == new and emits nothing, dropping the
+// symlink's target from the stream. That is the same conflation blobIdentity
+// rejects for exact-OID suppression, and inference must not reintroduce it.
+func matchDirectoryRename(
+	addPath string,
+	kind uint32,
+	renames directoryRenameIndex,
+	deletes []deletedEntry,
+	deletesByPath map[string]int,
+	used []bool,
+) (int, bool) {
 	// Collect the priority ranks of candidates rooted at each ancestor dir.
 	// Typical paths are a handful of levels deep and few ancestors are
 	// candidate roots, so the fixed buffer keeps this allocation-free.
@@ -1263,7 +1278,7 @@ func matchDirectoryRename(addPath string, renames directoryRenameIndex, deletesB
 		}
 		oldPath := joinPath(candidate.oldDir, rel)
 		idx, ok := deletesByPath[oldPath]
-		if ok && !used[idx] {
+		if ok && !used[idx] && deletes[idx].kind == kind {
 			return idx, true
 		}
 	}

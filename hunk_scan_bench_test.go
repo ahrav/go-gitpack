@@ -349,8 +349,7 @@ func gitCommitTB(tb testing.TB, dir, file string, rev int) {
 	tb.Helper()
 	runGit(tb, dir, "add", "--", file)
 	date := fmt.Sprintf("%d +0000", 1700000000+int64(rev)*60)
-	runGitEnv(tb, dir,
-		append(gitFixtureEnv(), "GIT_AUTHOR_DATE="+date, "GIT_COMMITTER_DATE="+date),
+	runGitEnv(tb, dir, gitFixtureEnvPinned(date),
 		"commit", "--quiet", "-m", fmt.Sprintf("rev %d", rev))
 }
 

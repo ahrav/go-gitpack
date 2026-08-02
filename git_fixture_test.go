@@ -96,14 +96,57 @@ var gitRepoSelectionVars = []string{
 	"GIT_DISCOVERY_ACROSS_FILESYSTEM",
 }
 
-// gitNeutralEnviron returns os.Environ() with every repo-selection variable
-// dropped, preserving all unrelated entries.
+// gitConfigInjectionVars are the environment variables that inject Git
+// configuration into an invocation, as opposed to naming a config FILE.
+// GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM are not here: gitFixtureEnv points
+// both at /dev/null, so an inherited value is superseded rather than dropped.
+//
+// GIT_CONFIG_PARAMETERS is the load-bearing one. Git exports it to carry a
+// parent invocation's `-c` settings down to hooks and subprocesses, and it
+// takes precedence over the GIT_CONFIG_COUNT/KEY/VALUE triples gitFixtureEnv
+// appends -- verified on git 2.50.1, where an inherited
+// GIT_CONFIG_PARAMETERS="'commit.gpgsign'='true'" wins over an explicit
+// GIT_CONFIG_KEY_n=commit.gpgsign / GIT_CONFIG_VALUE_n=false. Running the suite
+// under `git -c ...` (a hook, `git bisect run`, `git rebase --exec`) would
+// therefore re-enable the very signing and auto-maintenance the fixture
+// environment disables.
+var gitConfigInjectionVars = []string{
+	"GIT_CONFIG_PARAMETERS",
+	"GIT_CONFIG_COUNT",
+}
+
+// gitConfigInjectionPrefixes match the numbered config triples, whose indices
+// are unbounded and so cannot be enumerated. Dropping them means gitFixtureEnv
+// supplies the complete triple set rather than relying on later duplicate
+// entries in the environment winning.
+var gitConfigInjectionPrefixes = []string{
+	"GIT_CONFIG_KEY_",
+	"GIT_CONFIG_VALUE_",
+}
+
+// gitEnvMustDrop reports whether an environment variable named name would let
+// the parent process redirect or reconfigure a fixture's git invocation.
+func gitEnvMustDrop(name string) bool {
+	if slices.Contains(gitRepoSelectionVars, name) ||
+		slices.Contains(gitConfigInjectionVars, name) {
+		return true
+	}
+	for _, prefix := range gitConfigInjectionPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// gitNeutralEnviron returns os.Environ() with every repo-selection and
+// config-injection variable dropped, preserving all unrelated entries.
 func gitNeutralEnviron() []string {
 	parent := os.Environ()
 	out := make([]string, 0, len(parent))
 	for _, kv := range parent {
 		name, _, ok := strings.Cut(kv, "=")
-		if ok && slices.Contains(gitRepoSelectionVars, name) {
+		if ok && gitEnvMustDrop(name) {
 			continue
 		}
 		out = append(out, kv)
@@ -111,12 +154,20 @@ func gitNeutralEnviron() []string {
 	return out
 }
 
-// gitFixtureEnv must not carry a repo-selection variable through from the
-// parent environment, or every fixture would build its commits in whatever
-// repository that variable names. Blanking is not a substitute: GIT_DIR="" is
-// an explicit invalid path to Git, not an unset variable.
+// gitFixtureEnv must not carry a repo-selection or config-injection variable
+// through from the parent environment. A repo-selection variable would make
+// every fixture build its commits in whatever repository that variable names;
+// a config-injection variable would reconfigure the invocation, and
+// GIT_CONFIG_PARAMETERS specifically outranks the triples gitFixtureEnv sets.
+// Blanking is not a substitute for either: GIT_DIR="" is an explicit invalid
+// path to Git, not an unset variable.
 func TestGitFixtureEnvDropsInheritedRepoSelection(t *testing.T) {
-	for _, name := range gitRepoSelectionVars {
+	hostile := append([]string{}, gitRepoSelectionVars...)
+	hostile = append(hostile, gitConfigInjectionVars...)
+	for _, prefix := range gitConfigInjectionPrefixes {
+		hostile = append(hostile, prefix+"0", prefix+"7")
+	}
+	for _, name := range hostile {
 		t.Setenv(name, "/somewhere/else")
 	}
 	const sentinel = "GO_GITPACK_FIXTURE_ENV_SENTINEL"
@@ -129,7 +180,14 @@ func TestGitFixtureEnvDropsInheritedRepoSelection(t *testing.T) {
 		if !ok {
 			continue
 		}
-		if slices.Contains(gitRepoSelectionVars, name) {
+		// Checked against the hostile list this test built, NOT against
+		// gitEnvMustDrop: reusing the production predicate as the oracle would
+		// make the assertion vacuous, since narrowing the predicate would
+		// narrow the check with it.
+		//
+		// gitFixtureEnv appends its own config triples, so a name it also sets
+		// is a leak only while it still carries the parent's value.
+		if slices.Contains(hostile, name) && strings.HasSuffix(kv, "=/somewhere/else") {
 			leaked = append(leaked, kv)
 		}
 		if name == sentinel {
@@ -156,4 +214,25 @@ func TestRunGitIgnoresHostileGlobalCommitSigning(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(repo, "file.txt"), []byte("content\n"), 0o644))
 	runGitEnv(t, repo, hostileEnv, "add", "file.txt")
 	runGitEnv(t, repo, hostileEnv, "commit", "-m", "must not sign", "--quiet")
+}
+
+// A parent `git -c commit.gpgsign=true ...` exports GIT_CONFIG_PARAMETERS to
+// its subprocesses, and Git ranks that above the GIT_CONFIG_COUNT/KEY/VALUE
+// triples gitFixtureEnv sets -- so inheriting it would re-enable signing with a
+// nonexistent gpg program and break every fixture. Dropping it is what keeps
+// the suite runnable from inside a hook, `git bisect run`, or
+// `git rebase --exec`.
+func TestRunGitIgnoresInheritedConfigParameters(t *testing.T) {
+	requireGit(t)
+
+	home := t.TempDir()
+	missingGPG := filepath.Join(home, "missing-gpg")
+	t.Setenv("GIT_CONFIG_PARAMETERS",
+		"'commit.gpgsign'='true' 'gpg.program'='"+missingGPG+"'")
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "file.txt"), []byte("content\n"), 0o644))
+	runGit(t, repo, "add", "file.txt")
+	runGit(t, repo, "commit", "-m", "must not sign", "--quiet")
 }

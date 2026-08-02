@@ -173,7 +173,9 @@ func TestParallelCommitWalk_GOMAXPROCSInvariant(t *testing.T) {
 	}
 
 	single := walk(1)
-	multi := walk(runtime.NumCPU())
+	// At least 2, or a single-CPU runner would compare GOMAXPROCS(1) with
+	// itself and the test would assert nothing.
+	multi := walk(max(2, runtime.NumCPU()))
 	require.Equal(t, single, multi, "walk result depends on parallelism")
 }
 
