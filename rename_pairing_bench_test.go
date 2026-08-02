@@ -38,7 +38,9 @@ type pairingInput struct {
 	used       []bool
 }
 
-// recordDelete mirrors emitCommitBlobPairs' delete bookkeeping for fixtures.
+// recordDelete mirrors emitCommitBlobPairs' delete bookkeeping for fixtures:
+// a credit on the identity's group plus the path-bearing record that credit
+// can be traced back to.
 func recordDelete(in *pairingInput, path string, oid Hash) {
 	entry := deletedEntry{path: path, oid: oid, kind: modeBlob}
 	g := in.byIdentity[entry.identity()]
@@ -46,6 +48,7 @@ func recordDelete(in *pairingInput, path string, oid Hash) {
 		g = &deleteGroup{}
 		in.byIdentity[entry.identity()] = g
 	}
+	g.remaining++
 	g.indices = append(g.indices, len(in.deletes))
 	in.deletes = append(in.deletes, entry)
 }

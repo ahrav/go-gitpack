@@ -213,17 +213,24 @@ func TestDiffHistoryHunks_DeterministicMultiset(t *testing.T) {
 }
 
 // verifyDAGShape checks structural invariants that must hold regardless of walk
-// order: a single root commit, all parents resolvable within the set, and at
-// least one merge (multi-parent) commit so the test actually exercises the
-// branching case.
+// order: a single root commit, all parents resolvable within the set, every
+// parent positioned before its children, and at least one merge (multi-parent)
+// commit so the test actually exercises the branching case.
+//
+// Parent-first POSITION is checked and not just parent PRESENCE: loadFromRefs
+// documents that ordering so consumers can process the history in a single
+// forward pass, and a deterministic-but-misordered result would otherwise
+// satisfy every other assertion in this file.
 func verifyDAGShape(t *testing.T, commits []commitInfo) {
 	t.Helper()
 	set := make(map[Hash]bool, len(commits))
-	for _, c := range commits {
+	posOf := make(map[Hash]int, len(commits))
+	for i, c := range commits {
 		set[c.OID] = true
+		posOf[c.OID] = i
 	}
 	roots, merges := 0, 0
-	for _, c := range commits {
+	for i, c := range commits {
 		switch len(c.ParentOIDs) {
 		case 0:
 			roots++
@@ -233,6 +240,9 @@ func verifyDAGShape(t *testing.T, commits []commitInfo) {
 			}
 			for _, p := range c.ParentOIDs {
 				require.Truef(t, set[p], "parent %s of %s missing from walk", p, c.OID)
+				require.Lessf(t, posOf[p], i,
+					"parent %s must precede child %s: at index %d, child at %d",
+					p, c.OID, posOf[p], i)
 			}
 		}
 	}

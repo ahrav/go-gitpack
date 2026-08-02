@@ -523,3 +523,82 @@ func TestDiffHistoryHunks_InferredRenameFromOversizedOldBlobReportsTextLines(t *
 			"an inferred pairing must not substitute a placeholder for the new file's lines")
 	}
 }
+
+// TestDiffHistoryHunks_InferredRenameOntoMuchSmallerFileReportsTextLines
+// covers the shrinking-pairing case in gateInferredRenameHunks' similarity
+// test. An unrelated new file that is much smaller than the deleted file it
+// was paired with can share every one of its lines with that file, so the pair
+// diff has ZERO added lines. Scoring similarity against the new file alone
+// would read that as "identical content, trustworthy pairing" and emit no hunk
+// at all, dropping the new file's content from the stream; scoring against the
+// larger side rejects the pairing the way Git's max(src,dst) denominator does.
+func TestDiffHistoryHunks_InferredRenameOntoMuchSmallerFileReportsTextLines(t *testing.T) {
+	var big strings.Builder
+	for i := range 100 {
+		fmt.Fprintf(&big, "line-%d\n", i)
+	}
+	// The new file's only line occurs in the old file, so the pair diff adds
+	// nothing: 1 common line against a 100-line old side is 2% similar.
+	gitDir := buildInferredRenameRepo(t, []byte(big.String()), []byte("line-7\n"))
+
+	linesByPath, binaryByPath := scanHunksByPath(t, gitDir)
+
+	assert.Equal(t, []string{"line-7"}, linesByPath["new/data"],
+		"a pairing that only shrinks must fall back to the whole-file addition")
+	assert.False(t, binaryByPath["new/data"])
+}
+
+// TestDiffHistoryHunks_DroppedDeletePathsStillSuppressExactMoves pins the
+// degradation contract of maxRetainedDeletePathBytes. Past that bound a commit
+// stops retaining deleted paths, which costs directory-rename inference — it
+// has no source path left to build evidence from — but must not cost exact-OID
+// move suppression, which needs only a per-identity credit.
+func TestDiffHistoryHunks_DroppedDeletePathsStillSuppressExactMoves(t *testing.T) {
+	requireGit(t)
+
+	// Small enough that the fixture's handful of deleted paths overruns it.
+	restore := maxRetainedDeletePathBytes
+	maxRetainedDeletePathBytes = 8
+	t.Cleanup(func() { maxRetainedDeletePathBytes = restore })
+
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.Mkdir(filepath.Join(repo, "old"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "a.txt"), []byte("anchor a\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "b.txt"), []byte("anchor b\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "edited.txt"),
+		[]byte("keep one\nkeep two\nkeep three\nkeep four\n"), 0o644))
+	runGit(t, repo, "add", "old")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	// Move old/ -> new/. a.txt and b.txt move byte-identical (exact-OID moves);
+	// edited.txt gains a line, so inference is what would have paired it.
+	require.NoError(t, os.Rename(filepath.Join(repo, "old"), filepath.Join(repo, "new")))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "new", "edited.txt"),
+		[]byte("keep one\nkeep two\nkeep three\nkeep four\nbrand new\n"), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "move dir", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	hunks, errC := scanner.DiffHistoryHunks()
+	linesByPath := make(map[string][]string)
+	for h := range hunks {
+		linesByPath[h.Path()] = append(linesByPath[h.Path()], h.Lines()...)
+	}
+	require.NoError(t, <-errC)
+
+	// Suppression is unaffected: both exact moves stay silent.
+	assert.Empty(t, linesByPath["new/a.txt"], "an exact-OID move must stay suppressed without delete paths")
+	assert.Empty(t, linesByPath["new/b.txt"], "an exact-OID move must stay suppressed without delete paths")
+
+	// Inference is given up, so the edited file is a whole-file addition
+	// rather than just its one added line. Losing precision is the accepted
+	// cost; losing the content would not be.
+	assert.ElementsMatch(t,
+		[]string{"keep one", "keep two", "keep three", "keep four", "brand new"},
+		linesByPath["new/edited.txt"],
+		"without delete paths the edited file must still report every line")
+}
