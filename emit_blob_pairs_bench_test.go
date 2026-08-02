@@ -57,10 +57,8 @@ func rootHeavyRepo(tb testing.TB, fx *hunkBenchFixtures, fileCount, fileSize int
 	name := fmt.Sprintf("root-heavy-%dfiles-%dB", fileCount, fileSize)
 	return fx.repo(tb, name, func(tb testing.TB, work string) {
 		writeAddHeavyFiles(tb, work, "", fileCount, fileSize)
-		gitTB(tb, work, "add", "--", ".")
-		date := "1700000000 +0000"
-		gitEnvTB(tb, work,
-			[]string{"GIT_AUTHOR_DATE=" + date, "GIT_COMMITTER_DATE=" + date},
+		runGit(tb, work, "add", "--", ".")
+		runGitEnv(tb, work, gitFixtureEnvPinned("1700000000 +0000"),
 			"commit", "--quiet", "-m", "root import")
 
 		// One trailing modification so the history is not a single commit.

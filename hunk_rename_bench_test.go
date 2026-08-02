@@ -66,7 +66,7 @@ func (f *hunkBenchFixtures) renameTree(tb testing.TB, files, fileSize int) strin
 	return f.repo(tb, name, func(tb testing.TB, work string) {
 		writeTreeFiles(tb, work, "src", files, fileSize)
 		gitCommitAllTB(tb, work, 0)
-		gitTB(tb, work, "mv", "src", "dst")
+		runGit(tb, work, "mv", "src", "dst")
 		gitCommitAllTB(tb, work, 1)
 	})
 }
@@ -82,7 +82,7 @@ func (f *hunkBenchFixtures) deleteTree(tb testing.TB, files, fileSize int) strin
 	return f.repo(tb, name, func(tb testing.TB, work string) {
 		writeTreeFiles(tb, work, "src", files, fileSize)
 		gitCommitAllTB(tb, work, 0)
-		gitTB(tb, work, "rm", "-r", "-q", "--", "src")
+		runGit(tb, work, "rm", "-r", "-q", "--", "src")
 		gitCommitAllTB(tb, work, 1)
 	})
 }
@@ -167,10 +167,9 @@ func treeFileBody(index, size int) []byte {
 // therefore pack layout, identical across runs and machines.
 func gitCommitAllTB(tb testing.TB, dir string, rev int) {
 	tb.Helper()
-	gitTB(tb, dir, "add", "-A")
+	runGit(tb, dir, "add", "-A")
 	date := fmt.Sprintf("%d +0000", 1700000000+int64(rev)*60)
-	gitEnvTB(tb, dir,
-		[]string{"GIT_AUTHOR_DATE=" + date, "GIT_COMMITTER_DATE=" + date},
+	runGitEnv(tb, dir, gitFixtureEnvPinned(date),
 		"commit", "--quiet", "-m", fmt.Sprintf("rev %d", rev))
 }
 
