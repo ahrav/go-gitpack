@@ -204,7 +204,7 @@ const (
 	// LargeFileThreshold is 500 MB (500 << 20). Files whose size exceeds
 	// MediumFileThreshold and is at or below this limit trigger the hash‑
 	// based algorithm, which stores only 64‑bit hashes of each line.
-	LargeFileThreshold = 500 << 20 // 500 MB
+	LargeFileThreshold = 500 << 20 // 500 MB
 
 	// MaxDiffSize is 1 GB (1 << 30). If a blob consulted by computeAddedHunks
 	// is larger than this limit, the diff is skipped and a single placeholder
@@ -222,6 +222,13 @@ const (
 	//     was larger than the limit.
 	MaxDiffSize = 1 << 30 // 1 GB
 )
+
+// maxDiffSize is the limit actually consulted at runtime. Production always
+// runs at MaxDiffSize; it is a variable only so tests can exercise the
+// oversized-blob branches without materializing a gigabyte. Overriding it is
+// safe only from a test that does not call t.Parallel(), since the Go test
+// runner never overlaps serial top-level tests with parallel ones.
+var maxDiffSize int64 = MaxDiffSize
 
 // AddedHunk represents a contiguous block of added lines in a diff.
 // The struct groups consecutive lines that were added to a file, tracking
@@ -362,7 +369,7 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 	newSize := int64(len(newBytes))
 
 	// Hard size limit — users would rather see a placeholder than wait.
-	if newSize > MaxDiffSize {
+	if newSize > maxDiffSize {
 		placeholder := AddedHunk{
 			StartLine: 1,
 			Lines:     []string{fmt.Sprintf("[File too large to diff: new=%d bytes]", newSize)},
@@ -410,7 +417,7 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 	}
 	oldSize := int64(len(oldBytes))
 
-	if oldSize > MaxDiffSize {
+	if oldSize > maxDiffSize {
 		placeholder := AddedHunk{
 			StartLine: 1,
 			Lines:     []string{fmt.Sprintf("[File too large to diff: old=%d new=%d bytes]", oldSize, newSize)},

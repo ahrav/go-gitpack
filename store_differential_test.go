@@ -47,21 +47,13 @@ func buildDeltaHeavyRepo(t *testing.T) (repoDir, packDir string) {
 	}
 
 	repoDir = t.TempDir()
+	env := gitFixtureEnvPinned("2000-01-01T00:00:00Z")
 	git := func(args ...string) {
 		t.Helper()
-		cmd := gitTestCommand(repoDir, args...)
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
-			"GIT_AUTHOR_DATE=2000-01-01T00:00:00Z",
-			"GIT_COMMITTER_DATE=2000-01-01T00:00:00Z",
-		)
-		out, err := cmd.CombinedOutput()
-		require.NoErrorf(t, err, "git %s: %s", strings.Join(args, " "), out)
+		runGitEnv(t, repoDir, env, args...)
 	}
 
 	git("init", "-q")
-	git("config", "commit.gpgsign", "false")
 
 	// Content shapes chosen to exercise distinct materialization paths:
 	//
