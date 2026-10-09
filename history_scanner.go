@@ -514,14 +514,14 @@ func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
 // DiffHistoryHunks pipeline.
 type blobPairWork struct {
 	commit Hash
-	path   string
-	oldOID Hash
-	newOID Hash
-
 	// renameCandidate marks a pair whose oldOID came from a deleted path
 	// matched only by directory-rename evidence; the hunk stage pairs it
-	// against oldOID only when the contents are similar.
+	// against oldOID only when the contents are similar. It sits in the
+	// padding after commit, so the struct stays 80 bytes.
 	renameCandidate bool
+	path            string
+	oldOID          Hash
+	newOID          Hash
 }
 
 type exactRenameEvidence struct {

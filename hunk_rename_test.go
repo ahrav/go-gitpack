@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -209,4 +210,8 @@ func TestRenameLinesSimilar(t *testing.T) {
 			assert.Equal(t, c.want, renameLinesSimilar([]byte(c.old), []byte(c.new)))
 		})
 	}
+}
+
+func TestBlobPairWorkSize(t *testing.T) {
+	assert.LessOrEqual(t, unsafe.Sizeof(blobPairWork{}), uintptr(80))
 }

@@ -11,6 +11,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/require"
 )
@@ -208,9 +209,9 @@ func TestDiffHistoryHunksDedup_StalledConsumerBoundsRetention(t *testing.T) {
 	}
 
 	treeWorkers := int64(min(s.dedupLimits.workers, maxTreeDiffWorkers))
-	maxPairs := s.dedupLimits.pendingPairsCap + 2*treeWorkers*files
+	maxPairs := s.dedupLimits.pendingPairsCap + dedupDispatchDepth*treeWorkers*files
 	hunk := mkTestHunk(1, strings.Split(strings.TrimSuffix(uniqueText("c00f00.txt", lines), "\n"), "\n")...)
-	maxBytes := s.dedupLimits.retainedBytesCap + int64(s.dedupLimits.inFlightPairs)*hunkRetainedBytes(&hunk)
+	maxBytes := s.dedupLimits.retainedBytesCap + int64(s.dedupLimits.inFlightPairs)*int64(toKiB(uint64(hunkRetainedBytes(&hunk))))<<10
 	pairs, bytes := probe.peakPendingPairs.Load(), probe.peakRetainedBytes.Load()
 
 	close(release)
@@ -226,4 +227,11 @@ func TestDiffHistoryHunksDedup_StalledConsumerBoundsRetention(t *testing.T) {
 	t.Logf("peak pending pairs %d (bound %d), peak retained bytes %d (bound %d)", pairs, maxPairs, bytes, maxBytes)
 	require.LessOrEqualf(t, pairs, maxPairs, "pending pair lists outgrew the look-ahead budget")
 	require.LessOrEqualf(t, bytes, maxBytes, "retained hunk bytes outgrew the budget")
+}
+
+// The reorder ring holds one dedupPairResult per in-flight pair and is
+// zeroed on every scan, so a larger result shows up directly in short-scan
+// latency.
+func TestDedupPairResultSize(t *testing.T) {
+	require.LessOrEqual(t, unsafe.Sizeof(dedupPairResult{}), uintptr(64))
 }

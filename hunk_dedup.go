@@ -25,7 +25,8 @@
 //
 //  1. Ordered commit source: orderCommitsParentFirst(loadAllCommits()),
 //     dispatched to the tree stage up to dedupLookaheadCommits ahead of
-//     the emit cursor.
+//     the emit cursor while the pairs held ahead of it fit under
+//     dedupPendingPairsCap.
 //  2. Parallel tree diff: workers resolve each dispatched commit's pair
 //     list into a per-commit ring slot and estimate each pair's blob size
 //     from pack headers (no channel sends, so tree workers never block).
@@ -38,7 +39,9 @@
 //     pair in order, dedupPairBatchSize at a time. Stamping parks on
 //     dedupInFlightWindow once dedupMaxInFlightPairs seqs are undecided,
 //     so the reorder ring is bounded by construction however long one
-//     pair takes.
+//     pair takes, and while delivered hunk bytes not yet seen by fn exceed
+//     dedupRetainedBytesCap. A parked sequencer still returns queued
+//     expensive work, which the decision stage may need to advance.
 //  4. Parallel hunk workers -> serial decision stage -> parallel yield:
 //     hunk workers compute each pair's hunks, run prefilterHunk against
 //     the set's published snapshot, and deliver (seq, hunks, unresolved
@@ -62,6 +65,7 @@ package objstore
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"sync"
@@ -444,9 +448,8 @@ var prefetchSink uint64
 // saturates (at entry or during a candidate's probe) the single-pass rule
 // emits every later non-empty hunk, candidates or not, so the tail of the
 // pair is scanned in full from that point.
-func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition) ([]HunkAddition, int64) {
+func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition) []HunkAddition {
 	hunks := r.hunks
-	var kept int64
 	i := 0 // hunks[:i] are decided
 	for _, c := range r.candidates {
 		if s.saturated {
@@ -455,9 +458,6 @@ func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition)
 		h := &hunks[c.hunk]
 		if h.isBinary || s.verdictUnresolved(c.unresolved, len(h.lines)) {
 			out = append(out, *h)
-			if r.hunkBytes != nil {
-				kept += r.hunkBytes[c.hunk]
-			}
 		}
 		i = c.hunk + 1
 	}
@@ -466,13 +466,10 @@ func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition)
 			h := &hunks[i]
 			if h.isBinary || len(h.lines) > 0 {
 				out = append(out, *h)
-				if r.hunkBytes != nil {
-					kept += r.hunkBytes[i]
-				}
 			}
 		}
 	}
-	return out, kept
+	return out
 }
 
 // contains reports whether fp (zero already remapped) is in the set. It is
@@ -816,10 +813,10 @@ type dedupPairWork struct {
 	earlyBytes uint64
 }
 
-// bytes is the hunkRetainedBytes total of hunks.
+// kib is the retainedKiB total of the pairs whose hunks are in the batch.
 type dedupYieldBatch struct {
 	hunks []HunkAddition
-	bytes int64
+	kib   int64
 }
 
 // dedupCandidate names one hunk of a pair that the decision stage must
@@ -843,11 +840,20 @@ type dedupPairResult struct {
 	seq        uint64
 	hunks      []HunkAddition
 	candidates []dedupCandidate
-	earlyBytes uint64
 
-	// hunkBytes[i] is hunkRetainedBytes(&hunks[i]); bytes is their sum.
-	hunkBytes []int64
-	bytes     int64
+	// earlyKiB is the pair's dedupPairWork.earlyBytes in KiB. retainedKiB
+	// is the hunkRetainedBytes total of hunks in KiB, rounded up; surviving
+	// lines alias the pair's blob, so the whole pair stays charged while
+	// any of its hunks waits for fn. Both fields are 32 bits so a result
+	// stays 64 bytes: the reorder ring holds a window of them and is zeroed
+	// on every scan.
+	earlyKiB    uint32
+	retainedKiB uint32
+}
+
+// toKiB rounds n bytes up to whole KiB, saturating at the uint32 range.
+func toKiB(n uint64) uint32 {
+	return uint32(min((n+1023)>>10, math.MaxUint32))
 }
 
 // prefilterHunk hashes h's lines and probes sn for each, returning the
@@ -969,9 +975,10 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	ring := make([]dedupPairResult, window)
 	present := make([]atomic.Bool, window)
 	// pendingPairs counts pairs in tree-diffed slots the emit cursor has
-	// not passed; retainedBytes counts result bytes from delivery until fn
+	// not passed; retainedKiB counts result KiB from delivery until fn
 	// has seen every surviving hunk (dropped hunks release at decision).
-	var pendingPairs, retainedBytes atomic.Int64
+	var pendingPairs, retainedKiB atomic.Int64
+	retainedKiBCap := limits.retainedBytesCap >> 10
 	probe := hs.dedupProbe
 	// arrived collects delivered seqs for the decision goroutine's backlog
 	// pre-processing; resultsReady wakes it (without blocking the sender).
@@ -983,10 +990,10 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	deliver := func(results []dedupPairResult) {
 		var charged int64
 		for _, res := range results {
-			charged += res.bytes
+			charged += int64(res.retainedKiB)
 		}
-		if v := retainedBytes.Add(charged); probe != nil {
-			notePeak(&probe.peakRetainedBytes, v)
+		if v := retainedKiB.Add(charged); probe != nil {
+			notePeak(&probe.peakRetainedBytes, v<<10)
 		}
 		for _, res := range results {
 			i := res.seq & ringMask
@@ -1014,6 +1021,16 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// only read its published snapshot.
 	set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
 	inFlight := newDedupInFlightWindow(window, hs.dedupProbe)
+	// releaseRetained wakes the sequencer only when the release brings the
+	// charge back under the cap, the one transition stampable waits on.
+	releaseRetained := func(n int64) {
+		if n == 0 {
+			return
+		}
+		if after := retainedKiB.Add(-n); after+n > retainedKiBCap && after <= retainedKiBCap {
+			inFlight.notify()
+		}
+	}
 
 	var (
 		stopOnce sync.Once
@@ -1032,17 +1049,10 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		})
 	}
 
-	// Dispatch state, guarded by dispatchMu. dispatched mirrors
-	// nextDispatch and emitted mirrors the emit cursor for readers outside
-	// the lock; outstanding counts commits dispatched but not yet diffed.
-	var (
-		dispatchMu   sync.Mutex
-		nextDispatch int
-		dispatched   atomic.Int64
-		emitted      atomic.Int64
-		outstanding  atomic.Int64
-		dispatch     func()
-	)
+	// outstanding counts commits dispatched but not yet diffed.
+	// diffedPairs / diffedCommits is the mean pairs per diffed commit, which
+	// projects what outstanding commits will add to pendingPairs.
+	var outstanding, diffedPairs, diffedCommits atomic.Int64
 
 	for range treeWorkers {
 		treeWG.Add(1)
@@ -1069,6 +1079,9 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					if p := pendingPairs.Add(int64(len(pairs))); probe != nil {
 						notePeak(&probe.peakPendingPairs, p)
 					}
+					diffedPairs.Add(int64(len(pairs)))
+					diffedCommits.Add(1)
+					outstanding.Add(-1)
 					close(slot.done)
 					select {
 					case slotReady <- struct{}{}:
@@ -1078,8 +1091,6 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 						setError(err)
 						return
 					}
-					outstanding.Add(-1)
-					dispatch()
 				}
 			}
 		}()
@@ -1102,34 +1113,49 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// of order and not yet decided (see dedupEarlyBytesCap).
 	var earlyBytes atomic.Uint64
 	var (
-		seqMu      sync.Mutex
-		stamp      int    // commits [0, stamp) have seqs assigned
-		seq        uint64 // next seq to assign
-		emitCommit int    // emit cursor: commit index
-		emitPair   int    // emit cursor: index into slot.pairs
-		emitEarly  []int  // emitCommit's early list, consumed as we pass
-		seqDone    bool   // every pair has been handed out
+		seqMu        sync.Mutex
+		nextDispatch int    // commits [0, nextDispatch) are in the tree stage
+		stamp        int    // commits [0, stamp) have seqs assigned
+		seq          uint64 // next seq to assign
+		emitCommit   int    // emit cursor: commit index
+		emitPair     int    // emit cursor: index into slot.pairs
+		emitEarly    []int  // emitCommit's early list, consumed as we pass
+		seqDone      bool   // every pair has been handed out
 	)
-	// dispatch keeps the tree stage at most dispatchDepth commits deep and
-	// at most lookahead commits ahead of the emit cursor, and stops adding
-	// commits while pendingPairs is at its cap. The commit under the emit
-	// cursor is always dispatched, so the emit cursor never waits on a
-	// budget only it can release. Tree workers call dispatch after each
-	// commit and takeOrdered calls it as the emit cursor moves; both run
-	// it under dispatchMu, which nests inside seqMu. treeIdxChan's capacity
-	// equals lookahead, so the send never blocks.
+	// dispatch keeps the tree stage at most lookahead commits ahead of the
+	// emit cursor and stops adding commits while pendingPairs, plus the
+	// pairs projected for commits still in the tree stage, would exceed its
+	// cap. The commit under the emit cursor is always dispatched, so the
+	// emit cursor never waits on a budget only it can release. takeOrdered
+	// calls dispatch under seqMu on every pass, so the hunk workers that
+	// consume pairs are the ones that refill the tree stage. treeIdxChan's
+	// capacity equals lookahead, so the send never blocks.
 	dispatchDepth := int64(dedupDispatchDepth * treeWorkers)
-	dispatch = func() {
-		dispatchMu.Lock()
-		defer dispatchMu.Unlock()
-		for nextDispatch < len(order) {
-			passed := int(emitted.Load())
-			if nextDispatch-passed >= lookahead {
-				return
-			}
-			if nextDispatch > passed && (outstanding.Load() >= dispatchDepth || pendingPairs.Load() >= limits.pendingPairsCap) {
-				return
-			}
+	canDispatch := func(next int) bool {
+		if next >= len(order) || next-emitCommit >= lookahead {
+			return false
+		}
+		if next <= emitCommit {
+			return true
+		}
+		pending, out := pendingPairs.Load(), outstanding.Load()
+		if pending >= limits.pendingPairsCap {
+			return false
+		}
+		if out < dispatchDepth {
+			return true
+		}
+		// Past the floor, dispatch only while the projected pairs of the
+		// outstanding commits plus this one fit under the cap.
+		commits := diffedCommits.Load()
+		if commits == 0 {
+			return false
+		}
+		perCommit := (diffedPairs.Load() + commits - 1) / commits
+		return pending+(out+1)*max(perCommit, 1) <= limits.pendingPairsCap
+	}
+	dispatch := func() {
+		for canDispatch(nextDispatch) {
 			slot := &slots[nextDispatch%lookahead]
 			// Re-arm only the done channel: the tree worker overwrites
 			// pairs and err wholesale (adopting collectCommitPairs'
@@ -1141,14 +1167,13 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			outstanding.Add(1)
 			treeIdxChan <- nextDispatch
 			nextDispatch++
-			dispatched.Store(int64(nextDispatch))
 		}
 	}
 	stampable := func(n uint64) bool {
 		if n == 0 {
 			return true
 		}
-		if retainedBytes.Load() > limits.retainedBytesCap {
+		if retainedKiB.Load() > retainedKiBCap {
 			return false
 		}
 		decided := inFlight.decided.Load()
@@ -1162,7 +1187,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// expensiveChan has room. It stops at the first incomplete slot, at
 	// the in-flight window, or at a tree-stage error (reported as false).
 	stampAhead := func() bool {
-		for stamp < int(dispatched.Load()) {
+		for stamp < nextDispatch {
 			slot := &slots[stamp%lookahead]
 			select {
 			case <-slot.done:
@@ -1189,7 +1214,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				select {
 				case expensiveChan <- []dedupPairWork{{seq: seq + uint64(e.index), work: slot.pairs[e.index], earlyBytes: e.bytes}}:
 					slot.early = append(slot.early, e.index)
-					earlyBytes.Add(e.bytes)
+					earlyBytes.Add(uint64(toKiB(e.bytes)) << 10)
 				default:
 					// No room ahead of order; the emit cursor hands this
 					// pair out in its turn.
@@ -1280,11 +1305,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					batch = make([]dedupPairWork, 0, dedupPairBatchSize)
 				}
 				batch = append(batch, dedupPairWork{seq: s, work: slot.pairs[emitPair]})
-				// Once every commit is in the tree stage the scan is in its
-				// final window; single-pair batches there spread the last
-				// pairs across workers instead of leaving one worker with a
-				// sixteen-pair tail.
-				if len(batch) == dedupPairBatchSize || dispatched.Load() == int64(len(order)) {
+				if len(batch) == dedupPairBatchSize || nextDispatch == len(order) {
 					emitPair++
 					return batch, true
 				}
@@ -1295,7 +1316,6 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			slot.pairs, slot.expensive = nil, nil
 			emitPair = 0
 			emitCommit++
-			emitted.Store(int64(emitCommit))
 		}
 		seqDone = true
 		if len(batch) > 0 {
@@ -1353,15 +1373,10 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					// allocation.
 					var buf []uint64
 					var cands []dedupCandidate
-					var hunkBytes []int64
 					var total int64
-					if len(hunks) > 0 {
-						hunkBytes = make([]int64, len(hunks))
-					}
 					for i := range hunks {
 						h := &hunks[i]
-						hunkBytes[i] = hunkRetainedBytes(h)
-						total += hunkBytes[i]
+						total += hunkRetainedBytes(h)
 						if h.isBinary {
 							cands = append(cands, dedupCandidate{hunk: i})
 							continue
@@ -1373,8 +1388,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 						}
 					}
 					results = append(results, dedupPairResult{
-						seq: pw.seq, hunks: hunks, candidates: cands, earlyBytes: pw.earlyBytes,
-						hunkBytes: hunkBytes, bytes: total,
+						seq: pw.seq, hunks: hunks, candidates: cands,
+						earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(total)),
 					})
 				}
 				deliver(results)
@@ -1433,15 +1448,16 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					return false
 				}
 				next++
-				if r.earlyBytes != 0 {
-					earlyBytes.Add(^(r.earlyBytes - 1))
+				if r.earlyKiB != 0 {
+					earlyBytes.Add(^(uint64(r.earlyKiB)<<10 - 1))
 				}
-				var kept int64
-				batch.hunks, kept = set.decideResult(r, batch.hunks)
-				batch.bytes += kept
-				if dropped := r.bytes - kept; dropped != 0 {
-					retainedBytes.Add(-dropped)
-					inFlight.notify()
+				before := len(batch.hunks)
+				batch.hunks = set.decideResult(r, batch.hunks)
+				switch {
+				case len(batch.hunks) > before:
+					batch.kib += int64(r.retainedKiB)
+				default:
+					releaseRetained(int64(r.retainedKiB))
 				}
 				if len(batch.hunks) >= dedupYieldBatchHunks && !flush() {
 					return false
@@ -1529,8 +1545,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 							return
 						}
 					}
-					retainedBytes.Add(-batch.bytes)
-					inFlight.notify()
+					releaseRetained(batch.kib)
 				}
 			}
 		}()

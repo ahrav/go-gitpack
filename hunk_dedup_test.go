@@ -1161,7 +1161,7 @@ func TestDedupPrefilterPrep_MatchesSerialVerdicts(t *testing.T) {
 				}
 				for decided < len(pairs) && built[decided] {
 					var out []HunkAddition
-					out, _ = set.decideResult(results[decided], out)
+					out = set.decideResult(results[decided], out)
 					for _, h := range out {
 						for j := range pairs[decided].hunks {
 							if &pairs[decided].hunks[j].lines[0] == &h.lines[0] {
