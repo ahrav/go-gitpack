@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"sync"
 	"sync/atomic"
 
@@ -656,6 +657,19 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, error) {
 	return offset, nil
 }
 
+// The payload holds two size varints (at most ten bytes each) and
+// instructions that each produce at least one target byte: an insert costs
+// one opcode byte plus the inserted bytes, and a copy costs at most eight
+// bytes. The bound covers every valid delta whose target size is at most
+// maxTarget.
+func maxDeltaPayload(maxTarget uint64) uint64 {
+	const varints, perTargetByte = 20, 8
+	if maxTarget > (math.MaxUint64-varints)/perTargetByte {
+		return math.MaxUint64
+	}
+	return varints + perTargetByte*maxTarget
+}
+
 // applyDeltaStreaming applies delta instructions to reconstruct an object.
 // The method uses pre-allocated buffers and streaming decompression to minimize memory usage.
 //
@@ -713,8 +727,8 @@ func applyDeltaStreaming(
 	}
 
 	maxInt := uint64(^uint(0) >> 1)
-	if payloadSize > maxInt || (maxObjectSize > 0 && payloadSize > maxObjectSize) {
-		return nil, fmt.Errorf("%w: delta payload=%d limit=%d", ErrDeltaTargetTooLarge, payloadSize, maxObjectSize)
+	if payloadSize > maxInt || (maxObjectSize > 0 && payloadSize > maxDeltaPayload(maxObjectSize)) {
+		return nil, fmt.Errorf("%w: delta payload=%d limit=%d", ErrDeltaTargetTooLarge, payloadSize, maxDeltaPayload(maxObjectSize))
 	}
 	scratch := getDeltaScratch(int(payloadSize))
 	defer putDeltaScratch(scratch)

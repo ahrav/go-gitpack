@@ -855,7 +855,7 @@ func TestApplyDeltaStreaming_RejectsSizesBeforeAllocation(t *testing.T) {
 	}
 
 	t.Run("payload exceeds limit", func(t *testing.T) {
-		pack, typ, hdrLen := openDelta(t, []byte{1, 1, 1, 'x'}, 9)
+		pack, typ, hdrLen := openDelta(t, []byte{1, 1, 1, 'x'}, maxDeltaPayloadForTest(8)+1)
 		_, err := applyDeltaStreaming(pack, 0, typ, hdrLen, base, nil, 8, true)
 		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
 	})
@@ -868,7 +868,39 @@ func TestApplyDeltaStreaming_RejectsSizesBeforeAllocation(t *testing.T) {
 		_, err := applyDeltaStreaming(pack, 0, typ, hdrLen, base, nil, 8, true)
 		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
 	})
+
+	// The limit bounds the reconstructed target. Delta instructions can
+	// exceed the target size: inserts add one opcode byte per insert, and
+	// copies can use eight instruction bytes per copied byte.
+	t.Run("insert payload larger than target at limit", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, uint64(len(base)))
+		writeVarInt(&payload, 4)
+		payload.Write([]byte{4, 'w', 'x', 'y', 'z'})
+		pack, typ, hdrLen := openDelta(t, payload.Bytes(), uint64(payload.Len()))
+		got, err := applyDeltaStreaming(pack, 0, typ, hdrLen, base, nil, 4, true)
+		require.NoError(t, err)
+		require.Equal(t, []byte("wxyz"), got)
+	})
+
+	t.Run("maximal copy opcodes at limit", func(t *testing.T) {
+		var payload bytes.Buffer
+		writeVarInt(&payload, uint64(len(base)))
+		writeVarInt(&payload, 4)
+		for range 4 {
+			// Every offset and size byte present: offset 0, size 1.
+			payload.Write([]byte{0xff, 0, 0, 0, 0, 1, 0, 0})
+		}
+		pack, typ, hdrLen := openDelta(t, payload.Bytes(), uint64(payload.Len()))
+		got, err := applyDeltaStreaming(pack, 0, typ, hdrLen, base, nil, 4, true)
+		require.NoError(t, err)
+		require.Equal(t, []byte("aaaa"), got)
+	})
 }
+
+// maxDeltaPayloadForTest allows ten bytes per size varint and eight
+// instruction bytes per target byte.
+func maxDeltaPayloadForTest(limit uint64) uint64 { return 20 + 8*limit }
 
 func TestApplyDeltaStreaming_RejectsOutputOverrun(t *testing.T) {
 	base := []byte("a")
