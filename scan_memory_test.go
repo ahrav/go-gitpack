@@ -60,3 +60,18 @@ func TestLoadCommitsAndGraph_MatchesLoadAllCommits(t *testing.T) {
 		}
 	}
 }
+
+func TestWithHunkDedupRetainedBudget(t *testing.T) {
+	s := createScannerForRepo(t, "with-merges")
+	defer s.Close()
+	assert.Equal(t, int64(dedupRetainedBytesCap), s.dedupLimits.retainedBytesCap)
+	WithHunkDedupRetainedBudget(128 << 20)(s)
+	assert.Equal(t, int64(128<<20), s.dedupLimits.retainedBytesCap)
+	WithHunkDedupRetainedBudget(0)(s)
+	assert.Equal(t, int64(1<<20), s.dedupLimits.retainedBytesCap, "values below 1 MiB are raised to 1 MiB")
+
+	gitDir := repeatedPairRepo(t)
+	want := collectHunkScan(t, gitDir, WithHunkLineDedup(true))
+	got := collectHunkScan(t, gitDir, WithHunkLineDedup(true), WithHunkDedupRetainedBudget(1))
+	assert.Equal(t, want, got, "a tight budget leaves the emission multiset unchanged")
+}
