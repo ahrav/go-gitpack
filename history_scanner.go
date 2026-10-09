@@ -403,20 +403,9 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 
 	// Stage widths. Stage 2 gets one worker per CPU because it carries the
 	// expensive work (blob inflation plus line diff); stage 1 runs at half
-	// that, capped at maxTreeDiffWorkers. Two independent constraints set the
-	// stage-1 width and both point the same way. Tree diffing is cheap
-	// relative to blob diffing, so stage 1 keeps stage 2 fed at a fraction of
-	// its width. And every worker that sits inside a multi-hop delta
-	// resolution holds a 32 MiB ping-pong arena: only a fraction of the
-	// workers are in that state at any instant, which is why the arena
-	// free-list can be smaller than the total worker count — but once the
-	// instantaneous holder count crosses deltaArenaMaxRetained the free-list
-	// drops arenas on release and re-allocates (and re-zeroes) one on the next
-	// acquisition, which is the cost that free-list exists to remove.
-	// Widening a stage therefore buys throughput with retained arena bytes
-	// and, past that ceiling, with allocation churn. Halving alone still
-	// scales the stage-1 arena floor with core count, so the absolute cap
-	// applies on top of it; see the measured basis on maxTreeDiffWorkers.
+	// that, capped at maxTreeDiffWorkers. Tree diffing is cheap relative to
+	// blob diffing, so stage 1 keeps stage 2 fed at a fraction of its width;
+	// see the measured basis on maxTreeDiffWorkers.
 	blobWorkers := runtime.NumCPU()
 	treeWorkers := min(max(2, blobWorkers/2), maxTreeDiffWorkers)
 
@@ -558,13 +547,11 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 //
 // Measured on a stage-1-bound history (BenchmarkDiffHistoryHunksManySmallCommits,
 // 3000 single-file commits over a 200-file tree, 32-core arm64): raising the
-// cap to NumCPU is ~7% slower and allocates ~17x more bytes per scan (each
-// tree worker pins a delta arena, 34 MiB -> 596 MiB), so the cap costs no
-// throughput even when stage 1 dominates — stage-2 hunk workers, which are
-// uncapped, set pipeline throughput while extra producers only raise the RSS
-// floor. Halving alone would still scale that floor with core count, which is
-// why an absolute ceiling and not just a ratio. Re-run that benchmark before
-// changing this value.
+// cap to NumCPU was ~7% slower, so the cap costs no throughput even when
+// stage 1 dominates: stage-2 hunk workers, which are uncapped, set pipeline
+// throughput. On the trufflehog history at 16 logical CPUs, caps of 16 and
+// 32 measured within noise of 8. Re-run those benchmarks before changing
+// this value.
 const maxTreeDiffWorkers = 8
 
 // errScanAborted marks an internal early-stop condition used to unwind commit walks.

@@ -1,6 +1,6 @@
 // delta_test.go tests the delta decompression subsystem, including variable-
 // integer decoding, delta cycle detection, ping-pong buffer management during
-// multi-level delta chain resolution, buffer boundary conditions, arena pooling,
+// multi-level delta chain resolution, buffer boundary conditions,
 // and large-object delta application.
 
 package objstore
@@ -11,10 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
-	"sync"
 	"testing"
-	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -71,79 +68,6 @@ func TestDeltaCycleDetection(t *testing.T) {
 	assert.Error(t, ctx2.checkRefDelta(hash3), "Should hit depth limit")
 }
 
-// TestDeltaPingPongBufferManagement verifies that the ping-pong buffer strategy
-// correctly alternates between buffers during multi-level delta chain resolution.
-// This test ensures that data is properly copied between buffers and that the
-// final result matches the expected output.
-func TestDeltaPingPongBufferManagement(t *testing.T) {
-	// Create a simple base object.
-	baseData := []byte("Hello, this is the base object content!")
-
-	// Since we can't easily mock applyDeltaStreaming, we'll test the buffer
-	// management logic directly by creating our own test version.
-	arena := getDeltaArena()
-	defer putDeltaArena(arena)
-
-	// Calculate max target size.
-	maxTarget := uint64(len(baseData) + 30) // Extra space for appended text.
-
-	// Set up ping-pong buffers.
-	bufA := arena.data[:maxTarget]
-	bufB := arena.data[maxTarget : maxTarget*2]
-
-	// Start with base data in bufA.
-	current := bufA[:len(baseData)]
-	copy(current, baseData)
-
-	// Track which buffer we're using.
-	usingA := true
-
-	// Expected content after each delta application.
-	expectedAfterDelta := []string{
-		string(baseData) + " Level 1",
-		string(baseData) + " Level 1 Level 2",
-		string(baseData) + " Level 1 Level 2 Level 3",
-	}
-
-	// Simulate applying deltas with buffer switching.
-	for i, expected := range expectedAfterDelta {
-		// Choose output buffer (the one we're NOT currently using).
-		var out []byte
-		if usingA {
-			out = bufB[:0]
-			assert.True(t, usingA, "Should be using buffer A for input in iteration %d", i)
-		} else {
-			out = bufA[:0]
-			assert.False(t, usingA, "Should be using buffer B for input in iteration %d", i)
-		}
-
-		// Simulate delta application by appending level text.
-		levelText := fmt.Sprintf(" Level %d", i+1)
-		out = append(out, current...)
-		out = append(out, []byte(levelText)...)
-
-		// Verify the result is in the correct buffer.
-		assert.Equal(t, expected, string(out), "Delta %d result mismatch", i+1)
-
-		// The result is now in 'out' buffer, make it the current for next iteration.
-		current = out
-		usingA = !usingA // Switch which buffer we're using.
-
-		// Verify we switched buffers.
-		if i < len(expectedAfterDelta)-1 {
-			if i%2 == 0 {
-				assert.False(t, usingA, "Should have switched to buffer B after iteration %d", i)
-			} else {
-				assert.True(t, usingA, "Should have switched to buffer A after iteration %d", i)
-			}
-		}
-	}
-
-	// Verify final result.
-	finalExpected := string(baseData) + " Level 1 Level 2 Level 3"
-	assert.Equal(t, finalExpected, string(current), "Final result mismatch")
-}
-
 // TestMultiLevelDeltaChainResolution tests the resolution of delta chains with
 // multiple levels, similar to the 8-level chain that exposed the original bug.
 // This test verifies that each level correctly applies deltas and that buffer
@@ -171,19 +95,16 @@ func TestMultiLevelDeltaChainResolution(t *testing.T) {
 	// A COPY operation that copies bytes including the 0xa8 byte
 	// to a position where TreeIter might misinterpret it.
 
-	arena := getDeltaArena()
-	defer putDeltaArena(arena)
-
 	// Test with an 8-level deep chain to match the original bug scenario.
 	levels := 8
 	// Calculate max size: base + (levels * (entry_size))
 	// Each entry is approximately 33 bytes (mode + name + null + SHA1)
 	entrySize := 33
-	maxTarget := uint64(len(baseTreeData) + (levels * entrySize))
+	maxTarget := len(baseTreeData) + (levels * entrySize)
 
 	// Set up ping-pong buffers.
-	bufA := arena.data[:maxTarget]
-	bufB := arena.data[maxTarget : maxTarget*2]
+	bufA := make([]byte, maxTarget)
+	bufB := make([]byte, maxTarget)
 
 	// Start with base data in bufA.
 	current := bufA[:len(baseTreeData)]
@@ -275,8 +196,6 @@ func TestMultiLevelDeltaChainResolution(t *testing.T) {
 // buffer boundaries, particularly testing COPY operations that span across
 // different parts of the buffer.
 func TestDeltaBufferBoundaries(t *testing.T) {
-	arena := getDeltaArena()
-	defer putDeltaArena(arena)
 
 	// Create base data that will be used to test boundary conditions.
 	// We'll create a pattern that makes it easy to verify correctness.
@@ -361,11 +280,11 @@ func TestDeltaBufferBoundaries(t *testing.T) {
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
 			// Calculate required buffer size.
-			maxTarget := uint64(len(baseData) + 256) // Extra space for inserts.
+			maxTarget := len(baseData) + 256 // Extra space for inserts.
 
 			// Set up ping-pong buffers.
-			bufA := arena.data[:maxTarget]
-			bufB := arena.data[maxTarget : maxTarget*2]
+			bufA := make([]byte, maxTarget)
+			bufB := make([]byte, maxTarget)
 
 			// Start with base data in bufA.
 			current := bufA[:len(baseData)]
@@ -441,385 +360,6 @@ const (
 	deltaCopy deltaOpType = iota
 	deltaInsert
 )
-
-// TestDeltaArenaPooling verifies that the delta arena pool correctly manages
-// memory allocation and reuse across multiple delta operations.
-func TestDeltaArenaPooling(t *testing.T) {
-	t.Run("ArenaContract", func(t *testing.T) {
-		// Once an arena has been returned to the process-wide free-list,
-		// another goroutine may retrieve and mutate it, so nothing may be
-		// inspected after ownership transfers. The deterministic,
-		// safely-observable surface is therefore:
-		//
-		//   1. getDeltaArena returns a full-length arena of the standard
-		//      capacity, whether it came from New or the pool.
-		//   2. prepareDeltaArenaForPool — the reset/discard decision that
-		//      putDeltaArena applies BEFORE transferring ownership —
-		//      restores len == cap for standard arenas and reports them
-		//      pool-eligible.
-		//   3. Oversized arenas are reported ineligible and left untouched.
-		//
-		arena := getDeltaArena()
-		assert.Equal(t, defaultDeltaArenaSize, cap(arena.data), "standard arena capacity")
-		assert.Equal(t, cap(arena.data), len(arena.data), "arena must arrive full-length")
-
-		arena.data = arena.data[:10]
-		assert.True(t, prepareDeltaArenaForPool(arena), "standard arena must be pool-eligible")
-		assert.Equal(t, defaultDeltaArenaSize, len(arena.data),
-			"reset must restore len == cap before pooling")
-		putDeltaArena(arena) // return it; not inspected again
-
-		oversized := &deltaArena{data: make([]byte, defaultDeltaArenaSize+1)}
-		oversized.data = oversized.data[:5]
-		assert.False(t, prepareDeltaArenaForPool(oversized), "oversized arena must be discarded")
-		assert.Equal(t, 5, len(oversized.data), "discarded arena must be left untouched")
-	})
-
-	t.Run("MultipleConcurrentArenas", func(t *testing.T) {
-		// Verify multiple arenas can be acquired concurrently.
-		const numArenas = 5
-		arenas := make([]*deltaArena, numArenas)
-		ptrs := make(map[uintptr]bool)
-
-		for i := range numArenas {
-			arenas[i] = getDeltaArena()
-			ptr := uintptr(unsafe.Pointer(&arenas[i].data[0]))
-			assert.False(t, ptrs[ptr], "Each arena should have unique memory")
-			ptrs[ptr] = true
-		}
-
-		// Return all arenas to pool.
-		for i := range numArenas {
-			putDeltaArena(arenas[i])
-		}
-	})
-
-	t.Run("ArenaResetOnReturn", func(t *testing.T) {
-		// Verify arenas are properly reset when returned to pool.
-		arena := getDeltaArena()
-
-		// Modify the arena data.
-		testData := []byte("TEST_MODIFICATION")
-		copy(arena.data[:len(testData)], testData)
-
-		// Ensure the slice length is reset but capacity is preserved.
-		originalCap := cap(arena.data)
-		arena.data = arena.data[:100] // Modify length.
-
-		putDeltaArena(arena)
-
-		// Get arena again and verify it was reset.
-		arenaAfter := getDeltaArena()
-		assert.Equal(t, originalCap, len(arenaAfter.data), "Arena slice should be reset to full capacity")
-		assert.Equal(t, originalCap, cap(arenaAfter.data), "Arena capacity should be preserved")
-		putDeltaArena(arenaAfter)
-	})
-
-	t.Run("ConcurrentAccessSafety", func(t *testing.T) {
-		// Verify concurrent access safety.
-		var wg sync.WaitGroup
-		const numGoroutines = 10
-		const opsPerGoroutine = 100
-
-		errors := make(chan error, numGoroutines)
-
-		for i := range numGoroutines {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-
-				for range opsPerGoroutine {
-					arena := getDeltaArena()
-
-					// Perform some operation to ensure arena is valid.
-					if len(arena.data) < 2*16<<20 {
-						errors <- fmt.Errorf("goroutine %d: invalid arena size %d", id, len(arena.data))
-						return
-					}
-
-					// Use the arena briefly.
-					copy(arena.data[:8], []byte("CONCURRENT"))
-
-					putDeltaArena(arena)
-				}
-			}(i)
-		}
-
-		wg.Wait()
-		close(errors)
-
-		// Check for any errors.
-		for err := range errors {
-			t.Errorf("Concurrent access error: %v", err)
-		}
-	})
-}
-
-// TestDeltaArenaRetainLimitDropsIdleExcess offers more arenas than the limit
-// permits and expects the surplus to be dropped rather than retained.
-//
-// Token arenas are enough: the bound counts arenas, not bytes, and
-// putDeltaArena's decision reads only cap(data) via prepareDeltaArenaForPool.
-// Getting three real arenas from a drained free-list would allocate and zero
-// ~96 MiB to observe a count. The real-arena round trip is covered by
-// TestDeltaArenaRetentionDisabled, and pool eligibility by the
-// prepareDeltaArenaForPool cases above.
-func TestDeltaArenaRetainLimitDropsIdleExcess(t *testing.T) {
-	setDeltaArenaRetainLimitForTest(t, 2)
-
-	putTestDeltaArenas(3)
-	if got := idleDeltaArenas(); got != 2 {
-		t.Fatalf("delta arena free-list retained %d arenas, want 2", got)
-	}
-}
-
-// TestDeltaArenaRetainLimitBoundsConcurrentPutters pins the retention bound
-// against the race that a check-then-send admission test loses: every putter
-// reads the same under-limit idle count, every putter passes, and every putter
-// sends. Each round starts from an empty free-list so the whole limit is up for
-// grabs, and all putters are released from one barrier so they contend.
-//
-// The count after a round is exact rather than a range: nothing receives during
-// the round, so the first `limit` sends fill the free-list and every later one
-// is refused.
-//
-// This is sampled evidence — a green run says no round of this many contending
-// putters exceeded the bound, not that none can. The bound itself rests on
-// cap(idle): a non-blocking send cannot overfill a channel.
-func TestDeltaArenaRetainLimitBoundsConcurrentPutters(t *testing.T) {
-	const (
-		limit   = 8
-		putters = 64
-		rounds  = 200
-	)
-	setDeltaArenaRetainLimitForTest(t, limit)
-
-	for round := range rounds {
-		var release, done sync.WaitGroup
-		release.Add(1)
-
-		for range putters {
-			done.Add(1)
-			go func() {
-				defer done.Done()
-				arena := newTestDeltaArena()
-				release.Wait()
-				putDeltaArena(arena)
-			}()
-		}
-
-		release.Done()
-		done.Wait()
-
-		require.Equalf(t, limit, idleDeltaArenas(),
-			"round %d: %d contending putters retained more than the limit", round, putters)
-		drainDeltaArenaFreeList()
-	}
-}
-
-// TestDeltaArenaRetainLimitRuntimeChange covers the two directions of a budget
-// change: the new limit must bound the idle population immediately, and warm
-// arenas that still fit must survive the swap.
-func TestDeltaArenaRetainLimitRuntimeChange(t *testing.T) {
-	t.Run("LoweringShedsIdleExcess", func(t *testing.T) {
-		setDeltaArenaRetainLimitForTest(t, 6)
-		putTestDeltaArenas(6)
-		require.Equal(t, 6, idleDeltaArenas(), "free-list should be full at the initial limit")
-
-		require.Equal(t, 6, setDeltaArenaRetainLimit(2), "previous limit")
-		require.Equal(t, 2, idleDeltaArenas(), "lowering the limit must shed the idle excess")
-	})
-
-	t.Run("RaisingPermitsMoreRetention", func(t *testing.T) {
-		setDeltaArenaRetainLimitForTest(t, 2)
-		putTestDeltaArenas(4)
-		require.Equal(t, 2, idleDeltaArenas(), "the initial limit must bound retention")
-
-		require.Equal(t, 2, setDeltaArenaRetainLimit(6), "previous limit")
-		require.Equal(t, 2, idleDeltaArenas(), "raising the limit must keep the warm arenas")
-
-		putTestDeltaArenas(6)
-		require.Equal(t, 6, idleDeltaArenas(), "the raised limit must permit more retention")
-	})
-}
-
-// TestDeltaArenaRetentionDisabled verifies that a non-positive limit turns idle
-// retention off entirely rather than falling back to a single arena.
-func TestDeltaArenaRetentionDisabled(t *testing.T) {
-	for _, limit := range []int{0, -5} {
-		t.Run(fmt.Sprintf("limit_%d", limit), func(t *testing.T) {
-			setDeltaArenaRetainLimitForTest(t, limit)
-
-			putTestDeltaArenas(4)
-			require.Zero(t, idleDeltaArenas(), "a disabled free-list must retain nothing")
-
-			arena := getDeltaArena()
-			require.Equal(t, defaultDeltaArenaSize, cap(arena.data),
-				"a get against a disabled free-list must allocate a standard arena")
-			putDeltaArena(arena)
-			require.Zero(t, idleDeltaArenas(), "a disabled free-list must retain nothing")
-		})
-	}
-}
-
-// TestSetDeltaArenaBudget covers the byte-denominated public budget: the
-// previous value it reports and the whole-arena rounding its documentation
-// promises.
-func TestSetDeltaArenaBudget(t *testing.T) {
-	ambient := SetDeltaArenaBudget(4 * DeltaArenaSize)
-	t.Cleanup(func() {
-		drainDeltaArenaFreeList()
-		SetDeltaArenaBudget(ambient)
-	})
-	drainDeltaArenaFreeList()
-
-	require.Equal(t, 4*DeltaArenaSize, SetDeltaArenaBudget(2*DeltaArenaSize),
-		"SetDeltaArenaBudget must report the budget it replaced")
-
-	// Setting the same budget twice reports the effective budget: the second
-	// call replaces what the first installed.
-	tests := []struct {
-		name      string
-		budget    int
-		effective int
-	}{
-		{"whole arenas", 4 * DeltaArenaSize, 4 * DeltaArenaSize},
-		{"partial arena is not charged", 3*DeltaArenaSize + DeltaArenaSize/2, 3 * DeltaArenaSize},
-		{"one byte short of an arena disables retention", DeltaArenaSize - 1, 0},
-		{"zero disables retention", 0, 0},
-		{"negative disables retention", -DeltaArenaSize, 0},
-		{
-			"clamped to the hard ceiling",
-			(deltaArenaMaxRetained + 8) * DeltaArenaSize,
-			deltaArenaMaxRetained * DeltaArenaSize,
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			SetDeltaArenaBudget(tc.budget)
-			require.Equal(t, tc.effective, SetDeltaArenaBudget(tc.budget),
-				"effective budget for %d bytes", tc.budget)
-		})
-	}
-
-	// The rounding is not cosmetic: a sub-arena budget really retains nothing.
-	SetDeltaArenaBudget(DeltaArenaSize - 1)
-	putTestDeltaArenas(2)
-	require.Zero(t, idleDeltaArenas(), "a sub-arena budget must retain nothing")
-}
-
-// BenchmarkDeltaArenaGetPut measures the get/put round-trip the retention bound
-// sits on: one atomic load of the live free-list plus one non-blocking channel
-// operation each way. The free-list is seeded to capacity so a miss's 32 MiB
-// allocation does not dominate the measurement.
-func BenchmarkDeltaArenaGetPut(b *testing.B) {
-	b.Run("Serial", func(b *testing.B) {
-		setDeltaArenaRetainLimitForTest(b, deltaArenaMaxRetained)
-		putTestDeltaArenas(deltaArenaMaxRetained)
-
-		b.ReportAllocs()
-		for b.Loop() {
-			putDeltaArena(getDeltaArena())
-		}
-	})
-
-	b.Run("Parallel", func(b *testing.B) {
-		// RunParallel starts one worker per GOMAXPROCS, and each worker holds
-		// an arena between its get and its put. More workers than the
-		// free-list can retain therefore guarantees steady-state misses, and a
-		// miss allocates and zeroes a real DeltaArenaSize arena inside the
-		// measured loop — the cost this benchmark is seeded to exclude. On a
-		// host with more CPUs than deltaArenaMaxRetained that turned the
-		// pooled round trip into a measurement of allocation instead
-		// (2182 B/op at GOMAXPROCS=64 against 0 B/op at 32), with up to
-		// (workers - limit) concurrent 32 MiB allocations live at once.
-		//
-		// Capping GOMAXPROCS for the duration caps the worker count to the
-		// seeded population, so every iteration stays on the hit path.
-		if procs := runtime.GOMAXPROCS(0); procs > deltaArenaMaxRetained {
-			defer runtime.GOMAXPROCS(procs)
-			runtime.GOMAXPROCS(deltaArenaMaxRetained)
-		}
-
-		setDeltaArenaRetainLimitForTest(b, deltaArenaMaxRetained)
-		putTestDeltaArenas(deltaArenaMaxRetained)
-
-		b.ReportAllocs()
-		b.RunParallel(func(pb *testing.PB) {
-			for pb.Next() {
-				putDeltaArena(getDeltaArena())
-			}
-		})
-	})
-}
-
-// setDeltaArenaRetainLimitForTest installs limit as the process-wide retain
-// limit against an empty free-list and restores the previous limit afterwards.
-// Both edges drain because these tests count the idle population and seed it
-// with token arenas, neither of which may leak into another test.
-func setDeltaArenaRetainLimitForTest(tb testing.TB, limit int) {
-	tb.Helper()
-	previous := setDeltaArenaRetainLimit(limit)
-	tb.Cleanup(func() {
-		drainDeltaArenaFreeList()
-		setDeltaArenaRetainLimit(previous)
-	})
-	drainDeltaArenaFreeList()
-}
-
-// newTestDeltaArena returns a pool-eligible arena with a token backing array.
-// The retention bound counts arenas, not bytes, so the retention tests skip the
-// 32 MiB allocation a real arena carries; setDeltaArenaRetainLimitForTest
-// drains the free-list on both edges so an undersized arena can never reach a
-// real delta resolution.
-func newTestDeltaArena() *deltaArena { return &deltaArena{data: make([]byte, 64)} }
-
-// putTestDeltaArenas offers n token arenas to the free-list.
-func putTestDeltaArenas(n int) {
-	for range n {
-		putDeltaArena(newTestDeltaArena())
-	}
-}
-
-// idleDeltaArenas reports how many arenas the live free-list holds.
-func idleDeltaArenas() int { return len(deltaArenaFreeListRef.Load().idle) }
-
-func drainDeltaArenaFreeList() {
-	idle := deltaArenaFreeListRef.Load().idle
-	for {
-		select {
-		case <-idle:
-			continue
-		default:
-		}
-		break
-	}
-}
-
-// TestDeltaArenaPoolOversizeDiscard verifies that arenas grown beyond the
-// default pool size during dynamic resizing are not returned to the pool.
-// Without the size guard in putDeltaArena, an oversized arena pollutes the
-// pool and subsequent callers receive bloated allocations.
-func TestDeltaArenaPoolOversizeDiscard(t *testing.T) {
-	const defaultArenaSize = 2 * 16 << 20 // 32 MiB — matches deltaArenaPool.New
-
-	// Drain the pool so we get a fresh arena from New.
-	drainDeltaArenaFreeList()
-
-	arena := getDeltaArena()
-	assert.Equal(t, defaultArenaSize, cap(arena.data), "fresh arena should be 32 MiB")
-
-	// Simulate dynamic resizing: replace the backing slice with a 128 MiB allocation.
-	const oversized = 128 << 20
-	arena.data = make([]byte, oversized)
-	putDeltaArena(arena)
-
-	// The next arena from the pool must NOT be the oversized one.
-	next := getDeltaArena()
-	assert.LessOrEqual(t, cap(next.data), defaultArenaSize,
-		"oversized arena should not pollute the pool; got cap=%d", cap(next.data))
-	putDeltaArena(next)
-}
 
 // TestApplyDeltaStackWithLargeObjects tests delta application with objects that
 // approach or exceed the maximum cacheable size limit.
@@ -1182,20 +722,17 @@ type testDelta struct {
 
 // applyTestDeltaStack simulates applying a delta stack for testing.
 func applyTestDeltaStack(t *testing.T, _ deltaStack, baseData []byte, testDeltas []testDelta) []byte {
-	arena := getDeltaArena()
-	defer putDeltaArena(arena)
-
 	// Determine max size needed.
-	maxSize := uint64(len(baseData))
+	maxSize := len(baseData)
 	for _, td := range testDeltas {
-		if uint64(td.targetSize) > maxSize {
-			maxSize = uint64(td.targetSize)
+		if td.targetSize > maxSize {
+			maxSize = td.targetSize
 		}
 	}
 
-	// Set up buffers.
-	bufA := arena.data[:maxSize]
-	bufB := arena.data[maxSize : maxSize*2]
+	// Set up ping-pong buffers.
+	bufA := make([]byte, maxSize)
+	bufB := make([]byte, maxSize)
 
 	// Start with base data.
 	current := bufA[:len(baseData)]
@@ -1240,7 +777,7 @@ func applyTestDeltaStack(t *testing.T, _ deltaStack, baseData []byte, testDeltas
 func TestApplyDeltaStack_BorrowedVsCopy(t *testing.T) {
 	t.Parallel()
 
-	// For empty stack, borrowed=true returns baseData directly (no arena).
+	// For empty stack, borrowed=true returns baseData directly.
 	base := []byte("hello world")
 	result, typ, err := applyDeltaStackCached(nil, nil, base, ObjBlob, 0, true)
 	require.NoError(t, err)
@@ -1255,7 +792,7 @@ func TestApplyDeltaStack_BorrowedVsCopy(t *testing.T) {
 	assert.Equal(t, byte('h'), result2[0], "non-borrowed should be independent copy")
 }
 
-func TestDeltaArenaOverflowProtection(t *testing.T) {
+func TestApplyDeltaStackEmptyStackIgnoresLimit(t *testing.T) {
 	t.Parallel()
 
 	maxObj := uint64(512 << 20)
@@ -1267,24 +804,4 @@ func TestDeltaArenaOverflowProtection(t *testing.T) {
 	hugeBase := make([]byte, 1)
 	_, _, err = applyDeltaStackCached(nil, nil, hugeBase, ObjBlob, 0, false)
 	assert.NoError(t, err, "empty stack should always succeed regardless of base size")
-}
-
-func TestDeltaArenaOversizedPoolReturn(t *testing.T) {
-	arena := getDeltaArena()
-	standardCap := cap(arena.data)
-	t.Logf("standard arena capacity: %d bytes (%d MiB)", standardCap, standardCap>>20)
-
-	oversized := make([]byte, standardCap*4)
-	arena.data = oversized
-
-	putDeltaArena(arena)
-
-	arena2 := getDeltaArena()
-	oversizedCap := cap(arena2.data)
-	t.Logf("retrieved arena capacity: %d bytes (%d MiB)", oversizedCap, oversizedCap>>20)
-
-	if oversizedCap > standardCap {
-		t.Logf("CONFIRMED: oversized arena (%d bytes) returned to pool without cap", oversizedCap)
-	}
-	putDeltaArena(arena2)
 }

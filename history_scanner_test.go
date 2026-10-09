@@ -881,3 +881,46 @@ func TestDiffHistoryHunksFunc_NilCallbackRejected(t *testing.T) {
 	require.Error(t, err, "a nil callback must be rejected, not dispatched to workers")
 	require.Contains(t, err.Error(), "must not be nil")
 }
+
+// TestBlobPairEmitterBatches checks the stage-1 hand-off batching: records
+// are delivered in order, a full batch is sent as soon as it fills, the
+// remainder is sent by flush, and a closed stop channel aborts the send.
+func TestBlobPairEmitterBatches(t *testing.T) {
+	t.Parallel()
+
+	out := make(chan []blobPairWork, 8)
+	stop := make(chan struct{})
+	e := blobPairEmitter{out: out, stopCh: stop}
+
+	total := blobPairBatchSize + 3
+	for i := range total {
+		require.NoError(t, e.emit(blobPairWork{path: fmt.Sprintf("f%03d", i)}))
+	}
+	require.Len(t, out, 1, "a full batch is sent as soon as it fills")
+	require.NoError(t, e.flush())
+	require.NoError(t, e.flush(), "flushing an empty emitter is a no-op")
+	close(out)
+
+	var got []string
+	batches := 0
+	for batch := range out {
+		batches++
+		require.LessOrEqual(t, len(batch), blobPairBatchSize)
+		for _, w := range batch {
+			got = append(got, w.path)
+		}
+	}
+	require.Equal(t, 2, batches)
+	require.Len(t, got, total)
+	for i, p := range got {
+		require.Equal(t, fmt.Sprintf("f%03d", i), p, "records keep their emission order")
+	}
+
+	// A stopped scan aborts the hand-off instead of blocking on a full queue.
+	full := make(chan []blobPairWork) // unbuffered, nobody receives
+	stopped := make(chan struct{})
+	close(stopped)
+	e2 := blobPairEmitter{out: full, stopCh: stopped}
+	require.NoError(t, e2.emit(blobPairWork{path: "x"}))
+	require.ErrorIs(t, e2.flush(), errScanAborted)
+}

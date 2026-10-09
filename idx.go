@@ -247,10 +247,16 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 
 	// The checksum over the whole file takes about as long as parsing its
-	// tables, and neither depends on the other, so the two overlap. The
-	// channel is buffered, so an error return below leaves the goroutine
-	// free to finish and exit on its own.
+	// tables, and neither depends on the other, so the two overlap. Every
+	// return path joins the goroutine: the caller may close the mapping as
+	// soon as this function returns.
 	checksumOK := make(chan bool, 1)
+	joined := false
+	defer func() {
+		if !joined {
+			<-checksumOK
+		}
+	}()
 	go func() {
 		var want [hashSize]byte
 		if _, err := ix.ReadAt(want[:], size-hashSize); err != nil {
@@ -429,6 +435,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 
 	// Trailer verification: the file's own SHA-1 covers everything before
 	// it. The hash ran concurrently with the table parsing above.
+	joined = true
 	if !<-checksumOK {
 		return nil, ErrBadIdxChecksum
 	}

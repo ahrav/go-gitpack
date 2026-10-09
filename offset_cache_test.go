@@ -1,6 +1,12 @@
 package objstore
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
 
 // TestOffsetCacheBudgetRejectsOversizedEntries verifies that add honors the
 // configured per-shard budget: an entry larger than budgetPerShard must be
@@ -59,4 +65,88 @@ func TestOffsetCacheAddStaysWithinBudget(t *testing.T) {
 				i, used, c.budgetPerShard)
 		}
 	}
+}
+
+// TestWhaleCandidatesAndPrefetch builds a repository with one blob whose
+// compressed size exceeds whaleMinCompressedBytes and checks that the scan
+// prefetch selects it, that store.get serves the prefetched bytes, and that a
+// stopped prefetch leaves the normal path intact.
+func TestWhaleCandidatesAndPrefetch(t *testing.T) {
+	requireGit(t)
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+
+	// Incompressible content so the compressed entry stays above the
+	// threshold; a small text file keeps a second, ordinary object around.
+	big := make([]byte, whaleMinCompressedBytes+1<<20)
+	rng := uint64(0x9E3779B97F4A7C15)
+	for i := range big {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		big[i] = byte(rng)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "big.bin"), big, 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "small.txt"), []byte("hello\n"), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+	runGit(t, repo, "repack", "-a", "-d", "-q")
+
+	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
+	require.NoError(t, err)
+	defer s.Close()
+
+	cands := s.whaleCandidates()
+	require.Len(t, cands, 1, "exactly one entry exceeds the compressed threshold")
+	require.GreaterOrEqual(t, cands[0].compressed, uint64(whaleMinCompressedBytes))
+
+	bigOID := calculateHash(ObjBlob, big)
+	pack, off, ok := s.findPackedObject(bigOID)
+	require.True(t, ok)
+	require.Equal(t, cands[0].off, off)
+	require.Same(t, cands[0].pack, pack)
+
+	stop := make(chan struct{})
+	wait := s.prefetchWhales(stop)
+	w := s.whales.Load()
+	require.NotNil(t, w, "prefetch registers a whale cache")
+	data, typ, found := w.get(pack, off, nil)
+	require.True(t, found)
+	require.Equal(t, ObjBlob, typ)
+	require.Equal(t, big, data)
+
+	// store.get hands out the prefetched bytes without a second inflation.
+	got, typ, err := s.get(bigOID)
+	require.NoError(t, err)
+	require.Equal(t, ObjBlob, typ)
+	require.Equal(t, big, got)
+	wait()
+	require.Nil(t, s.whales.Load(), "wait releases the whale cache")
+
+	// A stop before the prefetch runs marks the entry failed; store.get then
+	// materializes normally.
+	close(stop)
+	wait = s.prefetchWhales(stop)
+	wait()
+	got, _, err = s.get(bigOID)
+	require.NoError(t, err)
+	require.Equal(t, big, got)
+}
+
+func TestWhaleCandidatesEmptyForSmallPacks(t *testing.T) {
+	requireGit(t)
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "a.txt"), []byte("a\n"), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+	runGit(t, repo, "repack", "-a", "-d", "-q")
+
+	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
+	require.NoError(t, err)
+	defer s.Close()
+	require.Empty(t, s.whaleCandidates())
+	wait := s.prefetchWhales(make(chan struct{}))
+	wait()
+	require.Nil(t, s.whales.Load())
 }
