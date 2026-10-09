@@ -567,6 +567,11 @@ func (w *dedupInFlightWindow) wait(seq uint64, stopCh <-chan struct{}) bool {
 // verdict, so hunks-emitted-intact is structural: this function cannot
 // return a modified hunk, and hunks are never split.
 //
+// This single pass is the specification the pipeline's split verdict
+// (prefilterHunk + prepBacklog + decideResult) is checked against; the
+// pipeline takes the split path so that hashing and most probing run on the
+// parallel workers.
+//
 // Duplicate lines inside one hunk cannot suppress each other or affect this
 // hunk's verdict: a block whose closing line repeats an earlier line of the
 // same hunk — armored key blocks sharing an END marker — still counts every
