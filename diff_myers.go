@@ -23,6 +23,7 @@ type diffScratch struct {
 	vf, vr []int32
 	stack  []diffRange
 	added  []bool
+	fa, fb []uint64
 }
 
 // diffRange is one pending subproblem: old[a0:a1] against new[b0:b1].
@@ -39,7 +40,40 @@ func putDiffScratch(sc *diffScratch) {
 	if cap(sc.added) > maxPooledFlags {
 		sc.added = nil
 	}
+	if cap(sc.fa) > maxPooledFlags {
+		sc.fa, sc.fb = nil, nil
+	}
 	diffScratchPool.Put(sc)
+}
+
+// lineFingerprints fills dst with one cheap 64-bit fingerprint per line:
+// the length mixed with the first and last eight bytes. Equal lines have
+// equal fingerprints, and the frontier searches compare fingerprints before
+// strings, so the common unequal comparison costs one word compare instead
+// of two pointer dereferences and a length check.
+func lineFingerprints(dst []uint64, lines []string) []uint64 {
+	dst = dst[:0]
+	for _, l := range lines {
+		var head, tail uint64
+		switch {
+		case len(l) >= 8:
+			head = le64s(l[:8])
+			tail = le64s(l[len(l)-8:])
+		default:
+			for i := 0; i < len(l); i++ {
+				head = head<<8 | uint64(l[i])
+			}
+		}
+		dst = append(dst, (uint64(len(l))*0x9E3779B97F4A7C15)^head^(tail*0xC2B2AE3D27D4EB4F))
+	}
+	return dst
+}
+
+// le64s reads the first eight bytes of s as a little-endian word; the
+// compiler fuses the shifts into one load.
+func le64s(s string) uint64 {
+	return uint64(s[0]) | uint64(s[1])<<8 | uint64(s[2])<<16 | uint64(s[3])<<24 |
+		uint64(s[4])<<32 | uint64(s[5])<<40 | uint64(s[6])<<48 | uint64(s[7])<<56
 }
 
 // addedLinesMyers marks in sc.added[i] whether newLines[i] lies outside a
@@ -62,12 +96,21 @@ func addedLinesMyers(oldLines, newLines []string, sc *diffScratch) bool {
 	// half each, so its cost is about (n+m)·half comparisons; subproblems
 	// have smaller edit distances and sizes.
 	half := min((n+m+1)/2, myersWorkBudget/(n+m+1)+1)
+	// The edit distance is at least the length difference, so a pair the
+	// budget cannot cover is known before any comparison; a large addition
+	// to a small file is the common shape.
+	if n-m > 2*half || m-n > 2*half {
+		return false
+	}
 	width := 2*half + 3
 	if cap(sc.vf) < width {
 		sc.vf = make([]int32, width)
 		sc.vr = make([]int32, width)
 	}
 	vf, vr := sc.vf[:width], sc.vr[:width]
+	sc.fa = lineFingerprints(sc.fa, oldLines)
+	sc.fb = lineFingerprints(sc.fb, newLines)
+	fa, fb := sc.fa, sc.fb
 
 	sc.stack = append(sc.stack[:0], diffRange{0, n, 0, m})
 	for len(sc.stack) > 0 {
@@ -94,7 +137,7 @@ func addedLinesMyers(oldLines, newLines []string, sc *diffScratch) bool {
 			}
 			continue
 		}
-		xs, ys, xe, ye, ok := middleSnake(oldLines[r.a0:r.a1], newLines[r.b0:r.b1], vf, vr, half)
+		xs, ys, xe, ye, ok := middleSnake(oldLines[r.a0:r.a1], newLines[r.b0:r.b1], fa[r.a0:r.a1], fb[r.b0:r.b1], vf, vr, half)
 		if !ok {
 			return false
 		}
@@ -110,8 +153,9 @@ func addedLinesMyers(oldLines, newLines []string, sc *diffScratch) bool {
 // and b: forward and reverse frontier searches advance by one edit each
 // until they overlap on a diagonal. It returns the snake's start and end
 // (xs, ys)-(xe, ye) in a/b coordinates, and false when the searches exceed
-// half edits each. vf and vr must hold at least 2*half+3 entries.
-func middleSnake(a, b []string, vf, vr []int32, half int) (xs, ys, xe, ye int, ok bool) {
+// half edits each. fa and fb are the lines' fingerprints; vf and vr must
+// hold at least 2*half+3 entries.
+func middleSnake(a, b []string, fa, fb []uint64, vf, vr []int32, half int) (xs, ys, xe, ye int, ok bool) {
 	n, m := len(a), len(b)
 	delta := n - m
 	odd := delta&1 != 0
@@ -130,7 +174,7 @@ func middleSnake(a, b []string, vf, vr []int32, half int) (xs, ys, xe, ye int, o
 			}
 			y := x - k
 			x0, y0 := x, y
-			for x < n && y < m && a[x] == b[y] {
+			for x < n && y < m && fa[x] == fb[y] && a[x] == b[y] {
 				x++
 				y++
 			}
@@ -154,7 +198,7 @@ func middleSnake(a, b []string, vf, vr []int32, half int) (xs, ys, xe, ye int, o
 			}
 			y := x - k
 			x0, y0 := x, y
-			for x < n && y < m && a[n-1-x] == b[m-1-y] {
+			for x < n && y < m && fa[n-1-x] == fb[m-1-y] && a[n-1-x] == b[m-1-y] {
 				x++
 				y++
 			}

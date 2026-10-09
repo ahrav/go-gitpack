@@ -136,3 +136,15 @@ func TestCommonSuffixLineBoundary(t *testing.T) {
 		require.Equal(t, c.want, commonSuffixLineBoundary([]byte(c.a), []byte(c.b)), "commonSuffixLineBoundary(%q, %q)", c.a, c.b)
 	}
 }
+
+func TestLineFingerprintsEqualLinesEqualFingerprints(t *testing.T) {
+	lines := []string{"", "a", "abcdefg", "abcdefgh", "abcdefghi", "the same long line here", "the same long line here", "the same long line herE"}
+	fps := lineFingerprints(nil, lines)
+	require.Len(t, fps, len(lines))
+	require.Equal(t, fps[5], fps[6])
+	require.NotEqual(t, fps[5], fps[7])
+	require.NotEqual(t, fps[2], fps[3])
+	require.NotEqual(t, fps[0], fps[1])
+	again := lineFingerprints(fps, lines)
+	require.Equal(t, fps, again, "reuses the destination")
+}
