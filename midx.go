@@ -16,7 +16,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"path/filepath"
-	"slices"
 	"sort"
 	"unsafe"
 
@@ -85,11 +84,7 @@ func (m *midxFile) findObject(h Hash) (p *mmap.ReaderAt, off uint64, ok bool) {
 		return nil, 0, false
 	}
 
-	rel, hit := slices.BinarySearchFunc(
-		m.objectIDs[start:end],
-		h,
-		func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
-	)
+	rel, hit := searchHashes(m.objectIDs[start:end], h)
 	if !hit {
 		return nil, 0, false
 	}

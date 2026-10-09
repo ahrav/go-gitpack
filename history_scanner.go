@@ -54,6 +54,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // commitInfo holds the minimal subset of commit metadata needed for
@@ -403,20 +405,9 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 
 	// Stage widths. Stage 2 gets one worker per CPU because it carries the
 	// expensive work (blob inflation plus line diff); stage 1 runs at half
-	// that, capped at maxTreeDiffWorkers. Two independent constraints set the
-	// stage-1 width and both point the same way. Tree diffing is cheap
-	// relative to blob diffing, so stage 1 keeps stage 2 fed at a fraction of
-	// its width. And every worker that sits inside a multi-hop delta
-	// resolution holds a 32 MiB ping-pong arena: only a fraction of the
-	// workers are in that state at any instant, which is why the arena
-	// free-list can be smaller than the total worker count — but once the
-	// instantaneous holder count crosses deltaArenaMaxRetained the free-list
-	// drops arenas on release and re-allocates (and re-zeroes) one on the next
-	// acquisition, which is the cost that free-list exists to remove.
-	// Widening a stage therefore buys throughput with retained arena bytes
-	// and, past that ceiling, with allocation churn. Halving alone still
-	// scales the stage-1 arena floor with core count, so the absolute cap
-	// applies on top of it; see the measured basis on maxTreeDiffWorkers.
+	// that, capped at maxTreeDiffWorkers. Tree diffing is cheap relative to
+	// blob diffing, so stage 1 keeps stage 2 fed at a fraction of its width;
+	// see the measured basis on maxTreeDiffWorkers.
 	blobWorkers := runtime.NumCPU()
 	treeWorkers := min(max(2, blobWorkers/2), maxTreeDiffWorkers)
 
@@ -448,7 +439,21 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// thousand commitInfo headers (~100 bytes each) buy full walk/tree
 		// decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
-		blobChan := make(chan blobPairWork, 4096)
+		blobChan := make(chan []blobPairWork, 1024)
+		// outstanding counts records sent on blobChan and not yet diffed.
+		// blobDone closes once stage 1 has finished sending and outstanding
+		// reaches zero, or when the scan stops on an error; it is the only
+		// exit signal the blob workers wait on. blobChan itself stays open,
+		// so a worker can push part of its batch back onto it at any time.
+		var outstanding atomic.Int64
+		var stage1Done atomic.Bool
+		blobDone := make(chan struct{})
+		var blobDoneOnce sync.Once
+		finishIfDrained := func() {
+			if stage1Done.Load() && outstanding.Load() == 0 {
+				blobDoneOnce.Do(func() { close(blobDone) })
+			}
+		}
 		stopCh := make(chan struct{})
 		var (
 			stopOnce sync.Once
@@ -456,6 +461,11 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			blobWG   sync.WaitGroup
 			firstErr error
 		)
+		// Whale blobs inflate for tens of milliseconds each and the walk
+		// may reach them last; inflating them from the start overlaps that
+		// work with the rest of the scan (see prefetchWhales).
+		waitWhales := hs.store.prefetchWhales()
+		defer waitWhales()
 		setError := func(err error) {
 			if err == nil {
 				return
@@ -463,6 +473,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			stopOnce.Do(func() {
 				firstErr = err
 				close(stopCh)
+				blobDoneOnce.Do(func() { close(blobDone) })
 			})
 		}
 
@@ -488,7 +499,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 							setError(fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err))
 							return
 						}
-						if err := hs.emitCommitBlobPairs(work.commit, parentTree, blobChan, stopCh); err != nil {
+						if err := hs.emitCommitBlobPairs(work.commit, parentTree, blobChan, &outstanding, stopCh); err != nil {
 							c := work.commit
 							setError(fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err))
 							return
@@ -502,16 +513,47 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			blobWG.Add(1)
 			go func() {
 				defer blobWG.Done()
-				for {
-					select {
-					case <-stopCh:
-						return
-					case work, ok := <-blobChan:
-						if !ok {
-							return
+				// runBatch pushes half of its remaining records back onto an
+				// empty blobChan once the record it just finished took at
+				// least blobPairStealAfter, so a history with fewer batches
+				// than workers can use waiting workers to share a batch of
+				// expensive pairs while cheap pairs stay batched and a queue
+				// with work already waiting is left alone.
+				runBatch := func(batch []blobPairWork) bool {
+					slow := false
+					done := 0
+					for len(batch) > 0 {
+						if slow && len(batch) > 1 && len(blobChan) == 0 {
+							half := len(batch) / 2
+							select {
+							case blobChan <- batch[half:]:
+								batch = batch[:half]
+							default:
+							}
 						}
+						work := batch[0]
+						batch = batch[1:]
+						start := time.Now()
 						if err := hs.streamBlobPairHunks(work, fn); err != nil {
 							setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
+							return false
+						}
+						slow = time.Since(start) >= blobPairStealAfter
+						done++
+					}
+					// One counter update per chunk keeps the shared counter
+					// off the per-record path.
+					if outstanding.Add(-int64(done)) == 0 {
+						finishIfDrained()
+					}
+					return true
+				}
+				for {
+					select {
+					case <-blobDone:
+						return
+					case batch := <-blobChan:
+						if !runBatch(batch) {
 							return
 						}
 					}
@@ -535,7 +577,8 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		})
 		close(workChan)
 		treeWG.Wait()
-		close(blobChan)
+		stage1Done.Store(true)
+		finishIfDrained()
 		blobWG.Wait()
 
 		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
@@ -551,13 +594,11 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 //
 // Measured on a stage-1-bound history (BenchmarkDiffHistoryHunksManySmallCommits,
 // 3000 single-file commits over a 200-file tree, 32-core arm64): raising the
-// cap to NumCPU is ~7% slower and allocates ~17x more bytes per scan (each
-// tree worker pins a delta arena, 34 MiB -> 596 MiB), so the cap costs no
-// throughput even when stage 1 dominates — stage-2 hunk workers, which are
-// uncapped, set pipeline throughput while extra producers only raise the RSS
-// floor. Halving alone would still scale that floor with core count, which is
-// why an absolute ceiling and not just a ratio. Re-run that benchmark before
-// changing this value.
+// cap to NumCPU was ~7% slower, so the cap costs no throughput even when
+// stage 1 dominates: stage-2 hunk workers, which are uncapped, set pipeline
+// throughput. On the trufflehog history at 16 logical CPUs, caps of 16 and
+// 32 measured within noise of 8. Re-run those benchmarks before changing
+// this value.
 const maxTreeDiffWorkers = 8
 
 // errScanAborted marks an internal early-stop condition used to unwind commit walks.
@@ -744,15 +785,73 @@ const (
 // emits inline, so it applies exact-OID suppression but not directory-rename
 // inference: inference needs every unsuppressed candidate in hand before it can
 // pair any of them, which is exactly the retention the budget refused.
-func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- blobPairWork, stopCh <-chan struct{}) error {
-	emit := func(work blobPairWork) error {
-		select {
-		case <-stopCh:
-			return errScanAborted
-		case blobs <- work:
-			return nil
-		}
+func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- []blobPairWork, outstanding *atomic.Int64, stopCh <-chan struct{}) error {
+	e := blobPairEmitter{out: blobs, outstanding: outstanding, stopCh: stopCh}
+	if err := hs.emitCommitBlobPairsTo(c, parentTree, e.emit, stopCh); err != nil {
+		return err
 	}
+	return e.flush()
+}
+
+// blobPairBatchSize is the largest number of stage-2 records one channel
+// send carries. Measured on the trufflehog history (63,729 pairs over 6,164
+// commits), a batch of this size holds a whole commit in the common case
+// while a whale commit is split into full batches. With one record per send,
+// sixteen blob workers and eight tree workers contend on the channel's
+// single lock for every record; the mutex profiler showed that lock wait as
+// the pipeline's largest blocking source at 16 workers.
+const blobPairBatchSize = 32
+
+// blobPairStealAfter gates the batch hand-off in runBatch: after a record
+// takes at least this long, the worker pushes half of its remaining batch
+// back onto an empty blobChan. Shorter records stay in their batch.
+const blobPairStealAfter = 500 * time.Microsecond
+
+// blobPairEmitter accumulates stage-2 records into batches of at most
+// blobPairBatchSize for the hand-off channel. A non-nil outstanding is raised
+// by the size of every batch sent.
+type blobPairEmitter struct {
+	out         chan<- []blobPairWork
+	outstanding *atomic.Int64
+	stopCh      <-chan struct{}
+	batch       []blobPairWork
+}
+
+func (e *blobPairEmitter) emit(work blobPairWork) error {
+	if e.batch == nil {
+		e.batch = make([]blobPairWork, 0, blobPairBatchSize)
+	}
+	e.batch = append(e.batch, work)
+	if len(e.batch) == blobPairBatchSize {
+		return e.flush()
+	}
+	return nil
+}
+
+// flush sends the pending partial batch.
+func (e *blobPairEmitter) flush() error {
+	if len(e.batch) == 0 {
+		return nil
+	}
+	batch := e.batch
+	e.batch = nil
+	if e.outstanding != nil {
+		e.outstanding.Add(int64(len(batch)))
+	}
+	select {
+	case <-e.stopCh:
+		if e.outstanding != nil {
+			e.outstanding.Add(-int64(len(batch)))
+		}
+		return errScanAborted
+	case e.out <- batch:
+		return nil
+	}
+}
+
+// emitCommitBlobPairsTo performs the tree diff of emitCommitBlobPairs and
+// hands each stage-2 record to emit.
+func (hs *HistoryScanner) emitCommitBlobPairsTo(c commitInfo, parentTree Hash, emit func(blobPairWork) error, stopCh <-chan struct{}) error {
 
 	// A zero parent tree (root commit, shallow history) has no old side:
 	// every entry is an addition and no deletion can exist, so no rename is
@@ -1383,15 +1482,20 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 	if cached {
 		return hunks, nil
 	}
-	computed, err := computeAddedHunks(hs.store, oldOID, newOID)
+	sc := getLineScratch()
+	computed, err := computeAddedHunksScratch(hs.store, oldOID, newOID, sc)
 	if err != nil {
+		putLineScratch(sc)
 		return nil, fmt.Errorf("compute added hunks: %w", err)
 	}
 	// Return what the cache hands back, not what computeAddedHunks produced:
 	// the computed Lines are zero-copy views into the whole decompressed new
 	// blob, so a HunkAddition built from them keeps that blob alive for as long
-	// as any consumer holds the hunk.
-	return hs.pairs.add(pk, computed), nil
+	// as any consumer holds the hunk. add also copies every header out of the
+	// scratch tables, which is what lets them go back to the pool here.
+	stored := hs.pairs.add(pk, computed)
+	putLineScratch(sc)
+	return stored, nil
 }
 
 // gateInferredRenameHunks validates a directory-rename pairing by content.

@@ -164,7 +164,7 @@ func TestGetNoCacheDoesNotPopulateOffsetCache(t *testing.T) {
 
 	entries := 0
 	for i := range store.offCache.shards {
-		entries += len(store.offCache.shards[i].m)
+		entries += store.offCache.shards[i].m.n
 	}
 	require.Zero(t, entries)
 }

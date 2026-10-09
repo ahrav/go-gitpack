@@ -204,24 +204,24 @@ func runEmitCommitBlobPairsBench(b *testing.B, hs *HistoryScanner, commit commit
 	var firstWorkTotal, iters int64
 	b.ReportAllocs()
 	for b.Loop() {
-		blobs := make(chan blobPairWork, 4096)
+		blobs := make(chan []blobPairWork, 4096)
 		ready := make(chan struct{})
 		done := make(chan emitDrainResult, 1)
 		var start time.Time
 		go func() {
 			close(ready)
 			result := emitDrainResult{firstWork: -1}
-			for range blobs {
+			for batch := range blobs {
 				if result.count == 0 {
 					result.firstWork = int64(time.Since(start))
 				}
-				result.count++
+				result.count += len(batch)
 			}
 			done <- result
 		}()
 		<-ready
 		start = time.Now()
-		if err := hs.emitCommitBlobPairs(commit, parentTree, blobs, stopCh); err != nil {
+		if err := hs.emitCommitBlobPairs(commit, parentTree, blobs, nil, stopCh); err != nil {
 			b.Fatalf("emitCommitBlobPairs: %v", err)
 		}
 		close(blobs)

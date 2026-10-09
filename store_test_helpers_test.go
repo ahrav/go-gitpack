@@ -453,21 +453,19 @@ func buildSelfContainedDelta(blobBase, blobDelta []byte) []byte {
 }
 
 func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]byte, error) {
-	// Build the delta instructions that transform baseData into targetData.
-	deltaInstructions := buildSelfContainedDelta(baseData, targetData)
+	return packRefDeltaObject(baseOID, buildSelfContainedDelta(baseData, targetData))
+}
 
-	// For REF_DELTA, the size in the header is the size of the delta instructions only.
+// packRefDeltaObject wraps a raw delta instruction stream in a REF_DELTA pack
+// object: [header] [20-byte base OID uncompressed] [zlib(instructions)]. The
+// header size field is the length of the instruction stream.
+func packRefDeltaObject(baseOID Hash, deltaInstructions []byte) ([]byte, error) {
 	header := encodeObjHeader(uint8(ObjRefDelta), uint64(len(deltaInstructions)))
 
-	// Build the complete object: [header] [20-byte base OID uncompressed] [compressed delta instructions].
 	var buf bytes.Buffer
-
 	buf.Write(header)
-
-	// The base OID is stored uncompressed (20 bytes).
 	buf.Write(baseOID[:])
 
-	// Only the delta instructions are compressed using zlib.
 	var compressedDelta bytes.Buffer
 	zw := zlib.NewWriter(&compressedDelta)
 	if _, err := zw.Write(deltaInstructions); err != nil {
@@ -476,7 +474,6 @@ func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]b
 	if err := zw.Close(); err != nil {
 		return nil, err
 	}
-
 	buf.Write(compressedDelta.Bytes())
 
 	return buf.Bytes(), nil
@@ -487,4 +484,14 @@ func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]b
 // functionality. Production code should use NewHistoryScanner instead.
 func OpenForTesting(dir string) (*store, error) {
 	return open(dir)
+}
+
+// drainBlobPairBatches flattens a closed stage-2 hand-off channel into the
+// records it carried, in send order.
+func drainBlobPairBatches(blobs <-chan []blobPairWork) []blobPairWork {
+	var out []blobPairWork
+	for batch := range blobs {
+		out = append(out, batch...)
+	}
+	return out
 }

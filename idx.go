@@ -123,17 +123,40 @@ func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
 		return 0, false // bucket empty
 	}
 
-	// Binary-search the slice [start:end) for the target hash.
-	relIdx, ok := slices.BinarySearchFunc(
-		f.oidTable[start:end],
-		hash,
-		func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
-	)
+	idx, ok := searchHashes(f.oidTable[start:end], hash)
 	if !ok {
 		return 0, false
 	}
-	absIdx := int(start) + relIdx
-	return f.entries[absIdx].offset, true
+	return f.entries[int(start)+idx].offset, true
+}
+
+// searchHashes binary-searches the sorted table for h and returns its
+// position. Each probe compares the leading eight bytes as a big-endian word,
+// which orders two distinct hashes the same way bytes.Compare does and settles
+// almost every probe in one comparison; only an equal leading word falls back
+// to the full 20-byte compare.
+func searchHashes(table []Hash, h Hash) (int, bool) {
+	want := binary.BigEndian.Uint64(h[:8])
+	lo, hi := 0, len(table)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		got := binary.BigEndian.Uint64(table[mid][:8])
+		if got < want {
+			lo = mid + 1
+		} else if got > want {
+			hi = mid
+		} else {
+			switch c := bytes.Compare(table[mid][8:], h[8:]); {
+			case c < 0:
+				lo = mid + 1
+			case c > 0:
+				hi = mid
+			default:
+				return mid, true
+			}
+		}
+	}
+	return lo, false
 }
 
 // crcAtOffset resolves the CRC-32 checksum for an object at the given pack
@@ -298,6 +321,33 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 			math.MaxUint32/hashSize)
 	}
 
+	// The checksum over the whole file takes about as long as parsing its
+	// tables, and neither depends on the other, so the two overlap. It starts
+	// here, after the header, fanout, and size checks above have passed, so
+	// an index those cheap checks reject fails without a full-file read.
+	// Every return path joins the goroutine: the caller may close the
+	// mapping as soon as this function returns.
+	checksumOK := make(chan bool, 1)
+	joined := false
+	defer func() {
+		if !joined {
+			<-checksumOK
+		}
+	}()
+	go func() {
+		var want [hashSize]byte
+		if _, err := ix.ReadAt(want[:], size-hashSize); err != nil {
+			checksumOK <- false
+			return
+		}
+		h := sha1.New()
+		if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-hashSize)); err != nil {
+			checksumOK <- false
+			return
+		}
+		checksumOK <- bytes.Equal(h.Sum(nil), want[:])
+	}()
+
 	oidBase := int64(headerSize + fanoutSize)
 	crcBase := oidBase + int64(objCount*hashSize)
 	offBase := crcBase + int64(objCount*crcSize)
@@ -408,36 +458,35 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 	}
 
-	offs := make([]uint64, objCount)
-	for i, e := range entries {
-		offs[i] = e.offset
-	}
-	slices.Sort(offs)
-
-	// Trailer verification.
-	trailer := make([]byte, 40)
-	if _, err := ix.ReadAt(trailer, int64(ix.Len()-40)); err != nil {
-		return nil, err
-	}
-
-	wantIdxSHA := trailer[hashSize:]
-
-	// Recompute idx‑SHA over everything **except** the final idx hash itself.
-	h := sha1.New()
-	if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-int64(hashSize))); err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(h.Sum(nil), wantIdxSHA) {
+	// Trailer verification: the file's own SHA-1 covers everything before
+	// it. The hash ran concurrently with the table parsing above.
+	joined = true
+	if !<-checksumOK {
 		return nil, ErrBadIdxChecksum
 	}
 
 	return &idxFile{
-		fanout:        fanout,
-		entries:       entries,
-		oidTable:      oids,
-		largeOffsets:  largeOffsets,
-		sortedOffsets: offs,
+		fanout:       fanout,
+		entries:      entries,
+		oidTable:     oids,
+		largeOffsets: largeOffsets,
 	}, nil
+}
+
+// parseIdx parses a version-2 pack index and leaves sortedOffsets nil;
+// loadReverseIndex fills it, from the pack's .rev file when one is present
+// and by sorting the entry offsets otherwise. parseIdxSorted is the
+// self-contained variant for callers that read sortedOffsets without a
+// reverse index.
+func parseIdxSorted(ix *mmap.ReaderAt) (*idxFile, error) {
+	f, err := parseIdx(ix)
+	if err != nil {
+		return nil, err
+	}
+	if len(f.entries) > 0 {
+		f.sortedOffsets = sortedPackOffsets(f.entries)
+	}
+	return f, nil
 }
 
 // resolveIdxPos converts a bit-index from a bitmap (which is ordered by pack

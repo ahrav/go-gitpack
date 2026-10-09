@@ -58,28 +58,11 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 		coldWaves      = 16
 	)
 
-	// Every in-flight multi-hop read holds one 32 MiB ping-pong arena for the
-	// duration of its reconstruction, so the worker count must not exceed what
-	// the free-list can retain: surplus holders allocate — and zero — a fresh
-	// 32 MiB arena per read, turning a race gate into allocator churn and an OOM
-	// risk on a small runner.
-	//
-	// Deriving that count from defaultDeltaArenaRetained would only restate a
-	// default. The live limit is process-wide and externally settable, via
-	// GOGITPACK_DELTA_ARENA_RETAIN and SetDeltaArenaBudget, and 0 and 1 are both
-	// supported values; under either, a worker count assuming the default
-	// reintroduces exactly that churn. So pin the limit for this test (restored
-	// on cleanup, free-list drained on both edges) and take the worker count
-	// from the pool that was actually installed, which makes "no worker can
-	// outrun the pool" true by construction rather than by assumption.
-	//
-	// The GOMAXPROCS term bounds peak scratch on small hosts; the readback is
-	// what makes the invariant hold regardless of what it produces.
-	arenaHolders := min(8, max(2, runtime.GOMAXPROCS(0)))
-	setDeltaArenaRetainLimitForTest(t, arenaHolders)
-	workers := cap(deltaArenaFreeListRef.Load().idle)
-	require.Equal(t, arenaHolders, workers,
-		"pinned retain limit must be the installed free-list capacity")
+	// Worker count: enough goroutines to overlap multi-hop reads on every P
+	// without turning a race gate into allocator churn on a small runner.
+	// Per-hop buffers are sized to their targets and pooled, so the count is
+	// bounded only by the parallelism available.
+	workers := min(8, max(2, runtime.GOMAXPROCS(0)))
 
 	// runConcurrently releases `n` goroutines simultaneously and fails the test
 	// if any reports an error. read is invoked with the worker index and

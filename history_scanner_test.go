@@ -757,13 +757,13 @@ func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
 	parentTree, err := scanner.firstParentTree(child)
 	require.NoError(t, err)
 
-	blobs := make(chan blobPairWork, 64)
+	blobs := make(chan []blobPairWork, 64)
 	stopCh := make(chan struct{})
-	require.NoError(t, scanner.emitCommitBlobPairs(child, parentTree, blobs, stopCh))
+	require.NoError(t, scanner.emitCommitBlobPairs(child, parentTree, blobs, nil, stopCh))
 	close(blobs)
 
 	var paths []string
-	for work := range blobs {
+	for _, work := range drainBlobPairBatches(blobs) {
 		paths = append(paths, work.path)
 		assert.False(t, work.newOID.IsZero(),
 			"deletion for %s must not be dispatched to stage 2", work.path)
@@ -799,12 +799,12 @@ func TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob(t *testing.T) {
 		parentTree, err := scanner.firstParentTree(c)
 		require.NoError(t, err)
 
-		blobs := make(chan blobPairWork, 64)
+		blobs := make(chan []blobPairWork, 64)
 		stopCh := make(chan struct{})
-		require.NoError(t, scanner.emitCommitBlobPairs(c, parentTree, blobs, stopCh))
+		require.NoError(t, scanner.emitCommitBlobPairs(c, parentTree, blobs, nil, stopCh))
 		close(blobs)
 
-		for w := range blobs {
+		for _, w := range drainBlobPairBatches(blobs) {
 			if !w.oldOID.IsZero() {
 				work, found = w, true
 			}
@@ -880,4 +880,88 @@ func TestDiffHistoryHunksFunc_NilCallbackRejected(t *testing.T) {
 	err := scanner.DiffHistoryHunksFunc(nil)
 	require.Error(t, err, "a nil callback must be rejected, not dispatched to workers")
 	require.Contains(t, err.Error(), "must not be nil")
+}
+
+// TestBlobPairEmitterBatches checks the stage-1 hand-off batching: records
+// are delivered in order, a full batch is sent as soon as it fills, the
+// remainder is sent by flush, and a closed stop channel aborts the send.
+func TestBlobPairEmitterBatches(t *testing.T) {
+	t.Parallel()
+
+	out := make(chan []blobPairWork, 8)
+	stop := make(chan struct{})
+	e := blobPairEmitter{out: out, stopCh: stop}
+
+	total := blobPairBatchSize + 3
+	for i := range total {
+		require.NoError(t, e.emit(blobPairWork{path: fmt.Sprintf("f%03d", i)}))
+	}
+	require.Len(t, out, 1, "a full batch is sent as soon as it fills")
+	require.NoError(t, e.flush())
+	require.NoError(t, e.flush(), "flushing an empty emitter is a no-op")
+	close(out)
+
+	var got []string
+	batches := 0
+	for batch := range out {
+		batches++
+		require.LessOrEqual(t, len(batch), blobPairBatchSize)
+		for _, w := range batch {
+			got = append(got, w.path)
+		}
+	}
+	require.Equal(t, 2, batches)
+	require.Len(t, got, total)
+	for i, p := range got {
+		require.Equal(t, fmt.Sprintf("f%03d", i), p, "records keep their emission order")
+	}
+
+	// A stopped scan aborts the hand-off instead of blocking on a full queue.
+	full := make(chan []blobPairWork) // unbuffered, nobody receives
+	stopped := make(chan struct{})
+	close(stopped)
+	e2 := blobPairEmitter{out: full, stopCh: stopped}
+	require.NoError(t, e2.emit(blobPairWork{path: "x"}))
+	require.ErrorIs(t, e2.flush(), errScanAborted)
+}
+
+// TestDiffHistoryHunksFunc_SmallHistorySpreadsPairsAcrossWorkers pins that
+// a history whose blob pairs fit in fewer batches than there are blob workers
+// still runs expensive pairs on several workers at once. One commit touching
+// blobPairBatchSize files fills exactly one batch; fn holds each pair for
+// longer than blobPairStealAfter, so the worker holding the batch hands part
+// of it to a waiting worker and two calls to fn overlap.
+func TestDiffHistoryHunksFunc_SmallHistorySpreadsPairsAcrossWorkers(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("needs at least two blob workers")
+	}
+	requireGit(t)
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	for i := range blobPairBatchSize {
+		name := filepath.Join(repo, fmt.Sprintf("f%02d.txt", i))
+		require.NoError(t, os.WriteFile(name, []byte(fmt.Sprintf("line %d\n", i)), 0o644))
+	}
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	var inFn, maxInFn atomic.Int32
+	err = scanner.DiffHistoryHunksFunc(func(HunkAddition) error {
+		n := inFn.Add(1)
+		defer inFn.Add(-1)
+		for {
+			seen := maxInFn.Load()
+			if n <= seen || maxInFn.CompareAndSwap(seen, n) {
+				break
+			}
+		}
+		time.Sleep(4 * blobPairStealAfter)
+		return nil
+	})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, maxInFn.Load(), int32(2), "expensive pairs of a single batch must reach more than one worker")
 }

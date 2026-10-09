@@ -42,10 +42,25 @@ if err := scanner.Scan(nil, &myScanner{}); err != nil {
   delta-chain resolution. Processes that open many repositories concurrently
   should lower it with `objstore.WithOffsetCacheBudget(bytes)`; a budget
   `<= 0` disables the cache. The memory is released on `Close`.
-- **Process-global delta arenas** — delta resolution reuses 32 MiB scratch
-  arenas from a bounded free-list sized from `GOMAXPROCS` (at most 8 arenas,
-  256 MiB). The reserve is retained for the process lifetime after peak
-  concurrency; bounding scan concurrency bounds it proportionally.
+- **Per-scanner pair cache** — each `HistoryScanner` memoizes computed diff
+  hunks by blob pair (default budget 128 MiB) because merges and long-lived
+  branches replay the same transitions. Entries are stored pointer-free (one
+  text buffer plus offset tables), so a full cache costs the garbage
+  collector little to mark. Lower it with `objstore.WithPairCacheBudget`.
+- **Delta reconstruction buffers** — each hop of a multi-hop delta chain
+  writes into a buffer sized to that hop's target, recycled through
+  size-class pools that the garbage collector trims when idle. An in-flight
+  reconstruction holds its two largest consecutive hops and nothing more, so
+  resident memory no longer scales with worker count (a 192-CPU host scanned
+  trufflehog's history in ~1 GB where fixed 32 MiB arenas took ~10 GB).
+- **Large-blob prefetch** — a hunk scan inflates pack entries above 2 MiB
+  compressed at scan start, biggest first, within a 256 MiB budget, so the
+  slowest single inflations overlap the rest of the walk instead of forming
+  its tail. A worker that needs one of these blobs before the prefetch
+  reaches it inflates the blob itself. The prefetched bytes are released
+  when the scan ends, and a scanner with the offset cache disabled
+  (`WithOffsetCacheBudget(0)` or `GOGITPACK_OFFSET_CACHE_BUDGET<=0`) skips
+  the prefetch.
 
 ## Environment variables
 
@@ -55,9 +70,6 @@ required:
 - `GOGITPACK_OFFSET_CACHE_BUDGET` — per-store offset-cache budget in bytes;
   `<= 0` disables the cache. Overrides the compiled 256 MiB default (code
   can still call `WithOffsetCacheBudget` per scanner).
-- `GOGITPACK_DELTA_ARENA_RETAIN` — maximum idle 32 MiB delta arenas retained
-  process-wide; `0` disables retention so arenas are released to the GC
-  after use.
 - `GOGITPACK_NOASM_INFLATE` — set to `1` to disable the amd64/arm64 assembly
   inflate kernels and use the portable Go decoder (same effect as building
   with the `purego` tag, without rebuilding).

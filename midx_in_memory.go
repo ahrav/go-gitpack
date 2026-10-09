@@ -185,13 +185,7 @@ func (m *inMemoryMidx) findEntry(oid Hash) (inMemoryMidxEntry, bool) {
 		return inMemoryMidxEntry{}, false
 	}
 
-	rel, ok := slices.BinarySearchFunc(
-		m.objectID[start:end],
-		oid,
-		func(a, b Hash) int {
-			return bytes.Compare(a[:], b[:])
-		},
-	)
+	rel, ok := searchHashes(m.objectID[start:end], oid)
 	if !ok {
 		return inMemoryMidxEntry{}, false
 	}

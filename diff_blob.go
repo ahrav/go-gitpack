@@ -259,43 +259,6 @@ func (h *AddedHunk) EndLine() uint32 {
 	return h.StartLine + uint32(len(h.Lines)) - 1
 }
 
-// tokenize splits a byte slice into individual lines without copying the underlying data.
-// The function recognizes '\n' as the line delimiter and excludes it from the results.
-// Empty input returns nil rather than an empty slice.
-//
-// Shared-memory safety invariant: the returned strings are created via btostr
-// (unsafe.go), which performs a zero-copy cast from []byte to string using
-// unsafe.String. The returned strings alias the memory of src. This is safe
-// only as long as src is not mutated after this call. If src's backing array is
-// modified, the previously returned strings will silently reflect the mutation,
-// violating Go's string immutability guarantee.
-func tokenize(src []byte) []string {
-	if len(src) == 0 {
-		return nil
-	}
-
-	// bytes.Count and bytes.IndexByte dispatch to vectorized assembly
-	// (NEON/AVX2), so both the counting pass and the split loop run at
-	// multiple bytes per cycle instead of the one-byte-per-iteration range
-	// loop this previously used.
-	lineCount := bytes.Count(src, nlByte) + 1
-
-	lines := make([]string, 0, lineCount)
-	rest := src
-	for {
-		i := bytes.IndexByte(rest, '\n')
-		if i < 0 {
-			break
-		}
-		lines = append(lines, btostr(rest[:i])) // Exclude the newline character.
-		rest = rest[i+1:]
-	}
-	if len(rest) > 0 { // Handle the last line without a newline.
-		lines = append(lines, btostr(rest))
-	}
-	return lines
-}
-
 // isBinary reports whether the first 8 KiB of data contains a null byte,
 // which is a strong indicator that the blob is a binary file.
 //
@@ -335,6 +298,54 @@ func isBinary(data []byte) bool {
 // pairCache.add reads that shape to decide when copying the lines out would
 // only retain the bytes they already alias.
 func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
+	return computeAddedHunksScratch(store, oldOID, newOID, nil)
+}
+
+// lineScratch holds the two tokenized line tables a text diff works over.
+// Neither table outlives the pair's compaction (pairCache.add copies the
+// headers of every hunk a positional diff reports), so the tables are
+// recycled across diffs instead of being allocated and zeroed per pair:
+// those two arrays were about a fifth of all bytes a scan allocated.
+//
+// Each table views only the blob of its latest diff (see retokenize).
+type lineScratch struct {
+	old, new []string
+}
+
+// Headers the previous split wrote past the new line count would keep the
+// previous blob reachable, so retokenize clears them.
+func retokenize(table []string, src []byte) []string {
+	prev := len(table)
+	out := tokenizeInto(table, src)
+	if n := len(out); n < prev {
+		clear(table[n:prev])
+	}
+	return out
+}
+
+var lineScratchPool = sync.Pool{New: func() any { return &lineScratch{} }}
+
+func getLineScratch() *lineScratch { return lineScratchPool.Get().(*lineScratch) }
+
+// putLineScratch returns sc to the pool. Tables that grew past
+// maxPooledLineTable entries are dropped so one huge diff cannot pin a large
+// table in the pool for the process lifetime.
+func putLineScratch(sc *lineScratch) {
+	const maxPooledLineTable = 1 << 18 // 4 MiB of headers
+	if cap(sc.old) > maxPooledLineTable {
+		sc.old = nil
+	}
+	if cap(sc.new) > maxPooledLineTable {
+		sc.new = nil
+	}
+	lineScratchPool.Put(sc)
+}
+
+// computeAddedHunksScratch is computeAddedHunks with caller-owned line
+// tables for the positional diff; a nil sc allocates fresh tables. Hunks
+// returned for a positional diff alias sc.new until pairCache.add compacts
+// them, so sc must stay untouched until then.
+func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch) ([]AddedHunk, error) {
 	// Pure deletion (or nothing at all): no added-line side exists, so the
 	// blobs never need to be loaded. This matters for history walks where
 	// large binaries get deleted — inflating a multi-MB blob only to
@@ -439,7 +450,7 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 
 	// Both files are text — choose the diff algorithm by size.
 	if oldSize <= SmallFileThreshold && newSize <= SmallFileThreshold {
-		return addedHunksWithPos(oldBytes, newBytes), nil
+		return addedHunksWithPosScratch(oldBytes, newBytes, sc), nil
 	}
 
 	return addedHunksForLargeFiles(oldBytes, newBytes), nil
@@ -474,6 +485,13 @@ func loadBlob(s *store, oid Hash) ([]byte, error) {
 // Returns nil if the byte slices are identical.
 // Returns a slice of AddedHunk structs representing all additions found in newB.
 func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
+	return addedHunksWithPosScratch(oldB, newB, nil)
+}
+
+// addedHunksWithPosScratch is addedHunksWithPos with caller-owned line
+// tables; a nil sc allocates fresh ones. The returned hunks' Lines alias the
+// new-side table.
+func addedHunksWithPosScratch(oldB, newB []byte, sc *lineScratch) []AddedHunk {
 	// First, check for the trivial case where the files are identical.
 	if bytes.Equal(oldB, newB) {
 		return nil
@@ -494,7 +512,14 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 
 	// Tokenize the old and new byte slices into lines for comparison.
 	// This is a zero-copy operation, creating string views into the original slices.
-	oldLines, newLines := tokenize(oldB), tokenize(newB)
+	var oldLines, newLines []string
+	if sc != nil {
+		sc.old = retokenize(sc.old, oldB)
+		sc.new = retokenize(sc.new, newB)
+		oldLines, newLines = sc.old, sc.new
+	} else {
+		oldLines, newLines = tokenize(oldB), tokenize(newB)
+	}
 
 	// For larger files, a hash index over old lines provides O(1) lookups.
 	// It is built lazily at the first mismatch: prefix-trimmed inputs
@@ -604,7 +629,13 @@ var nlByte = []byte{'\n'}
 func commonPrefixLineBoundary(a, b []byte) int {
 	n := min(len(a), len(b))
 	i := 0
-	// Word-at-a-time comparison; falls back to byte steps near the end.
+	// Consecutive versions usually share kilobytes of prefix, so the bulk
+	// of it is compared a chunk at a time through the runtime's vectorized
+	// equality, then the mismatching chunk is narrowed word- and byte-wise.
+	const chunk = 256
+	for i+chunk <= n && bytes.Equal(a[i:i+chunk], b[i:i+chunk]) {
+		i += chunk
+	}
 	for i+8 <= n && le64(a[i:]) == le64(b[i:]) {
 		i += 8
 	}

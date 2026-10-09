@@ -23,9 +23,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
-	"runtime"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
@@ -144,248 +141,28 @@ func (ctx *deltaContext) enterRefDelta(hash Hash) {
 	ctx.depth++
 }
 
-// deltaArena holds two equally‑sized byte slices so the resolver can ping‑pong
-// between *source* and *destination* buffers while walking a delta chain.
-type deltaArena struct{ data []byte }
-
-// defaultDeltaArenaSize is the standard allocation for pooled ping-pong arenas:
-// two 16 MiB halves = 32 MiB total.
-const defaultDeltaArenaSize = 2 * 16 << 20
-
-// deltaArenaMaxRetained is the hard ceiling on the retain limit: 32 arenas =
-// 1 GiB of idle arenas.
-const deltaArenaMaxRetained = 32
-
-// defaultDeltaArenaRetained is the retain limit installed at startup, in
-// arenas. It is derived from GOMAXPROCS: hosts with fewer CPUs cannot
-// productively use more concurrent arenas, so sizing the initial free-list to
-// the parallelism budget keeps the idle reserve proportional to the machine.
+// DeltaArenaSize is retained for API compatibility. Multi-hop delta
+// reconstruction sizes each hop's output buffer to that hop's target (see
+// applyDeltaStackCached) and recycles those buffers through size-class pools
+// (delta_buffers.go); it holds no fixed-size arenas.
 //
-// The default is coupled to caller concurrency and must be read together with
-// it: a goroutine inside a multi-hop delta resolution holds one arena, so the
-// free-list's steady-state population equals the peak number of simultaneous
-// multi-hop resolutions — bounded above by the sum of the concurrent stage
-// widths of whatever drives the store (for DiffHistoryHunksFunc: tree workers
-// + blob workers + commit-walk workers), and in practice well below it because
-// only a fraction of those workers are inside a resolution at any instant.
-// That sum can exceed the derived default on a wide host, so a scan's peak can
-// outrun the free-list: putDeltaArena drops the overflow and the next
-// getDeltaArena allocates and zeroes a fresh 32 MiB arena, reinstating the
-// memclr cost the free-list exists to remove. Bounding resident memory instead
-// of that cost is the point of the derived default; the environment variable
-// below and SetDeltaArenaBudget are the levers for callers whose scan width
-// justifies a larger reserve.
-//
-// GOGITPACK_DELTA_ARENA_RETAIN overrides the derived default with an explicit
-// arena count (each arena is DeltaArenaSize; 0 disables retention entirely so
-// every arena is released to the GC after use). This is the no-rebuild control
-// for memory-constrained, long-lived embedders. It is read once at process
-// start; malformed or negative values fall back to the derived default, and
-// any value is clamped to deltaArenaMaxRetained, so the ceiling holds for the
-// environment and for SetDeltaArenaBudget alike.
-var defaultDeltaArenaRetained = func() int {
-	if v := os.Getenv("GOGITPACK_DELTA_ARENA_RETAIN"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
-			return min(n, deltaArenaMaxRetained)
-		}
-	}
-	return min(8, max(2, runtime.GOMAXPROCS(0)))
-}()
+// Deprecated: no delta arenas exist. The constant keeps older call sites
+// compiling and has no effect on memory use.
+const DeltaArenaSize = 2 * 16 << 20
 
-// deltaArenaFreeList holds the arenas idle under one retain limit.
-//
-// A buffered channel is used instead of sync.Pool because sync.Pool is
-// emptied on every GC cycle. Bulk scans allocate gigabytes per second, so GC
-// runs every few milliseconds and a sync.Pool would shed its 32 MiB arenas
-// constantly — each miss re-allocates (and zeroes) 32 MiB, which showed up as
-// ~45% of all allocated bytes and ~5% of CPU in memclr. The channel retains
-// arenas across GC cycles instead.
-//
-// Unlike sync.Pool the free-list is never drained, so after a burst of
-// concurrent multi-hop resolutions the process retains up to its current
-// retain limit in idle arena memory. That reserve is process-global and shared
-// by every open store; it is the steady-state working set of the bulk-scan
-// workload this library targets, not a leak. SetDeltaArenaBudget and
-// GOGITPACK_DELTA_ARENA_RETAIN cap or disable it.
-//
-// cap(idle) *is* the retain limit, which is what makes the bound exact rather
-// than approximate: putDeltaArena only ever sends non-blockingly, so the
-// runtime itself refuses the send once cap(idle) arenas are buffered, however
-// many putters race. A checked-then-sent counter cannot promise that, because
-// every racing putter can read the same under-limit count and then send.
-//
-// A nil idle channel disables retention outright: neither a send to nor a
-// receive from a nil channel can ever proceed, so every put drops its arena
-// and every get allocates.
-type deltaArenaFreeList struct{ idle chan *deltaArena }
+var deltaArenaBudget atomic.Int64
 
-// newDeltaArenaFreeList returns a free-list that retains at most limit arenas.
-// limit must already be clamped to [0, deltaArenaMaxRetained].
-func newDeltaArenaFreeList(limit int) *deltaArenaFreeList {
-	if limit <= 0 {
-		return &deltaArenaFreeList{}
-	}
-	return &deltaArenaFreeList{idle: make(chan *deltaArena, limit)}
-}
-
-// deltaArenaFreeListRef publishes the live free-list. Changing the retain limit
-// swaps in a whole new free-list rather than editing a limit beside a
-// fixed-capacity channel, so the capacity that enforces the bound and the
-// configured limit can never disagree.
+// SetDeltaArenaBudget records bytes and returns the value recorded by the
+// previous call (zero before the first call).
 //
-// The seeding runs as this variable's own initializer rather than in an init
-// function because a nil reference is unusable: getDeltaArena and putDeltaArena
-// dereference the loaded free-list. Go runs every package-level variable
-// initializer before any init function, and it orders those initializers by
-// dependency, so any other package-level variable in this package whose
-// initializer reaches the arena helpers depends on this variable and is
-// therefore sequenced after the free-list exists. Seeding from an init function
-// leaves that window open, because init functions run only after all variable
-// initializers have.
-//
-// The variable holds *atomic.Pointer rather than atomic.Pointer because
-// atomic.Pointer embeds noCopy and there is no exported way to build a non-zero
-// one: a value-typed initializer would have to copy the atomic out of the
-// constructing function, which go vet's copylocks check rejects. Call sites are
-// unaffected — selectors auto-dereference the pointer.
-var deltaArenaFreeListRef = func() *atomic.Pointer[deltaArenaFreeList] {
-	var ref atomic.Pointer[deltaArenaFreeList]
-	ref.Store(newDeltaArenaFreeList(defaultDeltaArenaRetained))
-	return &ref
-}()
-
-// getDeltaArena retrieves a ping‑pong arena from the free-list or allocates
-// a fresh one when the list is empty.
-func getDeltaArena() *deltaArena {
-	select {
-	case arena := <-deltaArenaFreeListRef.Load().idle:
-		return arena
-	default:
-		return &deltaArena{data: make([]byte, defaultDeltaArenaSize)}
-	}
-}
-
-// prepareDeltaArenaForPool reports whether arena has a shape the free-list
-// accepts, restoring its full length in place when it does. Arenas that were
-// grown beyond the default pool size during dynamic resizing are ineligible
-// (and left untouched) so the pool is never polluted with oversized
-// allocations. Eligibility is not admission: the free-list capacity decides
-// whether an eligible arena is actually retained.
-//
-// Split from putDeltaArena so the reset/discard decision is testable before
-// ownership transfers to the pool: once the send runs, another goroutine may
-// legitimately retrieve and mutate the arena, so no caller (test or
-// otherwise) may inspect it afterwards.
-func prepareDeltaArenaForPool(arena *deltaArena) bool {
-	if cap(arena.data) > defaultDeltaArenaSize {
-		return false
-	}
-	arena.data = arena.data[:cap(arena.data)]
-	return true
-}
-
-// putDeltaArena returns arena to the free-list when it is pool-eligible (see
-// prepareDeltaArenaForPool). The send never blocks, so an arena that would push
-// the idle population past the retain limit — or any arena at all while
-// retention is disabled — is dropped for the GC. The arena must not be touched
-// after this call.
-func putDeltaArena(arena *deltaArena) {
-	if !prepareDeltaArenaForPool(arena) {
-		return
-	}
-	select {
-	case deltaArenaFreeListRef.Load().idle <- arena:
-	default:
-	}
-}
-
-// deltaArenaLimitMu serializes retain-limit changes so that reading the old
-// free-list, publishing the new one, and moving arenas between them is one
-// step. Only setters take it; getDeltaArena and putDeltaArena never do.
-var deltaArenaLimitMu sync.Mutex
-
-// setDeltaArenaRetainLimit publishes a free-list that retains at most limit
-// arenas and returns the previous limit. limit is clamped to
-// [0, deltaArenaMaxRetained]; zero disables retention.
-//
-// Arenas already idle move into the new free-list until it is full and the
-// remainder is dropped, so raising the limit keeps warm arenas and lowering it
-// sheds the idle excess.
-//
-// A putter or getter that loaded the old free-list before the swap keeps
-// operating on it. That is safe: the old free-list is an ordinary bounded
-// channel, and an arena left in it is unreachable from the pool, so it becomes
-// garbage once the last in-flight caller drops its reference. Each such caller
-// re-reads the reference on its next call, so at most one late arena arrives per
-// in-flight putter and the migration below terminates.
-func setDeltaArenaRetainLimit(limit int) int {
-	if limit < 0 {
-		limit = 0
-	}
-	if limit > deltaArenaMaxRetained {
-		limit = deltaArenaMaxRetained
-	}
-
-	deltaArenaLimitMu.Lock()
-	defer deltaArenaLimitMu.Unlock()
-
-	old := deltaArenaFreeListRef.Load()
-	previous := cap(old.idle)
-	if limit == previous {
-		return previous
-	}
-
-	next := newDeltaArenaFreeList(limit)
-	deltaArenaFreeListRef.Store(next)
-
-	for {
-		select {
-		case arena := <-old.idle:
-			select {
-			case next.idle <- arena:
-			default:
-			}
-		default:
-			return previous
-		}
-	}
-}
-
-// DeltaArenaSize is the size in bytes of one delta ping-pong arena. Budgets
-// passed to SetDeltaArenaBudget are whole multiples of it.
-const DeltaArenaSize = defaultDeltaArenaSize
-
-// SetDeltaArenaBudget bounds the memory held idle by the delta arena free-list
-// and returns the budget that was in effect before the call, in bytes.
-//
-// Multi-hop delta reconstruction borrows DeltaArenaSize ping-pong arenas from a
-// free-list that deliberately survives GC, because re-allocating (and zeroing)
-// an arena per resolution costs ~45% of a bulk scan's allocated bytes. The
-// budget caps only the idle population: an in-flight resolution still allocates
-// the arena it works in, so it bounds the floor, not the peak.
-//
-// The budget is rounded DOWN to a whole number of DeltaArenaSize arenas, so any
-// budget below DeltaArenaSize — like a plain 1<<20 — disables idle retention
-// entirely and makes every multi-hop resolution pay for a fresh arena. It is
-// also clamped to 1 GiB. Compute budgets as a multiple of DeltaArenaSize.
-//
-// The startup budget is derived from GOMAXPROCS and can be set without code by
-// GOGITPACK_DELTA_ARENA_RETAIN (see defaultDeltaArenaRetained); this call
-// overrides whichever of those is in effect.
-//
-// The free-list is process-wide, not per-scanner: this call affects every
-// HistoryScanner and every other user of the package in the process, and it
-// stays in effect until changed again.
-//
-// The budget is last-writer-wins, and the returned value is a plain snapshot
-// rather than an ownership token. Passing it back restores the previous budget
-// only if nothing else set one in the meantime; with two independent callers
-// interleaved, a restore reinstates a budget the other caller has already
-// replaced. Treat this the way the runtime's own process-wide knobs are
-// treated — set it once during startup, or from a test that owns the process
-// for the duration — not as a composable scoped override.
+// Deprecated: delta reconstruction retains no arenas. Per-hop buffers are
+// pooled by size class and released to the garbage collector when idle, so
+// idle memory is bounded by recent demand rather than by a configured arena
+// count; this call therefore changes nothing. It remains so existing callers
+// keep compiling. The GOGITPACK_DELTA_ARENA_RETAIN environment variable is
+// likewise read no longer.
 func SetDeltaArenaBudget(bytes int) (previous int) {
-	return setDeltaArenaRetainLimit(bytes/DeltaArenaSize) * DeltaArenaSize
+	return int(deltaArenaBudget.Swap(int64(bytes)))
 }
 
 // errDeltaOutputTooSmall reports that the caller-provided output buffer cannot
@@ -424,6 +201,10 @@ type inflationParams struct {
 
 	// maxObjectSize bounds reconstructed delta objects. Zero disables the bound.
 	maxObjectSize uint64
+
+	// offCacheChecked reports that the caller already looked (p, off) up in
+	// the offset cache and missed, so the walk-up skips that probe at depth 0.
+	offCacheChecked bool
 }
 
 // inflateDeltaChainStreaming reconstructs an object that is stored as a
@@ -548,8 +329,10 @@ func walkUpDeltaChain(
 		// scans ~90% of hops land on an already-materialized offset. The
 		// check also fires at depth 0: OID-keyed caches (delta window, ARC)
 		// can miss objects that the offset cache still holds.
-		if data, typ, ok := oc.get(currPack, currOff); ok {
-			return data, typ, nil
+		if depth > 0 || !params.offCacheChecked {
+			if data, typ, ok := oc.get(currPack, currOff); ok {
+				return data, typ, nil
+			}
 		}
 
 		typ, hdrLen, err := peekObjectType(currPack, currOff)
@@ -675,25 +458,15 @@ func applyDeltaStackCached(
 
 	// Single-hop fast path (the majority of chains once the offset cache
 	// short-circuits walk-up): apply the one delta into a fresh exact-size
-	// buffer and return it directly — no arena, no detach copy.
-	// applyDeltaStreaming enforces maxObjectSize before allocating the
-	// exact-size buffer, so a hostile advertised target cannot force a
-	// large allocation ahead of the limit check.
+	// buffer and return it directly. applyDeltaStreaming enforces
+	// maxObjectSize before allocating the exact-size buffer, so a hostile
+	// advertised target cannot force a large allocation ahead of the limit
+	// check.
 	if len(stack) == 1 {
 		d := stack[0]
-		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, baseData, nil, true, maxObjectSize)
+		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, baseData, nil, maxObjectSize)
 		if err != nil {
-			var tooSmall *errDeltaOutputTooSmall
-			// allocExact never under-allocates, so errDeltaOutputTooSmall
-			// here would indicate a logic error; handle size-limit checks
-			// explicitly below either way.
-			if errors.As(err, &tooSmall) && maxObjectSize > 0 && tooSmall.need > maxObjectSize {
-				return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
-			}
 			return nil, ObjBad, err
-		}
-		if maxObjectSize > 0 && uint64(len(final)) > maxObjectSize {
-			return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, len(final), maxObjectSize)
 		}
 		if oc != nil {
 			oc.add(d.pack, d.offset, final, baseType)
@@ -701,107 +474,63 @@ func applyDeltaStackCached(
 		return final, baseType, nil
 	}
 
-	arena := getDeltaArena()
-	defer putDeltaArena(arena)
-
-	maxTarget := uint64(len(baseData))
-	poolHalf := uint64(cap(arena.data) / 2)
-	if poolHalf > maxTarget && (maxObjectSize == 0 || poolHalf <= maxObjectSize) {
-		maxTarget = poolHalf
-	}
-	if maxObjectSize > 0 && maxTarget > maxObjectSize {
-		return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, maxTarget, maxObjectSize)
-	}
-	if maxTarget > uint64(cap(arena.data)/2) {
-		arena.data = make([]byte, maxTarget*2)
-	}
-
-	// Let's ping-pong! Full slice expressions pin each half's capacity to
-	// its own boundary: without them bufA's capacity would extend through
-	// bufB (and bufB's through any arena tail), letting a later hop whose
-	// target exceeds maxTarget write straight across the A/B boundary and
-	// corrupt the buffer the next hop reads — instead of taking the
-	// errDeltaOutputTooSmall resize path (which also enforces
-	// maxObjectSize).
-	bufA := arena.data[0:maxTarget:maxTarget]
-	bufB := arena.data[maxTarget : maxTarget*2 : maxTarget*2]
-
-	// The first application reads the base directly — applyDeltaStreaming
-	// never writes its input, so copying baseData into the arena first was
-	// pure overhead (one memmove per materialized object). usingA=false
-	// makes the first hop write into bufA; the ping-pong then proceeds
-	// normally and baseData is never written.
+	// Multi-hop: every hop writes into a buffer sized to its own target, so
+	// an in-flight reconstruction holds at most its two largest consecutive
+	// hops rather than a fixed arena. A hop whose result the offset cache
+	// admits writes straight into an exact-size allocation that the cache
+	// takes over, with no detach copy; every other hop borrows a pooled
+	// buffer that is returned as soon as the following hop has read it. The
+	// final hop always writes into an exact-size allocation because the
+	// caller and the OID caches retain it.
+	//
+	// applyDeltaStreaming never writes its input, so the base is read in
+	// place and never copied.
 	current := baseData
-	usingA := false
-
+	var pooled []byte // the pooled buffer current aliases, if any
 	for i := len(stack) - 1; i >= 0; i-- {
 		d := stack[i]
 
-		for {
-			// Choose output buffer (the one we're NOT currently using).
-			var out []byte
-			if usingA {
-				out = bufB[:0]
+		var publish bool
+		var hop []byte // the pooled buffer this hop borrowed, if any
+		alloc := func(n int) []byte {
+			if i == 0 {
+				return make([]byte, 0, n)
+			}
+			if oc.admits(n) {
+				publish = true
+				return make([]byte, 0, n)
+			}
+			hop = getDeltaBuf(n)
+			return hop
+		}
+		result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, alloc, maxObjectSize)
+		if pooled != nil {
+			putDeltaBuf(pooled)
+			pooled = nil
+		}
+		if err != nil {
+			// On failure this call still owns hop, so it goes back to its
+			// size-class pool.
+			if hop != nil {
+				putDeltaBuf(hop)
+			}
+			return nil, ObjBad, err
+		}
+		current = result
+
+		if i > 0 {
+			if publish {
+				// Later chains sharing this tail stop climbing here.
+				oc.add(d.pack, d.offset, current, baseType)
 			} else {
-				out = bufA[:0]
+				pooled = current
 			}
-
-			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out, false, maxObjectSize)
-			if err != nil {
-				var tooSmall *errDeltaOutputTooSmall
-				if errors.As(err, &tooSmall) {
-					if maxObjectSize > 0 && tooSmall.need > maxObjectSize {
-						return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
-					}
-					if tooSmall.need <= maxTarget {
-						return nil, ObjBad, err
-					}
-
-					maxTarget = tooSmall.need
-					arena.data = make([]byte, maxTarget*2)
-					bufA = arena.data[0:maxTarget:maxTarget]
-					bufB = arena.data[maxTarget : maxTarget*2 : maxTarget*2]
-
-					// Re-anchor current into the new arena and retry this delta.
-					rebased := bufA[:len(current)]
-					copy(rebased, current)
-					current = rebased
-					usingA = true
-					continue
-				}
-				return nil, ObjBad, err
-			}
-
-			// The result is now in 'out' buffer, make it the current for next iteration.
-			current = result
-			usingA = !usingA // Switch which buffer we're using
-			break
-		}
-
-		// Publish intermediate materializations (every hop except the final
-		// target, which callers cache by OID) into the offset cache so that
-		// later chains sharing this tail stop climbing here. The copy is
-		// required because 'current' aliases the recycled ping-pong arena;
-		// a memmove is far cheaper than the inflate+apply work it saves.
-		// The eligibility check runs BEFORE the detach copy: copying an entry
-		// that the configured cache budget rejects would burn a guaranteed-
-		// discarded allocation at every ineligible hop.
-		if i > 0 && oc.admits(len(current)) {
-			detached := make([]byte, len(current))
-			copy(detached, current)
-			oc.add(d.pack, d.offset, detached, baseType)
 		}
 	}
 
-	// Always copy final result out of the arena so the arena can be safely
-	// recycled without invalidating returned bytes.
-	final := make([]byte, len(current))
-	copy(final, current)
 	_ = borrowed // call-site signal is currently informational only.
-	if len(stack) > 0 {
-		oc.add(stack[0].pack, stack[0].offset, final, baseType)
-	}
-	return final, baseType, nil
+	oc.add(stack[0].pack, stack[0].offset, current, baseType)
+	return current, baseType, nil
 }
 
 // readOfsDeltaOffset reads a variable-length backward offset from an
@@ -871,13 +600,17 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, int, error) {
 //
 // applyDeltaStreaming returns an error if the delta instructions are malformed or reference
 // data outside the base object bounds.
+//
+// alloc supplies the output buffer once the target size is known: it must
+// return a zero-length slice with capacity of at least the requested size.
+// A nil alloc allocates a fresh exact-size buffer, which single-hop chains
+// and final hops return directly to the caller.
 func applyDeltaStreaming(
 	pack *mmap.ReaderAt,
 	offset uint64,
 	deltaType ObjectType,
 	base []byte,
-	out []byte, // Pre-allocated output buffer (ignored when allocExact)
-	allocExact bool, // allocate a fresh exact-size output after reading the header
+	alloc func(n int) []byte,
 	maxObjectSize uint64, // reject targets/payloads beyond this bound; 0 disables
 ) ([]byte, error) {
 	// Parse the pack object header ourselves: its size field is the
@@ -1010,18 +743,15 @@ func applyDeltaStreaming(
 			targetSize, len(delta))
 	}
 
-	if allocExact {
-		// Caller asked for a fresh, exactly-sized output buffer. This lets
-		// single-hop chains (the common case) bypass the ping-pong arena
-		// and the detach copy: the result is returned directly.
+	var out []byte
+	if alloc == nil {
 		out = make([]byte, 0, targetSize)
-	} else if uint64(cap(out)) < targetSize {
-		// Verify that the output buffer is large enough for the target object.
-		return nil, &errDeltaOutputTooSmall{need: targetSize, have: cap(out)}
+	} else {
+		out = alloc(int(targetSize))[:0]
+		if uint64(cap(out)) < targetSize {
+			return nil, &errDeltaOutputTooSmall{need: targetSize, have: cap(out)}
+		}
 	}
-
-	// Initialize a zero-length slice to ensure no undefined content is present.
-	out = out[:0]
 
 	// Process the delta instructions, copying data from the base or inserting new data.
 	i := 0
