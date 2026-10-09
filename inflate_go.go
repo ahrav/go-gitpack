@@ -457,17 +457,17 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) error {
 	}
 
 	clear(d.precodeLens[:])
+	var preCount [precodeTableBits + 1]int
 	for i := 0; i < numPrecode; i++ {
 		n, ok := r.read(3)
 		if !ok {
 			return errDeflateTruncated
 		}
 		d.precodeLens[precodeOrder[i]] = uint8(n)
+		preCount[n]++
 	}
 
-	preBits, ok := d.buildTable(
-		d.precode[:], d.precodeLens[:], precodeTable, precodeTableBits, 7, false,
-	)
+	preBits, ok := d.buildPrecodeTable(&preCount)
 	if !ok {
 		return errDeflateBadData
 	}
@@ -999,13 +999,25 @@ func (d *goInflater) buildTableCounted(
 		return 0, false
 	}
 
+	// One pass over the histogram yields the symbol total, the longest
+	// length, the Kraft slack, and the canonical start offset of each
+	// length group (offsets[n] is where length-n symbols begin in sorted
+	// order).
+	var offsets [maxCodeLen + 2]int
 	used := 0
 	actualMax := 0
+	left := 1
 	for n := 1; n <= maxLen; n++ {
-		if count[n] != 0 {
-			used += count[n]
+		c := count[n]
+		left = (left << 1) - c
+		if left < 0 {
+			return 0, false
+		}
+		if c != 0 {
+			used += c
 			actualMax = n
 		}
+		offsets[n+1] = offsets[n] + c
 	}
 
 	if used == 0 {
@@ -1014,14 +1026,6 @@ func (d *goInflater) buildTableCounted(
 		}
 		table[0] = huffInvalid
 		return 0, true
-	}
-
-	left := 1
-	for n := 1; n <= maxLen; n++ {
-		left = (left << 1) - count[n]
-		if left < 0 {
-			return 0, false
-		}
 	}
 	if left != 0 && !(used == 1 && actualMax == 1) {
 		return 0, false
@@ -1049,18 +1053,27 @@ func (d *goInflater) buildTableCounted(
 	}
 
 	// Sort symbols by codeword length and then by symbol value. Canonical
-	// codewords have this same ordering.
-	var offsets [maxCodeLen + 1]int
-	for n := 1; n < actualMax; n++ {
-		offsets[n+1] = offsets[n] + count[n]
-	}
+	// codewords have this same ordering. Unused symbols cluster in long
+	// runs (control bytes, high bytes), so eight lengths are tested per
+	// word and an all-zero word is skipped outright.
 	nextOffset := offsets
-	for sym, n := range lens {
-		if n == 0 {
+	sym := 0
+	for ; sym+8 <= len(lens); sym += 8 {
+		if binary.LittleEndian.Uint64(lens[sym:]) == 0 {
 			continue
 		}
-		d.sortedEntries[nextOffset[n]] = decodeResults[sym]
-		nextOffset[n]++
+		for j := sym; j < sym+8; j++ {
+			if n := lens[j]; n != 0 {
+				d.sortedEntries[nextOffset[n]] = decodeResults[j]
+				nextOffset[n]++
+			}
+		}
+	}
+	for ; sym < len(lens); sym++ {
+		if n := lens[sym]; n != 0 {
+			d.sortedEntries[nextOffset[n]] = decodeResults[sym]
+			nextOffset[n]++
+		}
 	}
 
 	sorted := d.sortedEntries[:used]
@@ -1154,6 +1167,63 @@ func (d *goInflater) buildTableCounted(
 			remaining = count[codeBits]
 		}
 	}
+}
+
+// buildPrecodeTable fills d.precode from d.precodeLens, whose histogram the
+// caller supplies in count. Every precode length fits precodeTableBits, so
+// the table has no subtables and each codeword is written directly at its
+// bit-reversed positions. It returns the table's index width.
+func (d *goInflater) buildPrecodeTable(count *[precodeTableBits + 1]int) (int, bool) {
+	// Canonical codes: first[n] is the first codeword of length n.
+	var first [precodeTableBits + 2]int
+	used := 0
+	actualMax := 0
+	left := 1
+	code := 0
+	for n := 1; n <= precodeTableBits; n++ {
+		c := count[n]
+		left = (left << 1) - c
+		if left < 0 {
+			return 0, false
+		}
+		if c != 0 {
+			used += c
+			actualMax = n
+		}
+		first[n] = code
+		code = (code + c) << 1
+	}
+	if used == 0 {
+		return 0, false
+	}
+	if left != 0 {
+		if used != 1 || actualMax != 1 {
+			return 0, false
+		}
+		for sym, n := range d.precodeLens {
+			if n != 0 {
+				d.precode[0] = precodeDecodeResults[sym] + 0x101
+				d.precode[1] = huffInvalid
+				break
+			}
+		}
+		return 1, true
+	}
+
+	mainBits := actualMax
+	table := d.precode[:1<<mainBits]
+	for sym, n := range d.precodeLens {
+		if n == 0 {
+			continue
+		}
+		rev := int(bits.Reverse8(uint8(first[n]))) >> (8 - int(n))
+		first[n]++
+		entry := precodeDecodeResults[sym] + uint32(n)*0x101
+		for i := rev; i < len(table); i += 1 << n {
+			table[i] = entry
+		}
+	}
+	return mainBits, true
 }
 
 func nextReversedCode(codeword, codeBits int) int {
