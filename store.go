@@ -460,8 +460,13 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// configurations even though inflation populates the delta window.
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
-		// Promote to ARC cache on second access (delta window hit).
-		if len(d) <= maxCacheableSize {
+		// Promote to the ARC cache on second access (delta window hit).
+		// A pack-resident object under an enabled offset cache is already
+		// retained there by (pack, offset), so the ARC holds loose objects
+		// and, with the offset cache disabled, packed ones; the entry-count
+		// bound of the ARC otherwise pinned hundreds of megabytes of blobs
+		// the offset cache was already serving.
+		if len(d) <= maxCacheableSize && !inPack {
 			s.cache.Add(oid, cachedObj{data: d, typ: t})
 		}
 		b.Release()
