@@ -474,32 +474,56 @@ func textAgainstOldHunks(oldBytes, newBytes []byte) []AddedHunk {
 
 // renameLinesSimilar reports whether at least half the lines of the longer
 // side also occur in the other side, counting each line occurrence once.
-// Lines are compared by 64-bit FarmHash, so the check uses one map entry
-// per distinct old line at any size; a hash collision can only overstate
-// similarity by one line. An old side that is binary or larger than
-// MaxDiffSize is never similar.
+// Lines are compared by 64-bit FarmHash, so the check holds one map entry
+// per distinct old line and no per-line slice for either side, keeping its
+// footprint below the hashing diff that follows a match; a hash collision
+// can only overstate similarity by one line. An old side that is binary or
+// larger than MaxDiffSize is never similar.
 func renameLinesSimilar(oldBytes, newBytes []byte) bool {
 	if len(oldBytes) > MaxDiffSize || isBinary(oldBytes) {
 		return false
 	}
-	oldLines := tokenize(oldBytes)
-	newLines := tokenize(newBytes)
-	if len(oldLines) == 0 || len(newLines) == 0 {
-		return false
+	counts := make(map[uint64]int32, bytes.Count(oldBytes, nlByte)+1)
+	oldLines := 0
+	for line := range eachLine(oldBytes) {
+		counts[farm.Hash64(line)]++
+		oldLines++
 	}
-	counts := make(map[uint64]int32, len(oldLines))
-	for _, line := range oldLines {
-		counts[farm.Hash64([]byte(line))]++
-	}
-	matches := 0
-	for _, line := range newLines {
-		h := farm.Hash64([]byte(line))
+	newLines, matches := 0, 0
+	for line := range eachLine(newBytes) {
+		newLines++
+		h := farm.Hash64(line)
 		if counts[h] > 0 {
 			counts[h]--
 			matches++
 		}
 	}
-	return matches*2 >= max(len(oldLines), len(newLines))
+	if oldLines == 0 || newLines == 0 {
+		return false
+	}
+	return matches*2 >= max(oldLines, newLines)
+}
+
+// eachLine yields src's lines with the same splitting as tokenize (the
+// newline excluded, a trailing unterminated line included) as sub-slices
+// of src.
+func eachLine(src []byte) func(yield func([]byte) bool) {
+	return func(yield func([]byte) bool) {
+		rest := src
+		for {
+			i := bytes.IndexByte(rest, '\n')
+			if i < 0 {
+				break
+			}
+			if !yield(rest[:i]) {
+				return
+			}
+			rest = rest[i+1:]
+		}
+		if len(rest) > 0 {
+			yield(rest)
+		}
+	}
 }
 
 // loadBlob retrieves the raw content of a single object ID from store.

@@ -158,11 +158,13 @@ type HistoryScanner struct {
 	traceFile *os.File
 
 	// commits caches commit enumeration for repeated history walks. The
-	// cache is valid while the repository's ref tips equal commitsTips: the
-	// set reachable from the same tips is fixed by content addressing.
-	commitsMu   sync.Mutex
-	commits     []commitInfo
-	commitsTips []Hash
+	// cache is valid while the repository's ref tips equal commitsTips and
+	// its shallow boundary equals commitsShallow: the set reachable from the
+	// same tips through the same boundary is fixed by content addressing.
+	commitsMu      sync.Mutex
+	commits        []commitInfo
+	commitsTips    []Hash
+	commitsShallow []byte
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -879,9 +881,11 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 // pipeline uses walkCommitsFromRefs directly; this materialized form serves
 // the dedup pipeline (which needs a total order up front) and package tests.
 //
-// Every call reads the ref tips. A scanner reused after new commits land
-// re-walks the history on its next call, so a dedup scan sees the same
-// commits a fresh walk would.
+// Every call reads the ref tips and the shallow file. A scanner reused after
+// new commits land, or after a shallow clone is deepened, re-walks the
+// history on its next call, so a dedup scan sees the same commits a fresh
+// walk would. Objects that appear with neither change (a partial clone
+// fetching missing ancestors on demand) are outside this key.
 //
 // Copy semantics: the returned []commitInfo is a shallow copy of the internal
 // cache. This prevents callers from mutating the scanner's cached state (e.g.
@@ -894,21 +898,25 @@ func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
 		return nil, err
 	}
 	slices.SortFunc(tips, func(a, b Hash) int { return bytes.Compare(a[:], b[:]) })
+	shallow, err := os.ReadFile(filepath.Join(hs.gitDir, "shallow"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
 
 	hs.commitsMu.Lock()
 	defer hs.commitsMu.Unlock()
 	switch {
-	case hs.commits != nil && slices.Equal(tips, hs.commitsTips):
+	case hs.commits != nil && slices.Equal(tips, hs.commitsTips) && bytes.Equal(shallow, hs.commitsShallow):
 		// Cache hit.
 	case hs.graphData != nil && hs.commits == nil:
 		hs.commits = hs.loadFromGraph()
-		hs.commitsTips = tips
+		hs.commitsTips, hs.commitsShallow = tips, shallow
 	default:
 		commits, err := hs.loadFromRefs()
 		if err != nil {
 			return nil, err
 		}
-		hs.commits, hs.commitsTips = commits, tips
+		hs.commits, hs.commitsTips, hs.commitsShallow = commits, tips, shallow
 		hs.graphData = buildCommitGraphFromCommits(commits)
 		if hs.meta != nil {
 			hs.meta.attachGraph(hs.graphData)

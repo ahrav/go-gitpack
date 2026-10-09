@@ -819,6 +819,43 @@ func TestDiffHistoryHunksDedup_ConcurrentScansIndependent(t *testing.T) {
 	}
 }
 
+// Deepening a shallow clone adds ancestors without moving any ref tip, so
+// the commit cache must key on the shallow boundary as well.
+func TestDiffHistoryHunksDedup_ReusedScannerSeesDeepenedHistory(t *testing.T) {
+	b := newDedupRepoBuilder(t)
+	b.write("a.txt", "alpha\n")
+	b.commit("one")
+	b.write("b.txt", "bravo\n")
+	b.commit("two")
+	b.write("c.txt", "charlie\n")
+	b.commit("three")
+	b.finish()
+
+	cloneDir := filepath.Join(t.TempDir(), "shallow")
+	b.git("clone", "-q", "--depth", "1", "file://"+b.repoDir, cloneDir)
+	gitDir := filepath.Join(cloneDir, ".git")
+
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
+	require.NoError(t, err)
+	defer s.Close()
+	shallow := collectHunkScanWith(t, s)
+	tipOut, err := gitTestCommand(cloneDir, "rev-parse", "HEAD").Output()
+	require.NoError(t, err)
+	tip := strings.TrimSpace(string(tipOut))
+	for _, h := range shallow {
+		require.True(t, strings.HasPrefix(h, tip), "a depth-1 clone attributes every line to its tip: %s", h)
+	}
+
+	// Five objects stay below git's unpack limit, so the deepened history
+	// arrives as loose objects the store can read without reopening.
+	out, err := gitTestCommand(cloneDir, "fetch", "-q", "--deepen", "2").CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	want := collectHunkScan(t, gitDir, WithHunkLineDedup(true))
+	require.NotEqual(t, shallow, want, "the deepened clone attributes lines to their introducing commits")
+	require.Equal(t, want, collectHunkScanWith(t, s), "reused scanner must see the deepened history")
+}
+
 func TestDiffHistoryHunksDedup_ReusedScannerSeesNewCommits(t *testing.T) {
 	b := newDedupRepoBuilder(t)
 	b.write("a.txt", "alpha\nbravo\n")
