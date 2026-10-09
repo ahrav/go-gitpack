@@ -175,10 +175,22 @@ type goInflater struct {
 
 	sortedEntries [maxLitlenSyms]uint32
 
+	// small receives objects up to smallDecodeLimit bytes. The extra
+	// deflateFastOutputMargin bytes let the fast Huffman loops run to the
+	// end of the stream instead of handing the final margin to the
+	// symbol-at-a-time tail decoder; the result is then copied into the
+	// caller's exact-size destination.
+	small [smallDecodeLimit + deflateFastOutputMargin]byte
+
 	litlenBits uint8
 	offsetBits uint8
 	static     bool
 }
+
+// smallDecodeLimit bounds the objects decoded through goInflater.small.
+// Commits, tags, and most trees fall under it; the final copy costs far less
+// than tail-decoding the last deflateFastOutputMargin bytes.
+const smallDecodeLimit = 8 << 10
 
 var goInflaterPool = sync.Pool{
 	New: func() any { return new(goInflater) },
@@ -200,7 +212,17 @@ func inflatePackZlibGo(src, dst []byte) (int, error) {
 	}
 
 	d := goInflaterPool.Get().(*goInflater)
-	consumed, produced, err := d.inflateRaw(src[2:], dst)
+	var consumed, produced int
+	var err error
+	if len(dst) <= smallDecodeLimit {
+		scratch := d.small[:len(dst)+deflateFastOutputMargin]
+		consumed, produced, err = d.inflateRawN(src[2:], scratch, len(dst))
+		if err == nil {
+			copy(dst, scratch[:len(dst)])
+		}
+	} else {
+		consumed, produced, err = d.inflateRawN(src[2:], dst, len(dst))
+	}
 	goInflaterPool.Put(d)
 	if err != nil {
 		return 0, err
@@ -279,6 +301,15 @@ func bitMask(n uint) uint64 {
 }
 
 func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
+	return d.inflateRawN(src, dst, len(dst))
+}
+
+// inflateRawN decodes one DEFLATE stream into dst and requires it to produce
+// exactly want bytes, where want <= len(dst). Bytes between want and len(dst)
+// are writable slack: the fast loops bound their writes by len(dst), while a
+// stream that ends with more than want bytes is an overrun and one that ends
+// with fewer is short output.
+func (d *goInflater) inflateRawN(src, dst []byte, want int) (int, int, error) {
 	r := deflateBits{src: src}
 	out := 0
 
@@ -312,7 +343,7 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 			// the produced count reflects real output the way flate's
 			// streaming decode does.
 			take := min(n, len(src)-r.pos)
-			if take > len(dst)-out {
+			if take > want-out {
 				return 0, out, errDeflateOutputOverrun
 			}
 			copy(dst[out:out+take], src[r.pos:r.pos+take])
@@ -346,8 +377,13 @@ func (d *goInflater) inflateRaw(src, dst []byte) (int, int, error) {
 			return 0, out, errDeflateBadData
 		}
 
+		// Huffman blocks bound their writes by len(dst); a block that ends
+		// past want has overrun the declared size even when it fit the slack.
+		if out > want {
+			return 0, out, errDeflateOutputOverrun
+		}
 		if final {
-			if out != len(dst) {
+			if out < want {
 				return 0, out, errDeflateShortOutput
 			}
 			return r.consumed(), out, nil

@@ -56,9 +56,8 @@ type commitPayloadReader interface {
 // metaEntry is one cached attribution record: the parsed author identity and
 // the raw commit message.
 //
-// Lifetime: ai.Name and ai.Email alias the payload copy the entry was parsed
-// from (see parseAuthorHeader), and msg is a string conversion of the
-// message half, so each entry retains roughly one payload's worth of bytes.
+// Lifetime: ai.Name, ai.Email, and msg are views into the payload the entry
+// was parsed from, so each entry retains one payload's worth of bytes.
 // The cache is insert-only and unbounded — typical messages are ~200-700 B,
 // so even 10k commits cost only a few MB, comparable to the header bytes the
 // cache has always retained. Monorepo-scale histories (~1M+ commits) would
@@ -165,10 +164,7 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 		if err != nil {
 			return CommitMetadata{}, err
 		}
-		// string(msg) makes a fresh copy; slicing (or btostr) would work
-		// too since payload is caller-owned, but a copy keeps msg
-		// independent of the header bytes ai already pins.
-		entry = metaEntry{ai: ai, msg: string(msg)}
+		entry = metaEntry{ai: ai, msg: btostr(msg)}
 
 		// Promote to cache.
 		c.mu.Lock()
@@ -230,10 +226,11 @@ var (
 // parseAuthorHeader extracts the author's name, e-mail, and timestamp from
 // an uncompressed Git commit header.
 //
-// The function scans the input line-by-line looking for the first "author "
-// header. If no author line exists it falls back to the first "committer "
-// line, because some tooling (e.g. filter-branch, BFG) can produce commits
-// where the author line is stripped but the committer line survives.
+// The function scans header lines up to and including the first "committer "
+// line, taking the last "author " line seen before it. If no author line
+// exists it falls back to the committer line, because some tooling (e.g.
+// filter-branch, BFG) can produce commits where the author line is stripped
+// but the committer line survives.
 //
 // It does zero-allocation substring slicing wherever possible and returns a
 // descriptive error when the header is missing or malformed.
@@ -247,37 +244,29 @@ func parseAuthorHeader(hdr []byte) (AuthorInfo, error) {
 	authorEnd := -1
 	isAuthor := false
 
-	i := 0
-	for i < len(hdr) {
-		// We are at the beginning of a line if i == 0
-		// or the previous byte is a newline.
-		if i == 0 || (i > 0 && hdr[i-1] == '\n') {
-			lineStart := i
-
-			// Find the end of the current line.
-			lineEnd := i
-			for lineEnd < len(hdr) && hdr[lineEnd] != '\n' {
-				lineEnd++
-			}
-
-			line := hdr[lineStart:lineEnd]
-
-			switch {
-			case len(line) >= 7 && bytes.Equal(line[:7], []byte("author ")):
-				authorStart = lineStart + 7
-				authorEnd = lineEnd
-				isAuthor = true
-			case !isAuthor && len(line) >= 10 && bytes.Equal(line[:10], []byte("committer ")):
-				// Fallback to "committer " only if no "author " was seen yet.
-				authorStart = lineStart + 10
-				authorEnd = lineEnd
-				// Continue scanning – there might be a genuine author line later.
-			}
-
-			i = lineEnd + 1
-		} else {
-			i++
+	// Walk header lines. The committer line closes the identity section of
+	// the object format (gpgsig, mergetag, and encoding follow it, and their
+	// continuation lines are space-prefixed), so the walk ends there; the
+	// pre-payload header reader truncated at the same line.
+	for i := 0; i < len(hdr); {
+		lineEnd := len(hdr)
+		if nl := bytes.IndexByte(hdr[i:], '\n'); nl >= 0 {
+			lineEnd = i + nl
 		}
+		line := hdr[i:lineEnd]
+
+		if bytes.HasPrefix(line, []byte("author ")) {
+			authorStart = i + 7
+			authorEnd = lineEnd
+			isAuthor = true
+		} else if bytes.HasPrefix(line, []byte("committer ")) {
+			if !isAuthor {
+				authorStart = i + 10
+				authorEnd = lineEnd
+			}
+			break
+		}
+		i = lineEnd + 1
 	}
 
 	if authorStart == -1 {
