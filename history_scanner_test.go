@@ -757,13 +757,13 @@ func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
 	parentTree, err := scanner.firstParentTree(child)
 	require.NoError(t, err)
 
-	blobs := make(chan blobPairWork, 64)
+	blobs := make(chan []blobPairWork, 64)
 	stopCh := make(chan struct{})
 	require.NoError(t, scanner.emitCommitBlobPairs(child, parentTree, blobs, stopCh))
 	close(blobs)
 
 	var paths []string
-	for work := range blobs {
+	for _, work := range drainBlobPairBatches(blobs) {
 		paths = append(paths, work.path)
 		assert.False(t, work.newOID.IsZero(),
 			"deletion for %s must not be dispatched to stage 2", work.path)
@@ -799,12 +799,12 @@ func TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob(t *testing.T) {
 		parentTree, err := scanner.firstParentTree(c)
 		require.NoError(t, err)
 
-		blobs := make(chan blobPairWork, 64)
+		blobs := make(chan []blobPairWork, 64)
 		stopCh := make(chan struct{})
 		require.NoError(t, scanner.emitCommitBlobPairs(c, parentTree, blobs, stopCh))
 		close(blobs)
 
-		for w := range blobs {
+		for _, w := range drainBlobPairBatches(blobs) {
 			if !w.oldOID.IsZero() {
 				work, found = w, true
 			}

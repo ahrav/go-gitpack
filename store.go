@@ -35,6 +35,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"unsafe"
 
 	"golang.org/x/exp/mmap"
@@ -178,6 +179,11 @@ type store struct {
 	// intermediate hop. See offset_cache.go for why OID-keyed caches
 	// cannot intercept ofs-delta hops.
 	offCache *offsetCache
+
+	// whales holds the objects a running history scan prefetched because
+	// they are too large for offCache (see prefetchWhales). It is nil
+	// outside a scan.
+	whales atomic.Pointer[whaleCache]
 
 	// maxDeltaDepth limits delta chain traversal depth.
 	// The default value is 100 (see defaultMaxDeltaDepth).
@@ -434,6 +440,11 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	if inPack {
 		if data, typ, ok := s.offCache.get(p, off); ok {
 			return data, typ, nil
+		}
+		if w := s.whales.Load(); w != nil {
+			if data, typ, ok := w.get(p, off, nil); ok {
+				return data, typ, nil
+			}
 		}
 	}
 

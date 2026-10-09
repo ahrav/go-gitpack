@@ -448,7 +448,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// thousand commitInfo headers (~100 bytes each) buy full walk/tree
 		// decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
-		blobChan := make(chan blobPairWork, 4096)
+		blobChan := make(chan []blobPairWork, 1024)
 		stopCh := make(chan struct{})
 		var (
 			stopOnce sync.Once
@@ -456,6 +456,11 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			blobWG   sync.WaitGroup
 			firstErr error
 		)
+		// Whale blobs inflate for tens of milliseconds each and the walk
+		// may reach them last; inflating them from the start overlaps that
+		// work with the rest of the scan (see prefetchWhales).
+		waitWhales := hs.store.prefetchWhales(stopCh)
+		defer waitWhales()
 		setError := func(err error) {
 			if err == nil {
 				return
@@ -506,13 +511,15 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 					select {
 					case <-stopCh:
 						return
-					case work, ok := <-blobChan:
+					case batch, ok := <-blobChan:
 						if !ok {
 							return
 						}
-						if err := hs.streamBlobPairHunks(work, fn); err != nil {
-							setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
-							return
+						for _, work := range batch {
+							if err := hs.streamBlobPairHunks(work, fn); err != nil {
+								setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
+								return
+							}
 						}
 					}
 				}
@@ -744,15 +751,60 @@ const (
 // emits inline, so it applies exact-OID suppression but not directory-rename
 // inference: inference needs every unsuppressed candidate in hand before it can
 // pair any of them, which is exactly the retention the budget refused.
-func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- blobPairWork, stopCh <-chan struct{}) error {
-	emit := func(work blobPairWork) error {
-		select {
-		case <-stopCh:
-			return errScanAborted
-		case blobs <- work:
-			return nil
-		}
+func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- []blobPairWork, stopCh <-chan struct{}) error {
+	e := blobPairEmitter{out: blobs, stopCh: stopCh}
+	if err := hs.emitCommitBlobPairsTo(c, parentTree, e.emit, stopCh); err != nil {
+		return err
 	}
+	return e.flush()
+}
+
+// blobPairBatchSize is the largest number of stage-2 records one channel
+// send carries. Measured on the trufflehog history (63,729 pairs over 6,164
+// commits), a batch of this size holds a whole commit in the common case
+// while a whale commit is split into full batches. With one record per send,
+// sixteen blob workers and eight tree workers contend on the channel's
+// single lock for every record; the mutex profiler showed that lock wait as
+// the pipeline's largest blocking source at 16 workers.
+const blobPairBatchSize = 32
+
+// blobPairEmitter accumulates stage-2 records into batches of at most
+// blobPairBatchSize for the hand-off channel.
+type blobPairEmitter struct {
+	out    chan<- []blobPairWork
+	stopCh <-chan struct{}
+	batch  []blobPairWork
+}
+
+func (e *blobPairEmitter) emit(work blobPairWork) error {
+	if e.batch == nil {
+		e.batch = make([]blobPairWork, 0, blobPairBatchSize)
+	}
+	e.batch = append(e.batch, work)
+	if len(e.batch) == blobPairBatchSize {
+		return e.flush()
+	}
+	return nil
+}
+
+// flush sends the pending partial batch.
+func (e *blobPairEmitter) flush() error {
+	if len(e.batch) == 0 {
+		return nil
+	}
+	batch := e.batch
+	e.batch = nil
+	select {
+	case <-e.stopCh:
+		return errScanAborted
+	case e.out <- batch:
+		return nil
+	}
+}
+
+// emitCommitBlobPairsTo performs the tree diff of emitCommitBlobPairs and
+// hands each stage-2 record to emit.
+func (hs *HistoryScanner) emitCommitBlobPairsTo(c commitInfo, parentTree Hash, emit func(blobPairWork) error, stopCh <-chan struct{}) error {
 
 	// A zero parent tree (root commit, shallow history) has no old side:
 	// every entry is an addition and no deletion can exist, so no rename is

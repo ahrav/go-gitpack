@@ -251,7 +251,7 @@ func TestEmitCommitBlobPairs_RootWalkAbortsOnNonBlobEntries(t *testing.T) {
 
 	// Buffered so a hypothetical emit could not block; the walk must abort
 	// before producing anything regardless.
-	blobs := make(chan blobPairWork, 8)
+	blobs := make(chan []blobPairWork, 8)
 	err = scanner.emitCommitBlobPairs(root, Hash{}, blobs, stopCh)
 
 	require.ErrorIs(t, err, errScanAborted,

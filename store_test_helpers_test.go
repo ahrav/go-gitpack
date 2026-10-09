@@ -488,3 +488,13 @@ func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]b
 func OpenForTesting(dir string) (*store, error) {
 	return open(dir)
 }
+
+// drainBlobPairBatches flattens a closed stage-2 hand-off channel into the
+// records it carried, in send order.
+func drainBlobPairBatches(blobs <-chan []blobPairWork) []blobPairWork {
+	var out []blobPairWork
+	for batch := range blobs {
+		out = append(out, batch...)
+	}
+	return out
+}

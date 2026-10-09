@@ -14,7 +14,9 @@
 package objstore
 
 import (
+	"cmp"
 	"os"
+	"slices"
 	"strconv"
 	"sync"
 
@@ -193,4 +195,161 @@ func (c *offsetCache) add(pack *mmap.ReaderAt, off uint64, data []byte, typ Obje
 		}
 	}
 	s.mu.Unlock()
+}
+
+// Whale objects: the largest pack entries, which the offset cache refuses
+// (maxCacheableSize) and which inflate in tens of milliseconds each. A
+// history walk discovers them in commit order, so when one surfaces near the
+// end of the walk a single worker inflates it while every other worker has
+// run out of work, and that inflation becomes the scan's tail. The prefetch
+// below starts those inflations at scan start, biggest first, so they overlap
+// with the rest of the walk, and parks the results where store.get finds
+// them on the miss path.
+
+// whaleMinCompressedBytes is the compressed pack-entry size at which an
+// object is prefetched. An entry of this size holds several MiB of output
+// and inflates in milliseconds, which is the scale at which a late discovery
+// is visible in the scan's wall time.
+const whaleMinCompressedBytes = 2 << 20
+
+// whalePrefetchBudget bounds the inflated bytes the prefetch retains at once.
+// Candidates beyond the budget are left to the normal miss path.
+const whalePrefetchBudget = 256 << 20
+
+// whaleCandidate names one pack entry selected for prefetch.
+type whaleCandidate struct {
+	pack       *mmap.ReaderAt
+	off        uint64
+	compressed uint64
+}
+
+// whaleEntry is one prefetched object. done closes once data and typ are
+// final; a reader that arrives first waits on it rather than inflating the
+// same object a second time.
+type whaleEntry struct {
+	done chan struct{}
+	data []byte
+	typ  ObjectType
+	err  error
+}
+
+// whaleCache holds prefetched whale objects for the duration of one scan.
+type whaleCache struct {
+	mu sync.Mutex
+	m  map[offCacheKey]*whaleEntry
+}
+
+// get returns the prefetched object at (pack, off), waiting for an inflation
+// in progress. stop aborts the wait.
+func (c *whaleCache) get(pack *mmap.ReaderAt, off uint64, stop <-chan struct{}) ([]byte, ObjectType, bool) {
+	if c == nil {
+		return nil, ObjBad, false
+	}
+	c.mu.Lock()
+	e := c.m[offCacheKey{pack, off}]
+	c.mu.Unlock()
+	if e == nil {
+		return nil, ObjBad, false
+	}
+	select {
+	case <-e.done:
+	case <-stop:
+		return nil, ObjBad, false
+	}
+	if e.err != nil {
+		return nil, ObjBad, false
+	}
+	return e.data, e.typ, true
+}
+
+// whaleCandidates lists the pack entries whose compressed size is at least
+// whaleMinCompressedBytes, largest first. Compressed size is the distance to
+// the next entry in pack order, so the scan touches only the index.
+func (s *store) whaleCandidates() []whaleCandidate {
+	var out []whaleCandidate
+	for _, f := range s.packs {
+		offs := f.sortedOffsets
+		if len(offs) == 0 {
+			continue
+		}
+		// The pack ends with a 20-byte trailer checksum.
+		end := uint64(f.pack.Len())
+		if end >= 20 {
+			end -= 20
+		}
+		for i, off := range offs {
+			next := end
+			if i+1 < len(offs) {
+				next = offs[i+1]
+			}
+			if next <= off {
+				continue
+			}
+			if size := next - off; size >= whaleMinCompressedBytes {
+				out = append(out, whaleCandidate{pack: f.pack, off: off, compressed: size})
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b whaleCandidate) int {
+		return cmp.Compare(b.compressed, a.compressed)
+	})
+	return out
+}
+
+// prefetchWhales inflates the pack's whale blobs in the background, largest
+// first, until the budget is spent or stop closes. The returned wait function
+// blocks until the prefetch goroutine has exited; callers invoke it before
+// releasing the cache so no inflation outlives the scan.
+func (s *store) prefetchWhales(stop <-chan struct{}) (wait func()) {
+	cands := s.whaleCandidates()
+	if len(cands) == 0 {
+		return func() {}
+	}
+	c := &whaleCache{m: make(map[offCacheKey]*whaleEntry, len(cands))}
+	var budget uint64 = whalePrefetchBudget
+	var selected []whaleCandidate
+	for _, cand := range cands {
+		typ, hdrLen, err := peekObjectType(cand.pack, cand.off)
+		if err != nil || typ != ObjBlob || hdrLen <= 0 {
+			continue
+		}
+		var hdr [32]byte
+		n, _ := cand.pack.ReadAt(hdr[:], int64(cand.off))
+		_, size, _ := parseObjectHeaderUnsafe(hdr[:n])
+		if size > budget {
+			continue
+		}
+		budget -= size
+		c.m[offCacheKey{cand.pack, cand.off}] = &whaleEntry{done: make(chan struct{})}
+		selected = append(selected, cand)
+	}
+	if len(selected) == 0 {
+		return func() {}
+	}
+	s.whales.Store(c)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for _, cand := range selected {
+			e := c.m[offCacheKey{cand.pack, cand.off}]
+			select {
+			case <-stop:
+				e.err = errScanAborted
+				close(e.done)
+				continue
+			default:
+			}
+			_, data, err := readRawObject(cand.pack, cand.off)
+			if err == nil {
+				err = s.verifyPackObjectCRCIfEnabled(cand.pack, cand.off, Hash{})
+			}
+			e.data, e.typ, e.err = data, ObjBlob, err
+			close(e.done)
+		}
+	}()
+	return func() {
+		<-done
+		s.whales.Store((*whaleCache)(nil))
+	}
 }
