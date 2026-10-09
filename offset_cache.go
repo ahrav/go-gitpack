@@ -21,7 +21,7 @@ import (
 
 // offsetCacheShards must be a power of two; offsets are distributed by their
 // low bits (pack entries are byte-aligned, so low bits are well mixed).
-const offsetCacheShards = 32
+const offsetCacheShards = 256
 
 // defaultOffsetCacheBudget bounds the total bytes retained across all shards.
 const defaultOffsetCacheBudget = 256 << 20

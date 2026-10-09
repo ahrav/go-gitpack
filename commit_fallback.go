@@ -128,6 +128,35 @@ func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) erro
 	// branches is visited once.
 	worker := func() {
 		var local []Hash
+		// Commits visit in batches under visitMu: one lock acquisition per
+		// walkVisitBatch commits instead of one per commit.
+		pending := make([]commitInfo, 0, walkVisitBatch)
+		flush := func() {
+			if len(pending) == 0 {
+				return
+			}
+			var err error
+			visitMu.Lock()
+			for i := range pending {
+				if err = visit(pending[i]); err != nil {
+					break
+				}
+			}
+			visitMu.Unlock()
+			pending = pending[:0]
+			if err != nil {
+				fail(err)
+			}
+		}
+		collect := func(info commitInfo) error {
+			pending = append(pending, info)
+			if len(pending) == walkVisitBatch {
+				flush()
+			}
+			return nil
+		}
+		var localMu sync.Mutex
+		defer flush()
 		for {
 			if len(local) == 0 {
 				mu.Lock()
@@ -154,7 +183,7 @@ func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) erro
 			oid := local[n]
 			local = local[:n]
 			if seen.mark(oid) {
-				hs.walkOne(oid, visit, &visitMu, func(next Hash) {
+				hs.walkOne(oid, collect, &localMu, func(next Hash) {
 					if !seen.contains(next) {
 						local = append(local, next)
 					}
@@ -203,6 +232,9 @@ const (
 	// walkSeenShards is the number of locks the walk's seen set is spread
 	// over; a power of two.
 	walkSeenShards = 64
+	// walkVisitBatch is how many commits a worker collects before calling
+	// visit for them under the visit mutex.
+	walkVisitBatch = 64
 )
 
 // walkSeen is a sharded set of visited OIDs for the parallel ref walk.
