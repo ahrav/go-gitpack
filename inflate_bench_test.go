@@ -2,7 +2,7 @@ package objstore
 
 import (
 	"bytes"
-	"embed"
+	_ "embed"
 	"fmt"
 	"io"
 	"testing"
@@ -10,8 +10,8 @@ import (
 	"github.com/klauspost/compress/flate"
 )
 
-//go:embed README.md blog/md/*.md
-var inflateBenchmarkText embed.FS
+//go:embed README.md
+var inflateBenchmarkText []byte
 
 func BenchmarkInflateOneShot(b *testing.B) {
 	sizes := []int{64, 512, 4 << 10, 16 << 10, 64 << 10, 1 << 20}
@@ -75,22 +75,7 @@ func BenchmarkInflateDynamicTables(b *testing.B) {
 }
 
 func makeBenchmarkText(n int) []byte {
-	names := [...]string{
-		"README.md",
-		"blog/md/part1.md",
-		"blog/md/part2.md",
-		"blog/md/part3.md",
-		"blog/md/part4.md",
-		"blog/md/part5.md",
-	}
-	var corpus []byte
-	for _, name := range names {
-		data, err := inflateBenchmarkText.ReadFile(name)
-		if err != nil {
-			panic(err)
-		}
-		corpus = append(corpus, data...)
-	}
+	corpus := inflateBenchmarkText
 	return bytes.Repeat(corpus, (n+len(corpus)-1)/len(corpus))[:n]
 }
 
