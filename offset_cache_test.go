@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+	"golang.org/x/exp/mmap"
 )
 
 // TestOffsetCacheBudgetRejectsOversizedEntries verifies that add honors the
@@ -149,4 +150,79 @@ func TestWhaleCandidatesEmptyForSmallPacks(t *testing.T) {
 	wait := s.prefetchWhales(make(chan struct{}))
 	wait()
 	require.Nil(t, s.whales.Load())
+}
+
+// TestOffTableMatchesMapOracle drives the open-addressing table with random
+// puts, gets, and evictions across growth and backward-shift deletions and
+// checks every answer against a plain map.
+func TestOffTableMatchesMapOracle(t *testing.T) {
+	t.Parallel()
+	packA := &mmap.ReaderAt{}
+	packB := &mmap.ReaderAt{}
+	var tbl offTable
+	tbl.rng = 0x1234567
+	oracle := map[offCacheKey][]byte{}
+	rng := uint64(42)
+	next := func() uint64 {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		return rng
+	}
+	for step := 0; step < 200000; step++ {
+		pack := packA
+		if next()%3 == 0 {
+			pack = packB
+		}
+		off := next() % 4096 // dense offsets force collisions and shared offsets across packs
+		key := offCacheKey{pack, off}
+		switch next() % 4 {
+		case 0, 1:
+			data := []byte{byte(off), byte(step)}
+			_, replaced := tbl.put(pack, off, offValue{pack: pack, data: data, typ: ObjBlob})
+			_, had := oracle[key]
+			require.Equal(t, had, replaced, "step %d replace flag", step)
+			oracle[key] = data
+		case 2:
+			v, ok := tbl.get(pack, off)
+			want, had := oracle[key]
+			require.Equal(t, had, ok, "step %d presence", step)
+			if ok {
+				require.Equal(t, want, v.data, "step %d value", step)
+				require.Same(t, pack, v.pack)
+			}
+		case 3:
+			if len(oracle) == 0 {
+				continue
+			}
+			v, ok := tbl.evictOne(pack, off)
+			if !ok {
+				// Only the protected key remains.
+				require.LessOrEqual(t, len(oracle), 1)
+				continue
+			}
+			victim := offCacheKey{v.pack, 0}
+			found := false
+			for k, d := range oracle {
+				if k.pack == v.pack && string(d) == string(v.data) {
+					if got, ok := tbl.get(k.pack, k.off); !ok || string(got.data) != string(d) {
+						victim = k
+						found = true
+						break
+					}
+				}
+			}
+			require.True(t, found, "step %d: evicted value must have been present and now absent", step)
+			require.False(t, victim == key, "step %d: the protected key must not be evicted", step)
+			delete(oracle, victim)
+		}
+		require.Equal(t, len(oracle), tbl.n, "step %d count", step)
+	}
+	// Every surviving key is still reachable after all the shifting.
+	for k, d := range oracle {
+		v, ok := tbl.get(k.pack, k.off)
+		require.True(t, ok)
+		require.Equal(t, d, v.data)
+	}
+	require.LessOrEqual(t, 2*tbl.n, len(tbl.keys), "load factor stays at or below one half")
 }

@@ -15,6 +15,7 @@ package objstore
 
 import (
 	"cmp"
+	"math/bits"
 	"os"
 	"slices"
 	"strconv"
@@ -59,14 +60,165 @@ type offCacheKey struct {
 
 type offsetCacheShard struct {
 	mu   sync.Mutex
-	m    map[offCacheKey]cachedObj
+	m    offTable
 	used int
 
 	// _ pads each shard to its own cache line (and covers the adjacent-line
-	// prefetcher). Without padding, three 24-byte shards share every 64-byte
-	// line, so mutex traffic on distinct shards bounces the same lines and
-	// defeats the contention reduction the sharding exists to provide.
-	_ [128 - 24]byte
+	// prefetcher). Without padding, shards share 64-byte lines, so mutex
+	// traffic on distinct shards bounces the same lines and defeats the
+	// contention reduction the sharding exists to provide.
+	_ [128 - 64]byte
+}
+
+// offTable is an open-addressing hash table from pack offset to cached
+// object, specialized for this cache: one probe reads the key and the value
+// from adjacent arrays, so a lookup costs about one cache miss where the
+// generic map's control groups and 48-byte slots cost two or three. perf
+// attributed 4% of scan cycles to map probes at IPC 0.14 before this table.
+//
+// keys holds off+1 so zero marks an empty slot. Two packs may share an
+// offset, so a key match also compares the pack handle and a mismatch is
+// treated as a collision. Deletion uses backward-shift so no tombstones
+// accumulate; the load factor stays at or below one half.
+type offTable struct {
+	keys []uint64
+	vals []offValue
+	n    int
+	rng  uint64
+}
+
+type offValue struct {
+	pack *mmap.ReaderAt
+	data []byte
+	typ  ObjectType
+}
+
+const offTableMinSlots = 256
+
+func (t *offTable) slot(off uint64) int {
+	return int((off * 0x9E3779B97F4A7C15) >> (64 - bits.Len(uint(len(t.keys))-1)))
+}
+
+func (t *offTable) find(pack *mmap.ReaderAt, off uint64) int {
+	if len(t.keys) == 0 {
+		return -1
+	}
+	mask := len(t.keys) - 1
+	i := t.slot(off)
+	for {
+		k := t.keys[i]
+		if k == 0 {
+			return -1
+		}
+		if k == off+1 && t.vals[i].pack == pack {
+			return i
+		}
+		i = (i + 1) & mask
+	}
+}
+
+// get returns the cached object at (pack, off).
+func (t *offTable) get(pack *mmap.ReaderAt, off uint64) (offValue, bool) {
+	i := t.find(pack, off)
+	if i < 0 {
+		return offValue{}, false
+	}
+	return t.vals[i], true
+}
+
+// put inserts or replaces (pack, off) and returns the replaced value.
+func (t *offTable) put(pack *mmap.ReaderAt, off uint64, v offValue) (old offValue, replaced bool) {
+	if i := t.find(pack, off); i >= 0 {
+		old = t.vals[i]
+		t.vals[i] = v
+		return old, true
+	}
+	if 2*(t.n+1) > len(t.keys) {
+		t.grow()
+	}
+	mask := len(t.keys) - 1
+	i := t.slot(off)
+	for t.keys[i] != 0 {
+		i = (i + 1) & mask
+	}
+	t.keys[i] = off + 1
+	t.vals[i] = v
+	t.n++
+	return offValue{}, false
+}
+
+func (t *offTable) grow() {
+	size := offTableMinSlots
+	for size < 4*(t.n+1) {
+		size <<= 1
+	}
+	oldKeys, oldVals := t.keys, t.vals
+	t.keys = make([]uint64, size)
+	t.vals = make([]offValue, size)
+	mask := size - 1
+	for j, k := range oldKeys {
+		if k == 0 {
+			continue
+		}
+		i := t.slot(k - 1)
+		for t.keys[i] != 0 {
+			i = (i + 1) & mask
+		}
+		t.keys[i] = k
+		t.vals[i] = oldVals[j]
+	}
+}
+
+// remove deletes slot i with backward shift, keeping every probe chain
+// intact.
+func (t *offTable) remove(i int) {
+	mask := len(t.keys) - 1
+	j := i
+	for {
+		j = (j + 1) & mask
+		k := t.keys[j]
+		if k == 0 {
+			break
+		}
+		home := t.slot(k - 1)
+		// Slot j may move to i when its home position does not lie in the
+		// cyclic range (i, j].
+		if (i <= j && (home <= i || home > j)) || (i > j && home <= i && home > j) {
+			t.keys[i] = k
+			t.vals[i] = t.vals[j]
+			i = j
+		}
+	}
+	t.keys[i] = 0
+	t.vals[i] = offValue{}
+	t.n--
+}
+
+// evictOne removes an arbitrary entry other than keep and returns it.
+// Victim choice is pseudo-random, which the cache's approximate-replacement
+// contract already promises; random replacement measured better here than
+// FIFO or CLOCK because the walk's repeats are long-range.
+func (t *offTable) evictOne(keepPack *mmap.ReaderAt, keepOff uint64) (offValue, bool) {
+	if t.n == 0 || (t.n == 1 && t.find(keepPack, keepOff) >= 0) {
+		return offValue{}, false
+	}
+	mask := len(t.keys) - 1
+	t.rng ^= t.rng << 13
+	t.rng ^= t.rng >> 7
+	t.rng ^= t.rng << 17
+	i := int(t.rng) & mask
+	for {
+		if k := t.keys[i]; k != 0 && !(k == keepOff+1 && t.vals[i].pack == keepPack) {
+			v := t.vals[i]
+			t.remove(i)
+			return v, true
+		}
+		i = (i + 1) & mask
+	}
+}
+
+func (t *offTable) reset() {
+	t.keys, t.vals, t.n = nil, nil, 0
 }
 
 // offsetCache is safe for concurrent use. Eviction is approximate: when a
@@ -81,7 +233,7 @@ type offsetCache struct {
 func newOffsetCache() *offsetCache {
 	c := &offsetCache{}
 	for i := range c.shards {
-		c.shards[i].m = make(map[offCacheKey]cachedObj, 256)
+		c.shards[i].m.rng = 0x9E3779B97F4A7C15 ^ uint64(i+1)
 	}
 	// Route through setBudget so the environment override shares the
 	// exact rounding and disable semantics of WithOffsetCacheBudget.
@@ -121,7 +273,7 @@ func (c *offsetCache) clear() {
 	for i := range c.shards {
 		s := &c.shards[i]
 		s.mu.Lock()
-		s.m = make(map[offCacheKey]cachedObj)
+		s.m.reset()
 		s.used = 0
 		s.mu.Unlock()
 	}
@@ -148,12 +300,12 @@ func (c *offsetCache) get(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, 
 	}
 	s := c.shard(off)
 	s.mu.Lock()
-	obj, ok := s.m[offCacheKey{pack, off}]
+	v, ok := s.m.get(pack, off)
 	s.mu.Unlock()
 	if !ok {
 		return nil, ObjBad, false
 	}
-	return obj.data, obj.typ, true
+	return v.data, v.typ, true
 }
 
 // add stores a materialized object under (pack, off). The cache takes shared
@@ -175,24 +327,17 @@ func (c *offsetCache) add(pack *mmap.ReaderAt, off uint64, data []byte, typ Obje
 		return
 	}
 	s := c.shard(off)
-	key := offCacheKey{pack, off}
 	s.mu.Lock()
-	if old, ok := s.m[key]; ok {
+	if old, replaced := s.m.put(pack, off, offValue{pack: pack, data: data, typ: typ}); replaced {
 		s.used -= len(old.data)
 	}
-	s.m[key] = cachedObj{data: data, typ: typ}
 	s.used += len(data)
-	if s.used > c.budgetPerShard {
-		for k, v := range s.m {
-			if k == key {
-				continue
-			}
-			delete(s.m, k)
-			s.used -= len(v.data)
-			if s.used <= c.budgetPerShard {
-				break
-			}
+	for s.used > c.budgetPerShard {
+		v, ok := s.m.evictOne(pack, off)
+		if !ok {
+			break
 		}
+		s.used -= len(v.data)
 	}
 	s.mu.Unlock()
 }

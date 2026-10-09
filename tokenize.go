@@ -30,14 +30,13 @@ func tokenizeInto(dst []string, src []byte) []string {
 		return dst[:0]
 	}
 
-	need := bytes.Count(src, nlByte) + 1
-	var lines []string
-	if cap(dst) >= need {
-		lines = dst[:need]
-	} else {
-		lines = make([]string, need)
+	// A fresh table is sized exactly, since a retained pure-addition result
+	// keeps it alive; a recycled table grows by append and keeps its
+	// capacity for the next split, which saves the counting pass.
+	lines := dst[:0]
+	if dst == nil {
+		lines = make([]string, 0, bytes.Count(src, nlByte)+1)
 	}
-	n := 0
 	start := 0 // start of the current line
 	i := 0
 	for ; i+64 <= len(src); i += 64 {
@@ -52,24 +51,21 @@ func tokenizeInto(dst []string, src []byte) []string {
 			newlineMask8(*(*uint64)(unsafe.Add(p, 56)))<<56
 		for m != 0 {
 			nl := i + bits.TrailingZeros64(m)
-			lines[n] = btostr(src[start:nl])
-			n++
+			lines = append(lines, btostr(src[start:nl]))
 			start = nl + 1
 			m &= m - 1
 		}
 	}
 	for ; i < len(src); i++ {
 		if src[i] == '\n' {
-			lines[n] = btostr(src[start:i])
-			n++
+			lines = append(lines, btostr(src[start:i]))
 			start = i + 1
 		}
 	}
 	if start < len(src) {
-		lines[n] = btostr(src[start:])
-		n++
+		lines = append(lines, btostr(src[start:]))
 	}
-	return lines[:n]
+	return lines
 }
 
 // newlineMask8 returns, in its low eight bits, one bit per byte of the

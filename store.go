@@ -667,6 +667,10 @@ func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 	return nil, 0, false
 }
 
+// maxOneShotCommitBytes bounds the commit objects readCommitHeader inflates
+// whole; larger commits (very long messages) stream and stop at the header.
+const maxOneShotCommitBytes = 64 << 10
+
 // readCommitHeader reads the header portion of a commit object.
 // The method returns the raw header up to and including the first author or committer line.
 //
@@ -690,12 +694,30 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		return nil, err
 	}
 	if typ == ObjCommit {
+		// A commit object of ordinary size is inflated whole in one shot into
+		// a pooled scratch buffer and trimmed to its header: commits average
+		// well under a kilobyte, so the streaming decoder's per-stream setup
+		// cost more than inflating the message body it avoided. Commits
+		// above the scratch bound keep the streaming path, which stops at
+		// the committer line.
+		var hdr [32]byte
+		n, _ := p.ReadAt(hdr[:], int64(off))
+		if _, size, _ := parseObjectHeaderUnsafe(hdr[:n]); size <= maxOneShotCommitBytes {
+			scratch := getDeltaScratch(int(size))
+			defer putDeltaScratch(scratch)
+			buf := scratch.buf[:size]
+			defer runtime.KeepAlive(p)
+			if err := inflateExact(p, int64(off)+int64(hdrLen), buf); err != nil {
+				return nil, err
+			}
+			return trimCommitHeader(buf)
+		}
 		off += uint64(hdrLen)
 
-		// Decompress only the beginning of the object, typically less than 512 bytes.
-		// openCommitHeaderStream is platform-abstracted: zero-copy over the
-		// mapped bytes on mmap-backed platforms, SectionReader-based zlib on
-		// the ReaderAt fallback build.
+		// Decompress only the beginning of the object. openCommitHeaderStream
+		// is platform-abstracted: zero-copy over the mapped bytes on
+		// mmap-backed platforms, SectionReader-based zlib on the ReaderAt
+		// fallback build.
 		defer runtime.KeepAlive(p)
 		zr, release, err := openCommitHeaderStream(p, int64(off))
 		if err != nil {
