@@ -7,6 +7,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/mmap"
@@ -351,4 +352,27 @@ func TestWhalePrefetchSharedAcrossConcurrentScans(t *testing.T) {
 
 	waitB()
 	require.Nil(t, s.whales.Load(), "the last scan releases the cache")
+}
+
+// TestOffsetCacheShardFillsWholeCacheLines pins the shard size to a multiple
+// of the 64-byte cache line, so adjacent shards in the shards array never
+// share a line and mutex traffic on one shard stays off its neighbors.
+func TestOffsetCacheShardFillsWholeCacheLines(t *testing.T) {
+	size := unsafe.Sizeof(offsetCacheShard{})
+	require.Zero(t, size%64, "offsetCacheShard is %d bytes; adjust its padding to a multiple of 64", size)
+	require.Equal(t, uintptr(128), size, "offsetCacheShard spans two cache lines")
+}
+
+// TestWhalePrefetchReleaseIsIdempotent pins that calling one scan's wait
+// function twice releases that scan's share once: the second call is a no-op
+// rather than a second decrement that would close an already-closed channel.
+func TestWhalePrefetchReleaseIsIdempotent(t *testing.T) {
+	s, _ := openWhaleStore(t)
+	waitA := s.prefetchWhales()
+	waitB := s.prefetchWhales()
+	waitA()
+	waitA()
+	require.NotNil(t, s.whales.Load(), "a repeated release by one scan leaves the other scan's share intact")
+	waitB()
+	require.Nil(t, s.whales.Load())
 }

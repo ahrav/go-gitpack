@@ -67,8 +67,10 @@ type offsetCacheShard struct {
 	// _ pads each shard to its own cache line (and covers the adjacent-line
 	// prefetcher). Without padding, shards share 64-byte lines, so mutex
 	// traffic on distinct shards bounces the same lines and defeats the
-	// contention reduction the sharding exists to provide.
-	_ [128 - 64]byte
+	// contention reduction the sharding exists to provide. mu, m, and used
+	// occupy 80 bytes; TestOffsetCacheShardFillsWholeCacheLines pins the
+	// total at 128.
+	_ [128 - 80]byte
 }
 
 // offTable is an open-addressing hash table from pack offset to cached
@@ -494,9 +496,9 @@ type whalePrefetch struct {
 }
 
 // prefetchWhales starts, or joins, the store's background whale prefetch.
-// The returned wait function releases this scan's share; the last release
-// stops the goroutine and blocks until it has exited. A disabled offset
-// cache skips the prefetch.
+// The returned wait function releases this scan's share once, so repeated
+// calls are no-ops; the last release stops the goroutine and blocks until
+// it has exited. A disabled offset cache skips the prefetch.
 func (s *store) prefetchWhales() (wait func()) {
 	if !s.offCache.enabled() {
 		return func() {}
@@ -506,7 +508,7 @@ func (s *store) prefetchWhales() (wait func()) {
 	defer p.mu.Unlock()
 	if p.refs > 0 {
 		p.refs++
-		return s.releaseWhales
+		return sync.OnceFunc(s.releaseWhales)
 	}
 	c := s.newWhaleCache()
 	if c == nil {
@@ -520,7 +522,7 @@ func (s *store) prefetchWhales() (wait func()) {
 		defer close(done)
 		c.run(stop)
 	}(p.stop, p.done)
-	return s.releaseWhales
+	return sync.OnceFunc(s.releaseWhales)
 }
 
 // releaseWhales drops one scan's share of the whale cache. The last release
