@@ -69,10 +69,12 @@ func TestPairCacheAdd_CopiesLineData(t *testing.T) {
 	runtime.KeepAlive(backing)
 }
 
-// TestPairCacheAdd_ReturnsStoredHunks proves add hands back exactly the slice
-// it stored. Callers deliver the returned slice to consumers, so this is what
-// keeps an in-flight hunk from retaining the whole decompressed blob its lines
-// were tokenized from.
+// TestPairCacheAdd_ReturnsStoredHunks proves add hands back the same content
+// the cache stores, with lines that own their bytes. Callers deliver the
+// returned slice to consumers, so this is what keeps an in-flight hunk from
+// retaining the whole decompressed blob its lines were tokenized from. The
+// entry is pointer-free, so a hit rebuilds its own []AddedHunk view rather
+// than returning the delivered slice.
 func TestPairCacheAdd_ReturnsStoredHunks(t *testing.T) {
 	backing := make([]byte, 1<<20)
 	for i := range backing {
@@ -86,10 +88,11 @@ func TestPairCacheAdd_ReturnsStoredHunks(t *testing.T) {
 
 	stored, ok := c.get(k)
 	require.True(t, ok)
-	require.Equal(t, unsafe.SliceData(stored), unsafe.SliceData(returned),
-		"add must return the stored slice so deliveries and cache hits share one copy")
+	require.Equal(t, stored, returned, "a cache hit reproduces the content add returned")
 	require.False(t, aliasesBuffer(returned[0].Lines[0], backing),
 		"returned line aliases the source blob buffer")
+	require.False(t, aliasesBuffer(stored[0].Lines[0], backing),
+		"cached line aliases the source blob buffer")
 	runtime.KeepAlive(backing)
 }
 

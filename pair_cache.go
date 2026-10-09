@@ -100,8 +100,8 @@ func (e *pairCacheEntry) view() []AddedHunk {
 }
 
 // pairCache is safe for concurrent use. Entries are immutable once stored:
-// readers receive the shared []AddedHunk and MUST NOT modify the hunks or
-// their Lines. An entry's line bytes are owned by the entry unless they
+// get returns a fresh []AddedHunk view whose Lines alias the entry's bytes,
+// and readers MUST NOT modify those Lines. An entry's line bytes are owned by the entry unless they
 // already span the whole new blob (see add), in which case they view the
 // store's immutable object buffer. Eviction is approximate (map-order) like
 // offsetCache. A zero budgetPerShard turns the memo off without changing what

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"golang.org/x/exp/mmap"
 )
@@ -59,18 +60,26 @@ type offCacheKey struct {
 	off  uint64
 }
 
-type offsetCacheShard struct {
+// offsetCacheShardData holds one shard's state. It is embedded in
+// offsetCacheShard so the padding there can be derived from its size on
+// every architecture.
+type offsetCacheShardData struct {
 	mu   sync.Mutex
 	m    offTable
 	used int
+}
 
-	// _ pads each shard to its own cache line (and covers the adjacent-line
-	// prefetcher). Without padding, shards share 64-byte lines, so mutex
-	// traffic on distinct shards bounces the same lines and defeats the
-	// contention reduction the sharding exists to provide. mu, m, and used
-	// occupy 80 bytes; TestOffsetCacheShardFillsWholeCacheLines pins the
-	// total at 128.
-	_ [128 - 80]byte
+type offsetCacheShard struct {
+	offsetCacheShardData
+
+	// _ pads each shard to 128 bytes: two cache lines, which also covers the
+	// adjacent-line prefetcher. Without padding, shards share 64-byte lines,
+	// so mutex traffic on distinct shards bounces the same lines and defeats
+	// the contention reduction the sharding exists to provide. The array
+	// length is a compile-time constant on every target, and a data struct
+	// larger than 128 bytes fails to compile here.
+	// TestOffsetCacheShardFillsWholeCacheLines pins the total at 128.
+	_ [128 - unsafe.Sizeof(offsetCacheShardData{})]byte
 }
 
 // offTable is an open-addressing hash table from pack offset to cached

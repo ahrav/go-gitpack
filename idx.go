@@ -269,31 +269,6 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, ErrBadIdxChecksum
 	}
 
-	// The checksum over the whole file takes about as long as parsing its
-	// tables, and neither depends on the other, so the two overlap. Every
-	// return path joins the goroutine: the caller may close the mapping as
-	// soon as this function returns.
-	checksumOK := make(chan bool, 1)
-	joined := false
-	defer func() {
-		if !joined {
-			<-checksumOK
-		}
-	}()
-	go func() {
-		var want [hashSize]byte
-		if _, err := ix.ReadAt(want[:], size-hashSize); err != nil {
-			checksumOK <- false
-			return
-		}
-		h := sha1.New()
-		if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-hashSize)); err != nil {
-			checksumOK <- false
-			return
-		}
-		checksumOK <- bytes.Equal(h.Sum(nil), want[:])
-	}()
-
 	// Fanout table: fanout[i] = total number of objects whose first byte is ≤ i.
 	// This enables O(1) range queries for object lookup by hash prefix.
 	fanoutData := make([]byte, fanoutSize)
@@ -345,6 +320,33 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, fmt.Errorf("idx claims %d objects – impl refuses >%d", objCount,
 			math.MaxUint32/hashSize)
 	}
+
+	// The checksum over the whole file takes about as long as parsing its
+	// tables, and neither depends on the other, so the two overlap. It starts
+	// here, after the header, fanout, and size checks above have passed, so
+	// an index those cheap checks reject fails without a full-file read.
+	// Every return path joins the goroutine: the caller may close the
+	// mapping as soon as this function returns.
+	checksumOK := make(chan bool, 1)
+	joined := false
+	defer func() {
+		if !joined {
+			<-checksumOK
+		}
+	}()
+	go func() {
+		var want [hashSize]byte
+		if _, err := ix.ReadAt(want[:], size-hashSize); err != nil {
+			checksumOK <- false
+			return
+		}
+		h := sha1.New()
+		if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-hashSize)); err != nil {
+			checksumOK <- false
+			return
+		}
+		checksumOK <- bytes.Equal(h.Sum(nil), want[:])
+	}()
 
 	oidBase := int64(headerSize + fanoutSize)
 	crcBase := oidBase + int64(objCount*hashSize)
