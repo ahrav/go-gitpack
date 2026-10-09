@@ -947,10 +947,12 @@ func applyDeltaPrefix(pack *mmap.ReaderAt, offset uint64, deltaType ObjectType, 
 }
 
 // readVarInt reads one delta size varint (little-endian 7-bit groups with a
-// continuation bit) from br.
+// continuation bit) from br. It accepts the same encodings as decodeVarInt:
+// at most nine bytes, so no group is shifted past bit 56 and a longer
+// encoding is rejected rather than wrapped modulo 2^64.
 func readVarInt(br *bufio.Reader) (uint64, error) {
 	var v uint64
-	for shift := uint(0); shift < 64; shift += 7 {
+	for shift := uint(0); shift <= 56; shift += 7 {
 		c, err := br.ReadByte()
 		if err != nil {
 			return 0, err
@@ -960,7 +962,7 @@ func readVarInt(br *bufio.Reader) (uint64, error) {
 			return v, nil
 		}
 	}
-	return 0, errors.New("varint exceeds 64 bits")
+	return 0, errors.New("delta size varint exceeds nine bytes")
 }
 
 // deltaScratch is a pooled buffer for one-shot delta payload inflation.

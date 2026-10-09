@@ -6,6 +6,7 @@
 package objstore
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"fmt"
@@ -898,5 +899,29 @@ func TestApplyDeltaPrefix_TruncatesAtLimit(t *testing.T) {
 		if limit <= 4096 {
 			require.Lessf(t, n, uint64(len(target))/4, "limit %d allocated %d bytes for a %d-byte target", limit, n, len(target))
 		}
+	}
+}
+
+// readVarInt accepts exactly the encodings decodeVarInt accepts: a size
+// varint longer than nine bytes is rejected rather than wrapped modulo 2^64.
+func TestReadVarInt_MatchesDecodeVarInt(t *testing.T) {
+	cases := [][]byte{
+		{0x00},
+		{0x7f},
+		{0x80, 0x01},
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+		{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02},
+		{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01},
+		{0x80},
+	}
+	for _, c := range cases {
+		want, n := decodeVarInt(c)
+		got, err := readVarInt(bufio.NewReader(bytes.NewReader(c)))
+		if n == 0 {
+			require.Errorf(t, err, "%x: decodeVarInt rejects this encoding", c)
+			continue
+		}
+		require.NoErrorf(t, err, "%x", c)
+		require.Equalf(t, want, got, "%x", c)
 	}
 }
