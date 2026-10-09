@@ -19,6 +19,8 @@
 package objstore
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 )
@@ -58,4 +60,41 @@ func ParseHash(s string) (Hash, error) {
 	}
 	copy(h[:], b)
 	return h, nil
+}
+
+// hashKey returns the first eight bytes of h as a big-endian integer, which
+// orders exactly like a lexicographic comparison of those bytes.
+func hashKey(h *Hash) uint64 {
+	return binary.BigEndian.Uint64(h[:8])
+}
+
+// searchHashes binary-searches the ascending slice hashes for target and
+// returns its index and whether it was found; a miss returns the insertion
+// point. The leading-word comparison keeps each probe to one 8-byte load
+// and compare on the common path.
+func searchHashes(hashes []Hash, target Hash) (int, bool) {
+	key := hashKey(&target)
+	lo, hi := 0, len(hashes)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		mk := hashKey(&hashes[mid])
+		var c int
+		switch {
+		case mk < key:
+			c = -1
+		case mk > key:
+			c = 1
+		default:
+			c = bytes.Compare(hashes[mid][8:], target[8:])
+		}
+		switch {
+		case c < 0:
+			lo = mid + 1
+		case c > 0:
+			hi = mid
+		default:
+			return mid, true
+		}
+	}
+	return lo, false
 }

@@ -147,11 +147,7 @@ func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
 	}
 
 	// Binary-search the slice [start:end) for the target hash.
-	relIdx, ok := slices.BinarySearchFunc(
-		f.oidTable[start:end],
-		hash,
-		func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
-	)
+	relIdx, ok := searchHashes(f.oidTable[start:end], hash)
 	if !ok {
 		return 0, false
 	}
