@@ -583,14 +583,24 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 		oldB, newB = oldB[p:], newB[p:]
 	}
 
-	// Tokenize the old and new byte slices into lines for comparison.
-	// This is a zero-copy operation, creating string views into the original
-	// slices. Both line slices are scratch: hunks copy the line headers they
-	// keep, so the slices return to the pool when the diff is done.
+	// The common byte suffix, snapped to a line boundary on both sides, lets
+	// the walk below stop early: once the new cursor is inside the suffix
+	// and the two remainders have equal length, the remainders are the same
+	// bytes, so every remaining line matches in lockstep and the walk would
+	// emit nothing more. The suffix lines of the new side are then never
+	// tokenized or compared. The old side stays fully tokenized because a
+	// lookup from the middle may land on a suffix line.
+	suffix := commonSuffixLineBoundary(oldB, newB)
+	newSuffixStart := len(newB) - suffix
+
+	// Tokenize the old side into lines for comparison. This is a zero-copy
+	// operation, creating string views into the original slice. The slice
+	// is scratch, as is the current-hunk line buffer: hunks copy the line
+	// headers they keep, so both return to the pool when the diff is done.
 	scratch := lineScratchPool.Get().(*lineScratch)
 	scratch.old = tokenizeInto(scratch.old, oldB)
-	scratch.new = tokenizeInto(scratch.new, newB)
-	oldLines, newLines := scratch.old, scratch.new
+	oldLines := scratch.old
+	hunkLines := scratch.new[:0]
 	defer scratch.release()
 
 	// For larger files, a hash index over old lines provides O(1) lookups.
@@ -608,22 +618,47 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 	}()
 
 	var hunks []AddedHunk
-	hunkStart := -1
 	hunkStartLine := uint32(0)
-	flushHunk := func(end int) {
-		if hunkStart < 0 {
+	flushHunk := func() {
+		if len(hunkLines) == 0 {
 			return
 		}
 		hunks = append(hunks, AddedHunk{
 			StartLine: hunkStartLine,
-			Lines:     append([]string(nil), newLines[hunkStart:end]...),
+			Lines:     append([]string(nil), hunkLines...),
 		})
-		hunkStart = -1
+		hunkLines = hunkLines[:0]
 	}
-	oldIdx := 0
+	// oldIdx is the old cursor as a line index; oldOff is the byte offset of
+	// that line in oldB, advanced with the cursor so the suffix check can
+	// compare remainders by length.
+	oldIdx, oldOff := 0, 0
+	advanceOld := func(to int) {
+		for ; oldIdx < to; oldIdx++ {
+			oldOff += len(oldLines[oldIdx]) + 1
+		}
+		if oldIdx >= len(oldLines) {
+			oldOff = len(oldB)
+		}
+	}
 
-	for newIdx, newLine := range newLines {
+	// The new side is split one line at a time; the walk reads each line
+	// once and keeps only the lines it adds.
+	newPos, newIdx := 0, 0
+	for newPos < len(newB) {
+		if newPos >= newSuffixStart && len(newB)-newPos == len(oldB)-oldOff {
+			break
+		}
+		var newLine string
+		if i := bytes.IndexByte(newB[newPos:], '\n'); i >= 0 {
+			newLine = btostr(newB[newPos : newPos+i])
+			newPos += i + 1
+		} else {
+			newLine = btostr(newB[newPos:])
+			newPos = len(newB)
+		}
 		lineNum := uint32(newIdx+skippedLines) + 1
+		newIdx++
 		isAdded := false
 
 		// If we've exhausted all lines in the old file,
@@ -647,14 +682,14 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 					// Found at or after our current position: fast-forward,
 					// treating the lines between oldIdx and pos as deleted.
 					foundLater = true
-					oldIdx = pos
+					advanceOld(pos)
 				}
 			} else {
 				// For smaller remainders, perform a linear search to find the line.
 				for j := oldIdx; j < len(oldLines); j++ {
 					if newLine == oldLines[j] {
 						foundLater = true
-						oldIdx = j
+						advanceOld(j)
 						break
 					}
 				}
@@ -670,24 +705,60 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 		if isAdded {
 			// Start a compact hunk view; clone its line headers once when
 			// the contiguous added run ends.
-			if hunkStart < 0 {
-				hunkStart = newIdx
+			if len(hunkLines) == 0 {
 				hunkStartLine = lineNum
 			}
+			hunkLines = append(hunkLines, newLine)
 		} else {
 			// The line is not an addition;
 			// it matches the corresponding line in the old file.
 			// If we were building a hunk, it's now complete.
-			flushHunk(newIdx)
-			oldIdx++
+			flushHunk()
+			advanceOld(oldIdx + 1)
 		}
 	}
 
 	// After the loop, if there's still an open hunk, add it to the list.
 	// This handles cases where the file ends with a block of added lines.
-	flushHunk(len(newLines))
+	flushHunk()
+	scratch.new = hunkLines
 
 	return hunks
+}
+
+// commonSuffixLineBoundary returns the length of the longest common byte
+// suffix of a and b that starts at the beginning of a line on both sides:
+// the byte before the suffix is '\n' or the suffix is the whole input.
+// Remainders of equal length that both lie inside this suffix are the same
+// bytes and split into the same lines.
+func commonSuffixLineBoundary(a, b []byte) int {
+	n := min(len(a), len(b))
+	i := 0
+	// Compare in shrinking chunks so the bulk of the work runs through the
+	// vectorized bytes.Equal; the final byte loop settles the exact length.
+	for _, chunk := range [...]int{4096, 256, 16} {
+		for i+chunk <= n && bytes.Equal(a[len(a)-i-chunk:len(a)-i], b[len(b)-i-chunk:len(b)-i]) {
+			i += chunk
+		}
+	}
+	for i < n && a[len(a)-1-i] == b[len(b)-1-i] {
+		i++
+	}
+	for i > 0 {
+		pa, pb := len(a)-i, len(b)-i
+		if (pa == 0 || a[pa-1] == '\n') && (pb == 0 || b[pb-1] == '\n') {
+			return i
+		}
+		// Inside the common region the bytes agree on both sides, so the
+		// longest line-aligned suffix starts after the first newline at or
+		// past the current start.
+		j := bytes.IndexByte(a[pa:len(a)-1], '\n')
+		if j < 0 {
+			return 0
+		}
+		i = len(a) - 1 - (pa + j)
+	}
+	return 0
 }
 
 // nlByte is '\n' as a []byte, for the bytes.Count newline scans.
