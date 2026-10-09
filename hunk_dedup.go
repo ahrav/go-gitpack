@@ -45,7 +45,11 @@
 //  4. Parallel hunk workers -> serial decision stage -> parallel yield:
 //     hunk workers compute each pair's hunks, run prefilterHunk against
 //     the set's published snapshot, and deliver (seq, hunks, unresolved
-//     fingerprints) into the reorder ring without blocking. The decision
+//     fingerprints) into the reorder ring without blocking. A pair whose
+//     (old, new) key was already computed at an earlier seq is delivered
+//     as a skipped repeat (pairFirstSeen): its lines are in the set by
+//     the time its seq is decided, so its diff is computed only when the
+//     set has saturated and fail-open emits it anyway. The decision
 //     goroutine settles each whole-hunk verdict in seq order with
 //     decideResult (serial, but over the unresolved fingerprints only),
 //     pre-processes the backlog with prepBacklog while it waits behind a
@@ -837,8 +841,14 @@ type dedupCandidate struct {
 // present in the snapshot, so it is a duplicate at its position unless the
 // set is saturated when the pair is reached (see decideResult).
 type dedupPairResult struct {
-	seq        uint64
-	hunks      []HunkAddition
+	seq   uint64
+	hunks []HunkAddition
+	// candidates is dedupSkippedMarker when the worker found the pair
+	// registered at an earlier seq with a text result and skipped the
+	// diff: every line of its hunks is in the set when this seq is
+	// decided, so the result is empty unless the set is saturated, in
+	// which case the decision stage recomputes the hunks from the work
+	// item kept in dedupSkippedWork to honor fail-open.
 	candidates []dedupCandidate
 
 	// earlyKiB is the pair's dedupPairWork.earlyBytes in KiB. retainedKiB
@@ -849,6 +859,41 @@ type dedupPairResult struct {
 	// on every scan.
 	earlyKiB    uint32
 	retainedKiB uint32
+}
+
+// dedupSkippedMarker is the candidates value of a result whose diff the
+// worker skipped as a repeat; see dedupPairResult.candidates. The marker is
+// shared between results; its single entry has a nil unresolved list, which
+// prepBacklog leaves untouched.
+var dedupSkippedMarker = []dedupCandidate{{hunk: -1}}
+
+func (r *dedupPairResult) skipped() bool {
+	return len(r.candidates) == 1 && r.candidates[0].hunk < 0
+}
+
+// dedupSkippedWork keeps the work item of every skipped repeat from its
+// delivery until the decision stage reaches its seq, so a saturated set can
+// still diff the repeat and emit its hunks.
+type dedupSkippedWork struct {
+	mu sync.Mutex
+	m  map[uint64]blobPairWork
+}
+
+func (w *dedupSkippedWork) put(seq uint64, work blobPairWork) {
+	w.mu.Lock()
+	if w.m == nil {
+		w.m = make(map[uint64]blobPairWork, 256)
+	}
+	w.m[seq] = work
+	w.mu.Unlock()
+}
+
+func (w *dedupSkippedWork) take(seq uint64) (blobPairWork, bool) {
+	w.mu.Lock()
+	work, ok := w.m[seq]
+	delete(w.m, seq)
+	w.mu.Unlock()
+	return work, ok
 }
 
 // toKiB rounds n bytes up to whole KiB, saturating at the uint32 range.
@@ -1020,6 +1065,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// The fingerprint set is owned by the decision goroutine; hunk workers
 	// only read its published snapshot.
 	set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
+	firstSeen := newPairFirstSeen()
+	var skippedWork dedupSkippedWork
 	inFlight := newDedupInFlightWindow(window, hs.dedupProbe)
 	// releaseRetained wakes the sequencer only when the release brings the
 	// charge back under the cap, the one transition stampable waits on.
@@ -1358,13 +1405,34 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				}
 				results := make([]dedupPairResult, 0, len(works))
 				for _, pw := range works {
+					// A pair already computed at an earlier seq adds no
+					// text lines in first-introduction order; register
+					// and skip repeats instead of memoizing their hunks.
+					var key pairKey
+					if !pw.work.renameCandidate {
+						key = makePairKey(pw.work.oldOID, pw.work.newOID)
+						if e, ok := firstSeen.lookup(key); ok && e.seq < pw.seq && !e.binary {
+							skippedWork.put(pw.seq, pw.work)
+							results = append(results, dedupPairResult{
+								seq: pw.seq, candidates: dedupSkippedMarker, earlyKiB: toKiB(pw.earlyBytes),
+							})
+							continue
+						}
+					}
 					var hunks []HunkAddition
-					if err := hs.streamBlobPairHunks(pw.work, func(h HunkAddition) error {
-						hunks = append(hunks, h)
-						return nil
-					}); err != nil {
+					added, err := hs.computeBlobPairHunks(pw.work)
+					if err == nil {
+						err = emitBlobPairHunks(pw.work, added, func(h HunkAddition) error {
+							hunks = append(hunks, h)
+							return nil
+						})
+					}
+					if err != nil {
 						setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
 						return
+					}
+					if !pw.work.renameCandidate {
+						firstSeen.registerMin(key, pw.seq, len(hunks) > 0 && hunks[0].isBinary)
 					}
 					// Hash and speculatively probe here, in parallel, so the
 					// decision goroutine only touches fingerprints the
@@ -1452,7 +1520,32 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					earlyBytes.Add(^(uint64(r.earlyKiB)<<10 - 1))
 				}
 				before := len(batch.hunks)
-				batch.hunks = set.decideResult(r, batch.hunks)
+				if r.skipped() {
+					work, ok := skippedWork.take(r.seq)
+					if !ok {
+						setError(fmt.Errorf("dedup skipped repeat seq %d has no work item", r.seq))
+						return false
+					}
+					if set.saturated {
+						// Fail-open: a saturated set emits every non-empty
+						// hunk, so the skipped repeat is diffed here.
+						var hunks []HunkAddition
+						added, err := hs.computeBlobPairHunks(work)
+						if err == nil {
+							err = emitBlobPairHunks(work, added, func(h HunkAddition) error {
+								hunks = append(hunks, h)
+								return nil
+							})
+						}
+						if err != nil {
+							setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
+							return false
+						}
+						batch.hunks = set.decideResult(dedupPairResult{seq: r.seq, hunks: hunks}, batch.hunks)
+					}
+				} else {
+					batch.hunks = set.decideResult(r, batch.hunks)
+				}
 				switch {
 				case len(batch.hunks) > before:
 					batch.kib += int64(r.retainedKiB)

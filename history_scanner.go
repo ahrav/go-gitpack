@@ -767,7 +767,32 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 			hs.pairs.add(pk, hunks)
 		}
 	}
+	return emitBlobPairHunks(work, hunks, fn)
+}
 
+// computeBlobPairHunks diffs one changed file without consulting or filling
+// the pair memo. The dedup pipeline uses it: in first-introduction order a
+// repeated (old, new) transition contributes no new lines, so it tracks
+// repeats by key instead of retaining their hunks.
+func (hs *HistoryScanner) computeBlobPairHunks(work blobPairWork) ([]AddedHunk, error) {
+	var (
+		hunks []AddedHunk
+		err   error
+	)
+	if work.renameCandidate {
+		hunks, err = computeRenameCandidateHunks(hs.store, work.oldOID, work.newOID)
+	} else {
+		hunks, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("compute added hunks: %w", err)
+	}
+	return hunks, nil
+}
+
+// emitBlobPairHunks delivers the computed hunks of one changed file to fn
+// as HunkAddition values attributed to the pair's commit and path.
+func emitBlobPairHunks(work blobPairWork, hunks []AddedHunk, fn func(HunkAddition) error) error {
 	for _, hunk := range hunks {
 		if hunk.IsBinary { // Don't fuse binary hunks
 			// Binary files are always sent as a single hunk.

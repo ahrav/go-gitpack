@@ -179,3 +179,62 @@ func cloneAddedHunksForCache(hunks []AddedHunk) []AddedHunk {
 	}
 	return cached
 }
+
+// pairFirstSeen records, per (old, new) blob pair, the lowest dedup sequence
+// number whose hunks have been computed and whether that result is a binary
+// hunk. The dedup pipeline consults it before diffing: a pair already
+// computed at an earlier seq contributes no new text lines in
+// first-introduction order (its lines were inserted, or already present,
+// when the earlier seq was decided), so the later seq skips the diff.
+// Binary results are recomputed because binary hunks are emitted at every
+// occurrence.
+//
+// Entries are written after a result is computed, so a reader that finds an
+// entry with a lower seq knows that result reaches the decision stage first.
+// A reader that finds no entry, or an entry with a higher seq, computes its
+// own result and registers it; registerMin keeps the minimum seq.
+type pairFirstSeen struct {
+	shards [pairCacheShards]pairFirstSeenShard
+}
+
+type pairFirstSeenShard struct {
+	mu sync.Mutex
+	m  map[pairKey]pairFirstSeenEntry
+}
+
+type pairFirstSeenEntry struct {
+	seq    uint64
+	binary bool
+}
+
+func newPairFirstSeen() *pairFirstSeen {
+	r := &pairFirstSeen{}
+	for i := range r.shards {
+		r.shards[i].m = make(map[pairKey]pairFirstSeenEntry, 1024)
+	}
+	return r
+}
+
+func (r *pairFirstSeen) shard(k *pairKey) *pairFirstSeenShard {
+	return &r.shards[int(k[0])&(pairCacheShards-1)]
+}
+
+// lookup returns the registered entry for k.
+func (r *pairFirstSeen) lookup(k pairKey) (pairFirstSeenEntry, bool) {
+	s := r.shard(&k)
+	s.mu.Lock()
+	e, ok := s.m[k]
+	s.mu.Unlock()
+	return e, ok
+}
+
+// registerMin records seq for k when k is new or seq is lower than the
+// registered seq.
+func (r *pairFirstSeen) registerMin(k pairKey, seq uint64, binary bool) {
+	s := r.shard(&k)
+	s.mu.Lock()
+	if e, ok := s.m[k]; !ok || seq < e.seq {
+		s.m[k] = pairFirstSeenEntry{seq: seq, binary: binary}
+	}
+	s.mu.Unlock()
+}
