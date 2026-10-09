@@ -209,10 +209,8 @@ func walkDiff(
 
 	// State of the "current" entry of each iterator.
 	var (
-		oln, nln         string // names
-		oidOld, oidNew   Hash
-		modeOld, modeNew uint32
-		okOld, okNew     bool
+		old, cur     parsedTreeEntry
+		okOld, okNew bool
 	)
 
 	// nextOld / nextNew advance the respective iterators and normalize EOF to
@@ -223,7 +221,7 @@ func walkDiff(
 			return nil
 		}
 		var err error
-		oln, oidOld, modeOld, okOld, err = oldIter.Next()
+		okOld, err = oldIter.next(&old)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
@@ -235,7 +233,7 @@ func walkDiff(
 			return nil
 		}
 		var err error
-		nln, oidNew, modeNew, okNew, err = newIter.Next()
+		okNew, err = newIter.next(&cur)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return err
 		}
@@ -251,6 +249,8 @@ func walkDiff(
 	}
 
 	for okOld || okNew {
+		oln, oidOld, modeOld := old.name, old.oid, old.mode
+		nln, oidNew, modeNew := cur.name, cur.oid, cur.mode
 		switch {
 		case !okOld: // only additions remain
 			if err := handleAdd(tc, prefix, nln, oidNew, modeNew, fn); err != nil {

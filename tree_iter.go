@@ -73,9 +73,27 @@ func newTreeIter(raw []byte) *TreeIter { return &TreeIter{rest: raw} }
 // Next is not safe for concurrent use; each TreeIter instance must be
 // confined to a single goroutine.
 func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err error) {
+	var e parsedTreeEntry
+	ok, err = it.next(&e)
+	return e.name, e.oid, e.mode, ok, err
+}
+
+// parsedTreeEntry is one parsed tree entry for the in-package fast path.
+type parsedTreeEntry struct {
+	name string
+	oid  Hash
+	mode uint32
+}
+
+// next parses the next entry into e. It reports ok=false with err == io.EOF
+// at the end of the tree and ok=false with another error on corrupt input.
+// Writing through a pointer keeps the merge-join in walkDiff from copying a
+// five-value return per entry.
+func (it *TreeIter) next(e *parsedTreeEntry) (ok bool, err error) {
 	if len(it.rest) == 0 {
-		return "", Hash{}, 0, false, io.EOF
+		return false, io.EOF
 	}
+	var mode uint32
 
 	// Safety check: if we have less than the minimum possible tree entry.
 	// The magic number 24 is the minimum byte count for a valid entry:
@@ -86,7 +104,7 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 	// + 20 bytes SHA-1 object ID
 	// = 24 bytes total.
 	if len(it.rest) < 24 {
-		return "", Hash{}, 0, false, fmt.Errorf("%w: insufficient data for tree entry (%d bytes)", ErrCorruptTree, len(it.rest))
+		return false, fmt.Errorf("%w: insufficient data for tree entry (%d bytes)", ErrCorruptTree, len(it.rest))
 	}
 
 	/* ---- <mode> (octal) -------------------------------------------- */
@@ -101,13 +119,13 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 			break
 		}
 		if b < '0' || b > '7' {
-			return "", Hash{}, 0, false, fmt.Errorf("%w: invalid octal digit '%c' in mode (mode so far: %o)", ErrCorruptTree, b, mode)
+			return false, fmt.Errorf("%w: invalid octal digit '%c' in mode (mode so far: %o)", ErrCorruptTree, b, mode)
 		}
 		// Build the mode one octal digit at a time, avoiding strconv allocations.
 		mode = mode<<3 | uint32(b-'0')
 	}
 	if sp == len(rest) {
-		return "", Hash{}, 0, false, fmt.Errorf("%w: no space after mode (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
+		return false, fmt.Errorf("%w: no space after mode (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
 	}
 	it.rest = rest[sp+1:]
 
@@ -115,19 +133,19 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 	// The entry name is NUL-terminated.
 	nul := bytes.IndexByte(it.rest, 0)
 	if nul < 0 {
-		return "", Hash{}, 0, false, fmt.Errorf("%w: no null terminator after filename (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
+		return false, fmt.Errorf("%w: no null terminator after filename (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
 	}
 	// Convert the slice header to string without copying bytes.
-	name = btostr(it.rest[:nul])
+	name := btostr(it.rest[:nul])
 	it.rest = it.rest[nul+1:]
 
 	/* ---- <sha1> (20 bytes) ----------------------------------------- */
 	if len(it.rest) < 20 {
-		return "", Hash{}, 0, false, fmt.Errorf("%w: insufficient bytes for SHA (%d < 20), name=%q, mode=%o", ErrCorruptTree, len(it.rest), name, mode)
+		return false, fmt.Errorf("%w: insufficient bytes for SHA (%d < 20), name=%q, mode=%o", ErrCorruptTree, len(it.rest), name, mode)
 	}
-	// Copy the 20-byte object ID into the Hash we return.
-	copy(oid[:], it.rest[:20])
+	e.name = name
+	e.mode = mode
+	copy(e.oid[:], it.rest[:20])
 	it.rest = it.rest[20:]
-
-	return name, oid, mode, true, nil
+	return true, nil
 }
