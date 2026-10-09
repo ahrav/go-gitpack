@@ -585,3 +585,37 @@ func TestReadCommitPayload_DeltaCommitCapPrecedesMaterialization(t *testing.T) {
 // TestReadCommitPayload_NotACommit pins the error contract: asking for a
 // non-commit object (a blob) fails with ErrObjectNotCommit rather than
 // returning payload bytes.
+
+// The header fallback for a delta commit above the payload cap reconstructs
+// the chain's bases and then only the header-sized prefix of the target, so
+// the read costs the base plus a few KiB rather than the whole target.
+func TestReadCommitHeader_OverCapDeltaCommitReconstructsHeaderPrefix(t *testing.T) {
+	packDir, oid, payload := buildBigDeltaCommitRepo(t)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	saved := maxCommitPayload
+	t.Cleanup(func() { maxCommitPayload = saved })
+	maxCommitPayload = len(payload) / 4
+
+	want, err := trimCommitHeader(payload)
+	require.NoError(t, err)
+
+	var hdr []byte
+	n := allocatedBytes(func() { hdr, err = st.readCommitHeader(oid) })
+	require.NoError(t, err)
+	require.Equal(t, want, hdr, "header must match the whole object's header")
+	t.Logf("commit payload %d bytes, cap %d, header read allocated %d bytes", len(payload), maxCommitPayload, n)
+	// The delta's base is a sibling commit of the same size and is
+	// reconstructed whole; the target must not be.
+	require.Lessf(t, n, uint64(len(payload))*3/2,
+		"header fallback reconstructed the over-cap target instead of its header prefix")
+
+	// Attribution end-to-end: the fallback still names the author.
+	meta, err := newMetaCache(nil, st).get(oid)
+	require.NoError(t, err)
+	require.Equal(t, "t", meta.Author.Name)
+	require.Empty(t, meta.Message)
+}
