@@ -90,19 +90,26 @@ func (it *TreeIter) Next() (name string, oid Hash, mode uint32, ok bool, err err
 	}
 
 	/* ---- <mode> (octal) -------------------------------------------- */
-	// Scan up to the first space; everything before it must be an octal digit.
-	sp := bytes.IndexByte(it.rest, ' ')
-	if sp < 0 {
-		return "", Hash{}, 0, false, fmt.Errorf("%w: no space after mode (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
-	}
-	for _, b := range it.rest[:sp] {
+	// Scan up to the first space; everything before it must be an octal
+	// digit. Modes are at most seven digits, so a direct byte loop beats a
+	// vectorized IndexByte call here.
+	rest := it.rest
+	sp := 0
+	for ; sp < len(rest); sp++ {
+		b := rest[sp]
+		if b == ' ' {
+			break
+		}
 		if b < '0' || b > '7' {
 			return "", Hash{}, 0, false, fmt.Errorf("%w: invalid octal digit '%c' in mode (mode so far: %o)", ErrCorruptTree, b, mode)
 		}
 		// Build the mode one octal digit at a time, avoiding strconv allocations.
 		mode = mode<<3 | uint32(b-'0')
 	}
-	it.rest = it.rest[sp+1:]
+	if sp == len(rest) {
+		return "", Hash{}, 0, false, fmt.Errorf("%w: no space after mode (data: %s)", ErrCorruptTree, hex.EncodeToString(it.rest))
+	}
+	it.rest = rest[sp+1:]
 
 	/* ---- <name>\0 --------------------------------------------------- */
 	// The entry name is NUL-terminated.

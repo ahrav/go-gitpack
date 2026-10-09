@@ -481,6 +481,8 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 			oid:           oid,
 			ctx:           ctx,
 			maxObjectSize: s.maxDeltaObjectSize,
+			// The fast path above already missed on this offset.
+			offCacheChecked: packLookupDone,
 		})
 	}
 	data, typ, err := s.readLooseObject(oid)

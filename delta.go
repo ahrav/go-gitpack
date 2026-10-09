@@ -201,6 +201,10 @@ type inflationParams struct {
 
 	// maxObjectSize bounds reconstructed delta objects. Zero disables the bound.
 	maxObjectSize uint64
+
+	// offCacheChecked reports that the caller already looked (p, off) up in
+	// the offset cache and missed, so the walk-up skips that probe at depth 0.
+	offCacheChecked bool
 }
 
 // inflateDeltaChainStreaming reconstructs an object that is stored as a
@@ -325,8 +329,10 @@ func walkUpDeltaChain(
 		// scans ~90% of hops land on an already-materialized offset. The
 		// check also fires at depth 0: OID-keyed caches (delta window, ARC)
 		// can miss objects that the offset cache still holds.
-		if data, typ, ok := oc.get(currPack, currOff); ok {
-			return data, typ, nil
+		if depth > 0 || !params.offCacheChecked {
+			if data, typ, ok := oc.get(currPack, currOff); ok {
+				return data, typ, nil
+			}
 		}
 
 		typ, hdrLen, err := peekObjectType(currPack, currOff)

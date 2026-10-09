@@ -123,17 +123,40 @@ func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
 		return 0, false // bucket empty
 	}
 
-	// Binary-search the slice [start:end) for the target hash.
-	relIdx, ok := slices.BinarySearchFunc(
-		f.oidTable[start:end],
-		hash,
-		func(a, b Hash) int { return bytes.Compare(a[:], b[:]) },
-	)
+	idx, ok := searchHashes(f.oidTable[start:end], hash)
 	if !ok {
 		return 0, false
 	}
-	absIdx := int(start) + relIdx
-	return f.entries[absIdx].offset, true
+	return f.entries[int(start)+idx].offset, true
+}
+
+// searchHashes binary-searches the sorted table for h and returns its
+// position. Each probe compares the leading eight bytes as a big-endian word,
+// which orders two distinct hashes the same way bytes.Compare does and settles
+// almost every probe in one comparison; only an equal leading word falls back
+// to the full 20-byte compare.
+func searchHashes(table []Hash, h Hash) (int, bool) {
+	want := binary.BigEndian.Uint64(h[:8])
+	lo, hi := 0, len(table)
+	for lo < hi {
+		mid := int(uint(lo+hi) >> 1)
+		got := binary.BigEndian.Uint64(table[mid][:8])
+		if got < want {
+			lo = mid + 1
+		} else if got > want {
+			hi = mid
+		} else {
+			switch c := bytes.Compare(table[mid][8:], h[8:]); {
+			case c < 0:
+				lo = mid + 1
+			case c > 0:
+				hi = mid
+			default:
+				return mid, true
+			}
+		}
+	}
+	return lo, false
 }
 
 // crcAtOffset resolves the CRC-32 checksum for an object at the given pack
