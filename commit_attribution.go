@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // AuthorInfo describes the Git author metadata attached to a secret
@@ -53,6 +54,12 @@ type commitPayloadReader interface {
 	// strings sliced from it. It returns an error if the object cannot be
 	// found or is not a commit.
 	readCommitPayload(oid Hash) ([]byte, error)
+
+	// readCommitHeader retrieves the header lines of a commit through its
+	// committer line, as a fresh allocation owned by the caller. metaCache
+	// uses these headers when readCommitPayload reports
+	// errCommitPayloadTooLarge.
+	readCommitHeader(oid Hash) ([]byte, error)
 }
 
 // payloadSink hands out destination memory for a commit payload. reserve
@@ -73,15 +80,6 @@ type commitPayloadReaderTo interface {
 
 // metaEntry is one cached attribution record: the parsed author identity and
 // the raw commit message.
-//
-// Lifetime: ai.Name, ai.Email, and msg are views into the payload the entry
-// was parsed from, which lives in a metaCache slab (see reserve), so each
-// entry retains one payload's worth of bytes.
-// The cache is insert-only and unbounded — typical messages are ~200-700 B,
-// so even 10k commits cost only a few MB, comparable to the header bytes the
-// cache has always retained. Monorepo-scale histories (~1M+ commits) would
-// push this toward a GB; the recorded escape hatches (don't-retain-oversize
-// flag, budgeted cache) are deliberately not built at this scale.
 type metaEntry struct {
 	ai  AuthorInfo
 	msg string
@@ -105,24 +103,23 @@ type metaCache struct {
 	// This is an alias to graph.Timestamps - no data is copied.
 	ts []int64
 
-	// mu guards concurrent access to the cache map.
+	// mu guards every field below.
 	mu sync.RWMutex
 
 	// m caches attribution entries by commit hash to avoid repeated
 	// inflation and parsing of commit payloads.
 	m map[Hash]metaEntry
 
-	// slab is the bump allocator behind cached payloads: reserve carves
-	// regions from it under slabMu and replaces a full slab rather than
-	// growing it, so regions handed out earlier stay valid. Entries are
-	// never evicted, so a slab lives exactly as long as its entries would.
-	slabMu sync.Mutex
-	slab   []byte
+	// Commit messages are attacker-controlled, so budget bounds the slab
+	// memory a crafted pack can pin through this cache.
+	slab      []byte
+	slabBytes int
+	budget    int
 }
 
-// metaSlabSize is the backing-array size of metaCache.slab. Payloads larger
-// than this get their own allocation.
 const metaSlabSize = 64 << 10
+
+const defaultMetaCacheBudget = 256 << 20
 
 // newMetaCache constructs a metaCache with the given commit graph (may be nil)
 // and commit payload reader. It is called once during NewHistoryScanner
@@ -137,10 +134,11 @@ func newMetaCache(g *commitGraphData, s commitPayloadReader) *metaCache {
 	}
 
 	return &metaCache{
-		graph: g,
-		store: s,
-		ts:    ts,
-		m:     make(map[Hash]metaEntry, cacheSize),
+		graph:  g,
+		store:  s,
+		ts:     ts,
+		m:      make(map[Hash]metaEntry, cacheSize),
+		budget: defaultMetaCacheBudget,
 	}
 }
 
@@ -155,6 +153,8 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 	defer c.mu.Unlock()
 
 	clear(c.m)
+	c.slab = nil
+	c.slabBytes = 0
 	if g == nil {
 		c.graph = nil
 		c.ts = nil
@@ -167,17 +167,8 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 // get returns the CommitMetadata for the given OID, using the cache when
 // possible and falling back to payload parsing on a miss.
 //
-// Concurrency protocol:
-//  1. Acquire RLock, probe the map, release RLock. A hit is complete: the
-//     entry carries author, message, and resolved timestamp.
-//  2. On miss (see miss): read and parse the payload outside any lock, then
-//     acquire the write Lock, resolve the timestamp against the attached
-//     graph, insert, release.
-//
-// Two goroutines missing the same OID may both parse it; metaEntry is an
-// immutable value and the second insert overwrites with an identical value.
-// The hit path is kept to this function so its code stays small and
-// independent of the miss path.
+// Two goroutines missing the same OID may both parse it; the first insert
+// wins and the others return the winner's entry.
 func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 	c.mu.RLock()
 	entry, ok := c.m[oid]
@@ -202,14 +193,23 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 	}, nil
 }
 
-// miss reads, parses, and caches the entry for a commit absent from the map.
+// miss reads and parses the entry for a commit absent from the map, and caches
+// it when retainLocked grants a region.
 func (c *metaCache) miss(oid Hash) (metaEntry, error) {
+	sc := payloadScratchPool.Get().(*payloadScratch)
+	defer payloadScratchPool.Put(sc)
+	sc.inBuf = false
+
 	var payload []byte
 	var err error
 	if to, ok := c.store.(commitPayloadReaderTo); ok {
-		payload, err = to.readCommitPayloadTo(oid, c)
+		payload, err = to.readCommitPayloadTo(oid, sc)
 	} else {
 		payload, err = c.store.readCommitPayload(oid)
+	}
+	if errors.Is(err, errCommitPayloadTooLarge) {
+		sc.inBuf = false
+		payload, err = c.store.readCommitHeader(oid)
 	}
 	if err != nil {
 		return metaEntry{}, err
@@ -218,33 +218,84 @@ func (c *metaCache) miss(oid Hash) (metaEntry, error) {
 	if err != nil {
 		return metaEntry{}, err
 	}
-	entry := metaEntry{ai: ai, msg: btostr(msg)}
 
 	c.mu.Lock()
-	entry.ts = c.timestampLocked(oid, ai)
-	c.m[oid] = entry
+	if existing, ok := c.m[oid]; ok {
+		c.mu.Unlock()
+		return existing, nil
+	}
+	ts := c.timestampLocked(oid, ai)
+	if region := c.retainLocked(len(payload)); region != nil {
+		copy(region, payload)
+		entry := rebaseEntry(ai, msg, payload, region, ts)
+		c.m[oid] = entry
+		c.mu.Unlock()
+		return entry, nil
+	}
 	c.mu.Unlock()
-	return entry, nil
+
+	if sc.inBuf {
+		owned := make([]byte, len(payload))
+		copy(owned, payload)
+		return rebaseEntry(ai, msg, payload, owned, ts), nil
+	}
+	return metaEntry{ai: ai, msg: btostr(msg), ts: ts}, nil
 }
 
-// reserve implements payloadSink: it returns the next n bytes of the slab,
-// starting a new slab when the current one cannot hold them. The region is
-// exclusively the caller's; a failed decode leaves it unused until the slab
-// is released with its entries.
-func (c *metaCache) reserve(n int) []byte {
+// retainLocked returns an n-byte slab region for a cached payload, or nil
+// when n exceeds metaSlabSize or a new slab would push slabBytes past budget.
+// It requires c.mu held for writing.
+func (c *metaCache) retainLocked(n int) []byte {
 	if n > metaSlabSize {
-		return make([]byte, n)
+		return nil
 	}
-	c.slabMu.Lock()
 	if n > cap(c.slab)-len(c.slab) {
+		if c.slabBytes+metaSlabSize > c.budget {
+			return nil
+		}
 		c.slab = make([]byte, 0, metaSlabSize)
+		c.slabBytes += metaSlabSize
 	}
 	start := len(c.slab)
 	c.slab = c.slab[:start+n]
-	region := c.slab[start : start+n : start+n]
-	c.slabMu.Unlock()
-	return region
+	return c.slab[start : start+n : start+n]
 }
+
+// rebaseEntry builds the entry for to, a byte-for-byte copy of from. ai's
+// strings and msg are views into from; msg is a suffix of it.
+func rebaseEntry(ai AuthorInfo, msg, from, to []byte, ts int64) metaEntry {
+	ai.Name = rebaseString(ai.Name, from, to)
+	ai.Email = rebaseString(ai.Email, from, to)
+	return metaEntry{ai: ai, msg: btostr(to[len(to)-len(msg):]), ts: ts}
+}
+
+// rebaseString maps s to the same offset in to. s must be a view into from.
+func rebaseString(s string, from, to []byte) string {
+	if len(s) == 0 {
+		return ""
+	}
+	off := int(uintptr(unsafe.Pointer(unsafe.StringData(s))) - uintptr(unsafe.Pointer(unsafe.SliceData(from))))
+	return btostr(to[off : off+len(s)])
+}
+
+// payloadScratch is a pooled payloadSink. inBuf reports whether the last
+// reserve returned buf, which the caller must copy out of before the scratch
+// returns to the pool.
+type payloadScratch struct {
+	buf   [metaSlabSize]byte
+	inBuf bool
+}
+
+func (s *payloadScratch) reserve(n int) []byte {
+	if n > len(s.buf) {
+		s.inBuf = false
+		return make([]byte, n)
+	}
+	s.inBuf = true
+	return s.buf[:n:n]
+}
+
+var payloadScratchPool = sync.Pool{New: func() any { return new(payloadScratch) }}
 
 // timestampLocked resolves the commit timestamp with c.mu held. The
 // commit-graph value is preferred because it is authoritative for the

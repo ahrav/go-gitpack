@@ -282,3 +282,33 @@ func TestCommitPayload_HeaderLargerThanMaxHdr(t *testing.T) {
 	require.Equal(t, "t@e", meta.Author.Email)
 	require.Equal(t, "octopus of unusual size\n", meta.Message)
 }
+
+func TestCommitPayload_OverCapFallsBackToHeader(t *testing.T) {
+	repoDir, packDir := buildCommitShapesRepo(t)
+	shapes := classifyCommitShapes(t, repoDir, packDir)
+	require.NotEmpty(t, shapes.plain)
+	require.NotEmpty(t, shapes.delta)
+	require.NotEmpty(t, shapes.loose)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	saved := maxCommitPayload
+	maxCommitPayload = 64 // below every fixture commit
+	t.Cleanup(func() { maxCommitPayload = saved })
+
+	mc := newMetaCache(nil, st)
+	for shape, oids := range map[string][]Hash{"plain": shapes.plain, "delta": shapes.delta, "loose": shapes.loose} {
+		for _, oid := range oids {
+			_, err := st.readCommitPayload(oid)
+			require.ErrorIsf(t, err, errCommitPayloadTooLarge, "%s commit %s", shape, oid)
+
+			meta, err := mc.get(oid)
+			require.NoErrorf(t, err, "%s commit %s", shape, oid)
+			require.Equalf(t, "t", meta.Author.Name, "%s commit %s", shape, oid)
+			require.Equalf(t, "t@e", meta.Author.Email, "%s commit %s", shape, oid)
+			require.Emptyf(t, meta.Message, "%s commit %s", shape, oid)
+		}
+	}
+}

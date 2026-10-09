@@ -54,11 +54,7 @@ func BenchmarkGetCommitMetadataCold(b *testing.B) {
 	i := 0
 	for b.Loop() {
 		if i%len(oids) == 0 {
-			// clear (not re-make) keeps this compiling across metaCache
-			// entry-type changes and avoids map re-allocation noise.
-			scanner.meta.mu.Lock()
-			clear(scanner.meta.m)
-			scanner.meta.mu.Unlock()
+			scanner.meta.attachGraph(scanner.graphData)
 		}
 		_, err := scanner.GetCommitMetadata(oids[i%len(oids)])
 		if err != nil {

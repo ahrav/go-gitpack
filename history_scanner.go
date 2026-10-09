@@ -1537,6 +1537,12 @@ func (hs *HistoryScanner) Close() error {
 // message for a single commit.
 //
 // Instances are immutable and therefore safe for concurrent reads.
+//
+// For a cached commit, the strings in Author and Message reference a 64 KiB
+// metaCache slab shared with other commits (metaCache.miss builds them with
+// rebaseEntry), so a retained CommitMetadata keeps that slab reachable,
+// including after Close. Callers that keep values beyond the scan should copy
+// the fields they need with strings.Clone.
 type CommitMetadata struct {
 	// Author records the commit author exactly as stored in the commit header.
 	Author AuthorInfo
@@ -1554,7 +1560,8 @@ type CommitMetadata struct {
 }
 
 // GetCommitMetadata returns (and caches) the commit's author, timestamp, and
-// message.
+// message. A commit whose payload exceeds maxCommitPayload is attributed from
+// its header, with an empty Message.
 func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }

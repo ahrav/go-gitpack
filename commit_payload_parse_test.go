@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,6 +130,158 @@ func (r *slabProbeReader) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byt
 	return dst, nil
 }
 
+func (r *slabProbeReader) readCommitHeader(oid Hash) ([]byte, error) {
+	p, ok := r.payloads[oid]
+	if !ok {
+		return nil, fmt.Errorf("object %x not found", oid)
+	}
+	return trimCommitHeader(p)
+}
+
+// gatedPayloadReader holds every payload read open after its destination is
+// reserved, so a test can force several goroutines to miss the same OID at
+// once and measure slab retention after the insert race.
+type gatedPayloadReader struct {
+	slabProbeReader
+	arrived sync.WaitGroup
+	gate    chan struct{}
+}
+
+func (r *gatedPayloadReader) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) {
+	p, err := r.slabProbeReader.readCommitPayloadTo(oid, sink)
+	r.arrived.Done()
+	<-r.gate
+	return p, err
+}
+
+// Holding all eight reads at the gate exposes slab retention from competing
+// inserts for one OID: the slab must hold exactly one payload afterwards.
+func TestMetaCacheConcurrentMissesRetainOnePayload(t *testing.T) {
+	const goroutines = 8
+	oid := Hash{0x31}
+	payload := []byte("tree 1234567890abcdef1234567890abcdef12345678\n" +
+		"author Racer <racer@example.com> 1500000000 +0000\n" +
+		"committer Racer <racer@example.com> 1500000000 +0000\n\n" +
+		strings.Repeat("racing message ", 40))
+	reader := &gatedPayloadReader{
+		slabProbeReader: slabProbeReader{payloads: map[Hash][]byte{oid: payload}},
+		gate:            make(chan struct{}),
+	}
+	reader.arrived.Add(goroutines)
+	cache := newMetaCache(nil, reader)
+
+	var wg sync.WaitGroup
+	results := make([]CommitMetadata, goroutines)
+	errs := make([]error, goroutines)
+	for g := range goroutines {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results[g], errs[g] = cache.get(oid)
+		}()
+	}
+	reader.arrived.Wait()
+	close(reader.gate)
+	wg.Wait()
+
+	_, wantMsg := splitCommitPayload(payload)
+	for g := range goroutines {
+		require.NoError(t, errs[g])
+		require.Equal(t, "Racer", results[g].Author.Name)
+		require.Equal(t, string(wantMsg), results[g].Message)
+	}
+	require.Equalf(t, len(payload), len(cache.slab),
+		"slab bytes after %d concurrent misses of one payload", goroutines)
+}
+
+func TestMetaCacheOversizedPayloadNotRetained(t *testing.T) {
+	oid := Hash{0x51}
+	payload := []byte("tree 1234567890abcdef1234567890abcdef12345678\n" +
+		"author Big <big@example.com> 1500000000 +0000\n" +
+		"committer Big <big@example.com> 1500000000 +0000\n\n" +
+		strings.Repeat("A", metaSlabSize+1))
+	cache := newMetaCache(nil, &slabProbeReader{payloads: map[Hash][]byte{oid: payload}})
+
+	_, wantMsg := splitCommitPayload(payload)
+	for range 2 {
+		meta, err := cache.get(oid)
+		require.NoError(t, err)
+		require.Equal(t, "Big", meta.Author.Name)
+		require.Equal(t, "big@example.com", meta.Author.Email)
+		require.Equal(t, string(wantMsg), meta.Message)
+	}
+	cache.mu.RLock()
+	_, cached := cache.m[oid]
+	cache.mu.RUnlock()
+	require.False(t, cached, "oversized payload was retained in the cache")
+	require.Zero(t, cache.slabBytes, "oversized payload consumed slab budget")
+}
+
+func TestMetaCacheBudgetBoundsRetention(t *testing.T) {
+	reader := &slabProbeReader{payloads: map[Hash][]byte{}}
+	const commits = 400 // ~400 * ~700 B needs more than two 64 KiB slabs
+	oids := make([]Hash, commits)
+	for i := range oids {
+		oid := Hash{0xb0, byte(i >> 8), byte(i)}
+		oids[i] = oid
+		reader.payloads[oid] = []byte(fmt.Sprintf(
+			"tree 1234567890abcdef1234567890abcdef12345678\n"+
+				"author A%d <a%d@example.com> %d +0000\n"+
+				"committer C%d <c%d@example.com> %d +0000\n\n%s",
+			i, i, 1500000000+i, i, i, 1600000000+i, strings.Repeat(fmt.Sprintf("m%d ", i), 120)))
+	}
+
+	for _, budget := range []int{2 * metaSlabSize, 0} {
+		cache := newMetaCache(nil, reader)
+		cache.budget = budget
+		for pass := range 2 {
+			for i, oid := range oids {
+				meta, err := cache.get(oid)
+				require.NoError(t, err)
+				require.Equalf(t, fmt.Sprintf("A%d", i), meta.Author.Name, "budget %d pass %d entry %d", budget, pass, i)
+				_, wantMsg := splitCommitPayload(reader.payloads[oid])
+				require.Equalf(t, string(wantMsg), meta.Message, "budget %d pass %d entry %d", budget, pass, i)
+			}
+		}
+		require.LessOrEqualf(t, cache.slabBytes, budget, "slab bytes exceed budget %d", budget)
+		require.Lessf(t, len(cache.m), commits, "budget %d cached every commit", budget)
+		if budget == 0 {
+			require.Empty(t, cache.m, "a zero budget must turn caching off")
+		} else {
+			require.NotEmpty(t, cache.m, "a positive budget must cache commits until it is spent")
+		}
+	}
+}
+
+type oversizedPayloadReader struct {
+	headers map[Hash][]byte
+}
+
+func (r *oversizedPayloadReader) readCommitPayload(oid Hash) ([]byte, error) {
+	return nil, fmt.Errorf("%w: %x", errCommitPayloadTooLarge, oid)
+}
+
+func (r *oversizedPayloadReader) readCommitHeader(oid Hash) ([]byte, error) {
+	return r.headers[oid], nil
+}
+
+func TestMetaCacheOversizedCommitFallsBackToHeader(t *testing.T) {
+	oid := Hash{0x61}
+	reader := &oversizedPayloadReader{headers: map[Hash][]byte{oid: []byte(
+		"tree 1234567890abcdef1234567890abcdef12345678\n" +
+			"author Huge <huge@example.com> 1500000000 +0000\n" +
+			"committer Huge <huge@example.com> 1500000000 +0000\n")}}
+	cache := newMetaCache(nil, reader)
+	for range 2 {
+		meta, err := cache.get(oid)
+		require.NoError(t, err)
+		require.Equal(t, "Huge", meta.Author.Name)
+		require.Equal(t, "huge@example.com", meta.Author.Email)
+		require.Equal(t, int64(1500000000), meta.Timestamp)
+		require.Empty(t, meta.Message)
+	}
+}
+
 // TestMetaCacheSlabRetention fills several slabs through the sink path and
 // then checks every cached entry: regions handed out before a slab was
 // replaced must still hold their own bytes, and entries must not alias.
@@ -173,12 +326,12 @@ func TestMetaCacheSlabRetention(t *testing.T) {
 	}
 }
 
-// TestMetaCacheReserveRegions checks reserve directly: regions are exactly
-// sized, capacity-clipped, disjoint, and a region reserved before a slab
-// replacement keeps its bytes afterwards.
-func TestMetaCacheReserveRegions(t *testing.T) {
+func TestMetaCacheRetainRegions(t *testing.T) {
 	c := newMetaCache(nil, newMockCommitPayloadReader())
-	first := c.reserve(100)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	first := c.retainLocked(100)
 	require.Len(t, first, 100)
 	require.Equal(t, 100, cap(first), "region capacity must not expose the rest of the slab")
 	for i := range first {
@@ -186,18 +339,19 @@ func TestMetaCacheReserveRegions(t *testing.T) {
 	}
 	// Exhaust the current slab so the next reservation starts a new one.
 	for reserved := 100; reserved+metaSlabSize/2 <= metaSlabSize; reserved += metaSlabSize / 2 {
-		c.reserve(metaSlabSize / 2)
+		require.NotNil(t, c.retainLocked(metaSlabSize/2))
 	}
-	second := c.reserve(metaSlabSize / 2)
+	second := c.retainLocked(metaSlabSize / 2)
 	require.Len(t, second, metaSlabSize/2)
+	require.Equal(t, 2*metaSlabSize, c.slabBytes)
 	for i := range second {
 		second[i] = 0x5a
 	}
 	for i := range first {
 		require.Equalf(t, byte(0xa5), first[i], "byte %d of the first region changed after slab replacement", i)
 	}
-	huge := c.reserve(metaSlabSize + 1)
-	require.Len(t, huge, metaSlabSize+1)
+	require.Nil(t, c.retainLocked(metaSlabSize+1))
+	require.Equal(t, 2*metaSlabSize, c.slabBytes, "an oversized request must not allocate a slab")
 }
 
 // TestMetaCacheAttachGraphRefreshesTimestamps pins that a graph attached

@@ -39,6 +39,14 @@ func (m *mockCommitPayloadReader) readCommitPayload(oid Hash) ([]byte, error) {
 	return nil, fmt.Errorf("object %x not found", oid)
 }
 
+func (m *mockCommitPayloadReader) readCommitHeader(oid Hash) ([]byte, error) {
+	payload, err := m.readCommitPayload(oid)
+	if err != nil {
+		return nil, err
+	}
+	return trimCommitHeader(payload)
+}
+
 // mockCommitMessage is the message body addCommit embeds in every generated
 // payload, so tests can assert Message extraction against a known value.
 const mockCommitMessage = "Test commit message\n"
@@ -645,6 +653,10 @@ type slowCommitPayloadReader struct {
 func (s *slowCommitPayloadReader) readCommitPayload(oid Hash) ([]byte, error) {
 	time.Sleep(s.delay)
 	return s.delegate.readCommitPayload(oid)
+}
+
+func (s *slowCommitPayloadReader) readCommitHeader(oid Hash) ([]byte, error) {
+	return s.delegate.readCommitHeader(oid)
 }
 
 // BenchmarkParseAuthorHeader measures the throughput of parseAuthorHeader across

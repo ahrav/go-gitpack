@@ -766,11 +766,18 @@ func trimCommitHeader(full []byte) ([]byte, error) {
 }
 
 // maxCommitPayload caps the decompressed size readCommitPayload accepts for
-// a single commit object. Real commit payloads are tiny (hundreds of bytes;
-// multi-KiB for merge shortlogs), so the cap only trips on corrupt or
-// adversarial packs claiming giant commits, and it is enforced before any
-// payload-sized allocation.
-const maxCommitPayload = 64 << 20 // 64 MiB
+// a single commit object. It is mutable so tests can exercise the cap with
+// small fixtures.
+var maxCommitPayload = 64 << 20 // 64 MiB
+
+var errCommitPayloadTooLarge = errors.New("commit payload exceeds attribution cap")
+
+func checkCommitPayloadSize(size uint64, oid Hash) error {
+	if size > uint64(maxCommitPayload) {
+		return fmt.Errorf("%w: %d bytes exceeds %d for %x", errCommitPayloadTooLarge, size, maxCommitPayload, oid)
+	}
+	return nil
+}
 
 // readCommitPayload reads the full uncompressed payload of a commit object:
 // header lines and the message that follows them.
@@ -806,8 +813,8 @@ func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) 
 		if typ != ObjCommit {
 			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
 		}
-		if len(full) > maxCommitPayload {
-			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", len(full), maxCommitPayload, oid)
+		if err := checkCommitPayloadSize(uint64(len(full)), oid); err != nil {
+			return nil, err
 		}
 		return full, nil
 	}
@@ -833,8 +840,8 @@ func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) 
 		// Plain packed commit: one exact-size destination, one-shot
 		// inflate. The size comes from the pack header, so the cap check
 		// precedes the reservation.
-		if size > maxCommitPayload {
-			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", size, maxCommitPayload, oid)
+		if err := checkCommitPayloadSize(size, oid); err != nil {
+			return nil, err
 		}
 		payload := sink.reserve(int(size))
 		if err := inflateExact(p, int64(off)+int64(hdrLen), payload); err != nil {
@@ -850,8 +857,8 @@ func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) 
 		if resolvedType != ObjCommit {
 			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
 		}
-		if len(full) > maxCommitPayload {
-			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", len(full), maxCommitPayload, oid)
+		if err := checkCommitPayloadSize(uint64(len(full)), oid); err != nil {
+			return nil, err
 		}
 		// The copy is mandatory: materialized bytes may alias shared cache
 		// buffers, and the caller retains the payload.
