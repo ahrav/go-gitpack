@@ -146,6 +146,9 @@ type HistoryScanner struct {
 	// hunkDedupBudget bounds fingerprint storage for deduplicating scans.
 	hunkDedupBudget int
 
+	dedupLimits dedupLimits
+	dedupProbe  *dedupProbe
+
 	// profileServer is the HTTP server for pprof endpoints.
 	profileServer *http.Server
 
@@ -205,6 +208,7 @@ func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, e
 		meta:            mc,
 		pairs:           newPairCache(),
 		hunkDedupBudget: defaultHunkDedupBudget,
+		dedupLimits:     defaultDedupLimits(),
 	}
 
 	for _, opt := range opts {

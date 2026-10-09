@@ -1204,30 +1204,53 @@ func TestBacklogScratch_EarlierPositionWins(t *testing.T) {
 // head computes seq-1) must return at once rather than wrap to a huge
 // distance and park forever.
 func TestDedupInFlightWindow_WaitNeverWrapsBelowDecided(t *testing.T) {
-	w := newDedupInFlightWindow()
+	w := newDedupInFlightWindow(dedupMaxInFlightPairs, nil)
 	w.advanced(10)
 	stop := make(chan struct{})
-	done := make(chan bool, 1)
-	go func() { done <- w.wait(9, stop) }()
-	select {
-	case ok := <-done:
-		require.True(t, ok)
-	case <-time.After(5 * time.Second):
-		t.Fatal("wait parked on a seq below the decided count")
+	work := make(chan []dedupPairWork, 1)
+	fits := func(seq uint64) func() bool {
+		return func() bool { return seq < w.decided.Load()+w.width }
 	}
-	// And a seq at the window edge parks until advanced moves it.
-	go func() { done <- w.wait(10+dedupMaxInFlightPairs, stop) }()
+	type parked struct {
+		works   []dedupPairWork
+		outcome parkOutcome
+	}
+	done := make(chan parked, 1)
+	park := func(ready func() bool) {
+		works, outcome := w.park(ready, stop, work)
+		done <- parked{works, outcome}
+	}
+
+	go park(fits(9))
+	select {
+	case p := <-done:
+		require.Equal(t, parkReady, p.outcome)
+	case <-time.After(5 * time.Second):
+		t.Fatal("park blocked on a seq below the decided count")
+	}
+
+	go park(fits(10 + dedupMaxInFlightPairs))
 	select {
 	case <-done:
-		t.Fatal("wait returned while the window was full")
+		t.Fatal("park returned while the window was full")
 	case <-time.After(50 * time.Millisecond):
 	}
 	w.advanced(1)
 	select {
-	case ok := <-done:
-		require.True(t, ok)
+	case p := <-done:
+		require.Equal(t, parkReady, p.outcome)
 	case <-time.After(5 * time.Second):
-		t.Fatal("advanced did not wake the waiter")
+		t.Fatal("advanced did not wake the parked sequencer")
+	}
+
+	go park(fits(11 + 2*dedupMaxInFlightPairs))
+	work <- []dedupPairWork{{seq: 7}}
+	select {
+	case p := <-done:
+		require.Equal(t, parkWork, p.outcome)
+		require.Equal(t, []dedupPairWork{{seq: 7}}, p.works)
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued work did not end the park")
 	}
 }
 

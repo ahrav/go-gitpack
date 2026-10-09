@@ -151,6 +151,34 @@ const (
 	dedupProbePrefetch = 16
 )
 
+type dedupLimits struct {
+	// inFlightPairs must be a power of two: the reorder ring is indexed by
+	// seq & (inFlightPairs-1).
+	inFlightPairs      uint64
+	lookaheadCommits   int
+	expensivePairBytes uint64
+	earlyBytesCap      uint64
+	yieldChanCap       int
+	workers            int
+}
+
+func defaultDedupLimits() dedupLimits {
+	return dedupLimits{
+		inFlightPairs:      dedupMaxInFlightPairs,
+		lookaheadCommits:   dedupLookaheadCommits,
+		expensivePairBytes: dedupExpensivePairBytes,
+		earlyBytesCap:      dedupEarlyBytesCap,
+		yieldChanCap:       dedupYieldChanCap,
+	}
+}
+
+// dedupProbe records pipeline observations for package tests.
+type dedupProbe struct {
+	// windowWaits counts sequencer waits on the in-flight window that
+	// returned ready.
+	windowWaits atomic.Uint64
+}
+
 // lineFingerprint hashes one added line (without its trailing newline —
 // tokenize already strips it) to the 64-bit fingerprint used for dedup.
 // FarmHash matches the package's existing line-hashing convention
@@ -526,35 +554,52 @@ type dedupInFlightWindow struct {
 	// stage's bookkeeping.
 	stampedSeqs atomic.Uint64
 	wake        chan struct{}
+	width       uint64
+	probe       *dedupProbe
 }
 
 // stamped returns how many seqs the sequencer has assigned so far.
 func (w *dedupInFlightWindow) stamped() uint64 { return w.stampedSeqs.Load() }
 
-func newDedupInFlightWindow() *dedupInFlightWindow {
-	return &dedupInFlightWindow{wake: make(chan struct{}, 1)}
+func newDedupInFlightWindow(width uint64, probe *dedupProbe) *dedupInFlightWindow {
+	return &dedupInFlightWindow{wake: make(chan struct{}, 1), width: width, probe: probe}
 }
 
 // advanced records that n more pairs, in seq order, have been decided.
 func (w *dedupInFlightWindow) advanced(n uint64) {
 	w.decided.Add(n)
+	w.notify()
+}
+
+// notify wakes a parked sequencer so it re-evaluates its condition.
+func (w *dedupInFlightWindow) notify() {
 	select {
 	case w.wake <- struct{}{}:
 	default:
 	}
 }
 
-// wait blocks until fewer than dedupMaxInFlightPairs seqs below seq remain
-// undecided, or stopCh closes (reported as false).
-func (w *dedupInFlightWindow) wait(seq uint64, stopCh <-chan struct{}) bool {
+type parkOutcome int
+
+const (
+	parkReady parkOutcome = iota
+	parkStopped
+	parkWork
+)
+
+func (w *dedupInFlightWindow) park(ready func() bool, stopCh <-chan struct{}, work <-chan []dedupPairWork) ([]dedupPairWork, parkOutcome) {
 	for {
-		decided := w.decided.Load()
-		if seq < decided || seq-decided < dedupMaxInFlightPairs {
-			return true
+		if ready() {
+			if w.probe != nil {
+				w.probe.windowWaits.Add(1)
+			}
+			return nil, parkReady
 		}
 		select {
 		case <-stopCh:
-			return false
+			return nil, parkStopped
+		case works := <-work:
+			return works, parkWork
 		case <-w.wake:
 		}
 	}
@@ -704,14 +749,13 @@ type dedupExpensivePair struct {
 	bytes uint64
 }
 
-// expensivePairs returns the pairs whose old or new blob estimatePackedSize
-// puts at dedupExpensivePairBytes or more.
 func (hs *HistoryScanner) expensivePairs(pairs []blobPairWork) []dedupExpensivePair {
+	threshold := hs.dedupLimits.expensivePairBytes
 	var out []dedupExpensivePair
 	for i := range pairs {
 		w := &pairs[i]
 		est := max(hs.estimatePackedSize(w.newOID), hs.estimatePackedSize(w.oldOID))
-		if est >= dedupExpensivePairBytes {
+		if est >= threshold {
 			out = append(out, dedupExpensivePair{index: i, bytes: est})
 		}
 	}
@@ -849,10 +893,17 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		order = filtered
 	}
 
-	numWorkers := runtime.NumCPU()
+	limits := hs.dedupLimits
+	window := limits.inFlightPairs
+	ringMask := window - 1
+	lookahead := limits.lookaheadCommits
+	numWorkers := limits.workers
+	if numWorkers <= 0 {
+		numWorkers = runtime.NumCPU()
+	}
 	treeWorkers := min(numWorkers, maxTreeDiffWorkers)
 
-	treeIdxChan := make(chan int, dedupLookaheadCommits)
+	treeIdxChan := make(chan int, lookahead)
 	expensiveChan := make(chan []dedupPairWork, dedupExpensiveChanCap)
 	// Results travel through a reorder ring indexed by seq: the sequencer
 	// never stamps a seq that is dedupMaxInFlightPairs or more ahead of the
@@ -860,8 +911,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// written by exactly one worker and read by the decision goroutine.
 	// Workers therefore never block on delivery; the only backpressure is
 	// the in-flight window itself.
-	ring := make([]dedupPairResult, dedupMaxInFlightPairs)
-	present := make([]atomic.Bool, dedupMaxInFlightPairs)
+	ring := make([]dedupPairResult, window)
+	present := make([]atomic.Bool, window)
 	// arrived collects delivered seqs for the decision goroutine's backlog
 	// pre-processing; resultsReady wakes it (without blocking the sender).
 	var (
@@ -871,7 +922,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	)
 	deliver := func(results []dedupPairResult) {
 		for _, res := range results {
-			i := res.seq & (dedupMaxInFlightPairs - 1)
+			i := res.seq & ringMask
 			ring[i] = res
 			present[i].Store(true)
 		}
@@ -888,14 +939,14 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// slotReady is pinged (without blocking) by tree workers when a slot
 	// completes so the sequencer can stamp ahead while it waits elsewhere.
 	slotReady := make(chan struct{}, 1)
-	yieldChan := make(chan []HunkAddition, dedupYieldChanCap)
+	yieldChan := make(chan []HunkAddition, limits.yieldChanCap)
 	stopCh := make(chan struct{})
-	slots := make([]dedupCommitSlot, dedupLookaheadCommits)
+	slots := make([]dedupCommitSlot, lookahead)
 
 	// The fingerprint set is owned by the decision goroutine; hunk workers
 	// only read its published snapshot.
 	set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
-	inFlight := newDedupInFlightWindow()
+	inFlight := newDedupInFlightWindow(window, hs.dedupProbe)
 
 	var (
 		stopOnce sync.Once
@@ -926,7 +977,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					if !ok {
 						return
 					}
-					slot := &slots[idx%dedupLookaheadCommits]
+					slot := &slots[idx%lookahead]
 					pairs, err := hs.collectCommitPairs(order[idx])
 					var expensive []dedupExpensivePair
 					if err == nil {
@@ -980,8 +1031,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// ahead of the emit cursor. treeIdxChan's capacity equals the window,
 	// so the send never blocks.
 	dispatch := func() {
-		for nextDispatch < len(order) && nextDispatch-emitCommit < dedupLookaheadCommits {
-			slot := &slots[nextDispatch%dedupLookaheadCommits]
+		for nextDispatch < len(order) && nextDispatch-emitCommit < lookahead {
+			slot := &slots[nextDispatch%lookahead]
 			// Re-arm only the done channel: the tree worker overwrites
 			// pairs and err wholesale (adopting collectCommitPairs'
 			// returned slice) before closing done, and the ring slot's
@@ -993,13 +1044,23 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			nextDispatch++
 		}
 	}
+	stampable := func(n uint64) bool {
+		if n == 0 {
+			return true
+		}
+		decided := inFlight.decided.Load()
+		if n > window {
+			return seq == decided
+		}
+		return seq+n <= decided+window
+	}
 	// stampAhead assigns seqs to every further commit whose slot is done,
 	// without blocking, and forwards its expensive pairs while
 	// expensiveChan has room. It stops at the first incomplete slot, at
 	// the in-flight window, or at a tree-stage error (reported as false).
 	stampAhead := func() bool {
 		for stamp < nextDispatch {
-			slot := &slots[stamp%dedupLookaheadCommits]
+			slot := &slots[stamp%lookahead]
 			select {
 			case <-slot.done:
 			default:
@@ -1009,20 +1070,17 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				return false
 			}
 			n := uint64(len(slot.pairs))
-			// Stamping needs every seq of the commit inside the window so
-			// the decision ring can hold them. A commit wider than the
-			// window is stamped only once nothing else is in flight; the
-			// emit path then hands it out pair by pair under the same
-			// bound.
-			if n > 0 {
-				decided := inFlight.decided.Load()
-				if seq+n-decided > dedupMaxInFlightPairs && !(seq == decided && n > dedupMaxInFlightPairs) {
-					return true
-				}
+			if !stampable(n) {
+				return true
 			}
 			slot.firstSeq = seq
+			// The ring indexes results by seq modulo the window, so an early
+			// pair past the window edge of a wide commit would share a slot
+			// with an undecided in-order pair. slot.expensive is in index
+			// order, so the first pair past the edge ends the loop.
+			edge := inFlight.decided.Load() + window
 			for _, e := range slot.expensive {
-				if earlyBytes.Load()+e.bytes > dedupEarlyBytesCap {
+				if seq+uint64(e.index) >= edge || earlyBytes.Load()+e.bytes > limits.earlyBytesCap {
 					break
 				}
 				select {
@@ -1057,10 +1115,10 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		for emitCommit < len(order) {
 			dispatch()
 			if !stampAhead() {
-				setError(slots[stamp%dedupLookaheadCommits].err)
+				setError(slots[stamp%lookahead].err)
 				return nil, false
 			}
-			slot := &slots[emitCommit%dedupLookaheadCommits]
+			slot := &slots[emitCommit%lookahead]
 			if stamp <= emitCommit {
 				// Not stamped yet: stampAhead stopped at slot(stamp),
 				// which is either still in the tree stage or blocked by
@@ -1069,28 +1127,27 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				if len(batch) > 0 {
 					return batch, true
 				}
-				blocked := &slots[stamp%dedupLookaheadCommits]
+				blocked := &slots[stamp%lookahead]
 				select {
 				case <-blocked.done:
 				default:
 					select {
 					case <-stopCh:
 						return nil, false
+					case works := <-expensiveChan:
+						return works, true
 					case <-blocked.done:
 					case <-slotReady:
 					}
 					continue
 				}
-				// Done but unstamped, so the window is full (stampAhead
-				// stamps empty commits unconditionally, so n >= 1): park
-				// until the decision stage frees room for the commit, or
-				// for one pair of a commit wider than the window.
-				want := seq + uint64(len(blocked.pairs)) - 1
-				if uint64(len(blocked.pairs)) > dedupMaxInFlightPairs {
-					want = seq
-				}
-				if !inFlight.wait(want, stopCh) {
+				n := uint64(len(blocked.pairs))
+				works, outcome := inFlight.park(func() bool { return stampable(n) }, stopCh, expensiveChan)
+				switch outcome {
+				case parkStopped:
 					return nil, false
+				case parkWork:
+					return works, true
 				}
 				continue
 			}
@@ -1103,13 +1160,17 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					continue
 				}
 				s := slot.firstSeq + uint64(emitPair)
-				if s-inFlight.decided.Load() >= dedupMaxInFlightPairs {
+				if s >= inFlight.decided.Load()+window {
 					// Only reachable inside a commit wider than the window.
 					if len(batch) > 0 {
 						return batch, true
 					}
-					if !inFlight.wait(s, stopCh) {
+					works, outcome := inFlight.park(func() bool { return s < inFlight.decided.Load()+window }, stopCh, expensiveChan)
+					switch outcome {
+					case parkStopped:
 						return nil, false
+					case parkWork:
+						return works, true
 					}
 				}
 				if batch == nil {
@@ -1242,13 +1303,17 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		drain := func() bool {
 			start := next
 			for {
-				i := next & (dedupMaxInFlightPairs - 1)
+				i := next & ringMask
 				if !present[i].Load() {
 					break
 				}
 				r := ring[i]
 				ring[i] = dedupPairResult{}
 				present[i].Store(false)
+				if r.seq != next {
+					setError(fmt.Errorf("dedup reorder ring slot %d holds seq %d, want %d", i, r.seq, next))
+					return false
+				}
 				next++
 				if r.earlyBytes != 0 {
 					earlyBytes.Add(^(r.earlyBytes - 1))
@@ -1299,7 +1364,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				seq := backlog[len(backlog)-1]
 				backlog = backlog[:len(backlog)-1]
 				if seq >= next {
-					if i := seq & (dedupMaxInFlightPairs - 1); present[i].Load() {
+					if i := seq & ringMask; present[i].Load() {
 						set.prepBacklog(ring[i], scratch)
 					}
 				}
