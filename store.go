@@ -316,14 +316,8 @@ func open(dir string) (*store, error) {
 		}
 		f.pack = handle
 		f.idx = ix
+		f.packPath = path
 		store.packs = append(store.packs, f)
-
-		if f.sortedOffsets != nil {
-			f.ridx, err = loadReverseIndex(path, f)
-			if err != nil {
-				return nil, fmt.Errorf("load ridx: %w", err)
-			}
-		}
 	}
 	if len(store.packs) > 1 {
 		store.memoryMidx = buildInMemoryMidx(store.packs)

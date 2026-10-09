@@ -20,6 +20,7 @@ import (
 	"io"
 	"math"
 	"slices"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/exp/mmap"
@@ -95,6 +96,28 @@ type idxFile struct {
 	// file (true) versus synthesized from sortedOffsets (false). Only trusted
 	// reverse indexes can map offset order back to idx-entry order for CRC lookups.
 	ridxCRCTrusted bool
+
+	// packPath locates the *.pack file whose reverse index ridxOnce loads on
+	// first use. Only the CRC paths consult the reverse index, so hunk and
+	// blob scans with VerifyCRC off never pay for it.
+	packPath string
+	ridxOnce sync.Once
+}
+
+// reverseIndex returns the pack's reverse index, loading it from the
+// companion .ridx/.rev file or synthesizing it from the entries table on
+// first use. A reverse index assigned before the first call (by
+// constructors in tests) is kept.
+func (f *idxFile) reverseIndex() []uint32 {
+	f.ridxOnce.Do(func() {
+		if f.ridx != nil || f.packPath == "" || f.sortedOffsets == nil {
+			return
+		}
+		// loadReverseIndex falls back to the synthesized table on every
+		// parse error and returns nil only for a nil receiver.
+		f.ridx, _ = loadReverseIndex(f.packPath, f)
+	})
+	return f.ridx
 }
 
 // findObject looks up hash in the tables that belong to a single
@@ -162,9 +185,10 @@ func (f *idxFile) crcAtOffset(off uint64) (uint32, bool) {
 
 	// Only trust on-disk ridx mappings for CRC lookups. Synthetic fallback
 	// tables encode descending rank, not offset->entries index mapping.
-	if f.ridxCRCTrusted && len(f.ridx) == len(f.sortedOffsets) {
+	ridx := f.reverseIndex()
+	if f.ridxCRCTrusted && len(ridx) == len(f.sortedOffsets) {
 		desc := len(f.sortedOffsets) - 1 - i
-		idxPos := int(f.ridx[desc])
+		idxPos := int(ridx[desc])
 		if idxPos >= 0 && idxPos < len(f.entries) {
 			return f.entries[idxPos].crc, true
 		}
@@ -408,27 +432,36 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 	}
 
-	offs := make([]uint64, objCount)
-	for i, e := range entries {
-		offs[i] = e.offset
-	}
-	slices.Sort(offs)
-
-	// Trailer verification.
+	// Trailer verification runs concurrently with the offset sort below;
+	// both are proportional to the object count and independent.
 	trailer := make([]byte, 40)
 	if _, err := ix.ReadAt(trailer, int64(ix.Len()-40)); err != nil {
 		return nil, err
 	}
-
 	wantIdxSHA := trailer[hashSize:]
+	shaErr := make(chan error, 1)
+	go func() {
+		// Recompute idx‑SHA over everything **except** the final idx hash itself.
+		h := sha1.New()
+		if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-int64(hashSize))); err != nil {
+			shaErr <- err
+			return
+		}
+		if !bytes.Equal(h.Sum(nil), wantIdxSHA) {
+			shaErr <- ErrBadIdxChecksum
+			return
+		}
+		shaErr <- nil
+	}()
 
-	// Recompute idx‑SHA over everything **except** the final idx hash itself.
-	h := sha1.New()
-	if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-int64(hashSize))); err != nil {
-		return nil, err
+	offs := make([]uint64, objCount)
+	for i, e := range entries {
+		offs[i] = e.offset
 	}
-	if !bytes.Equal(h.Sum(nil), wantIdxSHA) {
-		return nil, ErrBadIdxChecksum
+	sortOffsets(offs)
+
+	if err := <-shaErr; err != nil {
+		return nil, err
 	}
 
 	return &idxFile{
@@ -453,8 +486,47 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 //   - pf.ridx is non-nil (a reverse index was loaded for this pack).
 //   - 0 <= bit < len(pf.ridx).
 func (pf *idxFile) resolveIdxPos(bit int) uint32 {
-	if pf.ridx == nil || bit < 0 || bit >= len(pf.ridx) {
+	ridx := pf.reverseIndex()
+	if ridx == nil || bit < 0 || bit >= len(ridx) {
 		panic("idxFile.resolveIdxPos: out‑of‑range")
 	}
-	return pf.ridx[bit]
+	return ridx[bit]
+}
+
+// sortOffsets sorts pack offsets ascending with an LSD radix sort over 8-bit
+// digits. Passes above the highest set bit are skipped, so a pack below
+// 4 GiB takes four passes. Each pass is a counting sort, so the whole sort
+// reads the input a fixed number of times.
+func sortOffsets(offs []uint64) {
+	if len(offs) < 1024 {
+		slices.Sort(offs)
+		return
+	}
+	var maxOff uint64
+	for _, v := range offs {
+		maxOff |= v
+	}
+	tmp := make([]uint64, len(offs))
+	src, dst := offs, tmp
+	for shift := uint(0); shift < 64 && maxOff>>shift != 0; shift += 8 {
+		var counts [256]int
+		for _, v := range src {
+			counts[(v>>shift)&0xff]++
+		}
+		pos := 0
+		for i := range counts {
+			c := counts[i]
+			counts[i] = pos
+			pos += c
+		}
+		for _, v := range src {
+			d := (v >> shift) & 0xff
+			dst[counts[d]] = v
+			counts[d]++
+		}
+		src, dst = dst, src
+	}
+	if &src[0] != &offs[0] {
+		copy(offs, src)
+	}
 }
