@@ -1027,7 +1027,7 @@ func TestApplyDeltaStreaming_SizeMismatchIncludesSizes(t *testing.T) {
 	// Call with the WRONG base (different length) to trigger size mismatch.
 	wrongBase := []byte("short")
 	out := make([]byte, 0, 4096)
-	_, err = applyDeltaStreaming(pack, 0, typ, wrongBase, out, false, 0)
+	_, err = applyDeltaStreaming(pack, 0, typ, wrongBase, func(int) []byte { return out }, 0)
 	require.Error(t, err)
 
 	// After fix: the error message includes both sizes, not just "delta base size mismatch".
@@ -1061,7 +1061,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 
 	t.Run("payload exceeds configured limit", func(t *testing.T) {
 		pack, typ := openPayload(t, nil, 1024)
-		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, 64)
 		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
 	})
 
@@ -1073,7 +1073,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		// byte is read — here 1 GiB, and with maxObjectSize=0 the 8× bound
 		// is disabled entirely, so this check is the only allocation guard.
 		pack, typ := openPayload(t, nil, 1<<30)
-		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, 0)
 		require.ErrorContains(t, err, "cannot inflate")
 	})
 
@@ -1091,7 +1091,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		require.Greater(t, payload.Len(), 64, "test premise: payload exceeds the target limit")
 
 		pack, typ := openPayload(t, payload.Bytes(), 0)
-		out, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		out, err := applyDeltaStreaming(pack, 0, typ, nil, nil, 64)
 		require.NoError(t, err)
 		require.Equal(t, bytes.Repeat([]byte{'x'}, 64), out)
 	})
@@ -1101,7 +1101,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		writeVarInt(&payload, 0)
 		writeVarInt(&payload, 65)
 		pack, typ := openPayload(t, payload.Bytes(), 0)
-		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, 64)
 		require.ErrorIs(t, err, ErrDeltaTargetTooLarge)
 	})
 
@@ -1116,7 +1116,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		writeVarInt(&payload, 0)
 		writeVarInt(&payload, 1<<62)
 		pack, typ := openPayload(t, payload.Bytes(), 0)
-		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 0)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, 0)
 		require.ErrorContains(t, err, "not producible")
 	})
 
@@ -1126,7 +1126,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		writeVarInt(&payload, 1)
 		payload.Write([]byte{0x90, 0x02}) // Copy two bytes into a one-byte target.
 		pack, typ := openPayload(t, payload.Bytes(), 0)
-		_, err := applyDeltaStreaming(pack, 0, typ, []byte("ab"), nil, true, 64)
+		_, err := applyDeltaStreaming(pack, 0, typ, []byte("ab"), nil, 64)
 		require.ErrorContains(t, err, "exceeds declared target")
 	})
 
@@ -1136,7 +1136,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		writeVarInt(&payload, 1)
 		payload.Write([]byte{0x02, 'a', 'b'})
 		pack, typ := openPayload(t, payload.Bytes(), 0)
-		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, true, 64)
+		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, 64)
 		require.ErrorContains(t, err, "exceeds declared target")
 	})
 }

@@ -675,25 +675,15 @@ func applyDeltaStackCached(
 
 	// Single-hop fast path (the majority of chains once the offset cache
 	// short-circuits walk-up): apply the one delta into a fresh exact-size
-	// buffer and return it directly — no arena, no detach copy.
-	// applyDeltaStreaming enforces maxObjectSize before allocating the
-	// exact-size buffer, so a hostile advertised target cannot force a
-	// large allocation ahead of the limit check.
+	// buffer and return it directly. applyDeltaStreaming enforces
+	// maxObjectSize before allocating the exact-size buffer, so a hostile
+	// advertised target cannot force a large allocation ahead of the limit
+	// check.
 	if len(stack) == 1 {
 		d := stack[0]
-		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, baseData, nil, true, maxObjectSize)
+		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, baseData, nil, maxObjectSize)
 		if err != nil {
-			var tooSmall *errDeltaOutputTooSmall
-			// allocExact never under-allocates, so errDeltaOutputTooSmall
-			// here would indicate a logic error; handle size-limit checks
-			// explicitly below either way.
-			if errors.As(err, &tooSmall) && maxObjectSize > 0 && tooSmall.need > maxObjectSize {
-				return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
-			}
 			return nil, ObjBad, err
-		}
-		if maxObjectSize > 0 && uint64(len(final)) > maxObjectSize {
-			return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, len(final), maxObjectSize)
 		}
 		if oc != nil {
 			oc.add(d.pack, d.offset, final, baseType)
@@ -701,107 +691,56 @@ func applyDeltaStackCached(
 		return final, baseType, nil
 	}
 
-	arena := getDeltaArena()
-	defer putDeltaArena(arena)
-
-	maxTarget := uint64(len(baseData))
-	poolHalf := uint64(cap(arena.data) / 2)
-	if poolHalf > maxTarget && (maxObjectSize == 0 || poolHalf <= maxObjectSize) {
-		maxTarget = poolHalf
-	}
-	if maxObjectSize > 0 && maxTarget > maxObjectSize {
-		return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, maxTarget, maxObjectSize)
-	}
-	if maxTarget > uint64(cap(arena.data)/2) {
-		arena.data = make([]byte, maxTarget*2)
-	}
-
-	// Let's ping-pong! Full slice expressions pin each half's capacity to
-	// its own boundary: without them bufA's capacity would extend through
-	// bufB (and bufB's through any arena tail), letting a later hop whose
-	// target exceeds maxTarget write straight across the A/B boundary and
-	// corrupt the buffer the next hop reads — instead of taking the
-	// errDeltaOutputTooSmall resize path (which also enforces
-	// maxObjectSize).
-	bufA := arena.data[0:maxTarget:maxTarget]
-	bufB := arena.data[maxTarget : maxTarget*2 : maxTarget*2]
-
-	// The first application reads the base directly — applyDeltaStreaming
-	// never writes its input, so copying baseData into the arena first was
-	// pure overhead (one memmove per materialized object). usingA=false
-	// makes the first hop write into bufA; the ping-pong then proceeds
-	// normally and baseData is never written.
+	// Multi-hop: every hop writes into a buffer sized to its own target, so
+	// an in-flight reconstruction holds at most its two largest consecutive
+	// hops rather than a fixed arena. A hop whose result the offset cache
+	// admits writes straight into an exact-size allocation that the cache
+	// takes over, with no detach copy; every other hop borrows a pooled
+	// buffer that is returned as soon as the following hop has read it. The
+	// final hop always writes into an exact-size allocation because the
+	// caller and the OID caches retain it.
+	//
+	// applyDeltaStreaming never writes its input, so the base is read in
+	// place and never copied.
 	current := baseData
-	usingA := false
-
+	var pooled []byte // the pooled buffer current aliases, if any
 	for i := len(stack) - 1; i >= 0; i-- {
 		d := stack[i]
 
-		for {
-			// Choose output buffer (the one we're NOT currently using).
-			var out []byte
-			if usingA {
-				out = bufB[:0]
+		var publish bool
+		alloc := func(n int) []byte {
+			if i == 0 {
+				return make([]byte, 0, n)
+			}
+			if oc.admits(n) {
+				publish = true
+				return make([]byte, 0, n)
+			}
+			return getDeltaBuf(n)
+		}
+		result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, alloc, maxObjectSize)
+		if pooled != nil {
+			putDeltaBuf(pooled)
+			pooled = nil
+		}
+		if err != nil {
+			return nil, ObjBad, err
+		}
+		current = result
+
+		if i > 0 {
+			if publish {
+				// Later chains sharing this tail stop climbing here.
+				oc.add(d.pack, d.offset, current, baseType)
 			} else {
-				out = bufA[:0]
+				pooled = current
 			}
-
-			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, out, false, maxObjectSize)
-			if err != nil {
-				var tooSmall *errDeltaOutputTooSmall
-				if errors.As(err, &tooSmall) {
-					if maxObjectSize > 0 && tooSmall.need > maxObjectSize {
-						return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
-					}
-					if tooSmall.need <= maxTarget {
-						return nil, ObjBad, err
-					}
-
-					maxTarget = tooSmall.need
-					arena.data = make([]byte, maxTarget*2)
-					bufA = arena.data[0:maxTarget:maxTarget]
-					bufB = arena.data[maxTarget : maxTarget*2 : maxTarget*2]
-
-					// Re-anchor current into the new arena and retry this delta.
-					rebased := bufA[:len(current)]
-					copy(rebased, current)
-					current = rebased
-					usingA = true
-					continue
-				}
-				return nil, ObjBad, err
-			}
-
-			// The result is now in 'out' buffer, make it the current for next iteration.
-			current = result
-			usingA = !usingA // Switch which buffer we're using
-			break
-		}
-
-		// Publish intermediate materializations (every hop except the final
-		// target, which callers cache by OID) into the offset cache so that
-		// later chains sharing this tail stop climbing here. The copy is
-		// required because 'current' aliases the recycled ping-pong arena;
-		// a memmove is far cheaper than the inflate+apply work it saves.
-		// The eligibility check runs BEFORE the detach copy: copying an entry
-		// that the configured cache budget rejects would burn a guaranteed-
-		// discarded allocation at every ineligible hop.
-		if i > 0 && oc.admits(len(current)) {
-			detached := make([]byte, len(current))
-			copy(detached, current)
-			oc.add(d.pack, d.offset, detached, baseType)
 		}
 	}
 
-	// Always copy final result out of the arena so the arena can be safely
-	// recycled without invalidating returned bytes.
-	final := make([]byte, len(current))
-	copy(final, current)
 	_ = borrowed // call-site signal is currently informational only.
-	if len(stack) > 0 {
-		oc.add(stack[0].pack, stack[0].offset, final, baseType)
-	}
-	return final, baseType, nil
+	oc.add(stack[0].pack, stack[0].offset, current, baseType)
+	return current, baseType, nil
 }
 
 // readOfsDeltaOffset reads a variable-length backward offset from an
@@ -871,13 +810,17 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, int, error) {
 //
 // applyDeltaStreaming returns an error if the delta instructions are malformed or reference
 // data outside the base object bounds.
+//
+// alloc supplies the output buffer once the target size is known: it must
+// return a zero-length slice with capacity of at least the requested size.
+// A nil alloc allocates a fresh exact-size buffer, which single-hop chains
+// and final hops return directly to the caller.
 func applyDeltaStreaming(
 	pack *mmap.ReaderAt,
 	offset uint64,
 	deltaType ObjectType,
 	base []byte,
-	out []byte, // Pre-allocated output buffer (ignored when allocExact)
-	allocExact bool, // allocate a fresh exact-size output after reading the header
+	alloc func(n int) []byte,
 	maxObjectSize uint64, // reject targets/payloads beyond this bound; 0 disables
 ) ([]byte, error) {
 	// Parse the pack object header ourselves: its size field is the
@@ -1010,18 +953,15 @@ func applyDeltaStreaming(
 			targetSize, len(delta))
 	}
 
-	if allocExact {
-		// Caller asked for a fresh, exactly-sized output buffer. This lets
-		// single-hop chains (the common case) bypass the ping-pong arena
-		// and the detach copy: the result is returned directly.
+	var out []byte
+	if alloc == nil {
 		out = make([]byte, 0, targetSize)
-	} else if uint64(cap(out)) < targetSize {
-		// Verify that the output buffer is large enough for the target object.
-		return nil, &errDeltaOutputTooSmall{need: targetSize, have: cap(out)}
+	} else {
+		out = alloc(int(targetSize))[:0]
+		if uint64(cap(out)) < targetSize {
+			return nil, &errDeltaOutputTooSmall{need: targetSize, have: cap(out)}
+		}
 	}
-
-	// Initialize a zero-length slice to ensure no undefined content is present.
-	out = out[:0]
 
 	// Process the delta instructions, copying data from the base or inserting new data.
 	i := 0
