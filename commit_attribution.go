@@ -121,13 +121,15 @@ const metaSlabSize = 64 << 10
 
 const defaultMetaCacheBudget = 256 << 20
 
+// metaCacheInitialSize is the map capacity a fresh or cleared cache starts
+// with: a heuristic that avoids early rehashing for typical repository sizes
+// without over-allocating for very small repos.
+const metaCacheInitialSize = 1024
+
 // newMetaCache constructs a metaCache with the given commit graph (may be nil)
 // and commit payload reader. It is called once during NewHistoryScanner
-// initialization. The initial map capacity (1024) is a heuristic that avoids
-// early rehashing for typical repository sizes without over-allocating for
-// very small repos.
+// initialization.
 func newMetaCache(g *commitGraphData, s commitPayloadReader) *metaCache {
-	const cacheSize = 1024
 	var ts []int64
 	if g != nil {
 		ts = g.Timestamps
@@ -137,7 +139,7 @@ func newMetaCache(g *commitGraphData, s commitPayloadReader) *metaCache {
 		graph:  g,
 		store:  s,
 		ts:     ts,
-		m:      make(map[Hash]metaEntry, cacheSize),
+		m:      make(map[Hash]metaEntry, metaCacheInitialSize),
 		budget: defaultMetaCacheBudget,
 	}
 }
@@ -168,9 +170,11 @@ func (c *metaCache) clear() {
 	c.clearLocked()
 }
 
-// clearLocked requires c.mu held for writing.
+// clearLocked requires c.mu held for writing. The map is replaced rather
+// than emptied in place: clear(m) keeps the bucket array, which for a large
+// history is itself hundreds of MiB.
 func (c *metaCache) clearLocked() {
-	clear(c.m)
+	c.m = make(map[Hash]metaEntry, metaCacheInitialSize)
 	c.slab = nil
 	c.slabBytes = 0
 }

@@ -225,6 +225,13 @@ func TestReadCommitPayload_NotACommit(t *testing.T) {
 // objectsDir and returns its OID.
 func writeLooseObject(t *testing.T, objectsDir, typ string, body []byte) Hash {
 	t.Helper()
+	return writeLooseObjectDeclaring(t, objectsDir, typ, body, len(body))
+}
+
+// writeLooseObjectDeclaring is writeLooseObject with an explicit header size,
+// so tests can produce objects whose declared size disagrees with the body.
+func writeLooseObjectDeclaring(t *testing.T, objectsDir, typ string, body []byte, declared int) Hash {
+	t.Helper()
 	objType, ok := parseLooseObjectType(typ)
 	require.True(t, ok)
 	oid := calculateHash(objType, body)
@@ -233,7 +240,7 @@ func writeLooseObject(t *testing.T, objectsDir, typ string, body []byte) Hash {
 
 	var compressed bytes.Buffer
 	zw := zlib.NewWriter(&compressed)
-	_, err := fmt.Fprintf(zw, "%s %d\x00", typ, len(body))
+	_, err := fmt.Fprintf(zw, "%s %d\x00", typ, declared)
 	require.NoError(t, err)
 	_, err = zw.Write(body)
 	require.NoError(t, err)
@@ -342,6 +349,15 @@ func TestReadCommitHeader_LooseStreamsHeader(t *testing.T) {
 	require.True(t, bytes.HasSuffix(hdr, []byte("committer t <t@e> 1700000000 +0000\n")), "header %q", hdr)
 	require.Lessf(t, n, uint64(msgLen/4),
 		"loose header read allocated %d bytes; the message must not be inflated", n)
+
+	// A declared size shorter than the header marks the object corrupt in
+	// Git's terms; the streaming read must stay within it rather than
+	// accept bytes past the declared body as metadata.
+	objectsDir := t.TempDir()
+	body := []byte("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\nm\n")
+	short := writeLooseObjectDeclaring(t, objectsDir, "commit", body, 10)
+	_, err = (&store{objectsDir: objectsDir}).readCommitHeader(short)
+	require.Error(t, err, "header read must fail when the declared size ends before the committer line")
 
 	// The over-cap attribution path ends here: author from the header,
 	// empty message, no body inflation.

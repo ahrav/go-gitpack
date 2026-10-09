@@ -668,7 +668,13 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 			return nil, err
 		}
 		defer obj.release()
-		return readCommitHeaderFromStream(obj.body)
+		// Bytes past the declared size belong to a corrupt object, so the
+		// committer line has to arrive within obj.size.
+		hdr, err := readCommitHeaderFromStream(io.LimitReader(obj.body, int64(obj.size)))
+		if err != nil {
+			return nil, fmt.Errorf("loose commit %x: header within declared size %d: %w", oid, obj.size, err)
+		}
+		return hdr, nil
 	}
 	typ, hdrLen, err := peekObjectType(p, off)
 	if err != nil {

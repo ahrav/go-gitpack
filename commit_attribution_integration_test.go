@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -265,8 +266,11 @@ func TestHistoryScannerCloseReleasesMetaCache(t *testing.T) {
 	require.NotEmpty(t, scanner.meta.m)
 	require.NotZero(t, scanner.meta.slabBytes)
 
+	before := reflect.ValueOf(scanner.meta.m).UnsafePointer()
 	require.NoError(t, scanner.Close())
 	require.Empty(t, scanner.meta.m)
+	require.NotEqual(t, before, reflect.ValueOf(scanner.meta.m).UnsafePointer(),
+		"Close must replace the map so its bucket array is collectible")
 	require.Nil(t, scanner.meta.slab)
 	require.Zero(t, scanner.meta.slabBytes)
 }
