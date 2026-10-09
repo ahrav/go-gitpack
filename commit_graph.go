@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/exp/mmap"
@@ -146,18 +147,27 @@ func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 	times := make([]int64, n)
 	oidToIdx := make(map[Hash]int, n)
 
+	// The two maps are built concurrently; each is a few hundred thousand
+	// inserts on a large history and they share no state.
+	var parentsDone sync.WaitGroup
+	parentsDone.Add(1)
+	go func() {
+		defer parentsDone.Done()
+		for _, c := range commits {
+			// commitInfo.ParentOIDs is immutable after construction, so
+			// the graph shares the slice.
+			if len(c.ParentOIDs) > 0 {
+				parents[c.OID] = c.ParentOIDs
+			} else {
+				parents[c.OID] = nil
+			}
+		}
+	}()
 	totalParents := 0
 	for i, c := range commits {
 		ordered[i] = c.OID
 		trees[i] = c.TreeOID
 		times[i] = c.Timestamp
-		// commitInfo.ParentOIDs is immutable after construction, so the
-		// graph shares the slice.
-		if len(c.ParentOIDs) > 0 {
-			parents[c.OID] = c.ParentOIDs
-		} else {
-			parents[c.OID] = nil
-		}
 		oidToIdx[c.OID] = i
 		totalParents += len(c.ParentOIDs)
 	}
@@ -182,6 +192,7 @@ func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 		parentIndices[i] = idxs
 	}
 
+	parentsDone.Wait()
 	return &commitGraphData{
 		Parents:       parents,
 		OrderedOIDs:   ordered,

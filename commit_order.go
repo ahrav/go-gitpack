@@ -110,10 +110,7 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 	}
 
 	n := len(commits)
-	byOID := make(map[Hash]int32, n)
-	for i := range commits {
-		byOID[commits[i].OID] = int32(i)
-	}
+	byOID := newCommitIndex(commits)
 
 	// Count in-degrees and children per parent, then lay the child lists
 	// out contiguously: children of commit p are
@@ -122,7 +119,7 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 	childStart := make([]int32, n+1)
 	for i := range commits {
 		for _, p := range commits[i].ParentOIDs {
-			pi, ok := byOID[p]
+			pi, ok := byOID.lookup(p)
 			if !ok {
 				continue
 			}
@@ -138,7 +135,7 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 	copy(fill, childStart[:n])
 	for i := range commits {
 		for _, p := range commits[i].ParentOIDs {
-			pi, ok := byOID[p]
+			pi, ok := byOID.lookup(p)
 			if !ok {
 				continue
 			}
@@ -191,4 +188,42 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 	}
 
 	return out
+}
+
+// commitIndex maps commit OIDs to their positions in a commits slice with an
+// open-addressing table keyed by the OID's leading word. Slots hold the
+// position plus one, so zero marks an empty slot; a probe compares the full
+// OID against the commits slice before accepting a hit.
+type commitIndex struct {
+	commits []commitInfo
+	slots   []int32
+	mask    uint64
+}
+
+func newCommitIndex(commits []commitInfo) *commitIndex {
+	size := 1
+	for size < 2*len(commits) {
+		size <<= 1
+	}
+	ix := &commitIndex{commits: commits, slots: make([]int32, size), mask: uint64(size - 1)}
+	for i := range commits {
+		j := hashKey(&commits[i].OID) & ix.mask
+		for ix.slots[j] != 0 {
+			j = (j + 1) & ix.mask
+		}
+		ix.slots[j] = int32(i) + 1
+	}
+	return ix
+}
+
+func (ix *commitIndex) lookup(oid Hash) (int32, bool) {
+	for j := hashKey(&oid) & ix.mask; ; j = (j + 1) & ix.mask {
+		slot := ix.slots[j]
+		if slot == 0 {
+			return 0, false
+		}
+		if ix.commits[slot-1].OID == oid {
+			return slot - 1, true
+		}
+	}
 }
