@@ -3,60 +3,11 @@ package objstore
 import (
 	"bytes"
 	"math/rand"
-	"reflect"
 	"slices"
 	"testing"
 )
 
-// referenceAddedHunks tokenizes both inputs in full and runs the greedy
-// forward walk over every line; it defines the output addedHunksWithPos must
-// preserve through its prefix shortcut.
-func referenceAddedHunks(oldB, newB []byte) []AddedHunk {
-	if bytes.Equal(oldB, newB) {
-		return nil
-	}
-	oldLines, newLines := tokenize(oldB), tokenize(newB)
-	var hunks []AddedHunk
-	hunkStart := -1
-	flush := func(end int) {
-		if hunkStart < 0 {
-			return
-		}
-		hunks = append(hunks, AddedHunk{
-			StartLine: uint32(hunkStart) + 1,
-			Lines:     append([]string(nil), newLines[hunkStart:end]...),
-		})
-		hunkStart = -1
-	}
-	oldIdx := 0
-	for newIdx, line := range newLines {
-		added := false
-		if oldIdx >= len(oldLines) {
-			added = true
-		} else if line != oldLines[oldIdx] {
-			found := false
-			for j := oldIdx; j < len(oldLines); j++ {
-				if oldLines[j] == line {
-					found, oldIdx = true, j
-					break
-				}
-			}
-			added = !found
-		}
-		if added {
-			if hunkStart < 0 {
-				hunkStart = newIdx
-			}
-		} else {
-			flush(newIdx)
-			oldIdx++
-		}
-	}
-	flush(len(newLines))
-	return hunks
-}
-
-func TestAddedHunksWithPos_MatchesReferenceOnRandomEdits(t *testing.T) {
+func TestAddedHunksWithPosScratch_MinimalOnRandomEdits(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
 	words := []string{"a", "b", "c", "d", "", "x y", "foo", "bar\tbaz", "longer line here", "q", "a", "b"}
 	gen := func(n int) []byte {
@@ -120,9 +71,6 @@ func TestAddedHunksWithPos_MatchesReferenceOnRandomEdits(t *testing.T) {
 		} else {
 			got = addedHunksWithPosScratch(old, nw, nil)
 		}
-		want := referenceAddedHunks(old, nw)
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("old=%q\nnew=%q\ngot  %+v\nwant %+v", old, nw, got, want)
-		}
+		requireMinimalAddedHunks(t, old, nw, got)
 	}
 }
