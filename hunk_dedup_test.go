@@ -27,6 +27,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -1062,4 +1063,222 @@ func TestDiffHistoryHunksDedup_ErrorStopsPromptlyNoLeak(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// --- speculative prefilter, backlog pre-processing, and the reorder window ---
+
+// TestDedupPrefilterPrep_MatchesSerialVerdicts drives the worker-side and
+// decision-side machinery the pipeline is built from against the plain
+// single-pass dedupHunkEmission, on random pair streams with random
+// snapshot staleness and random backlog pre-processing order. Verdicts, the
+// final set contents, and the saturation point must all agree: the
+// snapshot probe, candidate lists, prepBacklog's two drop rules, and
+// decideResult's fail-open tail are each only valid if they never change a
+// verdict the serial pass would take.
+func TestDedupPrefilterPrep_MatchesSerialVerdicts(t *testing.T) {
+	for _, log2 := range []uint{7, 16} { // 128 slots saturates mid-run; 65536 never does
+		for seed := int64(1); seed <= 6; seed++ {
+			rng := rand.New(rand.NewSource(seed))
+
+			// A stream of pairs, each a few hunks of a few lines from a small
+			// domain so duplicates within and across pairs are frequent.
+			type pair struct{ hunks []HunkAddition }
+			pairs := make([]pair, 40)
+			for i := range pairs {
+				n := 1 + rng.Intn(4)
+				for h := 0; h < n; h++ {
+					lines := make([]string, 1+rng.Intn(6))
+					for l := range lines {
+						lines[l] = fmt.Sprintf("ln-%d", rng.Intn(60))
+					}
+					pairs[i].hunks = append(pairs[i].hunks, mkTestHunk(1+h*10, lines...))
+				}
+				if rng.Intn(8) == 0 {
+					pairs[i].hunks = append(pairs[i].hunks, HunkAddition{isBinary: true, lines: []string{"\x00bin"}})
+				}
+			}
+
+			// Serial reference: the documented single pass.
+			ref := newLineFingerprintSet(log2)
+			var want []string
+			for i, p := range pairs {
+				for j, h := range p.hunks {
+					if dedupHunkEmission(h, ref) {
+						want = append(want, fmt.Sprintf("%d/%d", i, j))
+					}
+				}
+			}
+
+			// Pipeline machinery. Workers probe a snapshot that may be
+			// arbitrarily stale (here: the set state after a random earlier
+			// prefix of pairs), results arrive and are pre-processed in a
+			// random order, and the decision stage settles them in seq
+			// order.
+			set := newLineFingerprintSet(log2)
+			snapshots := []*fingerprintSnapshot{set.snapshot()}
+			results := make([]dedupPairResult, len(pairs))
+			var got []string
+			decided := 0
+			scratch := newBacklogScratch()
+			backlog := make([]int, 0, len(pairs))
+			buildResult := func(i int) {
+				sn := snapshots[rng.Intn(len(snapshots))]
+				var buf []uint64
+				var cands []dedupCandidate
+				for h := range pairs[i].hunks {
+					hk := &pairs[i].hunks[h]
+					if hk.isBinary {
+						cands = append(cands, dedupCandidate{hunk: h})
+						continue
+					}
+					start := len(buf)
+					buf = prefilterHunk(hk, sn, buf)
+					if len(buf) > start {
+						cands = append(cands, dedupCandidate{hunk: h, unresolved: buf[start:len(buf):len(buf)]})
+					}
+				}
+				results[i] = dedupPairResult{seq: uint64(i), hunks: pairs[i].hunks, candidates: cands}
+			}
+			built := make([]bool, len(pairs))
+			for decided < len(pairs) {
+				// Build a few results out of order, pre-process some of the
+				// backlog, then drain whatever is ready at the head.
+				for k := 0; k < 1+rng.Intn(3); k++ {
+					i := decided + rng.Intn(min(5, len(pairs)-decided))
+					if !built[i] {
+						buildResult(i)
+						built[i] = true
+						backlog = append(backlog, i)
+					}
+				}
+				rng.Shuffle(len(backlog), func(a, b int) { backlog[a], backlog[b] = backlog[b], backlog[a] })
+				for len(backlog) > 0 && rng.Intn(2) == 0 {
+					i := backlog[len(backlog)-1]
+					backlog = backlog[:len(backlog)-1]
+					if i >= decided {
+						set.prepBacklog(results[i], scratch)
+					}
+				}
+				for decided < len(pairs) && built[decided] {
+					var out []HunkAddition
+					out = set.decideResult(results[decided], out)
+					for _, h := range out {
+						for j := range pairs[decided].hunks {
+							if &pairs[decided].hunks[j].lines[0] == &h.lines[0] {
+								got = append(got, fmt.Sprintf("%d/%d", decided, j))
+							}
+						}
+					}
+					decided++
+					if rng.Intn(3) == 0 {
+						snapshots = append(snapshots, set.snapshot())
+					}
+				}
+			}
+
+			require.Equalf(t, want, got, "log2=%d seed=%d: emissions diverged from the serial pass", log2, seed)
+			require.Equalf(t, ref.saturated, set.saturated, "log2=%d seed=%d: saturation diverged", log2, seed)
+			require.Equalf(t, ref.count, set.count, "log2=%d seed=%d: insert count diverged", log2, seed)
+		}
+	}
+}
+
+// TestBacklogScratch_EarlierPositionWins pins the scratch rule prepBacklog
+// relies on: a fingerprint is "seen before" only from a position at or
+// after the earliest one recorded, and a later recording never displaces an
+// earlier one.
+func TestBacklogScratch_EarlierPositionWins(t *testing.T) {
+	b := newBacklogScratch()
+	require.False(t, b.seenBefore(42, 10), "first sighting is new")
+	require.True(t, b.seenBefore(42, 10), "same hunk: an earlier line already covers it")
+	require.True(t, b.seenBefore(42, 11), "later position is covered")
+	require.False(t, b.seenBefore(42, 9), "an earlier position is not covered and takes over")
+	require.True(t, b.seenBefore(42, 10), "the earlier recording now covers 10")
+	b.reset()
+	require.False(t, b.seenBefore(42, 10), "reset forgets everything")
+}
+
+// TestDedupInFlightWindow_WaitNeverWrapsBelowDecided guards the window
+// against the one shape that deadlocked an earlier revision: asking to wait
+// for a seq the decision stage has already passed (an empty commit at the
+// head computes seq-1) must return at once rather than wrap to a huge
+// distance and park forever.
+func TestDedupInFlightWindow_WaitNeverWrapsBelowDecided(t *testing.T) {
+	w := newDedupInFlightWindow()
+	w.advanced(10)
+	stop := make(chan struct{})
+	done := make(chan bool, 1)
+	go func() { done <- w.wait(9, stop) }()
+	select {
+	case ok := <-done:
+		require.True(t, ok)
+	case <-time.After(5 * time.Second):
+		t.Fatal("wait parked on a seq below the decided count")
+	}
+	// And a seq at the window edge parks until advanced moves it.
+	go func() { done <- w.wait(10+dedupMaxInFlightPairs, stop) }()
+	select {
+	case <-done:
+		t.Fatal("wait returned while the window was full")
+	case <-time.After(50 * time.Millisecond):
+	}
+	w.advanced(1)
+	select {
+	case ok := <-done:
+		require.True(t, ok)
+	case <-time.After(5 * time.Second):
+		t.Fatal("advanced did not wake the waiter")
+	}
+}
+
+// buildDedupLargeBlobRepo creates a history whose middle commit adds a blob
+// above dedupExpensivePairBytes and later rewrites it, so the tree stage
+// classifies those pairs as expensive and the sequencer forwards them ahead
+// of order. Ordinary small files surround them so the ordered stream has
+// work to overlap with.
+func buildDedupLargeBlobRepo(t *testing.T) string {
+	t.Helper()
+	b := newDedupRepoBuilder(t)
+	big := strings.Repeat("the quick brown fox jumps over the lazy dog 0123456789\n", 3*dedupExpensivePairBytes/2/56)
+	for i := range 12 {
+		b.write(fmt.Sprintf("small-%02d.txt", i), fmt.Sprintf("small %d\nshared line\n", i))
+		switch i {
+		case 4:
+			b.write("big.txt", big)
+		case 8:
+			b.write("big.txt", big+"tail line\n")
+		}
+		b.commit(fmt.Sprintf("c%d", i))
+	}
+	return b.finish()
+}
+
+// TestDiffHistoryHunksDedup_LargeBlobEarlyForward asserts that the pack
+// header estimate flags the large blob's pairs, and that forwarding them
+// ahead of order leaves the emission multiset equal to the serial reference.
+func TestDiffHistoryHunksDedup_LargeBlobEarlyForward(t *testing.T) {
+	gitDir := buildDedupLargeBlobRepo(t)
+
+	s, err := NewHistoryScanner(gitDir)
+	require.NoError(t, err)
+	defer s.Close()
+	commits, err := s.loadAllCommits()
+	require.NoError(t, err)
+	flagged := 0
+	for _, c := range orderCommitsParentFirst(commits) {
+		pairs, err := s.collectCommitPairs(c)
+		require.NoError(t, err)
+		for _, e := range s.expensivePairs(pairs) {
+			require.Equal(t, "big.txt", pairs[e.index].path)
+			require.GreaterOrEqual(t, e.bytes, uint64(dedupExpensivePairBytes))
+			flagged++
+		}
+	}
+	require.Equal(t, 2, flagged, "the addition and the rewrite of big.txt must both be flagged")
+
+	want := serialDedupReference(t, gitDir, false, nil)
+	got := collectHunkScan(t, gitDir, WithHunkLineDedup(true))
+	require.Equal(t, want, got)
+	require.True(t, slices.ContainsFunc(got, func(s string) bool { return strings.Contains(s, "tail line") }),
+		"the rewrite's one new line must survive dedup")
 }
