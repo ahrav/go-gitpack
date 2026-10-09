@@ -152,9 +152,7 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	clear(c.m)
-	c.slab = nil
-	c.slabBytes = 0
+	c.clearLocked()
 	if g == nil {
 		c.graph = nil
 		c.ts = nil
@@ -162,6 +160,19 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 	}
 	c.graph = g
 	c.ts = g.Timestamps
+}
+
+func (c *metaCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearLocked()
+}
+
+// clearLocked requires c.mu held for writing.
+func (c *metaCache) clearLocked() {
+	clear(c.m)
+	c.slab = nil
+	c.slabBytes = 0
 }
 
 // get returns the CommitMetadata for the given OID, using the cache when

@@ -1530,6 +1530,9 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // This mirrors store.Close releasing the offset cache's object bytes.
 func (hs *HistoryScanner) Close() error {
 	hs.pairs.clear()
+	if hs.meta != nil {
+		hs.meta.clear()
+	}
 	return hs.store.Close()
 }
 
@@ -1541,8 +1544,9 @@ func (hs *HistoryScanner) Close() error {
 // For a cached commit, the strings in Author and Message reference a 64 KiB
 // metaCache slab shared with other commits (metaCache.miss builds them with
 // rebaseEntry), so a retained CommitMetadata keeps that slab reachable,
-// including after Close. Callers that keep values beyond the scan should copy
-// the fields they need with strings.Clone.
+// including after Close has dropped the cache's own reference. Callers that
+// keep values beyond the scan should copy the fields they need with
+// strings.Clone.
 type CommitMetadata struct {
 	// Author records the commit author exactly as stored in the commit header.
 	Author AuthorInfo

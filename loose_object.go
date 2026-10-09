@@ -15,6 +15,7 @@
 package objstore
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -24,55 +25,63 @@ import (
 	"strconv"
 )
 
-// readLooseObject loads and decompresses the loose object identified by oid
-// from the on-disk object store.
-//
-// How it works:
-//  1. Constructs the filesystem path via looseObjectPath.
-//  2. Opens the file, wraps it in a pooled zlib reader and a pooled
-//     bufio.Reader.
-//  3. Reads the NUL-terminated header to extract the object type and
-//     declared size.
-//  4. Reads the remaining body and verifies its length matches the declared
-//     size.
+// looseObjectStream is an open loose object positioned at the first body
+// byte: the "<type> <size>\0" header has been consumed and parsed. body
+// yields the inflated body; release returns the pooled readers and closes
+// the file, and must be called exactly once.
+type looseObjectStream struct {
+	body    *bufio.Reader
+	typ     ObjectType
+	size    uint64
+	release func()
+}
+
+// openLooseObject opens the loose object identified by oid, inflates and
+// parses its header, and returns the stream positioned at the body. The body
+// is left uninflated so callers can bound how much of it they read:
+// readLooseObject reads it whole, readCommitHeader stops at the committer
+// line, and readCommitPayloadTo checks size against its cap first.
 //
 // Pool discipline: both the zlib reader (getZlibReader / putZlibReader) and
-// the bufio.Reader (getBR / putBR) are obtained from sync.Pools and returned
-// via deferred calls, so they are recycled even on error paths.
+// the bufio.Reader (getBR / putBR) come from sync.Pools and are recycled by
+// release, or here on an error path.
 //
-// Thread safety: readLooseObject is safe for concurrent use because it
-// operates only on local variables and pooled readers; no shared mutable
-// state is accessed.
-func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
+// Thread safety: openLooseObject is safe for concurrent use because it
+// operates only on local variables and pooled readers.
+func (s *store) openLooseObject(oid Hash) (*looseObjectStream, error) {
 	if s == nil || s.objectsDir == "" {
-		return nil, ObjBad, objectNotFoundError(oid)
+		return nil, objectNotFoundError(oid)
 	}
 
 	path := looseObjectPath(s.objectsDir, oid)
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, ObjBad, objectNotFoundError(oid)
+			return nil, objectNotFoundError(oid)
 		}
-		return nil, ObjBad, err
+		return nil, err
 	}
-	defer f.Close()
 
 	zr, err := getZlibReader(f)
 	if err != nil {
-		return nil, ObjBad, err
+		f.Close()
+		return nil, err
 	}
-	defer putZlibReader(zr)
-
 	br := getBR(zr)
-	defer putBR(br)
+	release := func() {
+		putBR(br)
+		putZlibReader(zr)
+		f.Close()
+	}
 
 	hdr, err := br.ReadBytes(0)
 	if err != nil {
-		return nil, ObjBad, err
+		release()
+		return nil, err
 	}
 	if len(hdr) < 3 {
-		return nil, ObjBad, fmt.Errorf("invalid loose object header for %x", oid)
+		release()
+		return nil, fmt.Errorf("invalid loose object header for %x", oid)
 	}
 	// Trim the trailing NUL byte that ReadBytes includes in its result.
 	// After this, hdr contains "<type> <size>" with no terminator.
@@ -80,7 +89,8 @@ func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
 
 	sp := bytes.IndexByte(hdr, ' ')
 	if sp <= 0 || sp+1 >= len(hdr) {
-		return nil, ObjBad, fmt.Errorf("invalid loose object header for %x", oid)
+		release()
+		return nil, fmt.Errorf("invalid loose object header for %x", oid)
 	}
 
 	// btostr safety: hdr is a local slice owned by this call frame and will
@@ -88,25 +98,44 @@ func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
 	// conversion is safe for the lifetime of the parseLooseObjectType call.
 	typ, ok := parseLooseObjectType(btostr(hdr[:sp]))
 	if !ok {
-		return nil, ObjBad, fmt.Errorf("unsupported loose object type %q for %x", btostr(hdr[:sp]), oid)
+		err := fmt.Errorf("unsupported loose object type %q for %x", btostr(hdr[:sp]), oid)
+		release()
+		return nil, err
 	}
 
 	size, err := strconv.ParseUint(btostr(hdr[sp+1:]), 10, 64)
 	if err != nil {
-		return nil, ObjBad, fmt.Errorf("invalid loose object size for %x: %w", oid, err)
+		release()
+		return nil, fmt.Errorf("invalid loose object size for %x: %w", oid, err)
 	}
 
-	body, err := io.ReadAll(br)
+	return &looseObjectStream{body: br, typ: typ, size: size, release: release}, nil
+}
+
+// readLooseObject loads and decompresses the loose object identified by oid
+// from the on-disk object store: openLooseObject parses the header, then the
+// whole body is read and its length verified against the declared size.
+//
+// Thread safety: readLooseObject is safe for concurrent use; see
+// openLooseObject.
+func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
+	obj, err := s.openLooseObject(oid)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+	defer obj.release()
+
+	body, err := io.ReadAll(obj.body)
 	if err != nil {
 		return nil, ObjBad, err
 	}
 	// Size verification: the decompressed body length must match the size
 	// declared in the header. A mismatch indicates a truncated or corrupted
 	// object file.
-	if uint64(len(body)) != size {
+	if uint64(len(body)) != obj.size {
 		return nil, ObjBad, fmt.Errorf(
 			"loose object size mismatch for %x: want %d, got %d",
-			oid, size, len(body),
+			oid, obj.size, len(body),
 		)
 	}
 
@@ -127,7 +156,21 @@ func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
 		body = exact
 	}
 
-	return body, typ, nil
+	return body, obj.typ, nil
+}
+
+// openLooseCommit is openLooseObject for a commit: any other type fails
+// with ErrObjectNotCommit.
+func (s *store) openLooseCommit(oid Hash) (*looseObjectStream, error) {
+	obj, err := s.openLooseObject(oid)
+	if err != nil {
+		return nil, err
+	}
+	if obj.typ != ObjCommit {
+		obj.release()
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
+	return obj, nil
 }
 
 // looseObjectPath returns the filesystem path for a loose object given the

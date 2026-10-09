@@ -218,12 +218,19 @@ func TestCommitMetadataConcurrentDuplicateOIDs(t *testing.T) {
 	var wg sync.WaitGroup
 	errs := make(chan error, goroutines)
 
+	// Every worker's first request is the same missing OID, released by one
+	// close, so the duplicate-miss path runs with genuine overlap.
+	start := make(chan struct{})
 	for g := range goroutines {
 		wg.Add(1)
 		go func(seed int) {
 			defer wg.Done()
+			<-start
 			for i := range iterations {
 				oid := oids[(seed+i)%len(oids)]
+				if i == 0 {
+					oid = oids[0]
+				}
 				meta, err := scanner.GetCommitMetadata(oid)
 				if err != nil {
 					errs <- err
@@ -236,9 +243,30 @@ func TestCommitMetadataConcurrentDuplicateOIDs(t *testing.T) {
 			}
 		}(g)
 	}
+	close(start)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
 		t.Fatalf("concurrent GetCommitMetadata: %v", err)
 	}
+}
+
+// TestHistoryScannerCloseReleasesMetaCache pins that Close drops the
+// attribution cache along with the pair cache: a scanner value retained after
+// Close holds no cached entries and no metadata slabs.
+func TestHistoryScannerCloseReleasesMetaCache(t *testing.T) {
+	scanner := createScannerForRepo(t, "large-repo")
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+	_, err = scanner.GetCommitMetadata(commits[0].OID)
+	require.NoError(t, err)
+	require.NotEmpty(t, scanner.meta.m)
+	require.NotZero(t, scanner.meta.slabBytes)
+
+	require.NoError(t, scanner.Close())
+	require.Empty(t, scanner.meta.m)
+	require.Nil(t, scanner.meta.slab)
+	require.Zero(t, scanner.meta.slabBytes)
 }

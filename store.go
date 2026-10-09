@@ -663,14 +663,12 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	// Locate the commit object and skip past its generic object header.
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		full, typ, err := s.readLooseObject(oid)
+		obj, err := s.openLooseCommit(oid)
 		if err != nil {
 			return nil, err
 		}
-		if typ != ObjCommit {
-			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
-		}
-		return trimCommitHeader(full)
+		defer obj.release()
+		return readCommitHeaderFromStream(obj.body)
 	}
 	typ, hdrLen, err := peekObjectType(p, off)
 	if err != nil {
@@ -798,25 +796,26 @@ type heapSink struct{}
 func (heapSink) reserve(n int) []byte { return make([]byte, n) }
 
 // readCommitPayloadTo is readCommitPayload with the destination chosen by
-// sink: plain packed commits inflate straight into sink memory and delta
-// commits are copied into it, while loose commits return the fresh buffer
-// readLooseObject already produced.
+// sink.
 func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) {
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		// Loose fallback: readLooseObject inflates into a fresh buffer, so
-		// it can be returned without copying.
-		full, typ, err := s.readLooseObject(oid)
+		obj, err := s.openLooseCommit(oid)
 		if err != nil {
 			return nil, err
 		}
-		if typ != ObjCommit {
-			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
-		}
-		if err := checkCommitPayloadSize(uint64(len(full)), oid); err != nil {
+		defer obj.release()
+		if err := checkCommitPayloadSize(obj.size, oid); err != nil {
 			return nil, err
 		}
-		return full, nil
+		payload := sink.reserve(int(obj.size))
+		if _, err := io.ReadFull(obj.body, payload); err != nil {
+			return nil, fmt.Errorf("loose object size mismatch for %x: want %d: %w", oid, obj.size, err)
+		}
+		if err := ensureZlibStreamEnd(obj.body); err != nil {
+			return nil, fmt.Errorf("loose object size mismatch for %x: want %d: %w", oid, obj.size, err)
+		}
+		return payload, nil
 	}
 
 	// Parse the generic object header ourselves (rather than via
@@ -841,6 +840,9 @@ func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) 
 		// inflate. The size comes from the pack header, so the cap check
 		// precedes the reservation.
 		if err := checkCommitPayloadSize(size, oid); err != nil {
+			return nil, err
+		}
+		if err := s.verifyPackObjectCRCIfEnabled(p, off, oid); err != nil {
 			return nil, err
 		}
 		payload := sink.reserve(int(size))
