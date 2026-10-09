@@ -19,6 +19,7 @@
 package objstore
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -626,30 +627,9 @@ func applyDeltaStreaming(
 	// on mmap-backed platforms ReadAt is a bounds-checked copy of ≤32
 	// bytes, and on fallback platforms (no mmapData symbol) it is real
 	// file I/O of the same size.
-	var hdrBuf [32]byte
-	n, err := pack.ReadAt(hdrBuf[:], int64(offset))
-	if err != nil && !errors.Is(err, io.EOF) {
+	pos, payloadSize, err := deltaPayloadStart(pack, offset, deltaType)
+	if err != nil {
 		return nil, err
-	}
-	if n == 0 {
-		return nil, io.ErrUnexpectedEOF
-	}
-	_, payloadSize, hdrLen := parseObjectHeaderUnsafe(hdrBuf[:n])
-	if hdrLen <= 0 {
-		return nil, ErrCannotParseObjectHeader
-	}
-	pos := int64(offset) + int64(hdrLen)
-
-	// Skip the base object reference (hash or offset).
-	switch deltaType {
-	case ObjRefDelta:
-		pos += 20
-	case ObjOfsDelta:
-		_, consumed, err := readOfsDeltaOffset(pack, pos)
-		if err != nil {
-			return nil, err
-		}
-		pos += int64(consumed)
 	}
 
 	// Bound the payload before sizing any allocation from it. payloadSize
@@ -856,6 +836,133 @@ func applyDeltaStreaming(
 	}
 
 	return out, nil
+}
+
+// deltaPayloadStart parses the pack object header at offset and skips the
+// base reference, returning the position of the compressed delta payload and
+// the payload's decompressed size as the header declares it.
+func deltaPayloadStart(pack *mmap.ReaderAt, offset uint64, deltaType ObjectType) (pos int64, payloadSize uint64, err error) {
+	var hdrBuf [32]byte
+	n, err := pack.ReadAt(hdrBuf[:], int64(offset))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return 0, 0, err
+	}
+	if n == 0 {
+		return 0, 0, io.ErrUnexpectedEOF
+	}
+	_, payloadSize, hdrLen := parseObjectHeaderUnsafe(hdrBuf[:n])
+	if hdrLen <= 0 {
+		return 0, 0, ErrCannotParseObjectHeader
+	}
+	pos = int64(offset) + int64(hdrLen)
+	switch deltaType {
+	case ObjRefDelta:
+		pos += 20
+	case ObjOfsDelta:
+		_, consumed, err := readOfsDeltaOffset(pack, pos)
+		if err != nil {
+			return 0, 0, err
+		}
+		pos += int64(consumed)
+	}
+	return pos, payloadSize, nil
+}
+
+// applyDeltaPrefix reconstructs the first limit bytes of the target of the
+// delta at offset, streaming the instruction stream and stopping once the
+// prefix is complete. A copy or insert that crosses the limit is truncated.
+// The payload is inflated only as far as those instructions reach, so the
+// cost is bounded by the prefix, whatever the target's size.
+//
+// It serves readCommitHeader for a delta commit whose whole target exceeds
+// the commit payload cap: the header is at the front of the object, and the
+// base has already been reconstructed by the caller.
+func applyDeltaPrefix(pack *mmap.ReaderAt, offset uint64, deltaType ObjectType, base []byte, limit int) ([]byte, error) {
+	pos, _, err := deltaPayloadStart(pack, offset, deltaType)
+	if err != nil {
+		return nil, err
+	}
+	zr, release, err := openCommitHeaderStream(pack, pos)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	br := getBR(zr)
+	defer putBR(br)
+
+	baseSize, err := readVarInt(br)
+	if err != nil {
+		return nil, fmt.Errorf("read delta base size: %w", err)
+	}
+	if baseSize != uint64(len(base)) {
+		return nil, fmt.Errorf("delta base size mismatch: header=%d actual=%d", baseSize, len(base))
+	}
+	targetSize, err := readVarInt(br)
+	if err != nil {
+		return nil, fmt.Errorf("read delta target size: %w", err)
+	}
+	want := min(targetSize, uint64(limit))
+	out := make([]byte, 0, want)
+	for uint64(len(out)) < want {
+		cmd, err := br.ReadByte()
+		if err != nil {
+			return nil, fmt.Errorf("delta instruction stream ended at %d of %d target bytes: %w", len(out), targetSize, err)
+		}
+		room := int(want) - len(out)
+		switch {
+		case cmd&0x80 != 0:
+			// Operand bytes follow for each set low bit: bits 0-3 are the
+			// copy offset's bytes, bits 4-6 the copy size's.
+			var cpOff, cpSize int
+			for bit, dst := range []*int{&cpOff, &cpOff, &cpOff, &cpOff, &cpSize, &cpSize, &cpSize} {
+				if cmd&(1<<bit) == 0 {
+					continue
+				}
+				b, err := br.ReadByte()
+				if err != nil {
+					return nil, io.ErrUnexpectedEOF
+				}
+				*dst |= int(b) << (bit % 4 * 8)
+			}
+			if cpSize == 0 {
+				cpSize = 0x10000
+			}
+			if cpOff < 0 || cpSize > len(base) || cpOff > len(base)-cpSize {
+				return nil, errors.New("copy beyond base bounds")
+			}
+			out = append(out, base[cpOff:cpOff+min(cpSize, room)]...)
+		case cmd > 0:
+			size := int(cmd)
+			n := min(size, room)
+			start := len(out)
+			out = out[:start+n]
+			if _, err := io.ReadFull(br, out[start:]); err != nil {
+				return nil, fmt.Errorf("delta insert truncated: %w", err)
+			}
+		default:
+			return nil, errors.New("invalid delta command")
+		}
+	}
+	return out, nil
+}
+
+// readVarInt reads one delta size varint (little-endian 7-bit groups with a
+// continuation bit) from br. It accepts the same encodings as decodeVarInt:
+// at most nine bytes, so no group is shifted past bit 56 and a longer
+// encoding is rejected rather than wrapped modulo 2^64.
+func readVarInt(br *bufio.Reader) (uint64, error) {
+	var v uint64
+	for shift := uint(0); shift <= 56; shift += 7 {
+		c, err := br.ReadByte()
+		if err != nil {
+			return 0, err
+		}
+		v |= uint64(c&0x7f) << shift
+		if c&0x80 == 0 {
+			return v, nil
+		}
+	}
+	return 0, errors.New("delta size varint exceeds nine bytes")
 }
 
 // deltaScratch is a pooled buffer for one-shot delta payload inflation.

@@ -491,3 +491,131 @@ func TestCommitPayload_OverCapFallsBackToHeader(t *testing.T) {
 		}
 	}
 }
+
+// A loose object whose decompressed stream puts the header's NUL terminator
+// far past the longest valid header ("<type> <size>\0") is rejected once
+// the header limit is reached, before the body is touched.
+func TestOpenLooseObjectBoundsHeader(t *testing.T) {
+	objectsDir := t.TempDir()
+	oid := Hash{0x56, 0x78}
+	path := looseObjectPath(objectsDir, oid)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, err := zw.Write([]byte("commit " + strings.Repeat("9", 1<<20) + "\x00hello"))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, os.WriteFile(path, compressed.Bytes(), 0o644))
+
+	st := &store{objectsDir: objectsDir}
+	_, err = st.openLooseObject(oid)
+	require.ErrorContains(t, err, "header exceeds")
+}
+
+// buildBigDeltaCommitRepo returns a repository whose second commit carries a
+// 1 MiB message nearly identical to the first commit's, so an aggressive
+// repack stores it as a delta against the first. It returns the pack dir
+// and the delta commit's OID, and skips when git stored the commit whole.
+func buildBigDeltaCommitRepo(t *testing.T) (packDir string, delta Hash, payload []byte) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+	repoDir := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := gitTestCommand(repoDir, args...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
+		)
+		out, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "git %s: %s", strings.Join(args, " "), out)
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("config", "commit.gpgsign", "false")
+	body := strings.Repeat("the same very long commit message line\n", (1<<20)/40)
+	msgFile := filepath.Join(t.TempDir(), "msg")
+	for c := range 2 {
+		require.NoError(t, os.WriteFile(filepath.Join(repoDir, "f.txt"), []byte(fmt.Sprintf("content %d\n", c)), 0o644))
+		require.NoError(t, os.WriteFile(msgFile, []byte(fmt.Sprintf("commit %d\n%s", c, body)), 0o644))
+		git("add", "f.txt")
+		git("commit", "-q", "-F", msgFile)
+	}
+	git("repack", "-adf", "--window=250", "--depth=50")
+	packDir = filepath.Join(repoDir, ".git", "objects", "pack")
+	shapes := classifyCommitShapes(t, repoDir, packDir)
+	if len(shapes.delta) == 0 {
+		t.Skip("git stored both big commits whole; no delta commit to test")
+	}
+	delta = shapes.delta[0]
+	return packDir, delta, gitCatFile(t, repoDir, "commit", delta)
+}
+
+// A delta-chained commit larger than the payload cap is rejected from its
+// delta header. The rejected read inflates the chain's root base (a 1 MiB
+// commit here) and nothing for the over-cap target itself, so it allocates
+// well under two payloads; a read that reconstructs the target first
+// allocates at least the base plus the target.
+func TestReadCommitPayload_DeltaCommitCapPrecedesMaterialization(t *testing.T) {
+	packDir, oid, payload := buildBigDeltaCommitRepo(t)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	saved := maxCommitPayload
+	t.Cleanup(func() { maxCommitPayload = saved })
+	maxCommitPayload = len(payload) / 4
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err = st.readCommitPayload(oid)
+	runtime.ReadMemStats(&after)
+	require.ErrorContains(t, err, "exceeds")
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("commit payload %d bytes, cap %d, rejected read allocated %d bytes", len(payload), maxCommitPayload, allocated)
+	require.Lessf(t, allocated, uint64(len(payload))*3/2,
+		"rejecting an over-cap delta commit must not allocate its reconstructed payload")
+}
+
+// TestReadCommitPayload_NotACommit pins the error contract: asking for a
+// non-commit object (a blob) fails with ErrObjectNotCommit rather than
+// returning payload bytes.
+
+// The header fallback for a delta commit above the payload cap reconstructs
+// the chain's bases and then only the header-sized prefix of the target, so
+// the read costs the base plus a few KiB rather than the whole target.
+func TestReadCommitHeader_OverCapDeltaCommitReconstructsHeaderPrefix(t *testing.T) {
+	packDir, oid, payload := buildBigDeltaCommitRepo(t)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	saved := maxCommitPayload
+	t.Cleanup(func() { maxCommitPayload = saved })
+	maxCommitPayload = len(payload) / 4
+
+	want, err := trimCommitHeader(payload)
+	require.NoError(t, err)
+
+	var hdr []byte
+	n := allocatedBytes(func() { hdr, err = st.readCommitHeader(oid) })
+	require.NoError(t, err)
+	require.Equal(t, want, hdr, "header must match the whole object's header")
+	t.Logf("commit payload %d bytes, cap %d, header read allocated %d bytes", len(payload), maxCommitPayload, n)
+	// The delta's base is a sibling commit of the same size and is
+	// reconstructed whole; the target must not be.
+	require.Lessf(t, n, uint64(len(payload))*3/2,
+		"header fallback reconstructed the over-cap target instead of its header prefix")
+
+	// Attribution end-to-end: the fallback still names the author.
+	meta, err := newMetaCache(nil, st).get(oid)
+	require.NoError(t, err)
+	require.Equal(t, "t", meta.Author.Name)
+	require.Empty(t, meta.Message)
+}

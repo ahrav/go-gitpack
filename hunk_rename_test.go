@@ -1,10 +1,14 @@
 package objstore
 
 import (
+	"bytes"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -640,4 +644,111 @@ func TestDiffHistoryHunks_InferredRenameOfLargeFileReportsTextLines(t *testing.T
 	assert.Len(t, linesByPath["new/data"], lines,
 		"a pairing the gate cannot measure must fall back to the whole-file addition")
 	assert.False(t, binaryByPath["new/data"])
+}
+func buildDirectoryRenameEditRepo(t *testing.T, base, tail string) (repo string) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+	repo = t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	require.NoError(t, os.Mkdir(filepath.Join(repo, "old"), 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "edited.txt"), []byte(base), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "same-a.txt"), []byte("same a\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "old", "same-b.txt"), []byte("same b\n"), 0o644))
+	runGit(t, repo, "add", "old")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	require.NoError(t, os.Rename(filepath.Join(repo, "old"), filepath.Join(repo, "new")))
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "new", "edited.txt"), []byte(base+tail), 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "rename edit", "--quiet")
+	return repo
+}
+
+func addedLinesByPath(t *testing.T, gitDir string, opts ...ScannerOption) map[string][]string {
+	t.Helper()
+	scanner, err := NewHistoryScanner(gitDir, opts...)
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	var mu sync.Mutex
+	linesByPath := make(map[string][]string)
+	require.NoError(t, scanner.DiffHistoryHunksFunc(func(h HunkAddition) error {
+		mu.Lock()
+		linesByPath[h.Path()] = append(linesByPath[h.Path()], h.Lines()...)
+		mu.Unlock()
+		return nil
+	}))
+	return linesByPath
+}
+
+// A directory-rename candidate larger than SmallFileThreshold still pairs
+// against its old path when the content is similar, so a one-line edit
+// emits one line.
+func TestDiffHistoryHunks_DirectoryRenameEditLargeFilePairsAgainstOldPath(t *testing.T) {
+	var base strings.Builder
+	for i := 0; base.Len() <= SmallFileThreshold; i++ {
+		fmt.Fprintf(&base, "stable line %06d of a large generated file\n", i)
+	}
+	repo := buildDirectoryRenameEditRepo(t, base.String(), "secret\n")
+
+	for _, dedup := range []bool{false, true} {
+		linesByPath := addedLinesByPath(t, filepath.Join(repo, ".git"), WithHunkLineDedup(dedup))
+		assert.Equalf(t, []string{"secret"}, linesByPath["new/edited.txt"], "dedup=%v", dedup)
+	}
+}
+
+// The path filter drops a directory-rename candidate before either blob is
+// read, so a filtered candidate whose old blob is unreadable leaves the
+// scan unaffected.
+func TestDiffHistoryHunks_PathFilteredRenameCandidateSkipsBlobLoads(t *testing.T) {
+	repo := buildDirectoryRenameEditRepo(t, "stable\n", "secret\n")
+	out, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD~1:old/edited.txt").Output()
+	require.NoError(t, err)
+	oldBlob := strings.TrimSpace(string(out))
+	gitDir := filepath.Join(repo, ".git")
+	require.NoError(t, os.Remove(filepath.Join(gitDir, "objects", oldBlob[:2], oldBlob[2:])))
+
+	skipEdited := func(_ Hash, path string) bool { return strings.HasSuffix(path, "/edited.txt") }
+	for _, dedup := range []bool{false, true} {
+		linesByPath := addedLinesByPath(t, gitDir, WithHunkLineDedup(dedup), WithHunkPathFilter(skipEdited))
+		assert.Emptyf(t, linesByPath["new/edited.txt"], "dedup=%v", dedup)
+		assert.Equalf(t, []string{"same a"}, linesByPath["old/same-a.txt"], "dedup=%v", dedup)
+	}
+}
+
+func TestRenameLinesSimilar(t *testing.T) {
+	cases := []struct {
+		name     string
+		old, new string
+		want     bool
+	}{
+		{"identical", "a\nb\n", "a\nb\n", true},
+		{"quarter of the longer side shared", "a\nb\n", "a\nc\nd\ne\n", false},
+		{"exactly half shared", "a\nb\n", "a\nb\nc\nd\n", true},
+		{"duplicates count once each", "a\n", "a\na\na\n", false},
+		{"binary old side", "a\x00\nb\n", "a\nb\n", false},
+		{"empty old side", "", "a\n", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, renameLinesSimilar([]byte(c.old), []byte(c.new)))
+		})
+	}
+}
+
+// The similarity probe sizes its map by distinct lines: a blob of millions
+// of identical lines must cost one map entry, not one per line.
+func TestRenameLinesSimilar_RepeatedLinesAllocateOneEntry(t *testing.T) {
+	old := bytes.Repeat([]byte("\n"), 1<<22)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	similar := renameLinesSimilar(old, []byte("\n\n"))
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("similarity probe over %d repeated lines allocated %d bytes", 1<<22, allocated)
+	assert.False(t, similar)
+	assert.Less(t, allocated, uint64(1<<20), "map capacity must follow distinct lines, not total lines")
 }

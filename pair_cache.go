@@ -75,6 +75,7 @@ type cachedHunk struct {
 	count     uint32
 	startLine uint32
 	isBinary  bool
+	tooLarge  bool
 }
 
 // view rebuilds the []AddedHunk a stored entry represents. The returned
@@ -94,6 +95,7 @@ func (e *pairCacheEntry) view() []AddedHunk {
 			Lines:     lines[h.first:end:end],
 			StartLine: h.startLine,
 			IsBinary:  h.isBinary,
+			tooLarge:  h.tooLarge,
 		}
 	}
 	return out
@@ -354,6 +356,7 @@ func compactHunks(hunks []AddedHunk, lineBytes int) ([]AddedHunk, pairCacheEntry
 			count:     uint32(len(src.Lines)),
 			startLine: src.StartLine,
 			isBinary:  src.IsBinary,
+			tooLarge:  src.tooLarge,
 		}
 		next += len(src.Lines)
 		for j, l := range src.Lines {
@@ -368,6 +371,7 @@ func compactHunks(hunks []AddedHunk, lineBytes int) ([]AddedHunk, pairCacheEntry
 			Lines:     lines,
 			StartLine: src.StartLine,
 			IsBinary:  src.IsBinary,
+			tooLarge:  src.tooLarge,
 		}
 	}
 	return out, pairCacheEntry{data: buf, spans: spans, hunks: shapes}
@@ -415,6 +419,7 @@ func aliasingEntry(hunks []AddedHunk) pairCacheEntry {
 			count:     uint32(len(h.Lines)),
 			startLine: h.StartLine,
 			isBinary:  h.IsBinary,
+			tooLarge:  h.tooLarge,
 		}
 		for _, l := range h.Lines {
 			if len(l) != 0 {

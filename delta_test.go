@@ -6,6 +6,7 @@
 package objstore
 
 import (
+	"bufio"
 	"bytes"
 	"compress/zlib"
 	"fmt"
@@ -852,4 +853,75 @@ func TestApplyDeltaStackReturnsPooledBufferOnError(t *testing.T) {
 		putDeltaBuf(again)
 	}
 	require.True(t, reused, "the buffer borrowed for the failed hop returns to its pool")
+}
+
+// applyDeltaPrefix reproduces the leading bytes of a target without
+// allocating the whole target: copies and inserts are truncated at the limit
+// and the instruction stream is read only as far as the prefix needs.
+func TestApplyDeltaPrefix_TruncatesAtLimit(t *testing.T) {
+	base := []byte("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\nbase message\n")
+	header := base[:len(base)-len("base message\n")]
+	message := bytes.Repeat([]byte("m"), 1<<20)
+	target := append(append([]byte{}, header...), message...)
+
+	// One copy of the shared header, then the message as a run of maximal
+	// inserts: the shape git produces for a commit whose only change is a
+	// much longer message.
+	var instr bytes.Buffer
+	writeVarInt(&instr, uint64(len(base)))
+	writeVarInt(&instr, uint64(len(target)))
+	instr.Write([]byte{0x80 | 0x10, byte(len(header))}) // copy offset 0, one size byte
+	for rest := message; len(rest) > 0; {
+		n := min(len(rest), 127)
+		instr.WriteByte(byte(n))
+		instr.Write(rest[:n])
+		rest = rest[n:]
+	}
+	obj, err := packRefDeltaObject(calculateHash(ObjCommit, base), instr.Bytes())
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "delta.packobj")
+	require.NoError(t, os.WriteFile(path, obj, 0o644))
+	pack, err := mmap.Open(path)
+	require.NoError(t, err)
+	defer pack.Close()
+
+	// Warm the pooled inflater and bufio reader so their first-use
+	// allocations stay out of the measured calls.
+	_, err = applyDeltaPrefix(pack, 0, ObjRefDelta, base, 1)
+	require.NoError(t, err)
+
+	for _, limit := range []int{1, 10, len(base) - 5, 4096, len(target) + 10} {
+		var got []byte
+		n := allocatedBytes(func() { got, err = applyDeltaPrefix(pack, 0, ObjRefDelta, base, limit) })
+		require.NoErrorf(t, err, "limit %d", limit)
+		want := target[:min(limit, len(target))]
+		require.Equalf(t, want, got, "limit %d", limit)
+		if limit <= 4096 {
+			require.Lessf(t, n, uint64(len(target))/4, "limit %d allocated %d bytes for a %d-byte target", limit, n, len(target))
+		}
+	}
+}
+
+// readVarInt accepts exactly the encodings decodeVarInt accepts: a size
+// varint longer than nine bytes is rejected rather than wrapped modulo 2^64.
+func TestReadVarInt_MatchesDecodeVarInt(t *testing.T) {
+	cases := [][]byte{
+		{0x00},
+		{0x7f},
+		{0x80, 0x01},
+		{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f},
+		{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02},
+		{0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01},
+		{0x80},
+	}
+	for _, c := range cases {
+		want, n := decodeVarInt(c)
+		got, err := readVarInt(bufio.NewReader(bytes.NewReader(c)))
+		if n == 0 {
+			require.Errorf(t, err, "%x: decodeVarInt rejects this encoding", c)
+			continue
+		}
+		require.NoErrorf(t, err, "%x", c)
+		require.Equalf(t, want, got, "%x", c)
+	}
 }

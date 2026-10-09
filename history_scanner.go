@@ -51,6 +51,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -136,16 +137,41 @@ type HistoryScanner struct {
 	// replay hunks already seen on the merged branch.
 	skipMergeDiffs bool
 
+	// hunkLineDedup, when true, routes hunk scans through the deduplicating
+	// pipeline (hunk_dedup.go): a hunk is emitted intact iff it contains at
+	// least one line unseen earlier in deterministic parent-first order.
+	// See WithHunkLineDedup for the full behavioral contract.
+	hunkLineDedup bool
+
+	// hunkPathFilter, when non-nil, drops blob pairs whose (commit,
+	// post-image path) it reports true for before any diff work, in both
+	// the streaming and dedup hunk pipelines. Dropped pairs never reach the
+	// dedup fingerprint set. See WithHunkPathFilter for the full contract.
+	hunkPathFilter func(commit Hash, path string) bool
+
+	// hunkDedupBudget bounds fingerprint storage for deduplicating scans.
+	hunkDedupBudget int
+
+	// dedupLimits holds the dedup pipeline's bounds; tests shrink them to
+	// exercise window edges on small repositories. dedupProbe, when set,
+	// records pipeline observations for tests.
+	dedupLimits dedupLimits
+	dedupProbe  *dedupProbe
+
 	// profileServer is the HTTP server for pprof endpoints.
 	profileServer *http.Server
 
 	// traceFile holds the file handle for execution trace output.
 	traceFile *os.File
 
-	// commitsOnce caches commit enumeration for repeated history walks.
-	commitsOnce sync.Once
-	commits     []commitInfo
-	commitsErr  error
+	// commits caches commit enumeration for repeated history walks. The
+	// cache is valid while the repository's ref tips equal commitsTips and
+	// its shallow boundary equals commitsShallow: the set reachable from the
+	// same tips through the same boundary is fixed by content addressing.
+	commitsMu      sync.Mutex
+	commits        []commitInfo
+	commitsTips    []Hash
+	commitsShallow []byte
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -227,12 +253,14 @@ func NewHistoryScanner(gitDir string, opts ...ScannerOption) (*HistoryScanner, e
 	mc := newMetaCache(nil, store)
 
 	hs := &HistoryScanner{
-		gitDir:    gitDir,
-		scanMode:  ScanModeBlob,
-		store:     store,
-		graphData: nil,
-		meta:      mc,
-		pairs:     newPairCache(),
+		gitDir:          gitDir,
+		scanMode:        ScanModeBlob,
+		store:           store,
+		graphData:       nil,
+		meta:            mc,
+		pairs:           newPairCache(),
+		hunkDedupBudget: defaultHunkDedupBudget,
+		dedupLimits:     defaultDedupLimits(),
 	}
 
 	for _, opt := range opts {
@@ -266,7 +294,16 @@ type HunkAddition struct {
 
 	// isBinary indicates whether this hunk contains binary data.
 	isBinary bool
+
+	// tooLarge marks a "[File too large to diff]" placeholder (see
+	// AddedHunk.tooLarge).
+	tooLarge bool
 }
+
+// dedupExempt reports whether a hunk bypasses line dedup: binary hunks and
+// too-large placeholders carry no diffed lines, so they always survive and
+// never mark the fingerprint set.
+func (h *HunkAddition) dedupExempt() bool { return h.isBinary || h.tooLarge }
 
 // String returns a human‑readable representation.
 func (h *HunkAddition) String() string {
@@ -413,6 +450,9 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
 	if fn == nil {
 		return errors.New("DiffHistoryHunksFunc: fn must not be nil")
+	}
+	if hs.hunkLineDedup {
+		return hs.diffHistoryHunksDedup(fn)
 	}
 
 	// Stage widths. Stage 2 gets one worker per CPU because it carries the
@@ -863,7 +903,22 @@ func (e *blobPairEmitter) flush() error {
 
 // emitCommitBlobPairsTo performs the tree diff of emitCommitBlobPairs and
 // hands each stage-2 record to emit.
+//
+// When hunkPathFilter is set, pairs it reports true for are dropped here,
+// before any blob is loaded or diffed, so filtered paths cost no diff work
+// and, in dedup mode, never mark the fingerprint set.
 func (hs *HistoryScanner) emitCommitBlobPairsTo(c commitInfo, parentTree Hash, emit func(blobPairWork) error, stopCh <-chan struct{}) error {
+	if skip := hs.hunkPathFilter; skip != nil {
+		inner := emit
+		emit = func(w blobPairWork) error {
+			// The predicate sees the post-image path exactly as
+			// HunkAddition.Path() would report it (forward slashes).
+			if skip(w.commit, filepath.ToSlash(w.path)) {
+				return nil
+			}
+			return inner(w)
+		}
+	}
 
 	// A zero parent tree (root commit, shallow history) has no old side:
 	// every entry is an addition and no deletion can exist, so no rename is
@@ -1435,53 +1490,57 @@ func trimPathPrefix(p, prefix string) (string, bool) {
 // only on the two blob contents, and histories with merges replay the same
 // transition repeatedly.
 func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAddition) error) error {
-	hunks, err := hs.pairAddedHunks(work.oldOID, work.newOID)
+	hunks, err := hs.pairHunks(work)
 	if err != nil {
 		return err
 	}
-
-	if work.inferredRename {
-		hunks, err = hs.gateInferredRenameHunks(work.oldOID, work.newOID, hunks)
-		if err != nil {
-			return err
-		}
-	}
-
+	// Emit each hunk exactly as computeAddedHunks produced it; adjacent
+	// hunks are not merged.
 	for _, hunk := range hunks {
-		if hunk.IsBinary { // Don't fuse binary hunks
-			// Binary files are always sent as a single hunk.
-			// Convention: for binary hunks, startLine == endLine to signal
-			// that line-based range semantics do not apply. The value
-			// comes from hunk.StartLine and is repeated for endLine to
-			// communicate "this is a single indivisible blob" rather than
-			// a contiguous line range.
-			if err := fn(HunkAddition{
-				commit:    work.commit,
-				path:      filepath.ToSlash(work.path),
-				startLine: int(hunk.StartLine),
-				endLine:   int(hunk.StartLine),
-				lines:     hunk.Lines,
-				isBinary:  true,
-			}); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// Emit each hunk exactly as computeAddedHunks produced it;
-		// adjacent hunks are not merged.
-		if err := fn(HunkAddition{
-			commit:    work.commit,
-			path:      filepath.ToSlash(work.path),
-			startLine: int(hunk.StartLine),
-			endLine:   int(hunk.EndLine()),
-			lines:     hunk.Lines,
-			isBinary:  false,
-		}); err != nil {
+		if err := fn(newHunkAddition(work, hunk)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// pairHunks returns the added hunks for one changed file: the memoized pair
+// diff, content-validated when the pairing was inferred from a directory
+// rename. Every returned hunk's lines are either compacted into their own
+// buffer or span the whole new blob (see pairCache.add), so the bytes a
+// retained hunk keeps alive equal its line bytes.
+func (hs *HistoryScanner) pairHunks(work blobPairWork) ([]AddedHunk, error) {
+	hunks, err := hs.pairAddedHunks(work.oldOID, work.newOID)
+	if err != nil {
+		return nil, err
+	}
+	if work.inferredRename {
+		return hs.gateInferredRenameHunks(work.oldOID, work.newOID, hunks)
+	}
+	return hunks, nil
+}
+
+// newHunkAddition attributes one computed hunk to the commit and path of
+// the pair it came from.
+//
+// Convention: for binary hunks, startLine == endLine to signal that
+// line-based range semantics do not apply. The value comes from
+// hunk.StartLine and is repeated for endLine to communicate "this is a
+// single indivisible blob" rather than a contiguous line range.
+func newHunkAddition(work blobPairWork, hunk AddedHunk) HunkAddition {
+	endLine := int(hunk.EndLine())
+	if hunk.IsBinary {
+		endLine = int(hunk.StartLine)
+	}
+	return HunkAddition{
+		commit:    work.commit,
+		path:      filepath.ToSlash(work.path),
+		startLine: int(hunk.StartLine),
+		endLine:   endLine,
+		lines:     hunk.Lines,
+		isBinary:  hunk.IsBinary,
+		tooLarge:  hunk.tooLarge,
+	}
 }
 
 // pairAddedHunks returns the added hunks for one (old,new) blob transition,
@@ -1531,7 +1590,8 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 //   - Either side over SmallFileThreshold: computeAddedHunks used the line-set
 //     or hashing algorithm, which is a set-membership test rather than a
 //     multiplicity-aware diff, so its added-line count cannot be turned into a
-//     similarity score. Rejected rather than measured.
+//     similarity score. Measured directly from the blobs with
+//     renameLinesSimilar instead.
 //   - Both sides small text: a real line diff, which the similarity test below
 //     can measure.
 //
@@ -1567,16 +1627,15 @@ func (hs *HistoryScanner) gateInferredRenameHunks(oldOID, newOID Hash, hunks []A
 		// Past SmallFileThreshold computeAddedHunks switches to the line-set
 		// and hashing algorithms, which are set-membership tests: one
 		// occurrence of a line in the old blob marks EVERY occurrence of it in
-		// the new blob as not added. `added` is then an undercount and the
-		// `common` derived from it an overcount, so the similarity test below
-		// cannot be trusted here — a one-line old file paired with a megabyte
-		// of that same line repeated scores as fully common and the whole new
-		// file would be suppressed. Measuring it properly needs a
-		// multiplicity-aware common-line count over both blobs, which is a
-		// second full diff; until then an unmeasurable pairing is rejected the
-		// same way an oversized or binary one is. The cost is that an inferred
-		// rename of a file over 1 MB is always reported whole rather than as
-		// its added lines.
+		// the new blob as not added, so the added count below would overstate
+		// similarity (a one-line old file paired with a megabyte of that same
+		// line repeated would score as fully common). The gate therefore
+		// measures the blobs directly with renameLinesSimilar, a
+		// multiplicity-aware hashed line count that costs one map entry per
+		// distinct old line.
+		if renameLinesSimilar(oldBytes, newBytes) {
+			return hunks, nil
+		}
 		return hs.pairAddedHunks(Hash{}, newOID)
 	}
 
@@ -1639,16 +1698,25 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // Close releases any mmap handles or file descriptors held by the scanner.
 // It is idempotent; subsequent calls are no‑ops.
 //
-// The pair cache is cleared as well. Callers may retain a HistoryScanner value
-// after Close, and a hunk scan leaves that cache holding up to its full budget
-// of hunk lines — plus, for whole-blob entries, the object buffers those lines
-// view — which would otherwise stay reachable until the scanner itself does.
-// This mirrors store.Close releasing the offset cache's object bytes.
+// The pair cache and the commit cache are cleared as well. Callers may retain
+// a HistoryScanner value after Close, and a hunk scan leaves the pair cache
+// holding up to its full budget of hunk lines — plus, for whole-blob entries,
+// the object buffers those lines view — and a dedup scan leaves the commit
+// list and graph for the whole history; both would otherwise stay reachable
+// until the scanner itself does. This mirrors store.Close releasing the
+// offset cache's object bytes.
 func (hs *HistoryScanner) Close() error {
 	hs.pairs.clear()
 	if hs.meta != nil {
 		hs.meta.clear()
+		hs.meta.attachGraph(nil)
 	}
+	// A dedup scan materializes the commit list and the graph built from
+	// it (loadAllCommits); both scale with history and have no use after
+	// the object store is closed.
+	hs.commitsMu.Lock()
+	hs.commits, hs.commitsTips, hs.commitsShallow, hs.graphData = nil, nil, nil, nil
+	hs.commitsMu.Unlock()
 	return hs.store.Close()
 }
 
@@ -1686,12 +1754,17 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
-// loadAllCommits is an internal helper used by package tests. Production scan
-// paths should use streaming traversal.
+// loadAllCommits enumerates every reachable commit, caching the result for
+// as long as the repository's ref tips and shallow boundary stay unchanged.
+// The streaming hunk pipeline uses walkCommitsFromRefs directly; this
+// materialized form serves the dedup pipeline (which needs a total order up
+// front) and package tests.
 //
-// The method uses sync.Once to ensure the expensive commit enumeration is
-// performed at most once, even under concurrent calls. After the first
-// successful load, subsequent calls return a fresh copy of the cached slice.
+// Every call reads the ref tips and the shallow file. A scanner reused after
+// new commits land, or after a shallow clone is deepened, re-walks the
+// history on its next call, so a dedup scan sees the same commits a fresh
+// walk would. Objects that appear with neither change (a partial clone
+// fetching missing ancestors on demand) are outside this key.
 //
 // Copy semantics: the returned []commitInfo is a shallow copy of the internal
 // cache. This prevents callers from mutating the scanner's cached state (e.g.
@@ -1699,23 +1772,34 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 // safe to share because their mutable parts (the ParentOIDs slice) are never
 // modified after construction.
 func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
-	hs.commitsOnce.Do(func() {
-		if hs.graphData != nil {
-			hs.commits = hs.loadFromGraph()
-			return
+	tips, err := collectRefTips(hs.gitDir)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(tips, func(a, b Hash) int { return bytes.Compare(a[:], b[:]) })
+	shallow, err := os.ReadFile(filepath.Join(hs.gitDir, "shallow"))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+
+	hs.commitsMu.Lock()
+	defer hs.commitsMu.Unlock()
+	switch {
+	case hs.commits != nil && slices.Equal(tips, hs.commitsTips) && bytes.Equal(shallow, hs.commitsShallow):
+		// Cache hit.
+	case hs.graphData != nil && hs.commits == nil:
+		hs.commits = hs.loadFromGraph()
+		hs.commitsTips, hs.commitsShallow = tips, shallow
+	default:
+		commits, err := hs.loadFromRefs()
+		if err != nil {
+			return nil, err
 		}
-		hs.commits, hs.commitsErr = hs.loadFromRefs()
-		if hs.commitsErr != nil {
-			return
-		}
-		hs.graphData = buildCommitGraphFromCommits(hs.commits)
+		hs.commits, hs.commitsTips, hs.commitsShallow = commits, tips, shallow
+		hs.graphData = buildCommitGraphFromCommits(commits)
 		if hs.meta != nil {
 			hs.meta.attachGraph(hs.graphData)
 		}
-	})
-
-	if hs.commitsErr != nil {
-		return nil, hs.commitsErr
 	}
 
 	out := make([]commitInfo, len(hs.commits))

@@ -247,6 +247,10 @@ type AddedHunk struct {
 	// IsBinary indicates whether this hunk contains binary data.
 	// When true, Lines contains the raw binary content as a single string.
 	IsBinary bool
+
+	// tooLarge marks the placeholder tooLargeHunk emits for a blob over
+	// MaxDiffSize; its one line describes the skipped diff.
+	tooLarge bool
 }
 
 // EndLine returns the 1-based line number of the last line in this hunk.
@@ -381,12 +385,7 @@ func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch
 
 	// Hard size limit — users would rather see a placeholder than wait.
 	if newSize > maxDiffSize {
-		placeholder := AddedHunk{
-			StartLine: 1,
-			Lines:     []string{fmt.Sprintf("[File too large to diff: new=%d bytes]", newSize)},
-			IsBinary:  false,
-		}
-		return []AddedHunk{placeholder}, nil
+		return []AddedHunk{tooLargeHunk(fmt.Sprintf("[File too large to diff: new=%d bytes]", newSize))}, nil
 	}
 
 	if len(newBytes) > 0 && isBinary(newBytes) {
@@ -429,12 +428,7 @@ func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch
 	oldSize := int64(len(oldBytes))
 
 	if oldSize > maxDiffSize {
-		placeholder := AddedHunk{
-			StartLine: 1,
-			Lines:     []string{fmt.Sprintf("[File too large to diff: old=%d new=%d bytes]", oldSize, newSize)},
-			IsBinary:  false,
-		}
-		return []AddedHunk{placeholder}, nil
+		return []AddedHunk{tooLargeHunk(fmt.Sprintf("[File too large to diff: old=%d new=%d bytes]", oldSize, newSize))}, nil
 	}
 
 	if len(oldBytes) > 0 && isBinary(oldBytes) {
@@ -454,6 +448,67 @@ func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch
 	}
 
 	return addedHunksForLargeFiles(oldBytes, newBytes), nil
+}
+
+// tooLargeHunk is the one-line text hunk that stands in for a diff of a
+// blob larger than MaxDiffSize.
+func tooLargeHunk(text string) AddedHunk {
+	return AddedHunk{StartLine: 1, Lines: []string{text}, tooLarge: true}
+}
+
+// renameLinesSimilar reports whether at least half the lines of the longer
+// side also occur in the other side, counting each line occurrence once.
+// Lines are compared by 64-bit FarmHash, so the check holds one map entry
+// per distinct old line and no per-line slice for either side; a hash
+// collision can only overstate similarity by one line. An old side that is
+// binary or larger than MaxDiffSize is never similar.
+func renameLinesSimilar(oldBytes, newBytes []byte) bool {
+	if int64(len(oldBytes)) > maxDiffSize || isBinary(oldBytes) {
+		return false
+	}
+	// The map grows with distinct lines; a hint from the total line count
+	// would presize it for a blob of repeated lines.
+	counts := make(map[uint64]int32)
+	oldLines := 0
+	for line := range eachLine(oldBytes) {
+		counts[farm.Hash64(line)]++
+		oldLines++
+	}
+	newLines, matches := 0, 0
+	for line := range eachLine(newBytes) {
+		newLines++
+		h := farm.Hash64(line)
+		if counts[h] > 0 {
+			counts[h]--
+			matches++
+		}
+	}
+	if oldLines == 0 || newLines == 0 {
+		return false
+	}
+	return matches*2 >= max(oldLines, newLines)
+}
+
+// eachLine yields src's lines with the same splitting as tokenize (the
+// newline excluded, a trailing unterminated line included) as sub-slices
+// of src.
+func eachLine(src []byte) func(yield func([]byte) bool) {
+	return func(yield func([]byte) bool) {
+		rest := src
+		for {
+			i := bytes.IndexByte(rest, '\n')
+			if i < 0 {
+				break
+			}
+			if !yield(rest[:i]) {
+				return
+			}
+			rest = rest[i+1:]
+		}
+		if len(rest) > 0 {
+			yield(rest)
+		}
+	}
 }
 
 // loadBlob retrieves the raw content of a single object ID from store.

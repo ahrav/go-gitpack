@@ -502,6 +502,14 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 // The returned byte slice may alias internal cache buffers. Callers MUST NOT
 // modify the returned data.
 func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
+	return s.getMaterializedCapped(oid, s.maxDeltaObjectSize)
+}
+
+// getMaterializedCapped is getMaterialized with maxObjectSize bounding delta
+// reconstruction in place of the store-wide limit; zero disables the bound.
+// A delta whose header declares a larger target is rejected before its
+// output is allocated.
+func (s *store) getMaterializedCapped(oid Hash, maxObjectSize uint64) ([]byte, ObjectType, error) {
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
 		b.Release()
@@ -524,7 +532,7 @@ func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
 		off:           off,
 		oid:           oid,
 		ctx:           ctx,
-		maxObjectSize: s.maxDeltaObjectSize,
+		maxObjectSize: maxObjectSize,
 	}, false, true)
 }
 
@@ -748,7 +756,15 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
 	}
 
-	full, resolvedType, err := s.getMaterialized(oid)
+	// A delta commit within the payload cap is reconstructed whole, which
+	// also seeds the object caches for the attribution read that usually
+	// follows. One above the cap takes the header-prefix path instead of
+	// the store-wide delta limit, so the header read never allocates more
+	// of the target than the header itself.
+	full, resolvedType, err := s.getMaterializedCapped(oid, s.commitDeltaLimit())
+	if errors.Is(err, ErrDeltaTargetTooLarge) {
+		full, resolvedType, err = s.inflateDeltaCommitHeader(p, off, oid)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -756,6 +772,65 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
 	}
 	return trimCommitHeader(full)
+}
+
+// commitDeltaLimit is the per-hop reconstruction bound for commit reads: the
+// commit payload cap, or the store-wide delta limit when that is tighter.
+func (s *store) commitDeltaLimit() uint64 {
+	limit := uint64(maxCommitPayload)
+	if s.maxDeltaObjectSize > 0 && s.maxDeltaObjectSize < limit {
+		limit = s.maxDeltaObjectSize
+	}
+	return limit
+}
+
+// inflateDeltaCommitHeader reconstructs the delta chain at (p, off) far
+// enough to read the commit header of a target above the payload cap. The
+// chain's bases are reconstructed whole under the store-wide delta limit,
+// since copy instructions may address any byte of them; the target itself is
+// reconstructed whole only when its delta payload fits the cap (so the one-
+// shot inflate is bounded) and its declared size does too, and otherwise as
+// a MaxHdr-byte prefix (applyDeltaPrefix). A whole target is published to
+// the offset cache like any other materialization; a prefix is not.
+func (s *store) inflateDeltaCommitHeader(p *mmap.ReaderAt, off uint64, oid Hash) ([]byte, ObjectType, error) {
+	ctx := getDeltaContext(s.maxDeltaDepth)
+	defer putDeltaContext(ctx)
+	params := inflationParams{p: p, off: off, oid: oid, ctx: ctx, maxObjectSize: s.maxDeltaObjectSize}
+
+	stack := make(deltaStack, 0, 16)
+	base, baseType, err := walkUpDeltaChain(s, params, &stack, s.offCache)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+	if len(stack) == 0 {
+		return base, baseType, nil
+	}
+	if len(stack) > 1 {
+		base, baseType, err = applyDeltaStackCached(s.offCache, stack[1:], base, baseType, params.maxObjectSize, false)
+		if err != nil {
+			return nil, ObjBad, err
+		}
+	}
+
+	d := stack[0]
+	limit := s.commitDeltaLimit()
+	if _, payloadSize, err := deltaPayloadStart(d.pack, d.offset, d.typ); err != nil {
+		return nil, ObjBad, err
+	} else if payloadSize <= limit {
+		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, base, nil, limit)
+		if err == nil {
+			s.offCache.add(d.pack, d.offset, final, baseType)
+			return final, baseType, nil
+		}
+		if !errors.Is(err, ErrDeltaTargetTooLarge) {
+			return nil, ObjBad, err
+		}
+	}
+	prefix, err := applyDeltaPrefix(d.pack, d.offset, d.typ, base, MaxHdr)
+	if err != nil {
+		return nil, ObjBad, err
+	}
+	return prefix, baseType, nil
 }
 
 // countingReader records how many bytes have been read through it. A
@@ -921,7 +996,17 @@ func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) 
 		return payload, nil
 
 	case ObjOfsDelta, ObjRefDelta:
-		full, resolvedType, err := s.getMaterialized(oid)
+		// The commit cap bounds reconstruction itself, so an oversized
+		// delta commit is rejected from its target-size header rather than
+		// after a materialization up to the store-wide delta limit. The
+		// bound applies to every hop here; a chain with a base above the
+		// cap falls back to readCommitHeader, whose header-prefix path
+		// reconstructs bases under the store-wide limit and only the
+		// header of the target.
+		full, resolvedType, err := s.getMaterializedCapped(oid, s.commitDeltaLimit())
+		if errors.Is(err, ErrDeltaTargetTooLarge) {
+			return nil, fmt.Errorf("%w: %d cap for %x: %w", errCommitPayloadTooLarge, maxCommitPayload, oid, err)
+		}
 		if err != nil {
 			return nil, err
 		}
