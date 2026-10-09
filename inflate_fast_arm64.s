@@ -48,7 +48,7 @@ TEXT ·inflateHuffmanFastArm64(SB), NOSPLIT|NOFRAME, $0-8
 	AND	R11, R5, R16
 	MOVWU	(R3)(R16<<2), R14
 
-	PCALIGN	$32
+	PCALIGN	$64
 decode_entry:
 	MOVD	R5, R15
 	LSR	R14, R5, R5

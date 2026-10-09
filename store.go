@@ -682,14 +682,28 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	// Locate the commit object and skip past its generic object header.
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
-		full, typ, err := s.readLooseObject(oid)
+		obj, err := s.openLooseCommit(oid)
 		if err != nil {
 			return nil, err
 		}
-		if typ != ObjCommit {
-			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+		defer obj.release()
+		// Bytes past the declared size belong to a corrupt object, so the
+		// committer line has to arrive within obj.size.
+		body := &countingReader{r: io.LimitReader(obj.body, int64(obj.size)+1)}
+		hdr, err := readCommitHeaderFromStream(body)
+		if err != nil {
+			return nil, fmt.Errorf("loose commit %x: header within declared size %d: %w", oid, obj.size, err)
 		}
-		return trimCommitHeader(full)
+		// The rest of the body is inflated into a discard sink, so the
+		// declared size is validated the way readLooseObject validates it,
+		// with the header as the only retained allocation.
+		if _, err := io.Copy(io.Discard, body); err != nil {
+			return nil, err
+		}
+		if body.n != obj.size {
+			return nil, fmt.Errorf("loose object size mismatch for %x: want %d, got %d", oid, obj.size, body.n)
+		}
+		return hdr, nil
 	}
 	typ, hdrLen, err := peekObjectType(p, off)
 	if err != nil {
@@ -742,6 +756,20 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
 	}
 	return trimCommitHeader(full)
+}
+
+// countingReader records how many bytes have been read through it. A
+// LimitReader of size+1 underneath makes n == size prove that the stream
+// ended exactly at the declared size.
+type countingReader struct {
+	r io.Reader
+	n uint64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += uint64(n)
+	return n, err
 }
 
 // readCommitHeaderFromStream incrementally reads lines from a zlib stream
@@ -800,6 +828,118 @@ func trimCommitHeader(full []byte) ([]byte, error) {
 	}
 
 	return nil, fmt.Errorf("commit header exceeds %d bytes without committer line", MaxHdr)
+}
+
+// maxCommitPayload caps the decompressed size readCommitPayload accepts for
+// a single commit object. It is mutable so tests can exercise the cap with
+// small fixtures.
+var maxCommitPayload = 64 << 20 // 64 MiB
+
+var errCommitPayloadTooLarge = errors.New("commit payload exceeds attribution cap")
+
+func checkCommitPayloadSize(size uint64, oid Hash) error {
+	if size > uint64(maxCommitPayload) {
+		return fmt.Errorf("%w: %d bytes exceeds %d for %x", errCommitPayloadTooLarge, size, maxCommitPayload, oid)
+	}
+	return nil
+}
+
+// readCommitPayload reads the full uncompressed payload of a commit object:
+// header lines and the message that follows them.
+//
+// Unlike readCommitHeader (which stops at the committer line and serves the
+// commit walk), this inflates the whole object; it backs metadata attribution,
+// where the message is part of the result. The returned slice is always a
+// fresh allocation owned by the caller — it never aliases pooled buffers or
+// shared cache entries, so callers may retain it (or strings sliced from it)
+// indefinitely.
+func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
+	return s.readCommitPayloadTo(oid, heapSink{})
+}
+
+// heapSink is the payloadSink that gives every payload its own allocation.
+type heapSink struct{}
+
+func (heapSink) reserve(n int) []byte { return make([]byte, n) }
+
+// readCommitPayloadTo is readCommitPayload with the destination chosen by
+// sink.
+func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) {
+	p, off, ok := s.findPackedObject(oid)
+	if !ok {
+		obj, err := s.openLooseCommit(oid)
+		if err != nil {
+			return nil, err
+		}
+		defer obj.release()
+		if err := checkCommitPayloadSize(obj.size, oid); err != nil {
+			return nil, err
+		}
+		payload := sink.reserve(int(obj.size))
+		if _, err := io.ReadFull(obj.body, payload); err != nil {
+			return nil, fmt.Errorf("loose object size mismatch for %x: want %d: %w", oid, obj.size, err)
+		}
+		if err := ensureZlibStreamEnd(obj.body); err != nil {
+			return nil, fmt.Errorf("loose object size mismatch for %x: want %d: %w", oid, obj.size, err)
+		}
+		return payload, nil
+	}
+
+	// Parse the generic object header ourselves (rather than via
+	// peekObjectType) because the declared decompressed size gates the
+	// allocation below.
+	var hdr [32]byte
+	n, err := p.ReadAt(hdr[:], int64(off))
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, err
+	}
+	if n == 0 {
+		return nil, ErrEmptyObjectHeader
+	}
+	typ, size, hdrLen := parseObjectHeaderUnsafe(hdr[:n])
+	if hdrLen <= 0 {
+		return nil, ErrCannotParseObjectHeader
+	}
+
+	switch typ {
+	case ObjCommit:
+		// Plain packed commit: one exact-size destination, one-shot
+		// inflate. The size comes from the pack header, so the cap check
+		// precedes the reservation.
+		// Verification precedes the cap check so an over-cap record reaches
+		// the header fallback only after its CRC has passed.
+		if err := s.verifyPackObjectCRCIfEnabled(p, off, oid); err != nil {
+			return nil, err
+		}
+		if err := checkCommitPayloadSize(size, oid); err != nil {
+			return nil, err
+		}
+		payload := sink.reserve(int(size))
+		if err := inflateExact(p, int64(off)+int64(hdrLen), payload); err != nil {
+			return nil, err
+		}
+		return payload, nil
+
+	case ObjOfsDelta, ObjRefDelta:
+		full, resolvedType, err := s.getMaterialized(oid)
+		if err != nil {
+			return nil, err
+		}
+		if resolvedType != ObjCommit {
+			return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+		}
+		if err := checkCommitPayloadSize(uint64(len(full)), oid); err != nil {
+			return nil, err
+		}
+		// The copy is mandatory: materialized bytes may alias shared cache
+		// buffers, and the caller retains the payload.
+		payload := sink.reserve(len(full))
+		copy(payload, full)
+		return payload, nil
+
+	default:
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
 }
 
 // findCRCForObject returns the CRC-32 checksum for the specified object.

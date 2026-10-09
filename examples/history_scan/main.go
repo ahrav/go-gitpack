@@ -10,6 +10,8 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"sync/atomic"
 
 	objstore "github.com/ahrav/go-gitpack"
@@ -36,7 +38,7 @@ func main() {
 
 	fmt.Println("Scanning all unique blobs from repository history...")
 
-	s := &detailedScanner{}
+	s := &detailedScanner{scanner: scanner}
 	if err := scanner.Scan(nil, s); err != nil {
 		log.Fatalf("Error during scan: %v", err)
 	}
@@ -46,11 +48,17 @@ func main() {
 }
 
 // detailedScanner implements objstore.BlobScanner by draining each blob and
-// printing per-blob metadata. ScanBlob is called concurrently from multiple
-// decode workers, so counters use atomic operations.
+// printing per-blob metadata plus the author and title of meta.Commit, the
+// commit Scan selected for the blob (the first commit in its ordered walk
+// whose first-parent diff added the blob). ScanBlob is called concurrently
+// from multiple decode workers, so counters use atomic operations, each
+// record is written in one call under out, and GetCommitMetadata is safe for
+// concurrent use and caches per-commit results internally.
 type detailedScanner struct {
+	scanner    *objstore.HistoryScanner
 	blobs      atomic.Int64
 	totalBytes atomic.Int64
+	out        sync.Mutex
 }
 
 func (s *detailedScanner) ScanBlob(r io.Reader, meta objstore.ScanMeta) error {
@@ -61,14 +69,26 @@ func (s *detailedScanner) ScanBlob(r io.Reader, meta objstore.ScanMeta) error {
 	s.totalBytes.Add(n)
 	count := s.blobs.Add(1)
 
-	fmt.Printf("Blob #%d:\n", count)
-	fmt.Printf("  OID:    %s\n", meta.Blob)
-	fmt.Printf("  Commit: %s\n", meta.Commit)
-	fmt.Printf("  Path:   %s\n", meta.Path)
-	fmt.Printf("  Size:   %d bytes\n", n)
-	fmt.Println("  ---")
+	cm, err := s.scanner.GetCommitMetadata(meta.Commit)
+	if err != nil {
+		return fmt.Errorf("commit metadata for %s: %w", meta.Commit, err)
+	}
+	title, _, _ := strings.Cut(cm.Message, "\n")
 
-	return nil
+	var rec strings.Builder
+	fmt.Fprintf(&rec, "Blob #%d:\n", count)
+	fmt.Fprintf(&rec, "  OID:    %s\n", meta.Blob)
+	fmt.Fprintf(&rec, "  Commit: %s\n", meta.Commit)
+	fmt.Fprintf(&rec, "  Path:   %s\n", meta.Path)
+	fmt.Fprintf(&rec, "  Size:   %d bytes\n", n)
+	fmt.Fprintf(&rec, "  Author: %s <%s>\n", cm.Author.Name, cm.Author.Email)
+	fmt.Fprintf(&rec, "  Title:  %s\n", title)
+	rec.WriteString("  ---\n")
+
+	s.out.Lock()
+	defer s.out.Unlock()
+	_, err = os.Stdout.WriteString(rec.String())
+	return err
 }
 
 // findGitDir walks up the directory tree to find a .git directory.

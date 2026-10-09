@@ -194,6 +194,18 @@ func WithPairCacheBudget(bytes int) ScannerOption {
 	}
 }
 
+// WithMetaCacheBudget bounds the bytes of commit payloads (author lines and
+// messages) the scanner's GetCommitMetadata cache may retain (default
+// 256 MiB). Each scanner owns an independent cache, so processes that open
+// many repositories concurrently should lower the budget to bound aggregate
+// memory growth. A budget <= 0 disables the cache entirely: every call
+// re-reads and re-parses the commit.
+func WithMetaCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.meta.setBudget(bytes)
+	}
+}
+
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
 //
@@ -1634,22 +1646,42 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // This mirrors store.Close releasing the offset cache's object bytes.
 func (hs *HistoryScanner) Close() error {
 	hs.pairs.clear()
+	if hs.meta != nil {
+		hs.meta.clear()
+	}
 	return hs.store.Close()
 }
 
-// CommitMetadata bundles the author identity and commit timestamp for a single
-// commit.
+// CommitMetadata bundles the author identity, commit timestamp, and commit
+// message for a single commit.
 //
 // Instances are immutable and therefore safe for concurrent reads.
+//
+// For a cached commit, the strings in Author and Message reference a 64 KiB
+// metaCache slab shared with other commits (metaCache.miss builds them with
+// rebaseEntry), so a retained CommitMetadata keeps that slab reachable,
+// including after Close has dropped the cache's own reference. Callers that
+// keep values beyond the scan should copy the fields they need with
+// strings.Clone.
 type CommitMetadata struct {
 	// Author records the commit author exactly as stored in the commit header.
 	Author AuthorInfo
 
 	// Timestamp holds the committer time in seconds since the Unix epoch.
 	Timestamp int64
+
+	// Message holds the raw commit message: the bytes after the first blank
+	// line of the commit object, byte-faithful to `git cat-file commit`
+	// output. No encoding normalization or NUL truncation is applied (those
+	// are git-log presentation behaviors, not object format); any such
+	// normalization belongs to the consumer. Empty when the commit has no
+	// message.
+	Message string
 }
 
-// GetCommitMetadata returns (and caches) the commit's author and timestamp.
+// GetCommitMetadata returns (and caches) the commit's author, timestamp, and
+// message. A commit whose payload exceeds maxCommitPayload is attributed from
+// its header, with an empty Message.
 func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }

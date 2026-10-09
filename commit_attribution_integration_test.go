@@ -7,7 +7,11 @@
 package objstore
 
 import (
+	"bytes"
+	"os/exec"
 	"path/filepath"
+	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -118,4 +122,155 @@ func TestCommitAttributionEmptyRepo(t *testing.T) {
 	commits, err := scanner.loadAllCommits()
 	require.NoError(t, err)
 	assert.Empty(t, commits)
+}
+
+// TestCommitMessageAgainstGitOracle verifies, for EVERY commit in each
+// generated fixture repository, that GetCommitMetadata.Message byte-equals
+// the bytes after the first "\n\n" of `git cat-file commit` output.
+//
+// The oracle is deliberately `git cat-file commit` and NOT `git log
+// --format=%B`: %B re-encodes to the log output encoding and truncates at
+// embedded NULs, both presentation behaviors of git-log rather than object
+// format. Author fields are additionally asserted non-empty so a payload
+// split that ate the header would not pass silently.
+func TestCommitMessageAgainstGitOracle(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repos := []string{
+		"simple-linear",
+		"with-merges",
+		"large-repo",
+	}
+
+	for _, repoName := range repos {
+		t.Run(repoName, func(t *testing.T) {
+			repoPath := filepath.Join("testdata", "repos", repoName)
+
+			scanner, err := NewHistoryScanner(repoPath)
+			require.NoError(t, err)
+			defer scanner.Close()
+
+			commits, err := scanner.loadAllCommits()
+			require.NoError(t, err)
+			require.NotEmpty(t, commits)
+
+			for _, commit := range commits {
+				payload := gitCatFile(t, repoPath, "commit", commit.OID)
+
+				var wantMessage []byte
+				if i := bytes.Index(payload, []byte("\n\n")); i >= 0 {
+					wantMessage = payload[i+2:]
+				}
+
+				meta, err := scanner.GetCommitMetadata(commit.OID)
+				require.NoErrorf(t, err, "GetCommitMetadata %s", commit.OID)
+
+				assert.Equalf(t, string(wantMessage), meta.Message,
+					"message mismatch for commit %s", commit.OID)
+				assert.NotEmptyf(t, meta.Author.Name, "author name for %s", commit.OID)
+				assert.NotEmptyf(t, meta.Author.Email, "author email for %s", commit.OID)
+			}
+		})
+	}
+}
+
+// TestCommitMetadataConcurrentDuplicateOIDs exercises the metaCache's
+// double-parse-on-concurrent-miss tolerance against a real store: many
+// goroutines request the same small OID set simultaneously (all missing at
+// start), and every result must be identical. Run under -race, this covers
+// the RLock/parse/Lock insert protocol with genuine concurrent misses.
+func TestCommitMetadataConcurrentDuplicateOIDs(t *testing.T) {
+	repoPath := filepath.Join("testdata", "repos", "large-repo")
+
+	scanner, err := NewHistoryScanner(repoPath)
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+
+	// A small OID set maximizes duplicate-OID collisions across goroutines.
+	oids := make([]Hash, 0, 8)
+	for i, c := range commits {
+		if i >= 8 {
+			break
+		}
+		oids = append(oids, c.OID)
+	}
+
+	// Reference results, computed serially.
+	want := make(map[Hash]CommitMetadata, len(oids))
+	for _, oid := range oids {
+		meta, err := scanner.GetCommitMetadata(oid)
+		require.NoError(t, err)
+		want[oid] = meta
+	}
+
+	// Reset the cache so every goroutine races the miss path.
+	scanner.meta.mu.Lock()
+	clear(scanner.meta.m)
+	scanner.meta.mu.Unlock()
+
+	const goroutines = 16
+	const iterations = 200
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines)
+
+	// Every worker's first request is the same missing OID, released by one
+	// close, so the duplicate-miss path runs with genuine overlap.
+	start := make(chan struct{})
+	for g := range goroutines {
+		wg.Add(1)
+		go func(seed int) {
+			defer wg.Done()
+			<-start
+			for i := range iterations {
+				oid := oids[(seed+i)%len(oids)]
+				if i == 0 {
+					oid = oids[0]
+				}
+				meta, err := scanner.GetCommitMetadata(oid)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if meta != want[oid] {
+					errs <- assert.AnError
+					return
+				}
+			}
+		}(g)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent GetCommitMetadata: %v", err)
+	}
+}
+
+// TestHistoryScannerCloseReleasesMetaCache pins that Close drops the
+// attribution cache along with the pair cache: a scanner value retained after
+// Close holds no cached entries and no metadata slabs.
+func TestHistoryScannerCloseReleasesMetaCache(t *testing.T) {
+	scanner := createScannerForRepo(t, "large-repo")
+
+	commits, err := scanner.loadAllCommits()
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+	_, err = scanner.GetCommitMetadata(commits[0].OID)
+	require.NoError(t, err)
+	require.NotEmpty(t, scanner.meta.m)
+	require.NotZero(t, scanner.meta.slabBytes)
+
+	before := reflect.ValueOf(scanner.meta.m).UnsafePointer()
+	require.NoError(t, scanner.Close())
+	require.Empty(t, scanner.meta.m)
+	require.NotEqual(t, before, reflect.ValueOf(scanner.meta.m).UnsafePointer(),
+		"Close must replace the map so its bucket array is collectible")
+	require.Nil(t, scanner.meta.slab)
+	require.Zero(t, scanner.meta.slabBytes)
 }
