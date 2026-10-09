@@ -114,9 +114,9 @@ type HistoryScanner struct {
 	// so ~1/3 of pair diffs in a typical history walk are repeats.
 	pairs *pairCache
 
-	// treeOIDs memoizes commit OID -> root tree OID. Every commit header
-	// is otherwise inflated twice per scan: once when the walk visits the
-	// commit and once when its child resolves firstParentTree.
+	// treeOIDs memoizes commit OID -> root tree OID for parents outside
+	// the loaded commit set (shallow history, blob-mode scans that walk
+	// refs directly). Parents inside the set resolve through graphData.
 	treeOIDs sync.Map
 
 	// profiling holds optional profiling configuration.
@@ -349,12 +349,6 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 	if err != nil {
 		return err
 	}
-	// Publish every commit's tree OID up front so firstParentTree never
-	// re-inflates a header, including for skipped merge commits that are
-	// another commit's first parent.
-	for _, c := range commits {
-		hs.treeOIDs.Store(c.OID, c.TreeOID)
-	}
 
 	{
 		type workItem struct {
@@ -493,9 +487,15 @@ func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
 	}
 
 	parentOID := c.ParentOIDs[0]
-	// The commit walk records every visited commit's tree OID; a hit here
-	// avoids re-inflating the parent's header (which would otherwise
-	// happen once per child).
+	// loadAllCommits publishes every loaded commit's tree OID through the
+	// synthesized graph, so a parent inside the loaded set resolves with
+	// one map lookup; parents resolved from their headers are memoized in
+	// treeOIDs.
+	if g := hs.graphData; g != nil {
+		if idx, ok := g.OIDToIndex[parentOID]; ok {
+			return g.TreeOIDs[idx], nil
+		}
+	}
 	if t, ok := hs.treeOIDs.Load(parentOID); ok {
 		return t.(Hash), nil
 	}

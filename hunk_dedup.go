@@ -975,13 +975,6 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	if err != nil {
 		return err
 	}
-	// Publish every commit's tree OID up front so firstParentTree never
-	// re-inflates a header. This covers skipped merge commits too: a merge
-	// excluded from diffing can still be another commit's first parent.
-	for _, c := range commits {
-		hs.treeOIDs.Store(c.OID, c.TreeOID)
-	}
-
 	// loadAllCommits returns a fresh copy in parent-first order on both the
 	// ref-walk and commit-graph paths (each runs orderCommitsParentFirst),
 	// so the dedup pipeline consumes that order directly.

@@ -45,7 +45,29 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 	}); err != nil {
 		return nil, err
 	}
+	compactParentOIDs(out)
 	return orderCommitsParentFirst(out), nil
+}
+
+// compactParentOIDs moves every commit's ParentOIDs into one shared backing
+// array. The walk allocates each list separately; the scanner retains the
+// commit set for its lifetime, and one array costs the garbage collector a
+// single object instead of one per commit.
+func compactParentOIDs(commits []commitInfo) {
+	total := 0
+	for i := range commits {
+		total += len(commits[i].ParentOIDs)
+	}
+	backing := make([]Hash, total)
+	for i := range commits {
+		n := len(commits[i].ParentOIDs)
+		if n == 0 {
+			continue
+		}
+		copy(backing[:n], commits[i].ParentOIDs)
+		commits[i].ParentOIDs = backing[:n:n]
+		backing = backing[n:]
+	}
 }
 
 // walkCommitsFromRefs performs a ref-based reachable commit walk and calls visit
