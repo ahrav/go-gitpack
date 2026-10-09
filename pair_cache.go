@@ -28,17 +28,17 @@ const pairCacheShards = 32
 const defaultPairCacheBudget = 128 << 20
 
 // pairCacheHunkOverhead approximates the per-hunk cost beyond line bytes:
-// the AddedHunk struct and its Lines slice header.
+// the cachedHunk record plus the AddedHunk and Lines header rebuilt on a hit.
 const pairCacheHunkOverhead = 64
 
-// pairCacheLineOverhead is the per-line cost of a string header in a cached
-// hunk's Lines slice. Every stored hunk carries one []string sized to its
-// line count, so retention scales with the number of lines independently of
-// how many text bytes they hold: a diff of empty or very short lines retains
-// this much per line while contributing almost nothing to lineBytes. Charging
-// it stops a blank-line-heavy diff from being admitted as near-free and
-// keeps the accounted size within a small factor of the bytes retained.
-const pairCacheLineOverhead = int(unsafe.Sizeof(""))
+// pairCacheLineOverhead is the per-line cost of a cached hunk's span record
+// (start and end offset). Retention scales with the number of lines
+// independently of how many text bytes they hold: a diff of empty or very
+// short lines retains this much per line while contributing almost nothing
+// to lineBytes. Charging it stops a blank-line-heavy diff from being admitted
+// as near-free and keeps the accounted size within a small factor of the
+// bytes retained.
+const pairCacheLineOverhead = 2 * int(unsafe.Sizeof(uint32(0)))
 
 // pairCacheEntryOverhead approximates the fixed per-entry cost: the map key,
 // entry struct, and bucket bookkeeping. Charging it keeps entries with no
@@ -55,9 +55,48 @@ type pairCacheShard struct {
 	used int
 }
 
+// pairCacheEntry is the pointer-free form of a cached diff. Line text lives
+// in data and each line is the half-open span spans[2i]..spans[2i+1]; hunks
+// records how the lines group. Entries hold no string headers, so a full
+// cache costs the collector one slice of bytes and two slices of integers per
+// entry to mark rather than one pointer per cached line; get rebuilds the
+// []AddedHunk view on demand.
 type pairCacheEntry struct {
-	hunks []AddedHunk
+	data  []byte
+	spans []uint32
+	hunks []cachedHunk
 	size  int
+}
+
+// cachedHunk is one hunk's shape inside a pairCacheEntry: lines
+// [first, first+count) of the entry's span table.
+type cachedHunk struct {
+	first     uint32
+	count     uint32
+	startLine uint32
+	isBinary  bool
+}
+
+// view rebuilds the []AddedHunk a stored entry represents. The returned
+// lines alias e.data.
+func (e *pairCacheEntry) view() []AddedHunk {
+	if len(e.hunks) == 0 {
+		return nil
+	}
+	lines := make([]string, len(e.spans)/2)
+	for i := range lines {
+		lines[i] = btostr(e.data[e.spans[2*i]:e.spans[2*i+1]])
+	}
+	out := make([]AddedHunk, len(e.hunks))
+	for i, h := range e.hunks {
+		end := h.first + h.count
+		out[i] = AddedHunk{
+			Lines:     lines[h.first:end:end],
+			StartLine: h.startLine,
+			IsBinary:  h.isBinary,
+		}
+	}
+	return out
 }
 
 // pairCache is safe for concurrent use. Entries are immutable once stored:
@@ -162,7 +201,10 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 	s.mu.Lock()
 	e, ok := s.m[k]
 	s.mu.Unlock()
-	return e.hunks, ok
+	if !ok {
+		return nil, false
+	}
+	return e.view(), true
 }
 
 // clear drops every cached entry, releasing the retained hunk lines — and the
@@ -225,9 +267,13 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 		len(hunks)*pairCacheHunkOverhead + pairCacheEntryOverhead
 
 	stored := hunks
-	if !coversWholeNewBlob(&k, hunks) {
-		stored = compactHunks(hunks, lineBytes)
+	var entry pairCacheEntry
+	if coversWholeNewBlob(&k, hunks) {
+		entry = aliasingEntry(hunks)
+	} else {
+		stored, entry = compactHunks(hunks, lineBytes)
 	}
+	entry.size = size
 
 	// A disabled cache stores nothing. One giant diff must not evict a whole
 	// shard, so it is not stored either — but both are still compacted above
@@ -246,7 +292,7 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 	if old, ok := s.m[k]; ok {
 		s.used -= old.size
 	}
-	s.m[k] = pairCacheEntry{hunks: stored, size: size}
+	s.m[k] = entry
 	s.used += size
 	if s.used > c.budgetPerShard {
 		for key, v := range s.m {
@@ -280,24 +326,43 @@ func coversWholeNewBlob(k *pairKey, hunks []AddedHunk) bool {
 
 // compactHunks deep-copies hunks so that no line aliases its source blob.
 // All line bytes share one backing buffer sized to lineBytes, so the copy
-// costs a single allocation for the text plus the slice headers.
-func compactHunks(hunks []AddedHunk, lineBytes int) []AddedHunk {
+// costs a single allocation for the text plus the slice headers. It returns
+// the owned hunks for the first delivery and the pointer-free entry that
+// records the same content for the cache.
+func compactHunks(hunks []AddedHunk, lineBytes int) ([]AddedHunk, pairCacheEntry) {
 	if len(hunks) == 0 {
-		return nil
+		return nil, pairCacheEntry{}
+	}
+	lineCount := 0
+	for i := range hunks {
+		lineCount += len(hunks[i].Lines)
 	}
 	// buf never grows past its capacity, so string views into it stay valid.
 	buf := make([]byte, 0, lineBytes)
+	spans := make([]uint32, 0, 2*lineCount)
+	shapes := make([]cachedHunk, len(hunks))
+	// One header array serves every hunk; each hunk's Lines is a capacity-
+	// bounded window into it, so appending to one cannot reach the next.
+	headers := make([]string, lineCount)
 	out := make([]AddedHunk, len(hunks))
+	next := 0
 	for i := range hunks {
 		src := &hunks[i]
-		lines := make([]string, len(src.Lines))
+		lines := headers[next : next+len(src.Lines) : next+len(src.Lines)]
+		shapes[i] = cachedHunk{
+			first:     uint32(next),
+			count:     uint32(len(src.Lines)),
+			startLine: src.StartLine,
+			isBinary:  src.IsBinary,
+		}
+		next += len(src.Lines)
 		for j, l := range src.Lines {
-			if len(l) == 0 {
-				continue
-			}
 			start := len(buf)
 			buf = append(buf, l...)
-			lines[j] = btostr(buf[start:])
+			spans = append(spans, uint32(start), uint32(len(buf)))
+			if len(l) != 0 {
+				lines[j] = btostr(buf[start:])
+			}
 		}
 		out[i] = AddedHunk{
 			Lines:     lines,
@@ -305,5 +370,66 @@ func compactHunks(hunks []AddedHunk, lineBytes int) []AddedHunk {
 			IsBinary:  src.IsBinary,
 		}
 	}
-	return out
+	return out, pairCacheEntry{data: buf, spans: spans, hunks: shapes}
+}
+
+// aliasingEntry records hunks whose lines already view the whole new blob
+// (see coversWholeNewBlob) without copying: data is the stretch of the blob
+// buffer from the first line's start to the last line's end, and each span
+// is a line's position inside it. Every line is a substring of that one
+// buffer, which is what makes the offsets well defined.
+func aliasingEntry(hunks []AddedHunk) pairCacheEntry {
+	lineCount := 0
+	for i := range hunks {
+		lineCount += len(hunks[i].Lines)
+	}
+	shapes := make([]cachedHunk, len(hunks))
+	spans := make([]uint32, 2*lineCount)
+
+	// Locate the viewed byte range. Empty lines carry no position.
+	var (
+		loPtr  *byte
+		lo, hi uintptr
+	)
+	for i := range hunks {
+		for _, l := range hunks[i].Lines {
+			if len(l) == 0 {
+				continue
+			}
+			ptr := unsafe.StringData(l)
+			p := uintptr(unsafe.Pointer(ptr))
+			if loPtr == nil || p < lo {
+				loPtr, lo = ptr, p
+			}
+			if e := p + uintptr(len(l)); e > hi {
+				hi = e
+			}
+		}
+	}
+
+	next := 0
+	for i := range hunks {
+		h := &hunks[i]
+		shapes[i] = cachedHunk{
+			first:     uint32(next),
+			count:     uint32(len(h.Lines)),
+			startLine: h.StartLine,
+			isBinary:  h.IsBinary,
+		}
+		for _, l := range h.Lines {
+			if len(l) != 0 {
+				start := uintptr(unsafe.Pointer(unsafe.StringData(l))) - lo
+				spans[2*next] = uint32(start)
+				spans[2*next+1] = uint32(start) + uint32(len(l))
+			}
+			next++
+		}
+	}
+	if loPtr == nil {
+		return pairCacheEntry{spans: spans, hunks: shapes}
+	}
+	// loPtr addresses the lowest byte any line views and every line lies in
+	// the same blob buffer, so the slice stays within that allocation.
+	data := unsafe.Slice(loPtr, int(hi-lo))
+	return pairCacheEntry{data: data, spans: spans, hunks: shapes}
 }
