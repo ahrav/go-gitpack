@@ -77,6 +77,22 @@ func TestTokenizeRandomMatchesReference(t *testing.T) {
 	}
 }
 
+// Big-endian coverage: GOARCH=s390x go test -exec qemu-s390x -run Tokenize.
+func TestTokenizeUnalignedMatchesReference(t *testing.T) {
+	rng := rand.New(rand.NewSource(2))
+	alphabet := []byte("abc\n\x0a\x0b\xff ")
+	backing := make([]byte, 300)
+	for i := range backing {
+		backing[i] = alphabet[rng.Intn(len(alphabet))]
+	}
+	for start := 0; start < 8; start++ {
+		for _, n := range []int{63, 64, 65, 127, 128, 129, 200} {
+			src := backing[start : start+n]
+			requireSameLines(t, src, tokenize(src), tokenizeReference(src))
+		}
+	}
+}
+
 func TestTokenizeAliasesSource(t *testing.T) {
 	src := []byte("alpha\nbeta\ngamma")
 	lines := tokenize(src)
