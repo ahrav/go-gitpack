@@ -1,84 +1,99 @@
 // ridx.go
 //
-// Reverse‑index (“RIDX”) parser for Git packfiles.
-// The file maps *descending pack offsets* → *index position* so that bitmap
-// queries can translate a set bit (offset order) to an object id (idx order).
+// Reverse-index (".rev") loader for Git packfiles.
 //
-// The implementation keeps only the uint32 table in memory; the mmap handle
-// is closed immediately after parsing because look‑ups are O(1) on the slice.
+// Git writes pack-<hash>.rev beside each pack (pack.writeReverseIndex, the
+// default since Git 2.41): a table with one entry per packed object, sorted
+// by pack offset, each entry naming the object's position in the .idx tables.
+// This file reads that table and derives both the in-memory reverse index
+// and the ascending offset table from it, so opening a pack with a .rev file
+// sorts nothing. Without a .rev file both are built from the .idx offsets.
+//
+// In memory the reverse index is kept in *descending* offset order (largest
+// offset first): ridx[k] is the .idx position of the object at
+// sortedOffsets[len-1-k]. crcAtOffset depends on that orientation.
 
 package objstore
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	"golang.org/x/exp/mmap"
 )
 
 const (
-	ridxMagic       = "RIDX"
-	ridxHeaderSize  = 4 + 4 + fanoutSize // "RIDX", ver, fan‑out
-	ridxTrailerSize = hashSize * 2       // pack + idx SHA‑1
+	ridxMagic = "RIDX"
+	// ridxHeaderSize covers the magic, the format version, and the hash
+	// function identifier.
+	ridxHeaderSize = 4 + 4 + 4
+	// ridxTrailerSize covers the pack checksum and the file's own checksum.
+	ridxTrailerSize = hashSize * 2
+	// ridxHashSHA1 is the hash function identifier Git writes for SHA-1
+	// repositories; SHA-256 repositories write 2.
+	ridxHashSHA1 = 1
 )
 
-// loadReverseIndex tries to mmap and parse the reverse‑index that belongs to
-// the *.pack file identified by packPath.  When the file is absent it falls
-// back to building the slice from the ascending‑offset table already in idxFile.
-//
-// The returned slice has len = len(pf.sortedOffsets).  It panics only on
-// programmer error (nil pf or missing sortedOffsets).
+// loadReverseIndex returns the descending-offset reverse index for the pack
+// at packPath. When a valid .rev file is present it also fills
+// pf.sortedOffsets from it (when pf.sortedOffsets is nil) so the caller
+// skips sorting; otherwise pf.sortedOffsets is sorted here if still nil and
+// the reverse index is built from the .idx offsets. Both paths produce a
+// mapping that is trusted for CRC lookups.
 func loadReverseIndex(packPath string, pf *idxFile) ([]uint32, error) {
-	if pf == nil || pf.sortedOffsets == nil {
-		panic("loadReverseIndex called before parseIdx finished")
+	if pf == nil {
+		panic("loadReverseIndex called with a nil idxFile")
 	}
-	// Git originally used the ".rev" extension for reverse-index files.
-	// Starting with Git 2.34 the canonical extension was changed to ".ridx"
-	// and a proper binary format with magic bytes and version was introduced.
-	// We probe ".ridx" first (modern) and fall back to ".rev" (legacy) for
-	// backward compatibility with older repositories.
+	// Git originally used the ".rev" extension for reverse-index files;
+	// ".ridx" is probed as well for repositories written by tools that use
+	// that name for the same format.
 	var ridxPath string
-	for _, ext := range []string{".ridx", ".rev"} {
+	for _, ext := range []string{".rev", ".ridx"} {
 		try := strings.TrimSuffix(packPath, ".pack") + ext
 		if _, err := os.Stat(try); err == nil {
 			ridxPath = try
 			break
 		}
 	}
-	if ridxPath == "" {
-		// No on‑disk file – build from the entries and ascending offset order.
-		// buildReverseFromEntries produces a correct offset→entries mapping,
-		// so the result is trusted for CRC lookups.
-		pf.ridxCRCTrusted = true
-		return buildReverseFromEntries(pf), nil
+	if ridxPath != "" {
+		if ridx, err := tryLoadRidxFile(ridxPath, pf); err == nil {
+			pf.ridxCRCTrusted = true
+			return ridx, nil
+		}
+		// A corrupt, stale, or foreign file is non-fatal: the mapping can
+		// always be rebuilt from the .idx offsets already in memory.
 	}
-
-	ridx, err := tryLoadRidxFile(ridxPath, pf)
-	if err != nil {
-		// Any error during ridx parsing -> fall back to building from offsets.
-		// The error is intentionally swallowed because a corrupt or
-		// incompatible .ridx/.rev file is non-fatal: we can always
-		// reconstruct the reverse index from the forward-sorted offsets
-		// already loaded in idxFile. Logging would be noisy for
-		// repositories with stale or partially-written files.
-		return buildReverseFromEntries(pf), nil
+	if pf.sortedOffsets == nil {
+		pf.sortedOffsets = sortedPackOffsets(pf.entries)
 	}
 	pf.ridxCRCTrusted = true
-	return ridx, nil
+	return buildReverseFromEntries(pf), nil
 }
 
-// tryLoadRidxFile attempts to memory-map and parse a single .ridx (or .rev)
-// file. It validates the magic bytes, version, fanout object count against
-// the already-parsed idxFile, reads the uint32 reverse-index table, and
-// optionally verifies the pack and idx trailer checksums.
+// sortedPackOffsets returns every entry's pack offset in ascending order.
+func sortedPackOffsets(entries []idxEntry) []uint64 {
+	offs := make([]uint64, len(entries))
+	for i, e := range entries {
+		offs[i] = e.offset
+	}
+	slices.Sort(offs)
+	return offs
+}
+
+// tryLoadRidxFile parses a Git .rev file and returns the reverse index in
+// descending offset order. The file's entry count must match the .idx, its
+// pack checksum must match the pack trailer when the pack is mapped, and the
+// offsets it implies must be strictly increasing; any other shape is an
+// error so the caller rebuilds the mapping instead of trusting the file.
 //
-// Returns the reverse-index slice on success, or an error if any validation
-// step fails. The caller (loadReverseIndex) decides whether to fall back to
-// a computed reverse index on error.
+// When pf.sortedOffsets is nil the ascending offsets implied by the table are
+// stored there; when it is already populated the table is checked against it.
 func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	mr, err := mmap.Open(ridxPath)
 	if err != nil {
@@ -86,8 +101,11 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	}
 	defer mr.Close()
 
-	// === HEADER ===
-	var header [4 + 4]byte
+	size := int64(mr.Len())
+	if size < ridxHeaderSize+ridxTrailerSize {
+		return nil, errors.New("ridx: file too short")
+	}
+	var header [ridxHeaderSize]byte
 	if _, err := mr.ReadAt(header[:], 0); err != nil {
 		return nil, err
 	}
@@ -97,85 +115,82 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	if ver := binary.BigEndian.Uint32(header[4:8]); ver != 1 {
 		return nil, fmt.Errorf("ridx: unsupported version %d", ver)
 	}
+	if hashID := binary.BigEndian.Uint32(header[8:12]); hashID != ridxHashSHA1 {
+		return nil, fmt.Errorf("ridx: unsupported hash function %d", hashID)
+	}
 
-	// Fan‑out table (256 × uint32, big‑endian).
-	fanoutRaw := make([]byte, fanoutSize)
-	if _, err := mr.ReadAt(fanoutRaw, 8); err != nil {
+	tableLen := size - ridxHeaderSize - ridxTrailerSize
+	if tableLen%4 != 0 {
+		return nil, errors.New("ridx: table length is not a multiple of 4")
+	}
+	objCount := int(tableLen / 4)
+	if objCount != len(pf.entries) {
+		return nil, fmt.Errorf("ridx: object count mismatch (idx=%d ridx=%d)", len(pf.entries), objCount)
+	}
+
+	// The file's own checksum covers everything before it. Verifying it is
+	// cheap relative to the sort it replaces and rejects truncated or
+	// partially written files before their entries are trusted. Git defines
+	// this trailer as SHA-1 (the pack and idx trailers use the same hash);
+	// it detects corruption and is not a security boundary.
+	h := sha1.New() //nolint:gosec // Git .rev trailer format mandates SHA-1.
+	if _, err := h.Write(mmapData(mr)[:size-hashSize]); err != nil {
 		return nil, err
 	}
-	objCount := binary.BigEndian.Uint32(fanoutRaw[len(fanoutRaw)-4:])
-	if int(objCount) != len(pf.sortedOffsets) {
-		return nil, fmt.Errorf("ridx: object count mismatch (idx=%d ridx=%d)",
-			len(pf.sortedOffsets), objCount)
-	}
-
-	// === MAIN TABLE ===
-	entriesOfs := int64(ridxHeaderSize)
-	entriesLen := int64(objCount) * 4
-	entriesBuf := make([]byte, entriesLen)
-	if _, err := mr.ReadAt(entriesBuf, entriesOfs); err != nil {
+	var wantSelf [hashSize]byte
+	if _, err := mr.ReadAt(wantSelf[:], size-hashSize); err != nil {
 		return nil, err
 	}
+	if !bytes.Equal(h.Sum(nil), wantSelf[:]) {
+		return nil, errors.New("ridx trailer: file checksum mismatch")
+	}
+	if pf.pack != nil {
+		var wantPack, gotPack [hashSize]byte
+		if _, err := mr.ReadAt(wantPack[:], size-ridxTrailerSize); err != nil {
+			return nil, err
+		}
+		if _, err := pf.pack.ReadAt(gotPack[:], int64(pf.pack.Len()-hashSize)); err == nil &&
+			!bytes.Equal(gotPack[:], wantPack[:]) {
+			return nil, errors.New("ridx trailer: pack checksum mismatch")
+		}
+	}
 
+	table := mmapData(mr)[ridxHeaderSize : ridxHeaderSize+tableLen]
 	ridx := make([]uint32, objCount)
-	for i := range int(objCount) {
-		ridx[i] = binary.BigEndian.Uint32(entriesBuf[i*4 : (i+1)*4])
+	offs := make([]uint64, objCount)
+	var prev uint64
+	for i := 0; i < objCount; i++ {
+		pos := binary.BigEndian.Uint32(table[i*4:])
+		if int(pos) >= len(pf.entries) {
+			return nil, fmt.Errorf("ridx: entry %d names idx position %d of %d", i, pos, len(pf.entries))
+		}
+		off := pf.entries[pos].offset
+		if i > 0 && off <= prev {
+			return nil, fmt.Errorf("ridx: offsets not strictly increasing at entry %d", i)
+		}
+		prev = off
+		offs[i] = off
+		ridx[objCount-1-i] = pos
 	}
-
-	// === TRAILER CHECKS (best‑effort) ===
-	trOfs := entriesOfs + entriesLen
-	if trOfs+ridxTrailerSize <= int64(mr.Len()) {
-		wantPack := make([]byte, hashSize)
-		wantIdx := make([]byte, hashSize)
-		if _, err := mr.ReadAt(wantPack, trOfs); err != nil {
-			return nil, err
-		}
-		if _, err := mr.ReadAt(wantIdx, trOfs+hashSize); err != nil {
-			return nil, err
-		}
-
-		// Compare the recorded pack checksum with the one we already verified.
-		// while loading *.idx.  Skip when pf.pack is nil (rare midx‑only case).
-		if pf.pack != nil {
-			gotPack := make([]byte, hashSize)
-			if _, err := pf.pack.ReadAt(gotPack, int64(pf.pack.Len()-hashSize)); err == nil &&
-				!bytes.Equal(gotPack, wantPack) {
-				return nil, errors.New("ridx trailer: pack checksum mismatch")
-			}
-		}
-		// idx trailer already verified inside parseIdx → just skip comparison
-		// when idx mmap handle is unavailable (midx‑only pack).
-		if pf.idx != nil {
-			gotIdx := make([]byte, hashSize)
-			if _, err := pf.idx.ReadAt(gotIdx, int64(pf.idx.Len()-hashSize)); err == nil &&
-				!bytes.Equal(gotIdx, wantIdx) {
-				return nil, errors.New("ridx trailer: idx checksum mismatch")
-			}
-		}
+	if pf.sortedOffsets == nil {
+		pf.sortedOffsets = offs
+	} else if !slices.Equal(pf.sortedOffsets, offs) {
+		return nil, errors.New("ridx: offsets disagree with the idx")
 	}
 	return ridx, nil
 }
 
-// buildReverseFromEntries constructs a correct reverse-index from the parsed
-// idxFile. The ridx maps descending-offset positions to entries-table indices
-// (OID order), which is needed by crcAtOffset to look up the right CRC.
-//
-// The previous implementation (buildReverseFromOffsets) only performed a
-// simple position reversal (r[i] = n-1-i), which is incorrect whenever OID
-// order differs from pack-offset order — the common case in real repositories.
+// buildReverseFromEntries derives the descending-offset reverse index from
+// pf.sortedOffsets and pf.entries.
 func buildReverseFromEntries(pf *idxFile) []uint32 {
 	n := len(pf.sortedOffsets)
 	r := make([]uint32, n)
 
-	// Build a map from pack offset → entries-table index.
 	offsetToIdx := make(map[uint64]uint32, n)
 	for i, e := range pf.entries {
 		offsetToIdx[e.offset] = uint32(i)
 	}
 
-	// ridx[desc] must equal the entries-table index for the object whose
-	// pack offset is at descending position desc.
-	// Descending position k corresponds to ascending position n-1-k.
 	for k := range n {
 		off := pf.sortedOffsets[n-1-k]
 		r[k] = offsetToIdx[off]

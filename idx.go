@@ -408,12 +408,6 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 	}
 
-	offs := make([]uint64, objCount)
-	for i, e := range entries {
-		offs[i] = e.offset
-	}
-	slices.Sort(offs)
-
 	// Trailer verification.
 	trailer := make([]byte, 40)
 	if _, err := ix.ReadAt(trailer, int64(ix.Len()-40)); err != nil {
@@ -432,12 +426,27 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	}
 
 	return &idxFile{
-		fanout:        fanout,
-		entries:       entries,
-		oidTable:      oids,
-		largeOffsets:  largeOffsets,
-		sortedOffsets: offs,
+		fanout:       fanout,
+		entries:      entries,
+		oidTable:     oids,
+		largeOffsets: largeOffsets,
 	}, nil
+}
+
+// parseIdx parses a version-2 pack index and leaves sortedOffsets nil;
+// loadReverseIndex fills it, from the pack's .rev file when one is present
+// and by sorting the entry offsets otherwise. parseIdxSorted is the
+// self-contained variant for callers that read sortedOffsets without a
+// reverse index.
+func parseIdxSorted(ix *mmap.ReaderAt) (*idxFile, error) {
+	f, err := parseIdx(ix)
+	if err != nil {
+		return nil, err
+	}
+	if len(f.entries) > 0 {
+		f.sortedOffsets = sortedPackOffsets(f.entries)
+	}
+	return f, nil
 }
 
 // resolveIdxPos converts a bit-index from a bitmap (which is ordered by pack

@@ -259,43 +259,6 @@ func (h *AddedHunk) EndLine() uint32 {
 	return h.StartLine + uint32(len(h.Lines)) - 1
 }
 
-// tokenize splits a byte slice into individual lines without copying the underlying data.
-// The function recognizes '\n' as the line delimiter and excludes it from the results.
-// Empty input returns nil rather than an empty slice.
-//
-// Shared-memory safety invariant: the returned strings are created via btostr
-// (unsafe.go), which performs a zero-copy cast from []byte to string using
-// unsafe.String. The returned strings alias the memory of src. This is safe
-// only as long as src is not mutated after this call. If src's backing array is
-// modified, the previously returned strings will silently reflect the mutation,
-// violating Go's string immutability guarantee.
-func tokenize(src []byte) []string {
-	if len(src) == 0 {
-		return nil
-	}
-
-	// bytes.Count and bytes.IndexByte dispatch to vectorized assembly
-	// (NEON/AVX2), so both the counting pass and the split loop run at
-	// multiple bytes per cycle instead of the one-byte-per-iteration range
-	// loop this previously used.
-	lineCount := bytes.Count(src, nlByte) + 1
-
-	lines := make([]string, 0, lineCount)
-	rest := src
-	for {
-		i := bytes.IndexByte(rest, '\n')
-		if i < 0 {
-			break
-		}
-		lines = append(lines, btostr(rest[:i])) // Exclude the newline character.
-		rest = rest[i+1:]
-	}
-	if len(rest) > 0 { // Handle the last line without a newline.
-		lines = append(lines, btostr(rest))
-	}
-	return lines
-}
-
 // isBinary reports whether the first 8 KiB of data contains a null byte,
 // which is a strong indicator that the blob is a binary file.
 //

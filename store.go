@@ -324,7 +324,7 @@ func open(dir string) (*store, error) {
 		f.idx = ix
 		store.packs = append(store.packs, f)
 
-		if f.sortedOffsets != nil {
+		if len(f.entries) > 0 {
 			f.ridx, err = loadReverseIndex(path, f)
 			if err != nil {
 				return nil, fmt.Errorf("load ridx: %w", err)
