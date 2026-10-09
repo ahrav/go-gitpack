@@ -229,14 +229,23 @@ func tokenize(src []byte) []string {
 	if len(src) == 0 {
 		return nil
 	}
+	return tokenizeInto(nil, src)
+}
 
+// tokenizeInto is tokenize appending into dst's backing array when it has
+// room for every line, so a caller that keeps the slice alive across diffs
+// splits each blob without allocating.
+func tokenizeInto(dst []string, src []byte) []string {
 	// bytes.Count and bytes.IndexByte dispatch to vectorized assembly
 	// (NEON/AVX2), so both the counting pass and the split loop run at
 	// multiple bytes per cycle instead of the one-byte-per-iteration range
 	// loop this previously used.
 	lineCount := bytes.Count(src, nlByte) + 1
 
-	lines := make([]string, 0, lineCount)
+	lines := dst[:0]
+	if cap(lines) < lineCount {
+		lines = make([]string, 0, lineCount)
+	}
 	rest := src
 	for {
 		i := bytes.IndexByte(rest, '\n')
@@ -575,8 +584,14 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 	}
 
 	// Tokenize the old and new byte slices into lines for comparison.
-	// This is a zero-copy operation, creating string views into the original slices.
-	oldLines, newLines := tokenize(oldB), tokenize(newB)
+	// This is a zero-copy operation, creating string views into the original
+	// slices. Both line slices are scratch: hunks copy the line headers they
+	// keep, so the slices return to the pool when the diff is done.
+	scratch := lineScratchPool.Get().(*lineScratch)
+	scratch.old = tokenizeInto(scratch.old, oldB)
+	scratch.new = tokenizeInto(scratch.new, newB)
+	oldLines, newLines := scratch.old, scratch.new
+	defer scratch.release()
 
 	// For larger files, a hash index over old lines provides O(1) lookups.
 	// It is built lazily at the first mismatch: prefix-trimmed inputs
@@ -677,6 +692,30 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 
 // nlByte is '\n' as a []byte, for the bytes.Count newline scans.
 var nlByte = []byte{'\n'}
+
+// lineScratch holds the two tokenized line slices addedHunksWithPos works
+// over. The slices alias blob bytes only while a diff runs; release clears
+// them so the pool holds no blob reference and drops slices that grew past
+// lineScratchMaxCap, so one huge file cannot pin memory in the pool.
+type lineScratch struct {
+	old, new []string
+}
+
+const lineScratchMaxCap = 1 << 18
+
+var lineScratchPool = sync.Pool{
+	New: func() any { return &lineScratch{} },
+}
+
+func (s *lineScratch) release() {
+	if cap(s.old) > lineScratchMaxCap || cap(s.new) > lineScratchMaxCap {
+		return
+	}
+	clear(s.old[:cap(s.old)])
+	clear(s.new[:cap(s.new)])
+	s.old, s.new = s.old[:0], s.new[:0]
+	lineScratchPool.Put(s)
+}
 
 // commonPrefixLineBoundary returns the length of the longest common byte
 // prefix of a and b that ends immediately after a '\n'. Returning a
