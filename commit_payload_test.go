@@ -359,11 +359,22 @@ func TestReadCommitHeader_LooseStreamsHeader(t *testing.T) {
 	_, err = (&store{objectsDir: objectsDir}).readCommitHeader(short)
 	require.Error(t, err, "header read must fail when the declared size ends before the committer line")
 
-	// The over-cap attribution path ends here: author from the header,
-	// empty message, no body inflation.
+	// A declared size above the cap with a body that ends after the committer
+	// line is a corrupt object, not an oversized commit: the fallback must
+	// validate the body length it skips, as readLooseObject does.
 	saved := maxCommitPayload
 	maxCommitPayload = 1 << 20
 	t.Cleanup(func() { maxCommitPayload = saved })
+	objectsDir = t.TempDir()
+	bloated := writeLooseObjectDeclaring(t, objectsDir, "commit", body, 2<<20)
+	bst := &store{objectsDir: objectsDir}
+	_, err = bst.readCommitHeader(bloated)
+	require.Error(t, err, "header read must reject a body shorter than its over-cap declared size")
+	_, err = newMetaCache(nil, bst).get(bloated)
+	require.Error(t, err, "attribution must reject a corrupt over-cap loose commit")
+
+	// The over-cap attribution path ends here: author from the header,
+	// empty message, no body allocation.
 	mc := newMetaCache(nil, st)
 	var meta CommitMetadata
 	n = allocatedBytes(func() { meta, err = mc.get(oid) })

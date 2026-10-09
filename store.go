@@ -670,9 +670,19 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		defer obj.release()
 		// Bytes past the declared size belong to a corrupt object, so the
 		// committer line has to arrive within obj.size.
-		hdr, err := readCommitHeaderFromStream(io.LimitReader(obj.body, int64(obj.size)))
+		body := &countingReader{r: io.LimitReader(obj.body, int64(obj.size)+1)}
+		hdr, err := readCommitHeaderFromStream(body)
 		if err != nil {
 			return nil, fmt.Errorf("loose commit %x: header within declared size %d: %w", oid, obj.size, err)
+		}
+		// The rest of the body is inflated into a discard sink, so the
+		// declared size is validated the way readLooseObject validates it,
+		// with the header as the only retained allocation.
+		if _, err := io.Copy(io.Discard, body); err != nil {
+			return nil, err
+		}
+		if body.n != obj.size {
+			return nil, fmt.Errorf("loose object size mismatch for %x: want %d, got %d", oid, obj.size, body.n)
 		}
 		return hdr, nil
 	}
@@ -709,6 +719,20 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
 	}
 	return trimCommitHeader(full)
+}
+
+// countingReader records how many bytes have been read through it. A
+// LimitReader of size+1 underneath makes n == size prove that the stream
+// ended exactly at the declared size.
+type countingReader struct {
+	r io.Reader
+	n uint64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += uint64(n)
+	return n, err
 }
 
 // readCommitHeaderFromStream incrementally reads lines from a zlib stream
