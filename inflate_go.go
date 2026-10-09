@@ -1078,7 +1078,10 @@ func (d *goInflater) buildTableCounted(
 
 	sorted := d.sortedEntries[:used]
 	sortedPos := 0
-	codeword := 0
+	// code is the canonical codeword in symbol order; DEFLATE reads codes
+	// MSB-first into an LSB-first bit buffer, so table indices use its
+	// bit-reversed form.
+	code := 0
 	codeBits := 1
 	for count[codeBits] == 0 {
 		codeBits++
@@ -1090,10 +1093,10 @@ func (d *goInflater) buildTableCounted(
 	// This replaces strided stores with contiguous copies.
 	for codeBits <= mainBits {
 		for {
-			table[codeword] = sorted[sortedPos] + uint32(codeBits)*0x101
+			table[reverseCode(code, codeBits)] = sorted[sortedPos] + uint32(codeBits)*0x101
 			sortedPos++
 			remaining--
-			if codeword == tableEnd-1 {
+			if code == tableEnd-1 {
 				for codeBits < mainBits {
 					copy(table[tableEnd:tableEnd*2], table[:tableEnd])
 					tableEnd *= 2
@@ -1101,7 +1104,7 @@ func (d *goInflater) buildTableCounted(
 				}
 				return mainBits, true
 			}
-			codeword = nextReversedCode(codeword, codeBits)
+			code++
 			if remaining == 0 {
 				break
 			}
@@ -1109,6 +1112,7 @@ func (d *goInflater) buildTableCounted(
 
 		for {
 			codeBits++
+			code <<= 1
 			if codeBits <= mainBits {
 				copy(table[tableEnd:tableEnd*2], table[:tableEnd])
 				tableEnd *= 2
@@ -1129,6 +1133,7 @@ func (d *goInflater) buildTableCounted(
 	subtableEnd := 0
 
 	for {
+		codeword := reverseCode(code, codeBits)
 		prefix := codeword & mainMask
 		if prefix != subtablePrefix {
 			subtablePrefix = prefix
@@ -1157,13 +1162,14 @@ func (d *goInflater) buildTableCounted(
 			table[i] = entry
 		}
 
-		if codeword == 1<<codeBits-1 {
+		if code == 1<<codeBits-1 {
 			return mainBits, true
 		}
-		codeword = nextReversedCode(codeword, codeBits)
+		code++
 		remaining--
 		for remaining == 0 {
 			codeBits++
+			code <<= 1
 			remaining = count[codeBits]
 		}
 	}
@@ -1224,11 +1230,6 @@ func (d *goInflater) buildPrecodeTable(count *[precodeTableBits + 1]int) (int, b
 		}
 	}
 	return mainBits, true
-}
-
-func nextReversedCode(codeword, codeBits int) int {
-	bit := 1 << (bits.Len(uint(codeword^((1<<codeBits)-1))) - 1)
-	return codeword&(bit-1) | bit
 }
 
 func reverseCode(code, n int) int {
