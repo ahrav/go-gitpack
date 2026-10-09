@@ -311,6 +311,24 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		assert.NotNil(t, ridx)
 	})
 
+	// Positions at or above 1<<31 are negative as a 32-bit int; the bounds
+	// check must still reject them (exercised by GOARCH=386).
+	for _, pos := range []uint32{1, 1 << 31, 0xffffffff} {
+		t.Run(fmt.Sprintf("position_out_of_range_%#x", pos), func(t *testing.T) {
+			ridxPath := filepath.Join(dir, "test.ridx")
+			require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{pos}, nil))
+			defer os.Remove(ridxPath)
+
+			_, err := tryLoadRidxFile(ridxPath, pf)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "names idx position")
+
+			ridx, err := loadReverseIndex(packPath, pf)
+			require.NoError(t, err)
+			assert.Equal(t, []uint32{0}, ridx)
+		})
+	}
+
 	t.Run("bad_file_checksum", func(t *testing.T) {
 		ridxPath := filepath.Join(dir, "test.ridx")
 		require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{0}, nil))

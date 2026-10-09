@@ -180,7 +180,7 @@ func appendDeltaCopy(t *testing.T, dst []byte, off, size int) []byte {
 	require.Positive(t, size, "copy size 0 encodes as 0x10000")
 	require.LessOrEqual(t, size, 0xffffff, "copy size exceeds the 3-byte operand")
 	require.GreaterOrEqual(t, off, 0)
-	require.LessOrEqual(t, off, 0xffffffff, "copy offset exceeds the 4-byte operand")
+	require.LessOrEqual(t, uint64(off), uint64(0xffffffff), "copy offset exceeds the 4-byte operand")
 
 	cmd := byte(0x80)
 	var ops []byte

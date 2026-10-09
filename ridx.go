@@ -165,7 +165,9 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	var prev uint64
 	for i := 0; i < objCount; i++ {
 		pos := binary.BigEndian.Uint32(table[i*4:])
-		if int(pos) >= len(pf.entries) {
+		// Unsigned compare: on 32-bit targets int(pos) is negative for
+		// pos >= 1<<31 and would pass a signed check.
+		if uint64(pos) >= uint64(len(pf.entries)) {
 			return nil, fmt.Errorf("ridx: entry %d names idx position %d of %d", i, pos, len(pf.entries))
 		}
 		off := pf.entries[pos].offset
