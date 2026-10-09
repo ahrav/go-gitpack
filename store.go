@@ -931,7 +931,11 @@ func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) 
 	case ObjOfsDelta, ObjRefDelta:
 		// The commit cap bounds reconstruction itself, so an oversized
 		// delta commit is rejected from its target-size header rather than
-		// after a materialization up to the store-wide delta limit.
+		// after a materialization up to the store-wide delta limit. The
+		// bound applies to every hop: a delta's bases share its type, so an
+		// intermediate target above the cap is itself a commit above the
+		// cap, and materializing it whole is the allocation the cap exists
+		// to refuse.
 		limit := uint64(maxCommitPayload)
 		if s.maxDeltaObjectSize > 0 && s.maxDeltaObjectSize < limit {
 			limit = s.maxDeltaObjectSize
