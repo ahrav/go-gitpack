@@ -1,4 +1,4 @@
-//go:build amd64 && !purego
+//go:build amd64 && !purego && !(gitpack_libdeflate && cgo)
 
 #include "textflag.h"
 
