@@ -192,6 +192,18 @@ func WithPairCacheBudget(bytes int) ScannerOption {
 	}
 }
 
+// WithMetaCacheBudget bounds the bytes of commit payloads (author lines and
+// messages) the scanner's GetCommitMetadata cache may retain (default
+// 256 MiB). Each scanner owns an independent cache, so processes that open
+// many repositories concurrently should lower the budget to bound aggregate
+// memory growth. A budget <= 0 disables the cache entirely: every call
+// re-reads and re-parses the commit.
+func WithMetaCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.meta.setBudget(bytes)
+	}
+}
+
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
 //

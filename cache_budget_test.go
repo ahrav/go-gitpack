@@ -9,6 +9,7 @@
 package objstore
 
 import (
+	"path/filepath"
 	"runtime"
 	"testing"
 
@@ -177,4 +178,38 @@ func TestWithPairCacheBudget_AppliesToScanner(t *testing.T) {
 	require.NoError(t, err)
 	defer hs2.Close()
 	require.Equal(t, 1<<10, hs2.pairs.budgetPerShard)
+}
+
+// TestWithMetaCacheBudget_AppliesToScanner proves the option reaches the
+// metadata cache the scanner consults: a zero budget retains nothing, and a
+// one-slab budget stops growing after its first slab.
+func TestWithMetaCacheBudget_AppliesToScanner(t *testing.T) {
+	t.Parallel()
+
+	repoPath := filepath.Join("testdata", "repos", "large-repo")
+	hs, err := NewHistoryScanner(repoPath, WithMetaCacheBudget(0))
+	require.NoError(t, err)
+	defer hs.Close()
+	require.Zero(t, hs.meta.budget)
+
+	commits, err := hs.loadAllCommits()
+	require.NoError(t, err)
+	require.NotEmpty(t, commits)
+	for _, c := range commits {
+		meta, err := hs.GetCommitMetadata(c.OID)
+		require.NoError(t, err)
+		require.NotEmpty(t, meta.Author.Name)
+	}
+	require.Empty(t, hs.meta.m, "a zero budget must retain no entries")
+	require.Zero(t, hs.meta.slabBytes)
+
+	hs2, err := NewHistoryScanner(repoPath, WithMetaCacheBudget(metaSlabSize))
+	require.NoError(t, err)
+	defer hs2.Close()
+	for _, c := range commits {
+		_, err := hs2.GetCommitMetadata(c.OID)
+		require.NoError(t, err)
+	}
+	require.Equal(t, metaSlabSize, hs2.meta.slabBytes, "a one-slab budget allocates exactly one slab")
+	require.NotEmpty(t, hs2.meta.m)
 }

@@ -164,6 +164,14 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 	c.ts = g.Timestamps
 }
 
+// setBudget replaces the slab budget. Slabs already allocated stay in place;
+// the new budget governs the next slab allocation.
+func (c *metaCache) setBudget(bytes int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.budget = max(bytes, 0)
+}
+
 func (c *metaCache) clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
