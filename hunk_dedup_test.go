@@ -1348,6 +1348,17 @@ func TestBacklogScratch_EarlierPositionWins(t *testing.T) {
 	require.False(t, b.seenBefore(42, 10), "reset forgets everything")
 }
 
+// A hunk index at or past 2^20 must still order after every lower hunk of
+// the same pair: a pair diffed from alternating added and unchanged lines
+// under MaxDiffSize reaches that many hunks.
+func TestBacklogPos_OrdersHighHunkIndexes(t *testing.T) {
+	b := newBacklogScratch()
+	require.False(t, b.seenBefore(42, backlogPos(6, 1<<20)), "first sighting is new")
+	require.False(t, b.seenBefore(42, backlogPos(6, 0)), "hunk 0 precedes hunk 2^20 of the same pair")
+	require.True(t, b.seenBefore(42, backlogPos(6, 1<<20)), "the earlier hunk now covers it")
+	require.Less(t, backlogPos(6, 1<<20), backlogPos(7, 0), "a later pair orders after any hunk of an earlier one")
+}
+
 // TestDedupInFlightWindow_WaitNeverWrapsBelowDecided guards the window
 // against the one shape that deadlocked an earlier revision: asking to wait
 // for a seq the decision stage has already passed (an empty commit at the

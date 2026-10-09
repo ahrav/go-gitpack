@@ -339,6 +339,62 @@ func TestDiffHistoryHunksDedup_StalledConsumerReleasesLargeBlobs(t *testing.T) {
 		"stalled consumer pinned one %d-byte blob per in-flight one-line hunk", blobSize)
 }
 
+// A worker's batch is admitted as a whole, so a wide commit of large pairs
+// that are not forwarded early can materialize a full batch per worker
+// before any of it is charged. The charge must land per pair, and a worker
+// must hold off its next pair while the cap is exceeded, so the stalled heap
+// stays within a few blobs of the cap.
+func TestDiffHistoryHunksDedup_StalledConsumerBoundsWideBatch(t *testing.T) {
+	const (
+		files    = 24
+		blobSize = 2 * maxCacheableSize
+	)
+	b := newDedupRepoBuilder(t)
+	// Delta search across two dozen similar 8 MiB blobs would dominate the
+	// fixture's repack; storing them whole keeps it to a second.
+	b.git("config", "core.bigFileThreshold", "1m")
+	for f := range files {
+		name := fmt.Sprintf("f%02d.txt", f)
+		b.write(name, strings.Repeat(fmt.Sprintf("%s filler line of a large text file\n", name), blobSize/50))
+	}
+	b.commit("wide")
+	gitDir := b.finish()
+	want := serialDedupReference(t, gitDir, false, nil)
+	require.Len(t, want, files)
+
+	// Pure additions alias their whole blob, and the pair memo would retain
+	// them up to its budget; disabling it leaves the reorder ring as the
+	// only holder.
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true), WithPairCacheBudget(0))
+	require.NoError(t, err)
+	defer s.Close()
+	s.dedupLimits.inFlightPairs = 512
+	s.dedupLimits.workers = 1
+	s.dedupLimits.yieldChanCap = 1
+	s.dedupLimits.retainedBytesCap = 1 << 20
+	s.dedupLimits.expensivePairBytes = 1 << 40 // every pair travels the ordered batch path
+	probe := &dedupProbe{}
+	s.dedupProbe = probe
+
+	// Every emission here is a whole 8 MiB file, so the collected output
+	// itself is blob-sized; the baseline is taken before the scan, while
+	// the stalled consumer has collected nothing yet.
+	var before, stalled runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	got, _, charged := stalledScanPeaksThen(t, s, probe, func() {
+		runtime.GC()
+		runtime.ReadMemStats(&stalled)
+	})
+	require.Equal(t, want, got)
+
+	retained := int64(stalled.HeapAlloc) - int64(before.HeapAlloc)
+	t.Logf("heap while stalled exceeds pre-scan heap by %d bytes (%.1f blobs); peak charge %d bytes",
+		retained, float64(retained)/float64(blobSize), charged)
+	require.Lessf(t, retained, int64(dedupPairBatchSize/2*blobSize),
+		"a stalled consumer let a whole worker batch of %d-byte blobs materialize uncharged", blobSize)
+}
+
 // The reorder ring holds one dedupPairResult per in-flight pair and is
 // zeroed on every scan, so a larger result shows up directly in short-scan
 // latency.

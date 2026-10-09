@@ -511,7 +511,7 @@ func (s *lineFingerprintSet) prepBacklog(r dedupPairResult, scratch *backlogScra
 		if c.unresolved == nil {
 			continue
 		}
-		pos := r.seq<<20 | uint64(c.hunk&(1<<20-1))
+		pos := backlogPos(r.seq, c.hunk)
 		kept := c.unresolved[:0]
 		for _, fp := range c.unresolved {
 			if s.contains(fp) || scratch.seenBefore(fp, pos) {
@@ -521,6 +521,14 @@ func (s *lineFingerprintSet) prepBacklog(r dedupPairResult, scratch *backlogScra
 		}
 		c.unresolved = kept
 	}
+}
+
+// backlogPos encodes a (seq, hunk) position so that integer order equals
+// the pipeline's total order over hunks. Each half gets 32 bits: a pair's
+// hunk count is bounded by its line count, at most MaxDiffSize, and a
+// scan's pair count stays far below 2^32.
+func backlogPos(seq uint64, hunk int) uint64 {
+	return seq<<32 | uint64(uint32(hunk))
 }
 
 // backlogScratch records, for fingerprints seen while pre-processing the
@@ -1020,28 +1028,41 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		arrived      []uint64
 		resultsReady = make(chan struct{}, 1)
 	)
-	deliver := func(results []dedupPairResult) {
-		var charged int64
-		for _, res := range results {
-			charged += int64(res.retainedKiB)
-		}
-		if v := retainedKiB.Add(charged); probe != nil {
+	// deliver publishes one result as soon as its pair is materialized, so
+	// the retained-byte charge is visible to the admission gate and to
+	// workers mid-batch before the rest of a batch is computed.
+	deliver := func(res dedupPairResult) {
+		if v := retainedKiB.Add(int64(res.retainedKiB)); probe != nil {
 			notePeak(&probe.peakRetainedBytes, v<<10)
 		}
-		for _, res := range results {
-			i := res.seq & ringMask
-			ring[i] = res
-			present[i].Store(true)
-		}
+		i := res.seq & ringMask
+		ring[i] = res
+		present[i].Store(true)
 		arrivedMu.Lock()
-		for _, res := range results {
-			arrived = append(arrived, res.seq)
-		}
+		arrived = append(arrived, res.seq)
 		arrivedMu.Unlock()
 		select {
 		case resultsReady <- struct{}{}:
 		default:
 		}
+	}
+	// retainWake is closed and replaced whenever the retained charge drops
+	// back under its cap or the decided count advances, so a worker holding
+	// off its next pair can wait for either without polling.
+	var (
+		retainWakeMu sync.Mutex
+		retainWake   = make(chan struct{})
+	)
+	wakeRetainWaiters := func() {
+		retainWakeMu.Lock()
+		close(retainWake)
+		retainWake = make(chan struct{})
+		retainWakeMu.Unlock()
+	}
+	currentRetainWake := func() <-chan struct{} {
+		retainWakeMu.Lock()
+		defer retainWakeMu.Unlock()
+		return retainWake
 	}
 	// slotReady is pinged (without blocking) by tree workers when a slot
 	// completes so the sequencer can stamp ahead while it waits elsewhere.
@@ -1062,6 +1083,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		}
 		if after := retainedKiB.Add(-n); after+n > retainedKiBCap && after <= retainedKiBCap {
 			inFlight.notify()
+			wakeRetainWaiters()
 		}
 	}
 
@@ -1399,6 +1421,41 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		}
 	}
 
+	// process materializes one pair and delivers its result. It reports
+	// false after recording an error.
+	process := func(pw dedupPairWork) bool {
+		added, err := hs.pairHunks(pw.work)
+		if err != nil {
+			setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
+			return false
+		}
+		// pairHunks returns lines that are either compacted into their own
+		// buffer or span the whole new blob, so the retained-byte charge
+		// below (line bytes) is what a result actually pins.
+		hunks := make([]HunkAddition, len(added))
+		for i := range added {
+			hunks[i] = newHunkAddition(pw.work, added[i])
+		}
+		// Hash and speculatively probe here, in parallel, so the decision
+		// goroutine only touches fingerprints the snapshot did not already
+		// hold.
+		cands, total := pairCandidates(hunks, set.snapshot())
+		deliver(dedupPairResult{
+			seq: pw.seq, hunks: hunks, candidates: cands,
+			earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(total)),
+		})
+		return true
+	}
+	// admitted reports whether a worker may materialize seq s now: the
+	// batch it belongs to was handed out under the cap, but earlier pairs
+	// of the batch may have pushed the charge past it since. The seq the
+	// decision stage waits for always passes, which keeps that stage
+	// draining. While it waits, the worker takes early-forwarded expensive
+	// work, which may be what the decision stage needs next.
+	admitted := func(s uint64) bool {
+		return retainedKiB.Load() <= retainedKiBCap || s == inFlight.decided.Load()
+	}
+
 	for range numWorkers {
 		hunkWG.Add(1)
 		go func() {
@@ -1408,31 +1465,28 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				if !ok {
 					return
 				}
-				results := make([]dedupPairResult, 0, len(works))
 				for _, pw := range works {
-					added, err := hs.pairHunks(pw.work)
-					if err != nil {
-						setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
+					for !admitted(pw.seq) {
+						wake := currentRetainWake()
+						if admitted(pw.seq) {
+							break
+						}
+						select {
+						case <-stopCh:
+							return
+						case early := <-expensiveChan:
+							for _, e := range early {
+								if !process(e) {
+									return
+								}
+							}
+						case <-wake:
+						}
+					}
+					if !process(pw) {
 						return
 					}
-					// pairHunks returns lines that are either compacted into
-					// their own buffer or span the whole new blob, so the
-					// retained-byte charge below (line bytes) is what a
-					// result actually pins.
-					hunks := make([]HunkAddition, len(added))
-					for i := range added {
-						hunks[i] = newHunkAddition(pw.work, added[i])
-					}
-					// Hash and speculatively probe here, in parallel, so the
-					// decision goroutine only touches fingerprints the
-					// snapshot did not already hold.
-					cands, total := pairCandidates(hunks, set.snapshot())
-					results = append(results, dedupPairResult{
-						seq: pw.seq, hunks: hunks, candidates: cands,
-						earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(total)),
-					})
 				}
-				deliver(results)
 			}
 		}()
 	}
@@ -1505,6 +1559,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			}
 			if next != start {
 				inFlight.advanced(next - start)
+				wakeRetainWaiters()
 				if next == inFlight.stamped() {
 					// Nothing undecided remains, so the backlog is empty
 					// in effect; forget it and the scratch it fed.
