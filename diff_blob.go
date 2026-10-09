@@ -328,24 +328,28 @@ func isBinary(data []byte) bool {
 //
 // The returned slice is nil when there are no additions, or contains at least
 // one hunk (possibly a single placeholder line) in every other case.
-func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
+//
+// Text hunk lines are zero-copy views into the new blob (see tokenize), so
+// retaining any of them keeps the whole blob alive; aliased reports that
+// blob's size for text results and 0 otherwise.
+func computeAddedHunks(store *store, oldOID, newOID Hash) (hunks []AddedHunk, aliased int, err error) {
 	newBytes, hunks, done, err := newSideHunks(store, oldOID, newOID)
 	if done || err != nil {
-		return hunks, err
+		return hunks, 0, err
 	}
 
 	// Pure addition of a text file: everything in newBytes is new.
 	if oldOID.IsZero() {
-		return pureAdditionHunks(newBytes), nil
+		return pureAdditionHunks(newBytes), len(newBytes), nil
 	}
 
 	// New side is text; the old side is now needed for the line diff (or
 	// to detect a binary→text transition).
 	oldBytes, err := loadBlob(store, oldOID)
 	if err != nil {
-		return nil, fmt.Errorf("getting old blob: %w", err)
+		return nil, 0, fmt.Errorf("getting old blob: %w", err)
 	}
-	return textAgainstOldHunks(oldBytes, newBytes), nil
+	return textAgainstOldHunks(oldBytes, newBytes), len(newBytes), nil
 }
 
 // computeRenameCandidateHunks is computeAddedHunks for a directory-rename
@@ -355,22 +359,22 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 // candidate is reported as a full addition, so an unrelated old file never
 // hides lines the new file adds. The new blob is loaded first, so a binary
 // or oversized new side never loads the old blob.
-func computeRenameCandidateHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
+func computeRenameCandidateHunks(store *store, oldOID, newOID Hash) (hunks []AddedHunk, aliased int, err error) {
 	newBytes, hunks, done, err := newSideHunks(store, oldOID, newOID)
 	if done || err != nil {
-		return hunks, err
+		return hunks, 0, err
 	}
 	if oldOID.IsZero() {
-		return pureAdditionHunks(newBytes), nil
+		return pureAdditionHunks(newBytes), len(newBytes), nil
 	}
 	oldBytes, err := loadBlob(store, oldOID)
 	if err != nil {
-		return nil, fmt.Errorf("getting old blob: %w", err)
+		return nil, 0, fmt.Errorf("getting old blob: %w", err)
 	}
 	if !renameLinesSimilar(oldBytes, newBytes) {
-		return pureAdditionHunks(newBytes), nil
+		return pureAdditionHunks(newBytes), len(newBytes), nil
 	}
-	return textAgainstOldHunks(oldBytes, newBytes), nil
+	return textAgainstOldHunks(oldBytes, newBytes), len(newBytes), nil
 }
 
 // newSideHunks runs the steps of computeAddedHunks that need only the new
@@ -483,7 +487,9 @@ func renameLinesSimilar(oldBytes, newBytes []byte) bool {
 	if len(oldBytes) > MaxDiffSize || isBinary(oldBytes) {
 		return false
 	}
-	counts := make(map[uint64]int32, bytes.Count(oldBytes, nlByte)+1)
+	// The map grows with distinct lines; a hint from the total line count
+	// would presize it for a blob of repeated lines.
+	counts := make(map[uint64]int32)
 	oldLines := 0
 	for line := range eachLine(oldBytes) {
 		counts[farm.Hash64(line)]++

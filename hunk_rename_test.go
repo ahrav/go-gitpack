@@ -1,10 +1,12 @@
 package objstore
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -214,6 +216,21 @@ func TestRenameLinesSimilar(t *testing.T) {
 
 func TestBlobPairWorkSize(t *testing.T) {
 	assert.LessOrEqual(t, unsafe.Sizeof(blobPairWork{}), uintptr(80))
+}
+
+// The similarity probe sizes its map by distinct lines: a blob of millions
+// of identical lines must cost one map entry, not one per line.
+func TestRenameLinesSimilar_RepeatedLinesAllocateOneEntry(t *testing.T) {
+	old := bytes.Repeat([]byte("\n"), 1<<22)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	similar := renameLinesSimilar(old, []byte("\n\n"))
+	runtime.ReadMemStats(&after)
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("similarity probe over %d repeated lines allocated %d bytes", 1<<22, allocated)
+	assert.False(t, similar)
+	assert.Less(t, allocated, uint64(1<<20), "map capacity must follow distinct lines, not total lines")
 }
 
 func TestInferDirectoryRenames_TiedCandidatesDeterministic(t *testing.T) {

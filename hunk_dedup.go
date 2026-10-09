@@ -881,6 +881,34 @@ func prefilterHunk(h *HunkAddition, sn *fingerprintSnapshot, buf []uint64) []uin
 	return buf
 }
 
+// retainableHunks converts a pair's hunks for the reorder ring and returns
+// the bytes a retained result keeps alive. Text lines are views into the new
+// blob (aliased bytes), so a few added lines in a large blob pin the whole
+// blob while the result waits for fn; such hunks are copied into compact
+// storage (cloneAddedHunksForCache) and the blob is released. Hunks that
+// cover a quarter or more of the blob stay as views and are charged the
+// blob's size, which keeps the retained-byte cap honest either way.
+func retainableHunks(work blobPairWork, added []AddedHunk, aliased int) ([]HunkAddition, int64) {
+	charge := int64(aliased)
+	if aliased > 0 {
+		var lineBytes int
+		for i := range added {
+			for _, line := range added[i].Lines {
+				lineBytes += len(line)
+			}
+		}
+		if lineBytes*4 < aliased {
+			added = cloneAddedHunksForCache(added)
+			charge = 0
+		}
+	}
+	hunks := make([]HunkAddition, len(added))
+	for i := range added {
+		hunks[i] = newHunkAddition(work, added[i])
+	}
+	return hunks, charge
+}
+
 // pairCandidates runs the worker-side half of the split verdict over one
 // pair's hunks: it returns the hunks the decision stage must still look at
 // (see dedupCandidate), in hunk order, and the pair's hunkRetainedBytes
@@ -1405,21 +1433,19 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				}
 				results := make([]dedupPairResult, 0, len(works))
 				for _, pw := range works {
-					var hunks []HunkAddition
-					if err := hs.streamBlobPairHunks(pw.work, func(h HunkAddition) error {
-						hunks = append(hunks, h)
-						return nil
-					}); err != nil {
+					added, aliased, err := hs.pairHunks(pw.work)
+					if err != nil {
 						setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
 						return
 					}
+					hunks, charge := retainableHunks(pw.work, added, aliased)
 					// Hash and speculatively probe here, in parallel, so the
 					// decision goroutine only touches fingerprints the
 					// snapshot did not already hold.
 					cands, total := pairCandidates(hunks, set.snapshot())
 					results = append(results, dedupPairResult{
 						seq: pw.seq, hunks: hunks, candidates: cands,
-						earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(total)),
+						earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(max(total, charge))),
 					})
 				}
 				deliver(results)

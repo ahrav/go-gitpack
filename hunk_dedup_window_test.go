@@ -6,6 +6,7 @@ package objstore
 import (
 	"fmt"
 	"hash/fnv"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -151,6 +152,13 @@ func TestDiffHistoryHunksDedup_WideCommitParksUntilDrained(t *testing.T) {
 // sorted emissions with the observed peak pending pairs and retained bytes.
 func stalledScanPeaks(t *testing.T, s *HistoryScanner, probe *dedupProbe) (got []string, pairs, bytes int64) {
 	t.Helper()
+	return stalledScanPeaksThen(t, s, probe, func() {})
+}
+
+// stalledScanPeaksThen is stalledScanPeaks with a hook that runs once the
+// probe peaks are stable and before the consumer is released.
+func stalledScanPeaksThen(t *testing.T, s *HistoryScanner, probe *dedupProbe, whileStalled func()) (got []string, pairs, bytes int64) {
+	t.Helper()
 	release := make(chan struct{})
 	var mu sync.Mutex
 	done := make(chan error, 1)
@@ -179,6 +187,7 @@ func stalledScanPeaks(t *testing.T, s *HistoryScanner, probe *dedupProbe) (got [
 		}
 	}
 	pairs, bytes = probe.peakPendingPairs.Load(), probe.peakRetainedBytes.Load()
+	whileStalled()
 
 	close(release)
 	select {
@@ -278,6 +287,56 @@ func TestDiffHistoryHunksDedup_WideCommitStalledConsumerBoundsRetention(t *testi
 	t.Logf("peak retained bytes %d (bound %d, window %d pairs = %d bytes)", bytes, maxBytes,
 		s.dedupLimits.inFlightPairs, int64(s.dedupLimits.inFlightPairs)*pairBytes)
 	require.LessOrEqualf(t, bytes, maxBytes, "a wide commit kept admitting pairs past the retained-byte cap")
+}
+
+// A retained hunk keeps its backing blob alive, so a one-line edit to a
+// blob above every store cache's admission size must be charged (or
+// detached) as the blob it pins, or a stalled consumer retains one blob per
+// in-flight pair while the charge stays near zero.
+func TestDiffHistoryHunksDedup_StalledConsumerReleasesLargeBlobs(t *testing.T) {
+	const (
+		edits    = 12
+		blobSize = 2 * maxCacheableSize
+	)
+	b := newDedupRepoBuilder(t)
+	body := strings.Repeat("filler line of a large text file that stays mostly unchanged\n", blobSize/60)
+	b.write("big.txt", body)
+	b.commit("big")
+	for i := range edits {
+		body += fmt.Sprintf("edit %02d\n", i)
+		b.write("big.txt", body)
+		b.commit(fmt.Sprintf("edit %d", i))
+	}
+	gitDir := b.finish()
+	want := serialDedupReference(t, gitDir, false, nil)
+
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
+	require.NoError(t, err)
+	defer s.Close()
+	s.dedupLimits.inFlightPairs = 32
+	s.dedupLimits.workers = 2
+	s.dedupLimits.yieldChanCap = 1
+	s.dedupLimits.retainedBytesCap = 1 << 20
+	probe := &dedupProbe{}
+	s.dedupProbe = probe
+
+	var stalled runtime.MemStats
+	measure := func() {
+		runtime.GC()
+		runtime.ReadMemStats(&stalled)
+	}
+	got, _, charged := stalledScanPeaksThen(t, s, probe, measure)
+	require.Equal(t, want, got)
+
+	var after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	retained := int64(stalled.HeapAlloc) - int64(after.HeapAlloc)
+	t.Logf("heap while stalled exceeds post-scan heap by %d bytes; peak charge %d bytes; blob %d bytes", retained, charged, blobSize)
+	// The pure addition that seeds big.txt is charged and retained at its
+	// full size; the one-line edits must add far less than one blob each.
+	require.Lessf(t, retained, int64(edits/2*blobSize),
+		"stalled consumer pinned one %d-byte blob per in-flight one-line hunk", blobSize)
 }
 
 // The reorder ring holds one dedupPairResult per in-flight pair and is

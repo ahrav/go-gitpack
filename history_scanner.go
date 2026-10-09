@@ -763,32 +763,11 @@ func trimPathPrefix(p, prefix string) (string, bool) {
 }
 
 // streamBlobPairHunks computes the added hunks for one changed file and
-// delivers them to fn. Results are memoized by OID pair: the diff depends
-// only on the two blob contents, and histories with merges replay the same
-// transition repeatedly.
+// delivers them to fn.
 func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAddition) error) error {
-	var hunks []AddedHunk
-	if work.renameCandidate {
-		// The pair memo is keyed by (old, new) and holds a plain diff; a
-		// candidate's result also depends on its similarity verdict, so
-		// candidates bypass the memo in both directions.
-		var err error
-		hunks, err = computeRenameCandidateHunks(hs.store, work.oldOID, work.newOID)
-		if err != nil {
-			return fmt.Errorf("compute added hunks: %w", err)
-		}
-	} else {
-		pk := makePairKey(work.oldOID, work.newOID)
-		var cached bool
-		hunks, cached = hs.pairs.get(pk)
-		if !cached {
-			var err error
-			hunks, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
-			if err != nil {
-				return fmt.Errorf("compute added hunks: %w", err)
-			}
-			hs.pairs.add(pk, hunks)
-		}
+	hunks, _, err := hs.pairHunks(work)
+	if err != nil {
+		return err
 	}
 
 	// Emit each hunk on its own; fusing a single hunk is a no-op
@@ -801,6 +780,37 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 		}
 	}
 	return nil
+}
+
+// pairHunks computes the added hunks for one changed file. Results are
+// memoized by OID pair: the diff depends only on the two blob contents, and
+// histories with merges replay the same transition repeatedly.
+//
+// aliased is the size of the new blob the returned text lines are views
+// into (see computeAddedHunks), and 0 when they are not: a memo hit returns
+// the memo's compacted copy, and binary and placeholder hunks are charged
+// by their own length.
+func (hs *HistoryScanner) pairHunks(work blobPairWork) (hunks []AddedHunk, aliased int, err error) {
+	if work.renameCandidate {
+		// The pair memo is keyed by (old, new) and holds a plain diff; a
+		// candidate's result also depends on its similarity verdict, so
+		// candidates bypass the memo in both directions.
+		hunks, aliased, err = computeRenameCandidateHunks(hs.store, work.oldOID, work.newOID)
+		if err != nil {
+			return nil, 0, fmt.Errorf("compute added hunks: %w", err)
+		}
+		return hunks, aliased, nil
+	}
+	pk := makePairKey(work.oldOID, work.newOID)
+	if hunks, cached := hs.pairs.get(pk); cached {
+		return hunks, 0, nil
+	}
+	hunks, aliased, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
+	if err != nil {
+		return nil, 0, fmt.Errorf("compute added hunks: %w", err)
+	}
+	hs.pairs.add(pk, hunks)
+	return hunks, aliased, nil
 }
 
 // newHunkAddition attributes one computed hunk to the commit and path of
