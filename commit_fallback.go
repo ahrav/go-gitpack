@@ -51,7 +51,29 @@ func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
 	}); err != nil {
 		return nil, err
 	}
+	compactParentOIDs(out)
 	return orderCommitsParentFirst(out), nil
+}
+
+// compactParentOIDs moves every commit's ParentOIDs into one shared backing
+// array. The walk allocates each list separately; the scanner retains the
+// commit set for its lifetime, and one array costs the garbage collector a
+// single object instead of one per commit.
+func compactParentOIDs(commits []commitInfo) {
+	total := 0
+	for i := range commits {
+		total += len(commits[i].ParentOIDs)
+	}
+	backing := make([]Hash, total)
+	for i := range commits {
+		n := len(commits[i].ParentOIDs)
+		if n == 0 {
+			continue
+		}
+		copy(backing[:n], commits[i].ParentOIDs)
+		commits[i].ParentOIDs = backing[:n:n]
+		backing = backing[n:]
+	}
 }
 
 // walkCommitsFromRefs performs a ref-based reachable commit walk and calls
@@ -111,9 +133,9 @@ func (hs *HistoryScanner) walkCommitsFromRefsWorkers(numWorkers int, visit func(
 	}
 
 	var (
-		mu       sync.Mutex // guards seen, stack, active, firstErr
+		mu       sync.Mutex // guards stack, active, firstErr
 		cond     = sync.NewCond(&mu)
-		seen     = make(map[Hash]struct{}, len(tips)*4)
+		seen     = newWalkSeen(len(tips) * 4)
 		stack    = append([]Hash(nil), tips...)
 		active   int
 		firstErr error
@@ -128,47 +150,66 @@ func (hs *HistoryScanner) walkCommitsFromRefsWorkers(numWorkers int, visit func(
 		cond.Broadcast()
 	}
 
+	// Each worker walks its own lineage: parents go onto a private stack
+	// and are popped from there, so consecutive commits of one branch are
+	// visited by one worker in sequence and the shared stack is touched
+	// only to take work when the private stack is empty and, with several
+	// workers, to donate surplus when it grows past walkDonateAbove. The
+	// seen set is sharded and checked when an OID is popped, so a commit
+	// reachable from several branches is visited once. With one worker the
+	// private stack is the top of the shared stack and the visit order is
+	// the depth-first order described on walkCommitsFromRefsOrdered.
 	worker := func() {
+		var local []Hash
 		for {
-			mu.Lock()
-			for len(stack) == 0 && active > 0 && firstErr == nil {
-				cond.Wait()
-			}
-			if firstErr != nil || len(stack) == 0 {
-				// Done: either an error occurred, or the stack is empty with
-				// no worker still processing (which could add more work).
-				// Broadcast so peers blocked in Wait also observe the
-				// termination condition and exit.
-				mu.Unlock()
-				cond.Broadcast()
-				return
-			}
-			n := len(stack) - 1
-			oid := stack[n]
-			stack = stack[:n]
-			if _, ok := seen[oid]; ok {
-				mu.Unlock()
-				continue
-			}
-			seen[oid] = struct{}{}
-			active++
-			mu.Unlock()
-
-			pushed := hs.walkOne(oid, visit, func(next Hash) {
+			if len(local) == 0 {
 				mu.Lock()
-				if _, ok := seen[next]; !ok {
-					stack = append(stack, next)
+				for len(stack) == 0 && active > 0 && firstErr == nil {
+					cond.Wait()
 				}
+				if firstErr != nil || len(stack) == 0 {
+					// Done: either an error occurred, or the stack is
+					// empty with no worker still processing (which could
+					// add more work). Broadcast so peers blocked in Wait
+					// also observe the termination condition and exit.
+					mu.Unlock()
+					cond.Broadcast()
+					return
+				}
+				// Take an even share of the frontier, so a frontier with
+				// fewer entries than workers still spreads across them.
+				n := min(len(stack), max(1, len(stack)/numWorkers), walkStealBatch)
+				local = append(local, stack[len(stack)-n:]...)
+				stack = stack[:len(stack)-n]
+				active++
 				mu.Unlock()
-			}, fail)
+			}
 
-			mu.Lock()
-			active--
-			mu.Unlock()
-			// Wake waiters: either new work was pushed or active hit zero.
-			if pushed {
-				cond.Broadcast()
-			} else {
+			n := len(local) - 1
+			oid := local[n]
+			local = local[:n]
+			if seen.mark(oid) {
+				hs.walkOne(oid, visit, func(next Hash) {
+					if !seen.contains(next) {
+						local = append(local, next)
+					}
+				}, fail)
+				if numWorkers > 1 && len(local) > walkDonateAbove {
+					// Donate the older half of the private stack so idle
+					// workers find work.
+					half := len(local) / 2
+					mu.Lock()
+					stack = append(stack, local[:half]...)
+					mu.Unlock()
+					local = append(local[:0], local[half:]...)
+					cond.Broadcast()
+				}
+			}
+
+			if len(local) == 0 {
+				mu.Lock()
+				active--
+				mu.Unlock()
 				cond.Signal()
 			}
 		}
@@ -185,6 +226,56 @@ func (hs *HistoryScanner) walkCommitsFromRefsWorkers(numWorkers int, visit func(
 	wg.Wait()
 
 	return firstErr
+}
+
+const (
+	// walkStealBatch is how many frontier OIDs a worker takes from the
+	// shared stack when its private stack is empty.
+	walkStealBatch = 4
+	// walkDonateAbove is the private stack length above which a worker
+	// moves half of it to the shared stack.
+	walkDonateAbove = 32
+	// walkSeenShards is the number of locks the walk's seen set is spread
+	// over; a power of two.
+	walkSeenShards = 64
+)
+
+// walkSeen is a sharded set of visited OIDs for the parallel ref walk.
+type walkSeen struct {
+	shards [walkSeenShards]struct {
+		mu sync.Mutex
+		m  map[Hash]struct{}
+	}
+}
+
+func newWalkSeen(hint int) *walkSeen {
+	w := &walkSeen{}
+	per := max(hint/walkSeenShards, 16)
+	for i := range w.shards {
+		w.shards[i].m = make(map[Hash]struct{}, per)
+	}
+	return w
+}
+
+// mark records oid and reports whether it was absent.
+func (w *walkSeen) mark(oid Hash) bool {
+	s := &w.shards[oid[0]&(walkSeenShards-1)]
+	s.mu.Lock()
+	_, ok := s.m[oid]
+	if !ok {
+		s.m[oid] = struct{}{}
+	}
+	s.mu.Unlock()
+	return !ok
+}
+
+// contains reports whether oid has been marked.
+func (w *walkSeen) contains(oid Hash) bool {
+	s := &w.shards[oid[0]&(walkSeenShards-1)]
+	s.mu.Lock()
+	_, ok := s.m[oid]
+	s.mu.Unlock()
+	return ok
 }
 
 // walkOne processes a single OID popped from the walk frontier: it inflates
@@ -458,10 +549,17 @@ func parseCommitInfoFromHeader(oid Hash, hdr []byte) (commitInfo, error) {
 		ParentOIDs: make([]Hash, 0, 2),
 	}
 
-	sc := bufio.NewScanner(bytes.NewReader(hdr))
 	var haveTree, haveTS bool
-	for sc.Scan() {
-		line := sc.Bytes()
+	for rest := hdr; len(rest) > 0; {
+		var line []byte
+		if nl := bytes.IndexByte(rest, '\n'); nl >= 0 {
+			line, rest = rest[:nl], rest[nl+1:]
+		} else {
+			line, rest = rest, nil
+		}
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
 		if len(line) == 0 {
 			break
 		}
@@ -488,9 +586,6 @@ func parseCommitInfoFromHeader(oid Hash, hdr []byte) (commitInfo, error) {
 			info.Timestamp = ts
 			haveTS = true
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return commitInfo{}, err
 	}
 
 	if !haveTree {

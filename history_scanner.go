@@ -473,6 +473,17 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
 	}
 
+	// Commits are diffed in parent-first timestamp order. Consecutive
+	// commits in that order touch consecutive versions of the same files,
+	// so their delta chains share tails that are still in the offset cache;
+	// the ref-walk visit order interleaves unrelated lineages and roughly
+	// triples the bytes materialized on a rails scan. The graph resolves
+	// every loaded commit's first-parent tree without a header read.
+	commits, graph, err := hs.loadCommitsAndGraph()
+	if err != nil {
+		return err
+	}
+
 	{
 		type workItem struct {
 			commit commitInfo
@@ -486,10 +497,9 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// (cheap) and fans out per-file blob pairs; stage 2 computes hunks
 		// (expensive: inflation + line diff) at blob-pair granularity, which
 		// spreads a whale commit across every worker.
-		// workChan is deep so that the walk's visit callback, which runs on
-		// a walk worker, hands off without waiting on the tree stage: a few
-		// thousand commitInfo headers (~100 bytes each) buy full walk/tree
-		// decoupling for typical repositories.
+		// workChan is deep so the dispatcher stays ahead of the tree
+		// workers: a few thousand commitInfo headers (~100 bytes each) buy
+		// full dispatch/tree-stage decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
 		blobChan := make(chan []blobPairWork, 1024)
 		// outstanding counts records sent on blobChan and not yet diffed.
@@ -545,7 +555,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 						// the producer: the header inflation it requires is
 						// the dominant cost of the walk and parallelizes
 						// cleanly across the tree workers.
-						parentTree, err := hs.firstParentTree(work.commit)
+						parentTree, err := hs.firstParentTreeIn(graph, work.commit)
 						if err != nil {
 							c := work.commit
 							setError(fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err))
@@ -613,29 +623,22 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			}()
 		}
 
-		walkErr := hs.walkCommitsFromRefs(func(c commitInfo) error {
-			// Publish the tree OID before dispatch so children resolving
-			// firstParentTree find it without re-inflating the header.
-			hs.treeOIDs.Store(c.OID, c.TreeOID)
+	dispatch:
+		for _, c := range commits {
 			if hs.skipMergeDiffs && len(c.ParentOIDs) > 1 {
-				return nil
+				continue
 			}
 			select {
 			case <-stopCh:
-				return errScanAborted
+				break dispatch
 			case workChan <- workItem{commit: c}:
-				return nil
 			}
-		})
+		}
 		close(workChan)
 		treeWG.Wait()
 		stage1Done.Store(true)
 		finishIfDrained()
 		blobWG.Wait()
-
-		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
-			setError(walkErr)
-		}
 
 		return firstErr
 	}
@@ -668,11 +671,24 @@ var errScanAborted = errors.New("scan aborted")
 // This gracefully handles shallow clones and truncated history where parent
 // objects may be absent.
 func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
+	return hs.firstParentTreeIn(nil, c)
+}
+
+// firstParentTreeIn is firstParentTree with the loaded commit set's graph:
+// a parent inside the set resolves with one map lookup, and only parents
+// outside it (shallow history, refs walked without a load) go through the
+// treeOIDs memo and header reads.
+func (hs *HistoryScanner) firstParentTreeIn(graph *commitGraphData, c commitInfo) (Hash, error) {
 	if len(c.ParentOIDs) == 0 {
 		return Hash{}, nil
 	}
 
 	parentOID := c.ParentOIDs[0]
+	if graph != nil {
+		if idx, ok := graph.OIDToIndex[parentOID]; ok {
+			return graph.TreeOIDs[idx], nil
+		}
+	}
 	// The commit walk records every visited commit's tree OID; a hit here
 	// avoids re-inflating the parent's header (which would otherwise
 	// happen once per child).
@@ -1772,14 +1788,22 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 // safe to share because their mutable parts (the ParentOIDs slice) are never
 // modified after construction.
 func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
+	commits, _, err := hs.loadCommitsAndGraph()
+	return commits, err
+}
+
+// loadCommitsAndGraph is loadAllCommits plus the commit graph synthesized
+// from the same load, so a scan can resolve parents through the graph
+// without re-reading hs.graphData under the commit cache lock.
+func (hs *HistoryScanner) loadCommitsAndGraph() ([]commitInfo, *commitGraphData, error) {
 	tips, err := collectRefTips(hs.gitDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	slices.SortFunc(tips, func(a, b Hash) int { return bytes.Compare(a[:], b[:]) })
 	shallow, err := os.ReadFile(filepath.Join(hs.gitDir, "shallow"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return nil, nil, err
 	}
 
 	hs.commitsMu.Lock()
@@ -1793,7 +1817,7 @@ func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
 	default:
 		commits, err := hs.loadFromRefs()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		hs.commits, hs.commitsTips, hs.commitsShallow = commits, tips, shallow
 		hs.graphData = buildCommitGraphFromCommits(commits)
@@ -1804,7 +1828,7 @@ func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
 
 	out := make([]commitInfo, len(hs.commits))
 	copy(out, hs.commits)
-	return out, nil
+	return out, hs.graphData, nil
 }
 
 // loadFromGraph converts commit‑graph rows into commitInfo values.

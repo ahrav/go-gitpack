@@ -23,7 +23,7 @@
 // construction because no stage ever blocks waiting on something
 // downstream of itself:
 //
-//  1. Ordered commit source: orderCommitsParentFirst(loadAllCommits()),
+//  1. Ordered commit source: loadCommitsAndGraph() in parent-first order,
 //     dispatched to the tree stage up to dedupLookaheadCommits ahead of
 //     the emit cursor while the pairs held ahead of it fit under
 //     dedupPendingPairsCap.
@@ -919,7 +919,13 @@ func pairCandidates(hunks []HunkAddition, sn *fingerprintSnapshot) (cands []dedu
 // tree walk with errScanAborted. admit, when non-nil, runs before each pair
 // is appended and may block or return an error to abort.
 func (hs *HistoryScanner) collectCommitPairs(c commitInfo, stopCh <-chan struct{}, admit func() error) ([]blobPairWork, error) {
-	parentTree, err := hs.firstParentTree(c)
+	return hs.collectCommitPairsIn(nil, c, stopCh, admit)
+}
+
+// collectCommitPairsIn is collectCommitPairs resolving the first-parent tree
+// through graph, the loaded commit set's graph.
+func (hs *HistoryScanner) collectCommitPairsIn(graph *commitGraphData, c commitInfo, stopCh <-chan struct{}, admit func() error) ([]blobPairWork, error) {
+	parentTree, err := hs.firstParentTreeIn(graph, c)
 	if err != nil {
 		return nil, fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err)
 	}
@@ -971,25 +977,17 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
 	}
 
-	// loadAllCommits re-walks refs when the ref tips moved, so a reused
-	// scanner sees commits added since its previous scan.
-	commits, err := hs.loadAllCommits()
+	// loadCommitsAndGraph re-walks refs when the ref tips moved, so a
+	// reused scanner sees commits added since its previous scan. It returns
+	// a fresh copy in parent-first order on both the ref-walk and
+	// commit-graph paths (each runs orderCommitsParentFirst), and the graph
+	// resolves every loaded commit's first-parent tree, including skipped
+	// merges that are another commit's first parent.
+	commits, graph, err := hs.loadCommitsAndGraph()
 	if err != nil {
 		return err
 	}
-	// Publish every commit's tree OID up front so firstParentTree never
-	// re-inflates a header. This covers skipped merge commits too: a merge
-	// excluded from diffing can still be another commit's first parent.
-	for _, c := range commits {
-		hs.treeOIDs.Store(c.OID, c.TreeOID)
-	}
-
-	// loadAllCommits already returns parent-first order on the ref-walk
-	// path, but the commit-graph path materializes rows in on-disk
-	// (OID-lexicographic) order, so the dedup pipeline imposes the order
-	// itself. orderCommitsParentFirst is idempotent and cheap relative to
-	// the scan.
-	order := orderCommitsParentFirst(commits)
+	order := commits
 	if hs.skipMergeDiffs {
 		filtered := order[:0]
 		for _, c := range order {
@@ -1155,7 +1153,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 						}
 						return nil
 					}
-					pairs, err := hs.collectCommitPairs(order[idx], stopCh, admit)
+					pairs, err := hs.collectCommitPairsIn(graph, order[idx], stopCh, admit)
 					if err != nil {
 						pendingPairs.Add(-charged)
 					}
