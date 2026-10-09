@@ -30,16 +30,21 @@
 //     can never block).
 //  3. Sequencer (the calling goroutine): walks commits in order, waits for
 //     each slot, and forwards pairs to blobChan stamped with a monotonic
-//     seq. Dispatch order == seq order, so in-flight seqs are bounded by
-//     cap(blobChan) + the hunk-worker count + cap(resultChan), and the
-//     reorder buffer cannot grow without bound.
+//     seq, dedupPairBatchSize pairs per message. Dispatch order == seq
+//     order, and the sequencer parks on dedupInFlightWindow once
+//     dedupMaxInFlightPairs seqs are undecided, so the decision stage's
+//     reorder buffer is bounded by construction however long one pair
+//     takes.
 //  4. Parallel hunk workers -> serial decision stage -> parallel yield:
-//     hunk workers compute each pair's hunks into a slice and hand
-//     (seq, hunks) to the decision goroutine, which reorders by seq,
-//     applies the fingerprint table's whole-hunk verdicts (serial, cheap),
-//     and fans surviving hunks out to a pool of yield workers that invoke
-//     fn concurrently. Only dedup decisions are serialized; output is
-//     deterministic as a multiset, never as an order.
+//     hunk workers compute each pair's hunks and run prefilterHunk against
+//     the set's published snapshot, so the decision goroutine receives
+//     (seq, hunks, unresolved fingerprints). It reorders by seq, settles
+//     each whole-hunk verdict with decideResult (serial, but over the
+//     unresolved fingerprints only), pre-processes the backlog with
+//     prepBacklog while it waits behind a straggling pair, and fans
+//     surviving hunks out in batches to a pool of yield workers that
+//     invoke fn concurrently. Only dedup decisions are serialized; output
+//     is deterministic as a multiset, never as an order.
 //
 // Cross-file dependencies:
 //   - firstParentTree, emitCommitBlobPairs, streamBlobPairHunks
@@ -55,6 +60,7 @@ import (
 	"os"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/dgryski/go-farm"
 )
@@ -80,19 +86,48 @@ const (
 	// previous occupant.
 	dedupLookaheadCommits = 256
 
-	// dedupBlobChanCap, together with the hunk-worker count and
-	// cap(resultChan), bounds the number of in-flight seqs and therefore
-	// the decision stage's reorder buffer. It is sized well below the
-	// streaming pipeline's blobChan depth because measurements showed
-	// reorder-buffer memory scales with this cap while wall time is
-	// insensitive to it.
-	dedupBlobChanCap = 512
+	// dedupPairBatchSize is how many seq-stamped pairs travel per channel
+	// message on blobChan and resultChan. The sequencer is a single
+	// producer feeding every hunk worker, and each per-pair send under
+	// receiver contention cost several microseconds of its time (1.2s of a
+	// 1.4s scan on a 154k-pair repository), so pairs move in batches. The
+	// sequencer flushes a partial batch before it would block on a tree
+	// slot, so batching never starves the workers.
+	dedupPairBatchSize = 16
+
+	// dedupMaxInFlightPairs bounds seqs stamped but not yet decided. The
+	// decision stage drains resultChan into its reorder buffer
+	// unconditionally (so a straggling pair's result can always arrive),
+	// which means the buffer is bounded by what the sequencer stamps; the
+	// sequencer parks on dedupInFlightWindow once this many seqs are
+	// undecided. 65536 is about half a second of worker throughput on a
+	// 32-core host: a single whale pair (a 40 MB binary, a multi-MB
+	// generated file) holds the order for 50-100 ms, and parking earlier
+	// measurably idled the workers behind it.
+	dedupMaxInFlightPairs = 65536
+
+	// dedupBlobChanCap is in batches: 32 batches of dedupPairBatchSize
+	// pairs keep every hunk worker supplied through the sequencer's
+	// own scheduling gaps without queueing much work ahead of the
+	// decision stage.
+	dedupBlobChanCap = 32
 
 	// dedupYieldChanCap decouples the serial decision stage from fn
 	// scheduling: a whale pair can release thousands of hunks at once, and
 	// a shallow buffer would stall the decision loop (and transitively
-	// the reorder release) on every fn hiccup.
+	// the reorder release) on every fn hiccup. Each element is a batch of
+	// surviving hunks, so the channel carries far fewer messages than hunks.
 	dedupYieldChanCap = 256
+
+	// dedupYieldBatchHunks is the batch size the decision stage flushes
+	// survivors at. One channel send per hunk put the decision goroutine on
+	// the critical path under receiver contention (~2µs per contended
+	// send); batching amortizes it.
+	dedupYieldBatchHunks = 64
+
+	// dedupProbePrefetch is how many unresolved fingerprints
+	// verdictUnresolved touches ahead of probing them.
+	dedupProbePrefetch = 16
 )
 
 // lineFingerprint hashes one added line (without its trailing newline —
@@ -107,10 +142,13 @@ func lineFingerprint(line string) uint64 {
 // fingerprints with linear probing. Zero is the empty-slot sentinel;
 // fingerprints of zero are remapped to dedupZeroFingerprint.
 //
-// The set is used from a single goroutine (the decision stage), so it needs
-// no atomics: dedup decisions are serialized by pipeline design, which also
-// makes the insert order — and therefore the saturation point — fully
-// deterministic.
+// Exactly one goroutine (the decision stage) mutates the set, which keeps
+// the insert order — and therefore the growth and saturation points —
+// fully deterministic. Other goroutines may concurrently probe a published
+// snapshot (see snapshot and fingerprintSnapshot.contains): the writer
+// stores slot values with atomic stores and readers load them with atomic
+// loads, and slots only ever transition empty -> fingerprint, so a reader
+// observes a subset of the writer's current contents.
 //
 // When the insert count reaches the load-factor bound the set saturates and
 // fails open: markNew reports every subsequent fingerprint as new, so lines
@@ -130,6 +168,48 @@ type lineFingerprintSet struct {
 	// saturated is set once remaining hits zero; from then on markNew
 	// returns true unconditionally (fail-open).
 	saturated bool
+
+	// published is the snapshot concurrent readers probe. It always refers
+	// to the current slots slice; grow replaces it after the new slice is
+	// fully populated, and a reader still holding the previous slice sees
+	// a frozen, valid subset of the set.
+	published atomic.Pointer[fingerprintSnapshot]
+}
+
+// fingerprintSnapshot is a read-only view of a lineFingerprintSet's slots
+// for concurrent speculative probes. Contents only grow, so a hit is
+// authoritative (the fingerprint is in the set) while a miss is only a hint
+// (the writer may have inserted it since).
+type fingerprintSnapshot struct {
+	slots []uint64
+	mask  uint64
+}
+
+// contains reports whether fp is present in the snapshot. fp must already
+// have zero remapped to dedupZeroFingerprint. The probe terminates because
+// the writer keeps load below the saturation bound, so every snapshot has
+// empty slots.
+func (sn *fingerprintSnapshot) contains(fp uint64) bool {
+	i := fp & sn.mask
+	for {
+		v := atomic.LoadUint64(&sn.slots[i])
+		if v == fp {
+			return true
+		}
+		if v == 0 {
+			return false
+		}
+		i = (i + 1) & sn.mask
+	}
+}
+
+// snapshot returns the current published view for concurrent probes.
+func (s *lineFingerprintSet) snapshot() *fingerprintSnapshot {
+	return s.published.Load()
+}
+
+func (s *lineFingerprintSet) publish() {
+	s.published.Store(&fingerprintSnapshot{slots: s.slots, mask: s.mask})
 }
 
 // newLineFingerprintSet returns a set with 2^log2Slots slots that saturates
@@ -137,12 +217,14 @@ type lineFingerprintSet struct {
 // saturation cheaply; production uses dedupTableSlotsLog2.
 func newLineFingerprintSet(log2Slots uint) *lineFingerprintSet {
 	n := 1 << log2Slots
-	return &lineFingerprintSet{
+	s := &lineFingerprintSet{
 		slots:     make([]uint64, n),
 		mask:      uint64(n - 1),
 		remaining: n * 7 / 10,
 		maxSlots:  n,
 	}
+	s.publish()
+	return s
 }
 
 func newLineFingerprintSetWithBudget(log2Initial uint, budget int) *lineFingerprintSet {
@@ -158,12 +240,14 @@ func newLineFingerprintSetWithBudget(log2Initial uint, budget int) *lineFingerpr
 	if initial > maxPower {
 		initial = maxPower
 	}
-	return &lineFingerprintSet{
+	s := &lineFingerprintSet{
 		slots:     make([]uint64, initial),
 		mask:      uint64(initial - 1),
 		remaining: initial * 7 / 10,
 		maxSlots:  maxPower,
 	}
+	s.publish()
+	return s
 }
 
 func (s *lineFingerprintSet) grow() bool {
@@ -172,6 +256,8 @@ func (s *lineFingerprintSet) grow() bool {
 	}
 	newLen := min(len(s.slots)*2, s.maxSlots)
 	old := s.slots
+	// The new slice is private until publish, so plain stores are fine;
+	// readers keep probing the old slice, which is never written again.
 	s.slots = make([]uint64, newLen)
 	s.mask = uint64(newLen - 1)
 	for _, fp := range old {
@@ -185,6 +271,7 @@ func (s *lineFingerprintSet) grow() bool {
 		s.slots[i] = fp
 	}
 	s.remaining = newLen*7/10 - s.count
+	s.publish()
 	return true
 }
 
@@ -203,7 +290,9 @@ func (s *lineFingerprintSet) markNew(fp uint64) bool {
 		case fp:
 			return false
 		case 0:
-			s.slots[i] = fp
+			// Atomic store pairs with fingerprintSnapshot.contains' atomic
+			// load; the slot transitions exactly once, empty -> fp.
+			atomic.StoreUint64(&s.slots[i], fp)
 			s.count++
 			s.remaining--
 			if s.remaining <= 0 {
@@ -213,6 +302,232 @@ func (s *lineFingerprintSet) markNew(fp uint64) bool {
 		}
 		i = (i + 1) & s.mask
 	}
+}
+
+// verdictUnresolved settles one text hunk's whole-hunk verdict given the
+// fingerprints of its lines that a speculative snapshot probe did NOT find
+// (unresolved, in line order; zero already remapped), and lineCount, the
+// hunk's total line count.
+//
+// Equivalence with dedupHunkEmission (which hashes and marks every line):
+// a line the snapshot contained is in the set at this hunk's position, so
+// markNew would report it seen and insert nothing — skipping it changes
+// neither the verdict nor the insert sequence. Saturated at entry, every
+// markNew reports true, so the verdict is "non-empty" exactly as the full
+// pass computes. Saturation tripped mid-hunk happens only via an insert of
+// an unresolved line, which already settled the verdict true.
+func (s *lineFingerprintSet) verdictUnresolved(unresolved []uint64, lineCount int) bool {
+	if s.saturated {
+		return lineCount > 0
+	}
+	anyNew := false
+	for len(unresolved) > 0 {
+		n := min(len(unresolved), dedupProbePrefetch)
+		// Touch each fingerprint's home slot before probing it. The loads
+		// are independent, so the core overlaps their cache misses instead
+		// of taking them one at a time inside markNew's dependent probe
+		// loop; the table is far larger than L2 and a hunk's lines land on
+		// unrelated lines of it.
+		var touched uint64
+		for _, fp := range unresolved[:n] {
+			touched += s.slots[fp&s.mask]
+		}
+		prefetchSink = touched
+		for _, fp := range unresolved[:n] {
+			if s.markNew(fp) {
+				anyNew = true
+			}
+		}
+		unresolved = unresolved[n:]
+	}
+	return anyNew
+}
+
+// prefetchSink keeps verdictUnresolved's touch loop observable so the
+// compiler cannot drop the loads.
+var prefetchSink uint64
+
+// decideResult settles every hunk of one pair in order and appends the
+// survivors to out.
+//
+// Only candidates need a verdict: a binary hunk always survives, and a text
+// hunk with unresolved fingerprints is probed with verdictUnresolved. A
+// text hunk that is not a candidate had every line in the snapshot and is
+// therefore a duplicate while the set is unsaturated. Once the set
+// saturates (at entry or during a candidate's probe) the single-pass rule
+// emits every later non-empty hunk, candidates or not, so the tail of the
+// pair is scanned in full from that point.
+func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition) []HunkAddition {
+	hunks := r.hunks
+	i := 0 // hunks[:i] are decided
+	for _, c := range r.candidates {
+		if s.saturated {
+			break
+		}
+		h := &hunks[c.hunk]
+		if h.isBinary || s.verdictUnresolved(c.unresolved, len(h.lines)) {
+			out = append(out, *h)
+		}
+		i = c.hunk + 1
+	}
+	if s.saturated {
+		for ; i < len(hunks); i++ {
+			h := &hunks[i]
+			if h.isBinary || len(h.lines) > 0 {
+				out = append(out, *h)
+			}
+		}
+	}
+	return out
+}
+
+// contains reports whether fp (zero already remapped) is in the set. It is
+// a read-only probe for the owning goroutine; concurrent readers use the
+// published snapshot instead.
+func (s *lineFingerprintSet) contains(fp uint64) bool {
+	i := fp & s.mask
+	for {
+		switch s.slots[i] {
+		case fp:
+			return true
+		case 0:
+			return false
+		}
+		i = (i + 1) & s.mask
+	}
+}
+
+// prepBacklog shrinks the unresolved lists of a pending result while the
+// decision stage waits for an earlier pair. It drops a fingerprint when
+// either proof of duplication is already available:
+//
+//   - the set contains it: the set only grows, so it is still present when
+//     this pair's turn comes and markNew would report it seen;
+//   - scratch recorded it at an earlier position in the backlog: that
+//     occurrence is processed first and either inserts it or finds it
+//     present, so again it is present at this pair's turn. Saturation
+//     cannot break this: verdictUnresolved ignores the list once the set is
+//     saturated.
+//
+// Every drop removes a probe that would otherwise run inside the serial
+// drain after the straggler, which is the window where the decision
+// goroutine is the pipeline's bottleneck.
+func (s *lineFingerprintSet) prepBacklog(r dedupPairResult, scratch *backlogScratch) {
+	for ci := range r.candidates {
+		c := &r.candidates[ci]
+		if c.unresolved == nil {
+			continue
+		}
+		pos := r.seq<<20 | uint64(c.hunk&(1<<20-1))
+		kept := c.unresolved[:0]
+		for _, fp := range c.unresolved {
+			if s.contains(fp) || scratch.seenBefore(fp, pos) {
+				continue
+			}
+			kept = append(kept, fp)
+		}
+		c.unresolved = kept
+	}
+}
+
+// backlogScratch records, for fingerprints seen while pre-processing the
+// reorder backlog, the earliest (seq, hunk) position that mentioned them.
+// It is a bounded open-addressing table; once it reaches its load bound it
+// stops recording and seenBefore only answers from what it holds, which
+// keeps it a pure optimization. reset clears it between backlogs.
+type backlogScratch struct {
+	fps  []uint64
+	pos  []uint64
+	mask uint64
+	used int
+	cap  int
+}
+
+const backlogScratchSlotsLog2 = 20
+
+func newBacklogScratch() *backlogScratch {
+	return &backlogScratch{}
+}
+
+func (b *backlogScratch) reset() {
+	if b.used == 0 {
+		return
+	}
+	clear(b.fps)
+	b.used = 0
+}
+
+// seenBefore reports whether fp was recorded at a position before pos (or
+// in the same hunk, where an earlier line of the hunk already covers it),
+// recording pos otherwise when room remains.
+func (b *backlogScratch) seenBefore(fp, pos uint64) bool {
+	if b.fps == nil {
+		n := 1 << backlogScratchSlotsLog2
+		b.fps = make([]uint64, n)
+		b.pos = make([]uint64, n)
+		b.mask = uint64(n - 1)
+		b.cap = n * 7 / 10
+	}
+	i := fp & b.mask
+	for {
+		switch b.fps[i] {
+		case fp:
+			if b.pos[i] <= pos {
+				return true
+			}
+			b.pos[i] = pos
+			return false
+		case 0:
+			if b.used >= b.cap {
+				return false
+			}
+			b.fps[i] = fp
+			b.pos[i] = pos
+			b.used++
+			return false
+		}
+		i = (i + 1) & b.mask
+	}
+}
+
+// dedupInFlightWindow bounds the pairs that have been stamped with a seq but
+// not yet decided, which bounds the decision stage's reorder buffer and the
+// hunks it retains, regardless of how long one straggling pair takes.
+//
+// The sequencer calls wait before stamping each seq; the decision stage
+// calls advanced after settling each pair. The wake channel has capacity
+// one and advanced sends to it without blocking, so a wake-up is never
+// lost: either the sequencer is parked on it, or the token is waiting for
+// the next wait.
+type dedupInFlightWindow struct {
+	decided atomic.Uint64
+	wake    chan struct{}
+}
+
+func newDedupInFlightWindow() *dedupInFlightWindow {
+	return &dedupInFlightWindow{wake: make(chan struct{}, 1)}
+}
+
+// advanced records that one more pair, in seq order, has been decided.
+func (w *dedupInFlightWindow) advanced() {
+	w.decided.Add(1)
+	select {
+	case w.wake <- struct{}{}:
+	default:
+	}
+}
+
+// wait blocks until fewer than dedupMaxInFlightPairs seqs below seq remain
+// undecided, or stopCh closes (reported as false).
+func (w *dedupInFlightWindow) wait(seq uint64, stopCh <-chan struct{}) bool {
+	for seq-w.decided.Load() >= dedupMaxInFlightPairs {
+		select {
+		case <-stopCh:
+			return false
+		case <-w.wake:
+		}
+	}
+	return true
 }
 
 // dedupHunkEmission decides whether one hunk survives dedup, marking every
@@ -291,12 +606,49 @@ type dedupPairWork struct {
 	work blobPairWork
 }
 
+// dedupCandidate names one hunk of a pair that the decision stage must
+// still look at: a binary hunk (always emitted, never marked) or a text
+// hunk with at least one line the worker's snapshot probe did not find.
+// unresolved holds those fingerprints in line order, zero already
+// remapped; it is nil for binary hunks.
+type dedupCandidate struct {
+	hunk       int
+	unresolved []uint64
+}
+
 // dedupPairResult carries one pair's computed hunks back to the decision
 // stage. hunks may be empty; every dispatched seq produces exactly one
 // result on the happy path so the reorder cursor always advances.
+//
+// candidates is in hunk order. A text hunk absent from it had every line
+// present in the snapshot, so it is a duplicate at its position unless the
+// set is saturated when the pair is reached (see decideResult).
 type dedupPairResult struct {
-	seq   uint64
-	hunks []HunkAddition
+	seq        uint64
+	hunks      []HunkAddition
+	candidates []dedupCandidate
+}
+
+// prefilterHunk hashes h's lines and probes sn for each, returning the
+// fingerprints the snapshot did not contain, appended to buf.
+//
+// Soundness of treating a snapshot hit as a settled duplicate: the decision
+// goroutine processes pairs strictly in seq order and this hunk's pair has
+// not been handed to it yet, so every fingerprint in the snapshot was
+// inserted while processing an earlier seq — i.e. it is in the set at this
+// hunk's position in the total order. A miss is only a hint and is resolved
+// authoritatively by the decision stage.
+func prefilterHunk(h *HunkAddition, sn *fingerprintSnapshot, buf []uint64) []uint64 {
+	for _, line := range h.lines {
+		fp := lineFingerprint(line)
+		if fp == 0 {
+			fp = dedupZeroFingerprint
+		}
+		if !sn.contains(fp) {
+			buf = append(buf, fp)
+		}
+	}
+	return buf
 }
 
 // collectCommitPairs resolves c's first-parent tree and collects the
@@ -328,10 +680,13 @@ func (hs *HistoryScanner) collectCommitPairs(c commitInfo) ([]blobPairWork, erro
 //	                        seq-stamped pairs, then runs the shutdown chain
 //	tree workers            min(N, maxTreeDiffWorkers), consume treeIdxChan,
 //	                        fill slots, never block
-//	hunk workers            N, consume blobChan, produce resultChan
+//	hunk workers            N, consume blobChan, hash each line and probe
+//	                        the published fingerprint snapshot, produce
+//	                        resultChan with only the unresolved fingerprints
 //	decision goroutine      1, reorders by seq, owns the fingerprint set,
-//	                        produces yieldChan (closed on exit)
-//	yield workers           N, consume yieldChan, call fn concurrently
+//	                        settles verdicts from the unresolved fingerprints
+//	                        and produces batched yieldChan (closed on exit)
+//	yield workers           N, consume yieldChan batches, call fn concurrently
 //
 // On any error (setError closes stopCh) every stage unblocks via its stopCh
 // select and the shutdown chain — close(treeIdxChan), treeWG.Wait(),
@@ -377,11 +732,16 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	treeWorkers := min(numWorkers, maxTreeDiffWorkers)
 
 	treeIdxChan := make(chan int, dedupLookaheadCommits)
-	blobChan := make(chan dedupPairWork, dedupBlobChanCap)
-	resultChan := make(chan dedupPairResult, numWorkers)
-	yieldChan := make(chan HunkAddition, dedupYieldChanCap)
+	blobChan := make(chan []dedupPairWork, dedupBlobChanCap)
+	resultChan := make(chan []dedupPairResult, numWorkers)
+	yieldChan := make(chan []HunkAddition, dedupYieldChanCap)
 	stopCh := make(chan struct{})
 	slots := make([]dedupCommitSlot, dedupLookaheadCommits)
+
+	// The fingerprint set is owned by the decision goroutine; hunk workers
+	// only read its published snapshot.
+	set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
+	inFlight := newDedupInFlightWindow()
 
 	var (
 		stopOnce sync.Once
@@ -435,22 +795,45 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				select {
 				case <-stopCh:
 					return
-				case pw, ok := <-blobChan:
+				case works, ok := <-blobChan:
 					if !ok {
 						return
 					}
-					var hunks []HunkAddition
-					if err := hs.streamBlobPairHunks(pw.work, func(h HunkAddition) error {
-						hunks = append(hunks, h)
-						return nil
-					}); err != nil {
-						setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
-						return
+					results := make([]dedupPairResult, 0, len(works))
+					for _, pw := range works {
+						var hunks []HunkAddition
+						if err := hs.streamBlobPairHunks(pw.work, func(h HunkAddition) error {
+							hunks = append(hunks, h)
+							return nil
+						}); err != nil {
+							setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
+							return
+						}
+						// Hash and speculatively probe here, in parallel, so
+						// the decision goroutine only touches fingerprints the
+						// snapshot did not already hold. One buffer per pair
+						// keeps the unresolved lists as sub-slices of a single
+						// allocation.
+						var buf []uint64
+						var cands []dedupCandidate
+						for i := range hunks {
+							h := &hunks[i]
+							if h.isBinary {
+								cands = append(cands, dedupCandidate{hunk: i})
+								continue
+							}
+							start := len(buf)
+							buf = prefilterHunk(h, set.snapshot(), buf)
+							if len(buf) > start {
+								cands = append(cands, dedupCandidate{hunk: i, unresolved: buf[start:len(buf):len(buf)]})
+							}
+						}
+						results = append(results, dedupPairResult{seq: pw.seq, hunks: hunks, candidates: cands})
 					}
 					select {
 					case <-stopCh:
 						return
-					case resultChan <- dedupPairResult{seq: pw.seq, hunks: hunks}:
+					case resultChan <- results:
 					}
 				}
 			}
@@ -461,38 +844,101 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	go func() {
 		defer close(decisionDone)
 		defer close(yieldChan)
-		set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
-		// In-flight seqs are bounded by cap(blobChan) + numWorkers +
-		// cap(resultChan), so the reorder buffer stays small; it only
-		// grows toward that bound when pair completion times are skewed.
+		// In-flight seqs are bounded by (cap(blobChan) + numWorkers +
+		// cap(resultChan)) * dedupPairBatchSize, so the reorder buffer
+		// stays small; it only grows toward that bound when pair completion
+		// times are skewed.
 		pending := make(map[uint64]dedupPairResult, 64)
 		next := uint64(0)
+		batch := make([]HunkAddition, 0, dedupYieldBatchHunks)
+		// backlog holds seqs of pending results not yet pre-processed by
+		// prepBacklog; it is worked through only while next is missing and
+		// resultChan is empty, i.e. while this goroutine would otherwise
+		// idle behind a straggling pair.
+		var backlog []uint64
+		scratch := newBacklogScratch()
+		// flush hands the current batch to the yield pool and starts a
+		// fresh one. It reports false when the pipeline is stopping.
+		flush := func() bool {
+			if len(batch) == 0 {
+				return true
+			}
+			select {
+			case <-stopCh:
+				return false
+			case yieldChan <- batch:
+			}
+			batch = make([]HunkAddition, 0, dedupYieldBatchHunks)
+			return true
+		}
+		// drain settles every pair that is ready in seq order. It reports
+		// false when the pipeline is stopping.
+		drain := func() bool {
+			for {
+				r, ok := pending[next]
+				if !ok {
+					break
+				}
+				delete(pending, next)
+				next++
+				batch = set.decideResult(r, batch)
+				if len(batch) >= dedupYieldBatchHunks && !flush() {
+					return false
+				}
+				inFlight.advanced()
+			}
+			if len(pending) == 0 {
+				backlog = backlog[:0]
+				scratch.reset()
+			}
+			// Release what is ready rather than holding a partial batch
+			// until the next result arrives.
+			return flush()
+		}
+		accept := func(results []dedupPairResult) {
+			for _, res := range results {
+				pending[res.seq] = res
+				backlog = append(backlog, res.seq)
+			}
+		}
 		for {
+			// Prefer new results; they may carry next.
 			select {
 			case <-stopCh:
 				return
-			case res, ok := <-resultChan:
+			case results, ok := <-resultChan:
 				if !ok {
+					flush()
 					return
 				}
-				pending[res.seq] = res
-				for {
-					r, ok := pending[next]
-					if !ok {
-						break
-					}
-					delete(pending, next)
-					next++
-					for _, h := range r.hunks {
-						if !dedupHunkEmission(h, set) {
-							continue
-						}
-						select {
-						case <-stopCh:
-							return
-						case yieldChan <- h:
-						}
-					}
+				accept(results)
+				if !drain() {
+					return
+				}
+				continue
+			default:
+			}
+			// Nothing ready: pre-process one backlog entry so the drain
+			// after the straggler has little left to probe, then block.
+			if len(backlog) > 0 {
+				seq := backlog[len(backlog)-1]
+				backlog = backlog[:len(backlog)-1]
+				if r, ok := pending[seq]; ok {
+					set.prepBacklog(r, scratch)
+				}
+				continue
+			}
+			select {
+			case <-stopCh:
+				return
+			case results, ok := <-resultChan:
+				if !ok {
+					flush()
+					return
+				}
+				accept(results)
+				if !drain() {
+					return
 				}
 			}
 		}
@@ -506,13 +952,15 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				select {
 				case <-stopCh:
 					return
-				case h, ok := <-yieldChan:
+				case batch, ok := <-yieldChan:
 					if !ok {
 						return
 					}
-					if err := fn(h); err != nil {
-						setError(err)
-						return
+					for _, h := range batch {
+						if err := fn(h); err != nil {
+							setError(err)
+							return
+						}
 					}
 				}
 			}
@@ -543,6 +991,21 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	}
 
 	var seq uint64
+	batch := make([]dedupPairWork, 0, dedupPairBatchSize)
+	// flushBatch hands the accumulated pairs to the hunk workers. It
+	// reports false when the pipeline is stopping.
+	flushBatch := func() bool {
+		if len(batch) == 0 {
+			return true
+		}
+		select {
+		case <-stopCh:
+			return false
+		case blobChan <- batch:
+		}
+		batch = make([]dedupPairWork, 0, dedupPairBatchSize)
+		return true
+	}
 seqLoop:
 	for i := range order {
 		if !dispatch(i) {
@@ -550,23 +1013,43 @@ seqLoop:
 		}
 		slot := &slots[i%dedupLookaheadCommits]
 		select {
-		case <-stopCh:
-			break seqLoop
 		case <-slot.done:
+		default:
+			// The tree stage has not finished this commit: release the
+			// partial batch so hunk workers stay busy while we wait.
+			if !flushBatch() {
+				break seqLoop
+			}
+			select {
+			case <-stopCh:
+				break seqLoop
+			case <-slot.done:
+			}
 		}
 		if slot.err != nil {
 			// The tree worker already routed the error through setError.
 			break
 		}
 		for _, w := range slot.pairs {
-			select {
-			case <-stopCh:
+			if seq-inFlight.decided.Load() >= dedupMaxInFlightPairs {
+				// Window full: release what we hold so the decision stage
+				// can make progress, then park until it does.
+				if !flushBatch() || !inFlight.wait(seq, stopCh) {
+					break seqLoop
+				}
+			}
+			batch = append(batch, dedupPairWork{seq: seq, work: w})
+			seq++
+			// Once every commit has been dispatched to the tree stage the
+			// scan is in its final window; single-pair batches there spread
+			// the last pairs across workers instead of leaving one worker
+			// with a sixteen-pair tail.
+			if (len(batch) == dedupPairBatchSize || nextDispatch == len(order)) && !flushBatch() {
 				break seqLoop
-			case blobChan <- dedupPairWork{seq: seq, work: w}:
-				seq++
 			}
 		}
 	}
+	flushBatch()
 
 	// Shutdown chain: close each stage's input only after its upstream
 	// senders have exited, and wait for every goroutine so none outlives
