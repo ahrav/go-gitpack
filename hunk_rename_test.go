@@ -215,3 +215,17 @@ func TestRenameLinesSimilar(t *testing.T) {
 func TestBlobPairWorkSize(t *testing.T) {
 	assert.LessOrEqual(t, unsafe.Sizeof(blobPairWork{}), uintptr(80))
 }
+
+func TestInferDirectoryRenames_TiedCandidatesDeterministic(t *testing.T) {
+	evidence := []exactRenameEvidence{
+		{oldPath: "old-a/x.go", newPath: "merged/x.go"},
+		{oldPath: "old-a/y.go", newPath: "merged/y.go"},
+		{oldPath: "old-b/p.go", newPath: "merged/p.go"},
+		{oldPath: "old-b/q.go", newPath: "merged/q.go"},
+	}
+	first := inferDirectoryRenames(evidence)
+	require.Len(t, first, 2)
+	for run := range 64 {
+		require.Equalf(t, first, inferDirectoryRenames(evidence), "run %d", run)
+	}
+}

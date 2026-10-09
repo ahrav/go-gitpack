@@ -85,9 +85,8 @@ var dedupBenchHunkSizes = []int{1, 8, 64, 512}
 // and iteration N costs exactly what iteration 1 did. Regimes that insert
 // would either drift or force a fresh 256 KiB table per iteration.
 //
-// Read this against BenchmarkDedupMarkOnly at the same size: that is the
-// same work with the probe pass removed, i.e. the floor a single-pass
-// implementation could reach.
+// The verdict hashes and probes each line once (markNew), so this is also
+// the per-line floor of the decision: N hashes and N probes for N lines.
 func BenchmarkDedupHunkEmission(b *testing.B) {
 	for _, n := range dedupBenchHunkSizes {
 		for _, w := range dedupBenchWidths {
@@ -97,8 +96,8 @@ func BenchmarkDedupHunkEmission(b *testing.B) {
 				h := HunkAddition{lines: lines}
 
 				// Guard the regime: a true verdict here would mean some line was
-				// unseen, so the benchmark would be timing the early-break path
-				// under an "AllDup" label.
+				// unseen, so the benchmark would be timing an insert under an
+				// "AllDup" label.
 				if dedupHunkEmission(h, set) {
 					b.Fatalf("N=%d: hunk reported new in the all-duplicate regime", n)
 				}
@@ -111,83 +110,39 @@ func BenchmarkDedupHunkEmission(b *testing.B) {
 	}
 }
 
-// BenchmarkDedupMarkOnly measures just the marking pass — one hash and one
-// probe per line — over the same pre-seen lines as the AllDup case above.
-//
-// dedupHunkEmission hashes every line twice in that regime: once in the
-// probe loop (which cannot break early when no line is new) and again in the
-// marking loop. This benchmark is the N-hash floor; AllDup is the 2N
-// measurement. The ratio between them bounds what removing the second pass
-// could recover.
-func BenchmarkDedupMarkOnly(b *testing.B) {
-	for _, n := range dedupBenchHunkSizes {
-		for _, w := range dedupBenchWidths {
-			b.Run(fmt.Sprintf("N=%d/W=%d", n, w), func(b *testing.B) {
-				lines := dedupBenchLines("dup", n, w)
-				set := dedupBenchSet(b, lines)
-
-				for b.Loop() {
-					for _, line := range lines {
-						set.markNew(lineFingerprint(line))
-					}
-				}
-			})
-		}
-	}
-}
-
-// BenchmarkDedupHunkEmissionFirstNew measures the early-break regime, where
-// the hunk's first line is unseen so the probe loop exits after one hash and
-// the verdict costs N+1 hashes rather than 2N.
-//
-// The set is rebuilt per iteration because marking the new line would
-// otherwise turn iteration 2 into the all-duplicate case. Set construction
-// is therefore inside the timed region and this number is NOT comparable to
-// AllDup; it exists to confirm the early break happens at all, which is what
-// makes AllDup the worst case rather than the typical one.
-func BenchmarkDedupHunkEmissionFirstNew(b *testing.B) {
-	const n = 512
-	lines := dedupBenchLines("dup", n, 78)
-	// Everything except line 0 is already known.
-	seen := lines[1:]
-
-	for b.Loop() {
-		set := dedupBenchSet(b, seen)
-		if !dedupHunkEmission(HunkAddition{lines: lines}, set) {
-			b.Fatal("hunk reported duplicate although line 0 was unseen")
-		}
-	}
-}
-
-// dupChurn builds a repository whose every revision adds a NEW file holding a
-// shared boilerplate block plus one unique line.
+// dupChurn builds a repository whose every revision adds two NEW files: a
+// copy of a shared boilerplate block, and a one-line file unique to the
+// revision.
 //
 // That shape is what drives dedup: revision 0 introduces the block, and every
-// later revision re-adds the same block under a new path, so each of those
-// add-hunks is all-duplicate except for its single unique line. It is the
-// vendored-file / license-header / copied-config shape the feature targets,
-// and it is precisely what the checked-in fixtures lack — they add one
-// distinct line per commit and never repeat content.
+// later revision re-adds the same block under a new path as one pure-addition
+// hunk made entirely of seen lines, which whole-hunk dedup suppresses. The
+// unique file keeps every revision's own hunk emitted, so the two counters
+// the E2E benchmark reports separate suppressed from surviving work. It is
+// the vendored-file / license-header / copied-config shape the feature
+// targets, and it is precisely what the checked-in fixtures lack — they add
+// one distinct line per commit and never repeat content.
 //
 // blockLines controls the hunk size, lineWidth the per-line hashing cost (see
 // dedupBenchLines — farm.Hash64's cost steps at 64 bytes), and revisions how
-// many mostly-duplicate hunks the scan sees.
+// many duplicate hunks the scan sees.
 func (f *hunkBenchFixtures) dupChurn(tb testing.TB, blockLines, lineWidth, revisions int) string {
 	tb.Helper()
 	name := fmt.Sprintf("dup-%dlines-%dw-%drev", blockLines, lineWidth, revisions)
 	return f.repo(tb, name, func(tb testing.TB, work string) {
-		block := strings.Join(dedupBenchLines("shared", blockLines, lineWidth), "\n")
+		block := strings.Join(dedupBenchLines("shared", blockLines, lineWidth), "\n") + "\n"
 		for rev := range revisions {
-			file := fmt.Sprintf("vendored_%04d.txt", rev)
-			// The unique line is last, so the pre-fusion probe pass had to
-			// scan every duplicate line before finding it — the worst case
-			// for a probe-then-mark implementation.
-			body := block + "\n" + fmt.Sprintf("unique to rev %d", rev) + "\n"
-			path := filepath.Join(work, file)
-			if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-				tb.Fatalf("write %s: %v", path, err)
+			files := map[string]string{
+				fmt.Sprintf("vendored_%04d.txt", rev): block,
+				fmt.Sprintf("unique_%04d.txt", rev):   fmt.Sprintf("unique to rev %d\n", rev),
 			}
-			gitCommitTB(tb, work, file, rev)
+			for file, body := range files {
+				path := filepath.Join(work, file)
+				if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+					tb.Fatalf("write %s: %v", path, err)
+				}
+			}
+			gitCommitTB(tb, work, ".", rev)
 		}
 	})
 }
@@ -279,6 +234,16 @@ func BenchmarkDiffHistoryHunksDedup(b *testing.B) {
 				}
 				if got := lines.Load(); got != primedLines {
 					b.Fatalf("%s: line count drifted %d -> %d across iterations", name, primedLines, got)
+				}
+				// Guard the regime: dedup-off sees both hunks of every
+				// revision; dedup-on suppresses every block copy after the
+				// first, so the fixture measures the suppression path.
+				want := int64(2 * c.revisions)
+				if dedup {
+					want = int64(c.revisions + 1)
+				}
+				if primed != want {
+					b.Fatalf("%s: %d hunks reached fn, want %d", name, primed, want)
 				}
 				b.ReportMetric(float64(primed), "hunks")
 				b.ReportMetric(float64(primedLines), "lines")

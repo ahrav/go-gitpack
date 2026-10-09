@@ -12,10 +12,13 @@ package objstore
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha1"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -201,6 +204,141 @@ func TestReadLooseObjectLimitedRejectsDeclaredSizeBeforeBody(t *testing.T) {
 	st := &store{objectsDir: objectsDir}
 	_, _, err = st.readLooseObjectLimited(oid, 4)
 	require.ErrorContains(t, err, "exceeds 4 byte limit")
+}
+
+// A loose object whose decompressed stream puts the header's NUL terminator
+// far past the longest valid header ("<type> <size>\0") is rejected once
+// the header limit is reached, before the body limit applies.
+func TestReadLooseObjectLimitedBoundsHeader(t *testing.T) {
+	objectsDir := t.TempDir()
+	oid := Hash{0x56, 0x78}
+	path := looseObjectPath(objectsDir, oid)
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+
+	var compressed bytes.Buffer
+	zw := zlib.NewWriter(&compressed)
+	_, err := zw.Write([]byte("commit " + strings.Repeat("9", 1<<20) + "\x00hello"))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	require.NoError(t, os.WriteFile(path, compressed.Bytes(), 0o644))
+
+	st := &store{objectsDir: objectsDir}
+	_, _, err = st.readLooseObjectLimited(oid, 4)
+	require.ErrorContains(t, err, "header exceeds")
+}
+
+// corruptIdxCRCTable flips every byte of the pack index's CRC-32 table, so
+// any read that consults the index CRC fails verification.
+func corruptIdxCRCTable(t *testing.T, packDir string) {
+	t.Helper()
+	idxs, err := filepath.Glob(filepath.Join(packDir, "*.idx"))
+	require.NoError(t, err)
+	require.Len(t, idxs, 1)
+	data, err := os.ReadFile(idxs[0])
+	require.NoError(t, err)
+	const headerAndFanout = 8 + 256*4
+	objCount := int(binary.BigEndian.Uint32(data[headerAndFanout-4:]))
+	crcBase := headerAndFanout + objCount*20
+	for i := range objCount * 4 {
+		data[crcBase+i] ^= 0xFF
+	}
+	// Keep the index self-consistent: its trailing SHA-1 covers everything
+	// before it, and open rejects an index whose trailer mismatches.
+	sum := sha1.Sum(data[:len(data)-sha1.Size])
+	copy(data[len(data)-sha1.Size:], sum[:])
+	// git writes pack files read-only.
+	require.NoError(t, os.Chmod(idxs[0], 0o644))
+	require.NoError(t, os.WriteFile(idxs[0], data, 0o644))
+}
+
+// With SetVerifyCRC enabled every packed read is checked against the index
+// CRC, including the plain packed commit fast path of readCommitPayload.
+func TestReadCommitPayload_VerifiesCRCOnPlainPackedCommits(t *testing.T) {
+	repoDir, packDir := buildCommitShapesRepo(t)
+	shapes := classifyCommitShapes(t, repoDir, packDir)
+	require.NotEmpty(t, shapes.plain)
+	corruptIdxCRCTable(t, packDir)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+	st.VerifyCRC = true
+
+	oid := shapes.plain[0]
+	_, _, err = st.getMaterialized(oid)
+	require.ErrorContains(t, err, "crc mismatch", "the generic materializing read must reject the corrupt index")
+
+	_, err = st.readCommitPayload(oid)
+	require.ErrorContains(t, err, "crc mismatch", "the commit payload fast path must honor VerifyCRC")
+}
+
+// buildBigDeltaCommitRepo returns a repository whose second commit carries a
+// 1 MiB message nearly identical to the first commit's, so an aggressive
+// repack stores it as a delta against the first. It returns the pack dir
+// and the delta commit's OID, and skips when git stored the commit whole.
+func buildBigDeltaCommitRepo(t *testing.T) (packDir string, delta Hash, payload []byte) {
+	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+	repoDir := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := gitTestCommand(repoDir, args...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
+		)
+		out, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "git %s: %s", strings.Join(args, " "), out)
+		return strings.TrimSpace(string(out))
+	}
+	git("init", "-q")
+	git("config", "commit.gpgsign", "false")
+	body := strings.Repeat("the same very long commit message line\n", (1<<20)/40)
+	msgFile := filepath.Join(t.TempDir(), "msg")
+	for c := range 2 {
+		require.NoError(t, os.WriteFile(filepath.Join(repoDir, "f.txt"), []byte(fmt.Sprintf("content %d\n", c)), 0o644))
+		require.NoError(t, os.WriteFile(msgFile, []byte(fmt.Sprintf("commit %d\n%s", c, body)), 0o644))
+		git("add", "f.txt")
+		git("commit", "-q", "-F", msgFile)
+	}
+	git("repack", "-adf", "--window=250", "--depth=50")
+	packDir = filepath.Join(repoDir, ".git", "objects", "pack")
+	shapes := classifyCommitShapes(t, repoDir, packDir)
+	if len(shapes.delta) == 0 {
+		t.Skip("git stored both big commits whole; no delta commit to test")
+	}
+	delta = shapes.delta[0]
+	return packDir, delta, gitCatFile(t, repoDir, "commit", delta)
+}
+
+// A delta-chained commit larger than the payload cap is rejected from its
+// delta header. The rejected read inflates the chain's root base (a 1 MiB
+// commit here) and nothing for the over-cap target itself, so it allocates
+// well under two payloads; a read that reconstructs the target first
+// allocates at least the base plus the target.
+func TestReadCommitPayload_DeltaCommitCapPrecedesMaterialization(t *testing.T) {
+	packDir, oid, payload := buildBigDeltaCommitRepo(t)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	saved := maxCommitPayload
+	t.Cleanup(func() { maxCommitPayload = saved })
+	maxCommitPayload = len(payload) / 4
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err = st.readCommitPayload(oid)
+	runtime.ReadMemStats(&after)
+	require.ErrorContains(t, err, "exceeds")
+	allocated := after.TotalAlloc - before.TotalAlloc
+	t.Logf("commit payload %d bytes, cap %d, rejected read allocated %d bytes", len(payload), maxCommitPayload, allocated)
+	require.Lessf(t, allocated, uint64(len(payload))*3/2,
+		"rejecting an over-cap delta commit must not allocate its reconstructed payload")
 }
 
 // TestReadCommitPayload_NotACommit pins the error contract: asking for a

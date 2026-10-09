@@ -203,6 +203,10 @@ type AddedHunk struct {
 	// IsBinary indicates whether this hunk contains binary data.
 	// When true, Lines contains the raw binary content as a single string.
 	IsBinary bool
+
+	// tooLarge marks the placeholder tooLargeHunk emits for a blob over
+	// MaxDiffSize; its one line describes the skipped diff.
+	tooLarge bool
 }
 
 // EndLine returns the 1-based line number of the last line in this hunk.
@@ -408,12 +412,7 @@ func newSideHunks(store *store, oldOID, newOID Hash) (newBytes []byte, hunks []A
 
 	// Hard size limit — users would rather see a placeholder than wait.
 	if newSize > MaxDiffSize {
-		placeholder := AddedHunk{
-			StartLine: 1,
-			Lines:     []string{fmt.Sprintf("[File too large to diff: new=%d bytes]", newSize)},
-			IsBinary:  false,
-		}
-		return nil, []AddedHunk{placeholder}, true, nil
+		return nil, []AddedHunk{tooLargeHunk(fmt.Sprintf("[File too large to diff: new=%d bytes]", newSize))}, true, nil
 	}
 
 	if len(newBytes) > 0 && isBinary(newBytes) {
@@ -431,6 +430,12 @@ func newSideHunks(store *store, oldOID, newOID Hash) (newBytes []byte, hunks []A
 	return newBytes, nil, false, nil
 }
 
+// tooLargeHunk is the one-line text hunk that stands in for a diff of a
+// blob larger than MaxDiffSize.
+func tooLargeHunk(text string) AddedHunk {
+	return AddedHunk{StartLine: 1, Lines: []string{text}, tooLarge: true}
+}
+
 func pureAdditionHunks(newBytes []byte) []AddedHunk {
 	lines := tokenize(newBytes)
 	if len(lines) == 0 {
@@ -445,12 +450,7 @@ func pureAdditionHunks(newBytes []byte) []AddedHunk {
 func textAgainstOldHunks(oldBytes, newBytes []byte) []AddedHunk {
 	oldSize, newSize := int64(len(oldBytes)), int64(len(newBytes))
 	if oldSize > MaxDiffSize {
-		placeholder := AddedHunk{
-			StartLine: 1,
-			Lines:     []string{fmt.Sprintf("[File too large to diff: old=%d new=%d bytes]", oldSize, newSize)},
-			IsBinary:  false,
-		}
-		return []AddedHunk{placeholder}
+		return []AddedHunk{tooLargeHunk(fmt.Sprintf("[File too large to diff: old=%d new=%d bytes]", oldSize, newSize))}
 	}
 
 	if len(oldBytes) > 0 && isBinary(oldBytes) {

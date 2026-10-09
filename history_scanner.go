@@ -44,12 +44,14 @@
 package objstore
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -155,10 +157,12 @@ type HistoryScanner struct {
 	// traceFile holds the file handle for execution trace output.
 	traceFile *os.File
 
-	// commitsOnce caches commit enumeration for repeated history walks.
-	commitsOnce sync.Once
+	// commits caches commit enumeration for repeated history walks. The
+	// cache is valid while the repository's ref tips equal commitsTips: the
+	// set reachable from the same tips is fixed by content addressing.
+	commitsMu   sync.Mutex
 	commits     []commitInfo
-	commitsErr  error
+	commitsTips []Hash
 }
 
 // ScanError reports commits that failed to parse during a packfile scan.
@@ -242,7 +246,16 @@ type HunkAddition struct {
 
 	// isBinary indicates whether this hunk contains binary data.
 	isBinary bool
+
+	// tooLarge marks a "[File too large to diff]" placeholder (see
+	// AddedHunk.tooLarge).
+	tooLarge bool
 }
+
+// dedupExempt reports whether a hunk bypasses line dedup: binary hunks and
+// too-large placeholders carry no diffed lines, so they always survive and
+// never mark the fingerprint set.
+func (h *HunkAddition) dedupExempt() bool { return h.isBinary || h.tooLarge }
 
 // String returns a human‑readable representation.
 func (h *HunkAddition) String() string {
@@ -693,7 +706,15 @@ func inferDirectoryRenames(evidence []exactRenameEvidence) []directoryRenameCand
 		if candidates[i].count != candidates[j].count {
 			return candidates[i].count > candidates[j].count
 		}
-		return len(candidates[i].newDir) > len(candidates[j].newDir)
+		if len(candidates[i].newDir) != len(candidates[j].newDir) {
+			return len(candidates[i].newDir) > len(candidates[j].newDir)
+		}
+		// Name order settles ties so matchDirectoryRename picks the same
+		// source on every scan.
+		if candidates[i].newDir != candidates[j].newDir {
+			return candidates[i].newDir < candidates[j].newDir
+		}
+		return candidates[i].oldDir < candidates[j].oldDir
 	})
 	return candidates
 }
@@ -768,43 +789,39 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 		}
 	}
 
+	// Emit each hunk on its own; fusing a single hunk is a no-op
+	// (fuseHunks leaves slices shorter than 2 unchanged). Cross-hunk
+	// fusion, if ever wanted, must run over the whole per-file hunk
+	// slice instead.
 	for _, hunk := range hunks {
-		if hunk.IsBinary { // Don't fuse binary hunks
-			// Binary files are always sent as a single hunk.
-			// Convention: for binary hunks, startLine == endLine to signal
-			// that line-based range semantics do not apply. The value
-			// comes from hunk.StartLine and is repeated for endLine to
-			// communicate "this is a single indivisible blob" rather than
-			// a contiguous line range.
-			if err := fn(HunkAddition{
-				commit:    work.commit,
-				path:      filepath.ToSlash(work.path),
-				startLine: int(hunk.StartLine),
-				endLine:   int(hunk.StartLine),
-				lines:     hunk.Lines,
-				isBinary:  true,
-			}); err != nil {
-				return err
-			}
-			continue
-		}
-
-		// Emit each hunk on its own; fusing a single hunk is a no-op
-		// (fuseHunks leaves slices shorter than 2 unchanged). Cross-hunk
-		// fusion, if ever wanted, must run over the whole per-file hunk
-		// slice instead.
-		if err := fn(HunkAddition{
-			commit:    work.commit,
-			path:      filepath.ToSlash(work.path),
-			startLine: int(hunk.StartLine),
-			endLine:   int(hunk.EndLine()),
-			lines:     hunk.Lines,
-			isBinary:  false,
-		}); err != nil {
+		if err := fn(newHunkAddition(work, hunk)); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// newHunkAddition attributes one computed hunk to the commit and path of
+// the pair it came from.
+//
+// Convention: for binary hunks, startLine == endLine to signal that
+// line-based range semantics do not apply. The value comes from
+// hunk.StartLine and is repeated for endLine to communicate "this is a
+// single indivisible blob" rather than a contiguous line range.
+func newHunkAddition(work blobPairWork, hunk AddedHunk) HunkAddition {
+	endLine := int(hunk.EndLine())
+	if hunk.IsBinary {
+		endLine = int(hunk.StartLine)
+	}
+	return HunkAddition{
+		commit:    work.commit,
+		path:      filepath.ToSlash(work.path),
+		startLine: int(hunk.StartLine),
+		endLine:   endLine,
+		lines:     hunk.Lines,
+		isBinary:  hunk.IsBinary,
+		tooLarge:  hunk.tooLarge,
+	}
 }
 
 // get returns the fully materialized (i.e. delta-resolved, decompressed)
@@ -858,13 +875,13 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 }
 
 // loadAllCommits enumerates every reachable commit, caching the result for
-// the scanner's lifetime. The streaming hunk pipeline uses walkCommitsFromRefs
-// directly; this materialized form serves the dedup pipeline (which needs a
-// total order up front) and package tests.
+// as long as the repository's ref tips stay unchanged. The streaming hunk
+// pipeline uses walkCommitsFromRefs directly; this materialized form serves
+// the dedup pipeline (which needs a total order up front) and package tests.
 //
-// The method uses sync.Once to ensure the expensive commit enumeration is
-// performed at most once, even under concurrent calls. After the first
-// successful load, subsequent calls return a fresh copy of the cached slice.
+// Every call reads the ref tips. A scanner reused after new commits land
+// re-walks the history on its next call, so a dedup scan sees the same
+// commits a fresh walk would.
 //
 // Copy semantics: the returned []commitInfo is a shallow copy of the internal
 // cache. This prevents callers from mutating the scanner's cached state (e.g.
@@ -872,23 +889,30 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 // safe to share because their mutable parts (the ParentOIDs slice) are never
 // modified after construction.
 func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
-	hs.commitsOnce.Do(func() {
-		if hs.graphData != nil {
-			hs.commits = hs.loadFromGraph()
-			return
+	tips, err := collectRefTips(hs.gitDir)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(tips, func(a, b Hash) int { return bytes.Compare(a[:], b[:]) })
+
+	hs.commitsMu.Lock()
+	defer hs.commitsMu.Unlock()
+	switch {
+	case hs.commits != nil && slices.Equal(tips, hs.commitsTips):
+		// Cache hit.
+	case hs.graphData != nil && hs.commits == nil:
+		hs.commits = hs.loadFromGraph()
+		hs.commitsTips = tips
+	default:
+		commits, err := hs.loadFromRefs()
+		if err != nil {
+			return nil, err
 		}
-		hs.commits, hs.commitsErr = hs.loadFromRefs()
-		if hs.commitsErr != nil {
-			return
-		}
-		hs.graphData = buildCommitGraphFromCommits(hs.commits)
+		hs.commits, hs.commitsTips = commits, tips
+		hs.graphData = buildCommitGraphFromCommits(commits)
 		if hs.meta != nil {
 			hs.meta.attachGraph(hs.graphData)
 		}
-	})
-
-	if hs.commitsErr != nil {
-		return nil, hs.commitsErr
 	}
 
 	out := make([]commitInfo, len(hs.commits))

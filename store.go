@@ -463,6 +463,14 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 // The returned byte slice may alias internal cache buffers. Callers MUST NOT
 // modify the returned data.
 func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
+	return s.getMaterializedCapped(oid, s.maxDeltaObjectSize)
+}
+
+// getMaterializedCapped is getMaterialized with maxObjectSize bounding delta
+// reconstruction in place of the store-wide limit; zero disables the bound.
+// A delta whose header declares a larger target is rejected before its
+// output is allocated.
+func (s *store) getMaterializedCapped(oid Hash, maxObjectSize uint64) ([]byte, ObjectType, error) {
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
 		b.Release()
@@ -485,7 +493,7 @@ func (s *store) getMaterialized(oid Hash) ([]byte, ObjectType, error) {
 		off:           off,
 		oid:           oid,
 		ctx:           ctx,
-		maxObjectSize: s.maxDeltaObjectSize,
+		maxObjectSize: maxObjectSize,
 	}, false, true)
 }
 
@@ -838,8 +846,9 @@ func trimCommitHeader(full []byte) ([]byte, error) {
 // a single commit object. Real commit payloads are tiny (hundreds of bytes;
 // multi-KiB for merge shortlogs), so the cap only trips on corrupt or
 // adversarial packs claiming giant commits, and it is enforced before any
-// payload-sized allocation.
-const maxCommitPayload = 64 << 20 // 64 MiB
+// payload-sized allocation. It is a variable so tests can exercise the cap
+// with small fixtures.
+var maxCommitPayload = 64 << 20 // 64 MiB
 
 // readCommitPayload reads the full uncompressed payload of a commit object:
 // header lines and the message that follows them.
@@ -855,7 +864,7 @@ func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
 	if !ok {
 		// Loose fallback: readLooseObject inflates into a fresh buffer, so
 		// it can be returned without copying.
-		full, typ, err := s.readLooseObjectLimited(oid, maxCommitPayload)
+		full, typ, err := s.readLooseObjectLimited(oid, uint64(maxCommitPayload))
 		if err != nil {
 			return nil, err
 		}
@@ -888,9 +897,17 @@ func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
 	case ObjCommit:
 		// Plain packed commit: one exact-size allocation, one-shot inflate.
 		// The size comes from the pack header, so the cap check precedes
-		// the allocation.
-		if size > maxCommitPayload {
+		// the allocation. The index CRC check runs here because this path
+		// bypasses inflateFromPack, which performs it for other objects.
+		if size > uint64(maxCommitPayload) {
 			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", size, maxCommitPayload, oid)
+		}
+		if s.VerifyCRC {
+			if crc, ok := s.findCRCForObject(p, off, oid); ok {
+				if err := s.verifyCRCForPackObject(p, off, crc); err != nil {
+					return nil, err
+				}
+			}
 		}
 		payload := make([]byte, size)
 		if err := inflateExact(p, int64(off)+int64(hdrLen), payload); err != nil {
@@ -899,7 +916,17 @@ func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
 		return payload, nil
 
 	case ObjOfsDelta, ObjRefDelta:
-		full, resolvedType, err := s.getMaterialized(oid)
+		// The commit cap bounds reconstruction itself, so an oversized
+		// delta commit is rejected from its target-size header rather than
+		// after a materialization up to the store-wide delta limit.
+		limit := uint64(maxCommitPayload)
+		if s.maxDeltaObjectSize > 0 && s.maxDeltaObjectSize < limit {
+			limit = s.maxDeltaObjectSize
+		}
+		full, resolvedType, err := s.getMaterializedCapped(oid, limit)
+		if errors.Is(err, ErrDeltaTargetTooLarge) {
+			return nil, fmt.Errorf("commit payload exceeds %d cap for %x: %w", maxCommitPayload, oid, err)
+		}
 		if err != nil {
 			return nil, err
 		}

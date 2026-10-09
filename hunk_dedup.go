@@ -40,7 +40,9 @@
 //     dedupInFlightWindow once dedupMaxInFlightPairs seqs are undecided,
 //     so the reorder ring is bounded by construction however long one
 //     pair takes, and while delivered hunk bytes not yet seen by fn exceed
-//     dedupRetainedBytesCap. A parked sequencer still returns queued
+//     dedupRetainedBytesCap. The emit cursor applies both bounds again per
+//     pair, so a commit wider than the window stays bounded as the window
+//     slides through it. A parked sequencer still returns queued
 //     expensive work, which the decision stage may need to advance.
 //  4. Parallel hunk workers -> serial decision stage -> parallel yield:
 //     hunk workers compute each pair's hunks, run prefilterHunk against
@@ -265,6 +267,10 @@ type lineFingerprintSet struct {
 	// fully populated, and a reader still holding the previous slice sees
 	// a frozen, valid subset of the set.
 	published atomic.Pointer[fingerprintSnapshot]
+
+	// prefetchSink receives verdictUnresolved's touch-loop sum so the
+	// compiler preserves the loads.
+	prefetchSink uint64
 }
 
 // fingerprintSnapshot is a read-only view of a lineFingerprintSet's slots
@@ -423,7 +429,7 @@ func (s *lineFingerprintSet) verdictUnresolved(unresolved []uint64, lineCount in
 		for _, fp := range unresolved[:n] {
 			touched += s.slots[fp&s.mask]
 		}
-		prefetchSink = touched
+		s.prefetchSink = touched
 		for _, fp := range unresolved[:n] {
 			if s.markNew(fp) {
 				anyNew = true
@@ -434,15 +440,11 @@ func (s *lineFingerprintSet) verdictUnresolved(unresolved []uint64, lineCount in
 	return anyNew
 }
 
-// prefetchSink keeps verdictUnresolved's touch loop observable so the
-// compiler cannot drop the loads.
-var prefetchSink uint64
-
 // decideResult settles every hunk of one pair in order and appends the
 // survivors to out.
 //
-// Only candidates need a verdict: a binary hunk always survives, and a text
-// hunk with unresolved fingerprints is probed with verdictUnresolved. A
+// Only candidates need a verdict: an exempt hunk always survives, and a
+// text hunk with unresolved fingerprints is probed with verdictUnresolved. A
 // text hunk that is not a candidate had every line in the snapshot and is
 // therefore a duplicate while the set is unsaturated. Once the set
 // saturates (at entry or during a candidate's probe) the single-pass rule
@@ -456,7 +458,7 @@ func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition)
 			break
 		}
 		h := &hunks[c.hunk]
-		if h.isBinary || s.verdictUnresolved(c.unresolved, len(h.lines)) {
+		if h.dedupExempt() || s.verdictUnresolved(c.unresolved, len(h.lines)) {
 			out = append(out, *h)
 		}
 		i = c.hunk + 1
@@ -659,10 +661,11 @@ func (w *dedupInFlightWindow) park(ready func() bool, stopCh <-chan struct{}, wo
 // pipeline takes the split path so that hashing and most probing run on the
 // parallel workers.
 //
-// Duplicate lines inside one hunk cannot suppress each other or affect this
-// hunk's verdict: a block whose closing line repeats an earlier line of the
-// same hunk — armored key blocks sharing an END marker — still counts every
-// occurrence as new.
+// Duplicate lines inside one hunk leave its verdict unchanged: a block whose
+// closing line repeats an earlier line of the same hunk — armored key blocks
+// sharing an END marker — survives whenever its first occurrence was unseen.
+// The first occurrence inserts the fingerprint and reports new; later
+// occurrences report seen, and the verdict is already settled by then.
 //
 // That holds even though each line is marked as it is examined, which is what
 // lets one pass settle the verdict and so hashes each line once rather than
@@ -684,10 +687,10 @@ func (w *dedupInFlightWindow) park(ready func() bool, stopCh <-chan struct{}, wo
 // lines are all present inserts nothing and so cannot begin saturation.
 // Every case therefore agrees with a verdict taken against S alone.
 //
-// Binary hunks bypass dedup entirely: they always survive and never mark
-// the set.
+// Binary hunks and too-large placeholders (dedupExempt) bypass dedup
+// entirely: they always survive and never mark the set.
 func dedupHunkEmission(h HunkAddition, set *lineFingerprintSet) bool {
-	if h.isBinary {
+	if h.dedupExempt() {
 		return true
 	}
 
@@ -820,10 +823,10 @@ type dedupYieldBatch struct {
 }
 
 // dedupCandidate names one hunk of a pair that the decision stage must
-// still look at: a binary hunk (always emitted, never marked) or a text
-// hunk with at least one line the worker's snapshot probe did not find.
-// unresolved holds those fingerprints in line order, zero already
-// remapped; it is nil for binary hunks.
+// still look at: a dedup-exempt hunk (always emitted, never marked) or a
+// text hunk with at least one line the worker's snapshot probe did not
+// find. unresolved holds those fingerprints in line order, zero already
+// remapped; it is nil for exempt hunks.
 type dedupCandidate struct {
 	hunk       int
 	unresolved []uint64
@@ -878,6 +881,29 @@ func prefilterHunk(h *HunkAddition, sn *fingerprintSnapshot, buf []uint64) []uin
 	return buf
 }
 
+// pairCandidates runs the worker-side half of the split verdict over one
+// pair's hunks: it returns the hunks the decision stage must still look at
+// (see dedupCandidate), in hunk order, and the pair's hunkRetainedBytes
+// total. One buffer per pair keeps the unresolved lists as sub-slices of a
+// single allocation.
+func pairCandidates(hunks []HunkAddition, sn *fingerprintSnapshot) (cands []dedupCandidate, total int64) {
+	var buf []uint64
+	for i := range hunks {
+		h := &hunks[i]
+		total += hunkRetainedBytes(h)
+		if h.dedupExempt() {
+			cands = append(cands, dedupCandidate{hunk: i})
+			continue
+		}
+		start := len(buf)
+		buf = prefilterHunk(h, sn, buf)
+		if len(buf) > start {
+			cands = append(cands, dedupCandidate{hunk: i, unresolved: buf[start:len(buf):len(buf)]})
+		}
+	}
+	return cands, total
+}
+
 // collectCommitPairs resolves c's first-parent tree and collects the
 // commit's changed blob pairs in deterministic tree order. Errors come back
 // pre-wrapped with the same message formats the streaming pipeline uses, so
@@ -926,6 +952,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
 	}
 
+	// loadAllCommits re-walks refs when the ref tips moved, so a reused
+	// scanner sees commits added since its previous scan.
 	commits, err := hs.loadAllCommits()
 	if err != nil {
 		return err
@@ -1131,6 +1159,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// consume pairs are the ones that refill the tree stage. treeIdxChan's
 	// capacity equals lookahead, so the send never blocks.
 	dispatchDepth := int64(dedupDispatchDepth * treeWorkers)
+	tailPairs := int64(numWorkers * dedupPairBatchSize)
 	canDispatch := func(next int) bool {
 		if next >= len(order) || next-emitCommit >= lookahead {
 			return false
@@ -1181,6 +1210,18 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			return seq == decided
 		}
 		return seq+n <= decided+window
+	}
+	// Stamping applies the window and the retained-byte cap per commit;
+	// admissible applies them per pair, which matters inside a commit wider
+	// than the window, where the window slides pair by pair. While retained
+	// bytes exceed the cap, the seq the decision stage is waiting for still
+	// passes, so the decision stage keeps draining and releasing bytes.
+	admissible := func(s uint64) bool {
+		decided := inFlight.decided.Load()
+		if s >= decided+window {
+			return false
+		}
+		return s == decided || retainedKiB.Load() <= retainedKiBCap
 	}
 	// stampAhead assigns seqs to every further commit whose slot is done,
 	// without blocking, and forwards its expensive pairs while
@@ -1288,12 +1329,11 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					continue
 				}
 				s := slot.firstSeq + uint64(emitPair)
-				if s >= inFlight.decided.Load()+window {
-					// Only reachable inside a commit wider than the window.
+				if !admissible(s) {
 					if len(batch) > 0 {
 						return batch, true
 					}
-					works, outcome := inFlight.park(func() bool { return s < inFlight.decided.Load()+window }, stopCh, expensiveChan)
+					works, outcome := inFlight.park(func() bool { return admissible(s) }, stopCh, expensiveChan)
 					switch outcome {
 					case parkStopped:
 						return nil, false
@@ -1305,7 +1345,14 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					batch = make([]dedupPairWork, 0, dedupPairBatchSize)
 				}
 				batch = append(batch, dedupPairWork{seq: s, work: slot.pairs[emitPair]})
-				if len(batch) == dedupPairBatchSize || nextDispatch == len(order) {
+				// In the final stretch, single-pair batches spread the
+				// remaining work across workers. The stretch begins once every
+				// commit is dispatched and the pairs still ahead of the cursor
+				// fit in one batch per worker. The pendingPairs threshold
+				// preserves full-sized batches through the body of a scan whose
+				// repository is dispatched whole on the first pass.
+				if len(batch) == dedupPairBatchSize ||
+					(nextDispatch == len(order) && pendingPairs.Load() <= tailPairs) {
 					emitPair++
 					return batch, true
 				}
@@ -1368,25 +1415,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					}
 					// Hash and speculatively probe here, in parallel, so the
 					// decision goroutine only touches fingerprints the
-					// snapshot did not already hold. One buffer per pair
-					// keeps the unresolved lists as sub-slices of a single
-					// allocation.
-					var buf []uint64
-					var cands []dedupCandidate
-					var total int64
-					for i := range hunks {
-						h := &hunks[i]
-						total += hunkRetainedBytes(h)
-						if h.isBinary {
-							cands = append(cands, dedupCandidate{hunk: i})
-							continue
-						}
-						start := len(buf)
-						buf = prefilterHunk(h, set.snapshot(), buf)
-						if len(buf) > start {
-							cands = append(cands, dedupCandidate{hunk: i, unresolved: buf[start:len(buf):len(buf)]})
-						}
-					}
+					// snapshot did not already hold.
+					cands, total := pairCandidates(hunks, set.snapshot())
 					results = append(results, dedupPairResult{
 						seq: pw.seq, hunks: hunks, candidates: cands,
 						earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(total)),

@@ -4,10 +4,8 @@ package objstore
 // deduplicating hunk scan. The table grows on demand up to this budget and
 // then fails open, emitting rather than suppressing uncertain hunks.
 func WithHunkDedupBudget(bytes int) ScannerOption {
+	bytes = max(bytes, 0)
 	return func(hs *HistoryScanner) {
-		if bytes < 0 {
-			bytes = 0
-		}
 		hs.hunkDedupBudget = bytes
 	}
 }

@@ -47,6 +47,11 @@ func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
 	return s.readLooseObjectLimited(oid, 0)
 }
 
+// "<type> <size>\0" is at most 6 type bytes, a space, 20 decimal digits of a
+// uint64 size, and the NUL, so a stream with no NUL in its first 32 bytes is
+// malformed and is rejected before the body read.
+const maxLooseHeaderLen = 32
+
 // readLooseObjectLimited is readLooseObject with an optional decompressed
 // body limit. A positive limit is enforced from the declared header before
 // body allocation and again while inflating malformed streams.
@@ -74,16 +79,19 @@ func (s *store) readLooseObjectLimited(oid Hash, maxBodySize uint64) ([]byte, Ob
 	br := getBR(zr)
 	defer putBR(br)
 
-	hdr, err := br.ReadBytes(0)
-	if err != nil {
+	hdr, err := br.Peek(maxLooseHeaderLen)
+	nul := bytes.IndexByte(hdr, 0)
+	if nul < 0 {
+		if err != nil {
+			return nil, ObjBad, err
+		}
+		return nil, ObjBad, fmt.Errorf("loose object header exceeds %d bytes for %x", maxLooseHeaderLen, oid)
+	}
+	// hdr aliases the bufio buffer: parse it before reading the body.
+	hdr = hdr[:nul]
+	if _, err := br.Discard(nul + 1); err != nil {
 		return nil, ObjBad, err
 	}
-	if len(hdr) < 3 {
-		return nil, ObjBad, fmt.Errorf("invalid loose object header for %x", oid)
-	}
-	// Trim the trailing NUL byte that ReadBytes includes in its result.
-	// After this, hdr contains "<type> <size>" with no terminator.
-	hdr = hdr[:len(hdr)-1]
 
 	sp := bytes.IndexByte(hdr, ' ')
 	if sp <= 0 || sp+1 >= len(hdr) {

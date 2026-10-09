@@ -121,6 +121,36 @@ func TestLineFingerprintSet_GrowsWithinBudget(t *testing.T) {
 	require.False(t, set.markNew(1), "growth must preserve existing fingerprints")
 }
 
+// A budget below the minimum table size makes every markNew call report
+// the fingerprint as new.
+func TestLineFingerprintSet_ZeroBudgetFailsOpen(t *testing.T) {
+	for _, budget := range []int{0, 1, 8} {
+		set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, budget)
+		require.Truef(t, set.markNew(42), "budget %d: first mark", budget)
+		require.Truef(t, set.markNew(42), "budget %d: a set that cannot fit a table must fail open", budget)
+	}
+}
+
+// Run with -race to check concurrent option reuse for data races.
+func TestWithHunkDedupBudget_ReusableConcurrently(t *testing.T) {
+	opt := WithHunkDedupBudget(-1)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 100 {
+				hs := &HistoryScanner{}
+				opt(hs)
+				if hs.hunkDedupBudget != 0 {
+					t.Errorf("budget %d, want 0", hs.hunkDedupBudget)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // --- dedupHunkEmission ---
 
 // mkTestHunk builds a text HunkAddition with the package's endLine
@@ -244,6 +274,32 @@ func TestDedupHunkEmission_BinaryPassthrough(t *testing.T) {
 	for pass := range 2 {
 		require.Truef(t, dedupHunkEmission(bin, set),
 			"pass %d: binary hunk must never be suppressed", pass)
+	}
+}
+
+// Two oversized blobs of equal size yield byte-identical placeholder text
+// (see tooLargeHunk); the second file exceeds MaxDiffSize too, so its
+// placeholder survives like a binary hunk in both the single-pass verdict
+// and the pipeline's split verdict.
+func TestDedupHunkEmission_TooLargePlaceholderPassthrough(t *testing.T) {
+	text := fmt.Sprintf("[File too large to diff: new=%d bytes]", MaxDiffSize+1)
+	placeholder := func(pass int) HunkAddition {
+		work := blobPairWork{commit: Hash{0x01}, path: fmt.Sprintf("disk%d.img", pass)}
+		return newHunkAddition(work, tooLargeHunk(text))
+	}
+
+	single := newLineFingerprintSet(8)
+	for pass := range 2 {
+		require.Truef(t, dedupHunkEmission(placeholder(pass), single),
+			"pass %d: placeholder for an undiffed file must never be suppressed", pass)
+	}
+
+	split := newLineFingerprintSet(8)
+	for pass := range 2 {
+		hunks := []HunkAddition{placeholder(pass)}
+		cands, _ := pairCandidates(hunks, split.snapshot())
+		out := split.decideResult(dedupPairResult{seq: uint64(pass), hunks: hunks, candidates: cands}, nil)
+		require.Lenf(t, out, 1, "pass %d: the decision stage must pass the placeholder through", pass)
 	}
 }
 
@@ -741,6 +797,50 @@ func TestDiffHistoryHunksDedup_GOMAXPROCSInvariant(t *testing.T) {
 	require.Equal(t, single, multi, "dedup result depends on parallelism")
 }
 
+// Run with -race to detect shared-state races between concurrent scans.
+func TestDiffHistoryHunksDedup_ConcurrentScansIndependent(t *testing.T) {
+	gitDir := buildDedupOracleRepo(t)
+	want := collectHunkScan(t, gitDir, WithHunkLineDedup(true))
+
+	const scans = 4
+	results := make(chan []string, scans)
+	var wg sync.WaitGroup
+	for range scans {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			results <- collectHunkScan(t, gitDir, WithHunkLineDedup(true))
+		}()
+	}
+	wg.Wait()
+	close(results)
+	for got := range results {
+		require.Equal(t, want, got, "concurrent scan diverged")
+	}
+}
+
+func TestDiffHistoryHunksDedup_ReusedScannerSeesNewCommits(t *testing.T) {
+	b := newDedupRepoBuilder(t)
+	b.write("a.txt", "alpha\nbravo\n")
+	b.commit("root")
+	gitDir := b.finish()
+
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
+	require.NoError(t, err)
+	defer s.Close()
+	first := collectHunkScanWith(t, s)
+	require.Equal(t, collectHunkScan(t, gitDir), first, "nothing to suppress in a single commit")
+
+	b.write("b.txt", "charlie\nbravo\n")
+	b.commit("grow")
+
+	want := collectHunkScan(t, gitDir, WithHunkLineDedup(true))
+	require.Greater(t, len(want), len(first), "the new commit must add an emission")
+	require.Equal(t, want, collectHunkScanWith(t, s), "reused scanner must see the new commit")
+	require.Equal(t, collectHunkScan(t, gitDir), collectHunkScanWith(t, s),
+		"the new file's lines are unseen, so dedup and default scans agree")
+}
+
 // TestDiffHistoryHunks_DedupOffUnaffected asserts the dedup-off path is
 // untouched: a scanner with WithHunkLineDedup(false) matches one where the
 // option was never set, and dedup-on actually changes the fixture's output
@@ -967,10 +1067,10 @@ func TestDiffHistoryHunks_NilPathFilterNoChange(t *testing.T) {
 // --- stress and abandonment ---
 
 // buildDedupWhaleRepo creates a repository with one whale commit (a
-// several-thousand-line file) followed by more small commits than the
-// dedup pipeline's look-ahead window, so the reorder buffer, the bounded
-// dispatch window, and slot-ring reuse are all exercised under skewed
-// pair-completion times.
+// several-thousand-line file) followed by hundreds of small commits, so the
+// reorder buffer and the bounded dispatch window are exercised under skewed
+// pair-completion times. Slot-ring reuse needs a look-ahead smaller than
+// the commit count; see TestDiffHistoryHunksDedup_SlotRingReuse.
 func buildDedupWhaleRepo(t *testing.T) string {
 	b := newDedupRepoBuilder(t)
 
@@ -988,13 +1088,26 @@ func buildDedupWhaleRepo(t *testing.T) string {
 
 	var small strings.Builder
 	small.WriteString("seed\n")
-	for i := range 320 { // > dedupLookaheadCommits: forces slot-ring reuse
+	for i := range 320 {
 		fmt.Fprintf(&small, "small line %d\n", i)
 		b.write("small.txt", small.String())
 		b.commit(fmt.Sprintf("small %d", i))
 	}
 
 	return b.finish()
+}
+
+// A look-ahead far below the commit count makes every commit slot cycle
+// through the ring many times, covering the done re-arm, the early-list
+// reset, and the pair-list clearing on reuse.
+func TestDiffHistoryHunksDedup_SlotRingReuse(t *testing.T) {
+	gitDir := buildDedupWhaleRepo(t)
+	want := serialDedupReference(t, gitDir, false, nil)
+	got := scanDedupWithLimits(t, gitDir, time.Minute, func(l *dedupLimits) {
+		l.lookaheadCommits = 4
+		l.inFlightPairs = 8
+	}, nil)
+	require.Equal(t, want, got)
 }
 
 // TestDiffHistoryHunksDedup_WhaleStress runs the dedup scan over the whale
