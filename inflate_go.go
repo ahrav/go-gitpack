@@ -214,7 +214,8 @@ func inflatePackZlibGo(src, dst []byte) (int, error) {
 	d := goInflaterPool.Get().(*goInflater)
 	var consumed, produced int
 	var err error
-	if len(dst) <= smallDecodeLimit {
+	// src[2]&6 is the BTYPE field of the first DEFLATE block header.
+	if len(dst) <= smallDecodeLimit && len(src) > 2 && src[2]&6 != 0 {
 		scratch := d.small[:len(dst)+deflateFastOutputMargin]
 		consumed, produced, err = d.inflateRawN(src[2:], scratch, len(dst))
 		if err == nil {

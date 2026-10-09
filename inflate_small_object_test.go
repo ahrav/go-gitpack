@@ -61,11 +61,21 @@ func TestInflateSmallObjectRoundTrip(t *testing.T) {
 // truncation-class failure. Every case also satisfies the differential
 // oracle against compress/flate.
 func TestInflateSmallObjectDeclaredSizeMismatch(t *testing.T) {
-	payload := makeBenchmarkText(600)
-	encoded := encodeZlib(t, payload, 6)
+	members := map[string][]byte{
+		"huffman": encodeZlib(t, makeBenchmarkText(600), 6),
+		"stored":  encodeZlib(t, makeDeterministicBytes(600), 0),
+	}
+	for name, encoded := range members {
+		t.Run(name, func(t *testing.T) {
+			assertDeclaredSizeMismatchClasses(t, encoded, 600)
+		})
+	}
+}
 
+func assertDeclaredSizeMismatchClasses(t *testing.T, encoded []byte, size int) {
+	t.Helper()
 	for _, excess := range []int{1, 2, 50, deflateFastOutputMargin - 1, deflateFastOutputMargin, deflateFastOutputMargin + 1, 599} {
-		declared := len(payload) - excess
+		declared := size - excess
 		_, consumed, err := guardedGoInflate(t, encoded, declared)
 		if !errors.Is(err, errZlibStreamOverrun) {
 			t.Fatalf("declared %d (excess %d): got %v, want the stream-overrun class", declared, excess, err)
@@ -77,7 +87,7 @@ func TestInflateSmallObjectDeclaredSizeMismatch(t *testing.T) {
 	}
 
 	for _, short := range []int{1, 2, 100, deflateFastOutputMargin, 1000} {
-		declared := len(payload) + short
+		declared := size + short
 		_, _, err := guardedGoInflate(t, encoded, declared)
 		if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {
 			t.Fatalf("declared %d (short %d): got %v, want unexpected-EOF identity", declared, short, err)
