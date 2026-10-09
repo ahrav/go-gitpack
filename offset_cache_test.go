@@ -3,7 +3,10 @@ package objstore
 import (
 	"os"
 	"path/filepath"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/mmap"
@@ -68,11 +71,11 @@ func TestOffsetCacheAddStaysWithinBudget(t *testing.T) {
 	}
 }
 
-// TestWhaleCandidatesAndPrefetch builds a repository with one blob whose
-// compressed size exceeds whaleMinCompressedBytes and checks that the scan
-// prefetch selects it, that store.get serves the prefetched bytes, and that a
-// stopped prefetch leaves the normal path intact.
-func TestWhaleCandidatesAndPrefetch(t *testing.T) {
+// openWhaleStore opens a store over a one-commit repository holding one blob
+// whose compressed entry exceeds whaleMinCompressedBytes and one small text
+// file, and returns the store with the large blob's content.
+func openWhaleStore(t *testing.T) (*store, []byte) {
+	t.Helper()
 	requireGit(t)
 	repo := t.TempDir()
 	runGit(t, repo, "init", "--quiet")
@@ -95,7 +98,101 @@ func TestWhaleCandidatesAndPrefetch(t *testing.T) {
 
 	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
 	require.NoError(t, err)
-	defer s.Close()
+	t.Cleanup(func() { s.Close() })
+	return s, big
+}
+
+// TestWhalePrefetchSkippedWhenOffsetCacheDisabled pins that a disabled offset
+// cache also disables the prefetch: store.get reads prefetched whales only on
+// its offset-cache path, so with the cache off a prefetch would retain up to
+// whalePrefetchBudget bytes that no read consumes.
+func TestWhalePrefetchSkippedWhenOffsetCacheDisabled(t *testing.T) {
+	s, big := openWhaleStore(t)
+	s.offCache.setBudget(0)
+	require.NotEmpty(t, s.whaleCandidates())
+
+	wait := s.prefetchWhales(make(chan struct{}))
+	defer wait()
+	require.Nil(t, s.whales.Load(), "a disabled offset cache must not start a prefetch")
+
+	got, typ, err := s.get(calculateHash(ObjBlob, big))
+	require.NoError(t, err)
+	require.Equal(t, ObjBlob, typ)
+	require.Equal(t, big, got)
+}
+
+// TestWhaleGetInflatesUnstartedEntry pins that a reader waits only for an
+// inflation already in progress. The prefetch inflates one entry at a time,
+// so a reader that waited on every unstarted entry would queue behind all
+// larger whales and serialize work the scan workers would otherwise do in
+// parallel.
+func TestWhaleGetInflatesUnstartedEntry(t *testing.T) {
+	t.Parallel()
+	packA, packB := &mmap.ReaderAt{}, &mmap.ReaderAt{}
+	keyA, keyB := offCacheKey{packA, 12}, offCacheKey{packB, 12}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	releaseA := sync.OnceFunc(func() { close(release) })
+	var loadsB atomic.Int32
+	c := &whaleCache{
+		m: map[offCacheKey]*whaleEntry{
+			keyA: {done: make(chan struct{})},
+			keyB: {done: make(chan struct{})},
+		},
+		order: []offCacheKey{keyA, keyB},
+		load: func(pack *mmap.ReaderAt, _ uint64) ([]byte, error) {
+			if pack == packA {
+				close(entered)
+				<-release
+				return []byte("a"), nil
+			}
+			loadsB.Add(1)
+			return []byte("b"), nil
+		},
+	}
+	stop := make(chan struct{})
+	ran := make(chan struct{})
+	go func() {
+		defer close(ran)
+		c.run(stop)
+	}()
+	defer func() {
+		releaseA()
+		<-ran
+	}()
+	<-entered
+
+	got := make(chan []byte, 1)
+	go func() {
+		data, _, ok := c.get(packB, 12, nil)
+		if !ok {
+			data = nil
+		}
+		got <- data
+	}()
+	select {
+	case data := <-got:
+		require.Equal(t, []byte("b"), data)
+	case <-time.After(5 * time.Second):
+		t.Fatal("get on an unstarted whale waited behind the prefetch of a larger one")
+	}
+
+	// The prefetch skips the entry the reader already inflated.
+	releaseA()
+	<-ran
+	require.Equal(t, int32(1), loadsB.Load(), "each whale inflates exactly once")
+	data, _, ok := c.get(packA, 12, nil)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), data)
+}
+
+// TestWhaleCandidatesAndPrefetch builds a repository with one blob whose
+// compressed size exceeds whaleMinCompressedBytes and checks that the scan
+// prefetch selects it, that store.get serves the prefetched bytes, and that a
+// stopped prefetch leaves the normal path intact.
+func TestWhaleCandidatesAndPrefetch(t *testing.T) {
+	s, big := openWhaleStore(t)
 
 	cands := s.whaleCandidates()
 	require.Len(t, cands, 1, "exactly one entry exceeds the compressed threshold")

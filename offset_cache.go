@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"golang.org/x/exp/mmap"
 )
@@ -368,43 +369,81 @@ type whaleCandidate struct {
 	compressed uint64
 }
 
-// whaleEntry is one prefetched object. done closes once data and typ are
-// final; a reader that arrives first waits on it rather than inflating the
-// same object a second time.
+// whaleEntry is one prefetched object. Whoever sets claimed first, the
+// prefetch goroutine or a reader, inflates the entry; done closes once data,
+// typ, and err are final. A reader therefore waits only on an inflation that
+// is already running and inflates an unstarted entry itself instead of
+// queueing behind the larger whales the prefetch handles first.
 type whaleEntry struct {
-	done chan struct{}
-	data []byte
-	typ  ObjectType
-	err  error
+	claimed atomic.Bool
+	done    chan struct{}
+	data    []byte
+	typ     ObjectType
+	err     error
 }
 
-// whaleCache holds prefetched whale objects for the duration of one scan.
+// whaleCache holds prefetched whale objects for the duration of one scan. m
+// is complete before the cache is published through store.whales and is
+// read-only afterwards, so lookups take no lock.
 type whaleCache struct {
-	mu sync.Mutex
-	m  map[offCacheKey]*whaleEntry
+	m map[offCacheKey]*whaleEntry
+	// order lists m's keys in prefetch order, largest first.
+	order []offCacheKey
+	// load materializes one whale.
+	load func(pack *mmap.ReaderAt, off uint64) ([]byte, error)
 }
 
-// get returns the prefetched object at (pack, off), waiting for an inflation
-// in progress. stop aborts the wait.
+// get returns the prefetched object at (pack, off). It inflates an entry no
+// one has claimed and waits for one in progress; stop aborts the wait.
 func (c *whaleCache) get(pack *mmap.ReaderAt, off uint64, stop <-chan struct{}) ([]byte, ObjectType, bool) {
 	if c == nil {
 		return nil, ObjBad, false
 	}
-	c.mu.Lock()
-	e := c.m[offCacheKey{pack, off}]
-	c.mu.Unlock()
+	key := offCacheKey{pack, off}
+	e := c.m[key]
 	if e == nil {
 		return nil, ObjBad, false
 	}
-	select {
-	case <-e.done:
-	case <-stop:
-		return nil, ObjBad, false
+	if e.claimed.CompareAndSwap(false, true) {
+		c.fill(key, e)
+	} else {
+		select {
+		case <-e.done:
+		case <-stop:
+			return nil, ObjBad, false
+		}
 	}
 	if e.err != nil {
 		return nil, ObjBad, false
 	}
 	return e.data, e.typ, true
+}
+
+// run inflates, in prefetch order, every entry no reader has claimed. Once
+// stop closes, the remaining unclaimed entries are marked failed so their
+// readers fall back to the normal miss path.
+func (c *whaleCache) run(stop <-chan struct{}) {
+	for _, key := range c.order {
+		e := c.m[key]
+		if !e.claimed.CompareAndSwap(false, true) {
+			continue
+		}
+		select {
+		case <-stop:
+			e.err = errScanAborted
+			close(e.done)
+			continue
+		default:
+		}
+		c.fill(key, e)
+	}
+}
+
+// fill inflates e and publishes the result; the caller holds e's claim.
+func (c *whaleCache) fill(key offCacheKey, e *whaleEntry) {
+	e.data, e.err = c.load(key.pack, key.off)
+	e.typ = ObjBlob
+	close(e.done)
 }
 
 // whaleCandidates lists the pack entries whose compressed size is at least
@@ -444,15 +483,28 @@ func (s *store) whaleCandidates() []whaleCandidate {
 // prefetchWhales inflates the pack's whale blobs in the background, largest
 // first, until the budget is spent or stop closes. The returned wait function
 // blocks until the prefetch goroutine has exited; callers invoke it before
-// releasing the cache so no inflation outlives the scan.
+// releasing the cache, keeping inflation within the scan's lifetime.
+// store.get reads the whale cache after an offset-cache miss, so a store
+// whose offset cache is disabled skips the prefetch.
 func (s *store) prefetchWhales(stop <-chan struct{}) (wait func()) {
+	if !s.offCache.enabled() {
+		return func() {}
+	}
 	cands := s.whaleCandidates()
 	if len(cands) == 0 {
 		return func() {}
 	}
-	c := &whaleCache{m: make(map[offCacheKey]*whaleEntry, len(cands))}
+	c := &whaleCache{
+		m: make(map[offCacheKey]*whaleEntry, len(cands)),
+		load: func(pack *mmap.ReaderAt, off uint64) ([]byte, error) {
+			_, data, err := readRawObject(pack, off)
+			if err == nil {
+				err = s.verifyPackObjectCRCIfEnabled(pack, off, Hash{})
+			}
+			return data, err
+		},
+	}
 	var budget uint64 = whalePrefetchBudget
-	var selected []whaleCandidate
 	for _, cand := range cands {
 		typ, hdrLen, err := peekObjectType(cand.pack, cand.off)
 		if err != nil || typ != ObjBlob || hdrLen <= 0 {
@@ -465,10 +517,11 @@ func (s *store) prefetchWhales(stop <-chan struct{}) (wait func()) {
 			continue
 		}
 		budget -= size
-		c.m[offCacheKey{cand.pack, cand.off}] = &whaleEntry{done: make(chan struct{})}
-		selected = append(selected, cand)
+		key := offCacheKey{cand.pack, cand.off}
+		c.m[key] = &whaleEntry{done: make(chan struct{})}
+		c.order = append(c.order, key)
 	}
-	if len(selected) == 0 {
+	if len(c.order) == 0 {
 		return func() {}
 	}
 	s.whales.Store(c)
@@ -476,22 +529,7 @@ func (s *store) prefetchWhales(stop <-chan struct{}) (wait func()) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for _, cand := range selected {
-			e := c.m[offCacheKey{cand.pack, cand.off}]
-			select {
-			case <-stop:
-				e.err = errScanAborted
-				close(e.done)
-				continue
-			default:
-			}
-			_, data, err := readRawObject(cand.pack, cand.off)
-			if err == nil {
-				err = s.verifyPackObjectCRCIfEnabled(cand.pack, cand.off, Hash{})
-			}
-			e.data, e.typ, e.err = data, ObjBlob, err
-			close(e.done)
-		}
+		c.run(stop)
 	}()
 	return func() {
 		<-done

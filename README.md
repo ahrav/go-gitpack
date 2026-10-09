@@ -56,7 +56,11 @@ if err := scanner.Scan(nil, &myScanner{}); err != nil {
 - **Large-blob prefetch** — a hunk scan inflates pack entries above 2 MiB
   compressed at scan start, biggest first, within a 256 MiB budget, so the
   slowest single inflations overlap the rest of the walk instead of forming
-  its tail. The prefetched bytes are released when the scan ends.
+  its tail. A worker that needs one of these blobs before the prefetch
+  reaches it inflates the blob itself. The prefetched bytes are released
+  when the scan ends, and a scanner with the offset cache disabled
+  (`WithOffsetCacheBudget(0)` or `GOGITPACK_OFFSET_CACHE_BUDGET<=0`) skips
+  the prefetch.
 
 ## Environment variables
 
