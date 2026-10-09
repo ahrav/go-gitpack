@@ -40,6 +40,13 @@ func gitTestCommand(repoDir string, args ...string) *exec.Cmd {
 	return exec.Command("git", append(gitArgs, args...)...)
 }
 
+func gitCatFile(t *testing.T, repoDir, typ string, oid Hash) []byte {
+	t.Helper()
+	out, err := gitTestCommand(repoDir, "cat-file", typ, oid.String()).Output()
+	require.NoErrorf(t, err, "git cat-file %s %s", typ, oid)
+	return out
+}
+
 // createTempFileWithData creates a temporary file with the given data.
 func createTempFileWithData(t *testing.T, data []byte) string {
 	tempFile, err := os.CreateTemp("", "test-idx-*.idx")
