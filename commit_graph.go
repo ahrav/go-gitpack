@@ -136,8 +136,8 @@ func (g *commitGraphData) parentsOf(idx int) []Hash {
 // This constructor exists so that both the commit-graph file reader and the
 // fallback ref-walker produce the same data structure, allowing the rest of
 // the codebase to be agnostic to the source. The resulting commitGraphData
-// owns all of its slices (no aliasing with the input) and is safe for
-// concurrent reads.
+// shares the input's ParentOIDs slices, which are immutable after
+// construction, and is safe for concurrent reads.
 func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 	n := len(commits)
 	parents := make(Parents, n)
@@ -146,25 +146,32 @@ func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 	times := make([]int64, n)
 	oidToIdx := make(map[Hash]int, n)
 
+	totalParents := 0
 	for i, c := range commits {
 		ordered[i] = c.OID
 		trees[i] = c.TreeOID
 		times[i] = c.Timestamp
+		// commitInfo.ParentOIDs is immutable after construction, so the
+		// graph shares the slice.
 		if len(c.ParentOIDs) > 0 {
-			parents[c.OID] = append([]Hash(nil), c.ParentOIDs...)
+			parents[c.OID] = c.ParentOIDs
 		} else {
 			parents[c.OID] = nil
 		}
 		oidToIdx[c.OID] = i
+		totalParents += len(c.ParentOIDs)
 	}
 
-	// Build flat parent indices.
+	// Build flat parent indices; every commit's list is a window of one
+	// shared backing array.
 	parentIndices := make([][]int32, n)
+	backing := make([]int32, totalParents)
 	for i, c := range commits {
 		if len(c.ParentOIDs) == 0 {
 			continue
 		}
-		idxs := make([]int32, len(c.ParentOIDs))
+		idxs := backing[:len(c.ParentOIDs):len(c.ParentOIDs)]
+		backing = backing[len(c.ParentOIDs):]
 		for j, p := range c.ParentOIDs {
 			if pi, ok := oidToIdx[p]; ok {
 				idxs[j] = int32(pi)

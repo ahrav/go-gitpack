@@ -866,7 +866,8 @@ func applyDeltaStreaming(
 	return out, nil
 }
 
-// deltaScratch is a pooled buffer for one-shot delta payload inflation.
+// deltaScratch is a pooled buffer for one-shot inflation of delta payloads
+// and whole small objects such as commits.
 type deltaScratch struct{ buf []byte }
 
 var deltaScratchPool = sync.Pool{

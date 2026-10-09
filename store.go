@@ -748,11 +748,29 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 		return nil, err
 	}
 	if typ == ObjCommit {
+		data := mmapData(p)
+		if off >= uint64(len(data)) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		_, size, _ := parseObjectHeaderUnsafe(data[off:min(off+32, uint64(len(data)))])
 		off += uint64(hdrLen)
 
-		// Decompress only the beginning of the object, typically less than 512 bytes.
+		// Commit objects are small (hundreds of bytes; tens of KiB for
+		// merge shortlogs), and the pack header states the inflated size,
+		// so the whole object is inflated in one shot into pooled scratch
+		// by the fast inflater and the header is copied out of it.
+		if size <= maxOneShotCommitSize {
+			scratch := getDeltaScratch(int(size))
+			defer putDeltaScratch(scratch)
+			if err := inflateExact(p, int64(off), scratch.buf[:size]); err != nil {
+				return nil, err
+			}
+			return trimCommitHeader(scratch.buf[:size])
+		}
+
+		// Decompress only the beginning of the object.
 		defer runtime.KeepAlive(p)
-		zr, br, err := getZlibReaderAt(mmapData(p), int64(off))
+		zr, br, err := getZlibReaderAt(data, int64(off))
 		if err != nil {
 			return nil, err
 		}
@@ -775,6 +793,11 @@ func (s *store) readCommitHeader(oid Hash) ([]byte, error) {
 	}
 	return trimCommitHeader(full)
 }
+
+// maxOneShotCommitSize bounds the inflated commit size readCommitHeader
+// decodes whole into pooled scratch; larger commits stream and stop at the
+// committer line.
+const maxOneShotCommitSize = 256 << 10
 
 // readCommitHeaderFromStream incrementally reads lines from a zlib stream
 // until it encounters the "committer" line, then returns all bytes read up

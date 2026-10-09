@@ -23,7 +23,7 @@
 // construction because no stage ever blocks waiting on something
 // downstream of itself:
 //
-//  1. Ordered commit source: orderCommitsParentFirst(loadAllCommits()),
+//  1. Ordered commit source: loadAllCommits() in parent-first order,
 //     dispatched to the tree stage up to dedupLookaheadCommits ahead of
 //     the emit cursor while the pairs held ahead of it fit under
 //     dedupPendingPairsCap.
@@ -982,12 +982,10 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		hs.treeOIDs.Store(c.OID, c.TreeOID)
 	}
 
-	// loadAllCommits already returns parent-first order on the ref-walk
-	// path, but the commit-graph path materializes rows in on-disk
-	// (OID-lexicographic) order, so the dedup pipeline imposes the order
-	// itself. orderCommitsParentFirst is idempotent and cheap relative to
-	// the scan.
-	order := orderCommitsParentFirst(commits)
+	// loadAllCommits returns a fresh copy in parent-first order on both the
+	// ref-walk and commit-graph paths (each runs orderCommitsParentFirst),
+	// so the dedup pipeline consumes that order directly.
+	order := commits
 	if hs.skipMergeDiffs {
 		filtered := order[:0]
 		for _, c := range order {
