@@ -12,8 +12,6 @@ package objstore
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha1"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"os/exec"
@@ -177,7 +175,11 @@ func TestReadCommitPayload_DifferentialAgainstGit(t *testing.T) {
 			require.Equalf(t, want, got, "payload mismatch for %s (%s)", oid, shape)
 
 			// Second read: cache-warm delta paths must still return a
-			// private, uncorrupted copy.
+			// private, uncorrupted copy. Scribbling over the first result
+			// makes a shared buffer visible in the second.
+			for i := range got {
+				got[i] = ^got[i]
+			}
 			again, err := st.readCommitPayload(oid)
 			require.NoError(t, err)
 			require.Equalf(t, want, again, "warm payload mismatch for %s (%s)", oid, shape)
@@ -188,28 +190,312 @@ func TestReadCommitPayload_DifferentialAgainstGit(t *testing.T) {
 	check("loose", shapes.loose)
 }
 
-func TestReadLooseObjectLimitedRejectsDeclaredSizeBeforeBody(t *testing.T) {
-	objectsDir := t.TempDir()
-	oid := Hash{0x12, 0x34}
+// TestReadCommitPayload_NotACommit pins the error contract: asking for a
+// non-commit object (a blob) fails with ErrObjectNotCommit rather than
+// returning payload bytes, on both the loose and the packed branch.
+func TestReadCommitPayload_NotACommit(t *testing.T) {
+	t.Run("loose", func(t *testing.T) {
+		objectsDir := t.TempDir()
+		blobOID := writeLooseObject(t, objectsDir, "blob", []byte("not a commit"))
+
+		st := &store{objectsDir: objectsDir}
+		_, err := st.readCommitPayload(blobOID)
+		require.ErrorIs(t, err, ErrObjectNotCommit)
+	})
+
+	t.Run("packed", func(t *testing.T) {
+		repoDir, packDir := buildCommitShapesRepo(t)
+		out, err := gitTestCommand(repoDir, "rev-parse", "HEAD~1:f.txt").Output()
+		require.NoError(t, err)
+		blobOID, err := ParseHash(strings.TrimSpace(string(out)))
+		require.NoError(t, err)
+
+		st, err := OpenForTesting(packDir)
+		require.NoError(t, err)
+		defer st.Close()
+		_, _, inPack := st.findPackedObject(blobOID)
+		require.True(t, inPack, "fixture blob must be packed")
+
+		_, err = st.readCommitPayload(blobOID)
+		require.ErrorIs(t, err, ErrObjectNotCommit)
+	})
+}
+
+// writeLooseObject stores body as a loose object of the given type under
+// objectsDir and returns its OID.
+func writeLooseObject(t *testing.T, objectsDir, typ string, body []byte) Hash {
+	t.Helper()
+	return writeLooseObjectDeclaring(t, objectsDir, typ, body, len(body))
+}
+
+// writeLooseObjectDeclaring is writeLooseObject with an explicit header size,
+// so tests can produce objects whose declared size disagrees with the body.
+func writeLooseObjectDeclaring(t *testing.T, objectsDir, typ string, body []byte, declared int) Hash {
+	t.Helper()
+	objType, ok := parseLooseObjectType(typ)
+	require.True(t, ok)
+	oid := calculateHash(objType, body)
 	path := looseObjectPath(objectsDir, oid)
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 
 	var compressed bytes.Buffer
 	zw := zlib.NewWriter(&compressed)
-	_, err := zw.Write([]byte("commit 5\x00hello"))
+	_, err := fmt.Fprintf(zw, "%s %d\x00", typ, declared)
+	require.NoError(t, err)
+	_, err = zw.Write(body)
 	require.NoError(t, err)
 	require.NoError(t, zw.Close())
 	require.NoError(t, os.WriteFile(path, compressed.Bytes(), 0o644))
+	return oid
+}
 
-	st := &store{objectsDir: objectsDir}
-	_, _, err = st.readLooseObjectLimited(oid, 4)
-	require.ErrorContains(t, err, "exceeds 4 byte limit")
+// TestReadCommitPayload_HonorsVerifyCRC pins the store's CRC policy on the
+// attribution path: with VerifyCRC set, a plain packed commit whose index
+// CRC disagrees with the pack bytes is rejected instead of being returned
+// (and cached) unverified. The index entries are corrupted in memory after
+// open so the pack bytes stay valid and inflation itself succeeds.
+func TestReadCommitPayload_HonorsVerifyCRC(t *testing.T) {
+	repoDir, packDir := buildCommitShapesRepo(t)
+	shapes := classifyCommitShapes(t, repoDir, packDir)
+	require.NotEmpty(t, shapes.plain)
+	require.NotEmpty(t, shapes.delta)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	plain, delta := shapes.plain[0], shapes.delta[0]
+	for _, pf := range st.packs {
+		for i := range pf.entries {
+			pf.entries[i].crc ^= 0xFFFFFFFF
+		}
+	}
+
+	// Verification off: corrupt index CRCs are irrelevant.
+	_, err = st.readCommitPayload(plain)
+	require.NoError(t, err)
+
+	st.VerifyCRC = true
+	_, err = st.readCommitPayload(plain)
+	require.Error(t, err, "plain packed commit must fail CRC verification")
+	require.Contains(t, err.Error(), "crc mismatch")
+
+	_, err = st.readCommitPayload(delta)
+	require.Error(t, err, "delta commit must fail CRC verification")
+	require.Contains(t, err.Error(), "crc mismatch")
+
+	// An over-cap plain commit must still be verified, so the header
+	// fallback never attributes a record whose CRC disagrees with the index.
+	saved := maxCommitPayload
+	maxCommitPayload = 64
+	t.Cleanup(func() { maxCommitPayload = saved })
+	_, err = st.readCommitPayload(plain)
+	require.Error(t, err)
+	require.Containsf(t, err.Error(), "crc mismatch", "over-cap plain commit returned %v before CRC verification", err)
+	_, err = newMetaCache(nil, st).get(plain)
+	require.Error(t, err, "attribution must fail CRC verification for an over-cap commit")
+}
+
+// looseCommitWithMessage writes a well-formed loose commit whose message is
+// msgLen bytes of compressible content and returns the store plus its OID.
+func looseCommitWithMessage(t *testing.T, msgLen int) (*store, Hash) {
+	t.Helper()
+	var body bytes.Buffer
+	body.WriteString("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n")
+	body.WriteString("author t <t@e> 1700000000 +0000\n")
+	body.WriteString("committer t <t@e> 1700000000 +0000\n\n")
+	body.Write(bytes.Repeat([]byte("m"), msgLen))
+	objectsDir := t.TempDir()
+	oid := writeLooseObject(t, objectsDir, "commit", body.Bytes())
+	return &store{objectsDir: objectsDir}, oid
+}
+
+// allocatedBytes returns the heap bytes allocated while fn runs.
+func allocatedBytes(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// TestReadCommitPayload_LooseCapAppliesBeforeInflate pins that the payload
+// cap gates a loose commit on its declared size, before the body is
+// inflated: an over-cap loose commit is rejected without allocating its
+// body.
+func TestReadCommitPayload_LooseCapAppliesBeforeInflate(t *testing.T) {
+	const msgLen = 16 << 20
+	st, oid := looseCommitWithMessage(t, msgLen)
+
+	saved := maxCommitPayload
+	maxCommitPayload = 1 << 20
+	t.Cleanup(func() { maxCommitPayload = saved })
+
+	// Warm the reader pools so their first-use allocations stay out of the
+	// measured call.
+	_, _ = st.readCommitPayload(oid)
+
+	var err error
+	n := allocatedBytes(func() { _, err = st.readCommitPayload(oid) })
+	require.ErrorIs(t, err, errCommitPayloadTooLarge)
+	require.Lessf(t, n, uint64(msgLen/4),
+		"over-cap loose commit allocated %d bytes; the body must not be inflated", n)
+}
+
+// TestReadCommitHeader_LooseStreamsHeader pins that the header read of a
+// loose commit stops at the committer line instead of inflating the whole
+// object. This is the fallback path for over-cap commits, so it bounds the
+// attribution memory for loose commits the same way the cap does.
+func TestReadCommitHeader_LooseStreamsHeader(t *testing.T) {
+	const msgLen = 16 << 20
+	st, oid := looseCommitWithMessage(t, msgLen)
+
+	_, _ = st.readCommitHeader(oid) // warm pools
+
+	var hdr []byte
+	var err error
+	n := allocatedBytes(func() { hdr, err = st.readCommitHeader(oid) })
+	require.NoError(t, err)
+	require.True(t, bytes.HasSuffix(hdr, []byte("committer t <t@e> 1700000000 +0000\n")), "header %q", hdr)
+	require.Lessf(t, n, uint64(msgLen/4),
+		"loose header read allocated %d bytes; the message must not be inflated", n)
+
+	// A declared size shorter than the header marks the object corrupt in
+	// Git's terms; the streaming read must stay within it rather than
+	// accept bytes past the declared body as metadata.
+	objectsDir := t.TempDir()
+	body := []byte("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor t <t@e> 1 +0000\ncommitter t <t@e> 1 +0000\n\nm\n")
+	short := writeLooseObjectDeclaring(t, objectsDir, "commit", body, 10)
+	_, err = (&store{objectsDir: objectsDir}).readCommitHeader(short)
+	require.Error(t, err, "header read must fail when the declared size ends before the committer line")
+
+	// A declared size above the cap with a body that ends after the committer
+	// line is a corrupt object, not an oversized commit: the fallback must
+	// validate the body length it skips, as readLooseObject does.
+	saved := maxCommitPayload
+	maxCommitPayload = 1 << 20
+	t.Cleanup(func() { maxCommitPayload = saved })
+	objectsDir = t.TempDir()
+	bloated := writeLooseObjectDeclaring(t, objectsDir, "commit", body, 2<<20)
+	bst := &store{objectsDir: objectsDir}
+	_, err = bst.readCommitHeader(bloated)
+	require.Error(t, err, "header read must reject a body shorter than its over-cap declared size")
+	_, err = newMetaCache(nil, bst).get(bloated)
+	require.Error(t, err, "attribution must reject a corrupt over-cap loose commit")
+
+	// The over-cap attribution path ends here: author from the header,
+	// empty message, no body allocation.
+	mc := newMetaCache(nil, st)
+	var meta CommitMetadata
+	n = allocatedBytes(func() { meta, err = mc.get(oid) })
+	require.NoError(t, err)
+	require.Equal(t, "t", meta.Author.Name)
+	require.Empty(t, meta.Message)
+	require.Lessf(t, n, uint64(msgLen/4), "over-cap attribution allocated %d bytes", n)
+}
+
+// TestCommitPayload_HeaderLargerThanMaxHdr pins that a commit whose header
+// exceeds MaxHdr (4096 bytes), here a 100-parent octopus merge, is attributed
+// through the payload path, which has no header cap, and that its message
+// byte-matches the git oracle.
+func TestCommitPayload_HeaderLargerThanMaxHdr(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repoDir := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := gitTestCommand(repoDir, args...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
+		)
+		out, err := cmd.CombinedOutput()
+		require.NoErrorf(t, err, "git %s: %s", strings.Join(args, " "), out)
+		return strings.TrimSpace(string(out))
+	}
+
+	git("init", "-q")
+	git("config", "commit.gpgsign", "false")
+
+	// 100 distinct root commits to merge (distinct messages, otherwise
+	// identical commit-tree calls produce one deduplicated object); each
+	// "parent <sha1>\n" line is 48 bytes, so the octopus header comfortably
+	// exceeds MaxHdr.
+	require.NoError(t, os.WriteFile(filepath.Join(repoDir, "f.txt"), []byte("x\n"), 0o644))
+	git("add", "f.txt")
+	tree := git("write-tree")
+	parents := make([]string, 0, 100)
+	commitTreeArgs := []string{"commit-tree", tree, "-m", "octopus of unusual size"}
+	for i := range 100 {
+		parents = append(parents, git("commit-tree", tree, "-m", fmt.Sprintf("root %d", i)))
+	}
+	for _, p := range parents {
+		commitTreeArgs = append(commitTreeArgs, "-p", p)
+	}
+	octopus := git(commitTreeArgs...)
+	git("update-ref", "refs/heads/main", octopus)
+	git("repack", "-adq")
+
+	oid, err := ParseHash(octopus)
+	require.NoError(t, err)
+
+	packDir := filepath.Join(repoDir, ".git", "objects", "pack")
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	// The payload path must succeed and match the oracle.
+	want := gitCatFile(t, repoDir, "commit", oid)
+	got, err := st.readCommitPayload(oid)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	// Attribution end-to-end through the metaCache.
+	mc := newMetaCache(nil, st)
+	meta, err := mc.get(oid)
+	require.NoError(t, err)
+	require.Equal(t, "t", meta.Author.Name)
+	require.Equal(t, "t@e", meta.Author.Email)
+	require.Equal(t, "octopus of unusual size\n", meta.Message)
+}
+
+func TestCommitPayload_OverCapFallsBackToHeader(t *testing.T) {
+	repoDir, packDir := buildCommitShapesRepo(t)
+	shapes := classifyCommitShapes(t, repoDir, packDir)
+	require.NotEmpty(t, shapes.plain)
+	require.NotEmpty(t, shapes.delta)
+	require.NotEmpty(t, shapes.loose)
+
+	st, err := OpenForTesting(packDir)
+	require.NoError(t, err)
+	defer st.Close()
+
+	saved := maxCommitPayload
+	maxCommitPayload = 64 // below every fixture commit
+	t.Cleanup(func() { maxCommitPayload = saved })
+
+	mc := newMetaCache(nil, st)
+	for shape, oids := range map[string][]Hash{"plain": shapes.plain, "delta": shapes.delta, "loose": shapes.loose} {
+		for _, oid := range oids {
+			_, err := st.readCommitPayload(oid)
+			require.ErrorIsf(t, err, errCommitPayloadTooLarge, "%s commit %s", shape, oid)
+
+			meta, err := mc.get(oid)
+			require.NoErrorf(t, err, "%s commit %s", shape, oid)
+			require.Equalf(t, "t", meta.Author.Name, "%s commit %s", shape, oid)
+			require.Equalf(t, "t@e", meta.Author.Email, "%s commit %s", shape, oid)
+			require.Emptyf(t, meta.Message, "%s commit %s", shape, oid)
+		}
+	}
 }
 
 // A loose object whose decompressed stream puts the header's NUL terminator
 // far past the longest valid header ("<type> <size>\0") is rejected once
-// the header limit is reached, before the body limit applies.
-func TestReadLooseObjectLimitedBoundsHeader(t *testing.T) {
+// the header limit is reached, before the body is touched.
+func TestOpenLooseObjectBoundsHeader(t *testing.T) {
 	objectsDir := t.TempDir()
 	oid := Hash{0x56, 0x78}
 	path := looseObjectPath(objectsDir, oid)
@@ -223,53 +509,8 @@ func TestReadLooseObjectLimitedBoundsHeader(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, compressed.Bytes(), 0o644))
 
 	st := &store{objectsDir: objectsDir}
-	_, _, err = st.readLooseObjectLimited(oid, 4)
+	_, err = st.openLooseObject(oid)
 	require.ErrorContains(t, err, "header exceeds")
-}
-
-// corruptIdxCRCTable flips every byte of the pack index's CRC-32 table, so
-// any read that consults the index CRC fails verification.
-func corruptIdxCRCTable(t *testing.T, packDir string) {
-	t.Helper()
-	idxs, err := filepath.Glob(filepath.Join(packDir, "*.idx"))
-	require.NoError(t, err)
-	require.Len(t, idxs, 1)
-	data, err := os.ReadFile(idxs[0])
-	require.NoError(t, err)
-	const headerAndFanout = 8 + 256*4
-	objCount := int(binary.BigEndian.Uint32(data[headerAndFanout-4:]))
-	crcBase := headerAndFanout + objCount*20
-	for i := range objCount * 4 {
-		data[crcBase+i] ^= 0xFF
-	}
-	// Keep the index self-consistent: its trailing SHA-1 covers everything
-	// before it, and open rejects an index whose trailer mismatches.
-	sum := sha1.Sum(data[:len(data)-sha1.Size])
-	copy(data[len(data)-sha1.Size:], sum[:])
-	// git writes pack files read-only.
-	require.NoError(t, os.Chmod(idxs[0], 0o644))
-	require.NoError(t, os.WriteFile(idxs[0], data, 0o644))
-}
-
-// With SetVerifyCRC enabled every packed read is checked against the index
-// CRC, including the plain packed commit fast path of readCommitPayload.
-func TestReadCommitPayload_VerifiesCRCOnPlainPackedCommits(t *testing.T) {
-	repoDir, packDir := buildCommitShapesRepo(t)
-	shapes := classifyCommitShapes(t, repoDir, packDir)
-	require.NotEmpty(t, shapes.plain)
-	corruptIdxCRCTable(t, packDir)
-
-	st, err := OpenForTesting(packDir)
-	require.NoError(t, err)
-	defer st.Close()
-	st.VerifyCRC = true
-
-	oid := shapes.plain[0]
-	_, _, err = st.getMaterialized(oid)
-	require.ErrorContains(t, err, "crc mismatch", "the generic materializing read must reject the corrupt index")
-
-	_, err = st.readCommitPayload(oid)
-	require.ErrorContains(t, err, "crc mismatch", "the commit payload fast path must honor VerifyCRC")
 }
 
 // buildBigDeltaCommitRepo returns a repository whose second commit carries a
@@ -344,97 +585,3 @@ func TestReadCommitPayload_DeltaCommitCapPrecedesMaterialization(t *testing.T) {
 // TestReadCommitPayload_NotACommit pins the error contract: asking for a
 // non-commit object (a blob) fails with ErrObjectNotCommit rather than
 // returning payload bytes.
-func TestReadCommitPayload_NotACommit(t *testing.T) {
-	objectsDir := t.TempDir()
-	body := []byte("not a commit")
-	blobOID := calculateHash(ObjBlob, body)
-	path := looseObjectPath(objectsDir, blobOID)
-	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
-
-	var compressed bytes.Buffer
-	zw := zlib.NewWriter(&compressed)
-	_, err := fmt.Fprintf(zw, "blob %d\x00", len(body))
-	require.NoError(t, err)
-	_, err = zw.Write(body)
-	require.NoError(t, err)
-	require.NoError(t, zw.Close())
-	require.NoError(t, os.WriteFile(path, compressed.Bytes(), 0o644))
-
-	st := &store{objectsDir: objectsDir}
-	_, err = st.readCommitPayload(blobOID)
-	require.ErrorIs(t, err, ErrObjectNotCommit)
-}
-
-// TestCommitPayload_HeaderLargerThanMaxHdr pins an improvement the payload
-// path buys over the old header read: a commit whose header exceeds MaxHdr
-// (4096 bytes) — here a 100-parent octopus merge — used to fail attribution
-// because readCommitHeaderFromStream gives up at MaxHdr without finding the
-// committer line. The payload path has no header cap, so attribution now
-// succeeds, and the message still byte-matches the git oracle.
-func TestCommitPayload_HeaderLargerThanMaxHdr(t *testing.T) {
-	if _, err := exec.LookPath("git"); err != nil {
-		t.Skip("git executable not found in PATH")
-	}
-
-	repoDir := t.TempDir()
-	git := func(args ...string) string {
-		t.Helper()
-		cmd := gitTestCommand(repoDir, args...)
-		cmd.Env = append(os.Environ(),
-			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
-			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e",
-		)
-		out, err := cmd.CombinedOutput()
-		require.NoErrorf(t, err, "git %s: %s", strings.Join(args, " "), out)
-		return strings.TrimSpace(string(out))
-	}
-
-	git("init", "-q")
-	git("config", "commit.gpgsign", "false")
-
-	// 100 distinct root commits to merge (distinct messages, otherwise
-	// identical commit-tree calls produce one deduplicated object); each
-	// "parent <sha1>\n" line is 48 bytes, so the octopus header comfortably
-	// exceeds MaxHdr.
-	require.NoError(t, os.WriteFile(filepath.Join(repoDir, "f.txt"), []byte("x\n"), 0o644))
-	git("add", "f.txt")
-	tree := git("write-tree")
-	parents := make([]string, 0, 100)
-	commitTreeArgs := []string{"commit-tree", tree, "-m", "octopus of unusual size"}
-	for i := range 100 {
-		parents = append(parents, git("commit-tree", tree, "-m", fmt.Sprintf("root %d", i)))
-	}
-	for _, p := range parents {
-		commitTreeArgs = append(commitTreeArgs, "-p", p)
-	}
-	octopus := git(commitTreeArgs...)
-	git("update-ref", "refs/heads/main", octopus)
-	git("repack", "-adq")
-
-	oid, err := ParseHash(octopus)
-	require.NoError(t, err)
-
-	packDir := filepath.Join(repoDir, ".git", "objects", "pack")
-	st, err := OpenForTesting(packDir)
-	require.NoError(t, err)
-	defer st.Close()
-
-	// The old header path fails on this commit — pinned so this test starts
-	// failing (and gets updated) if readCommitHeader ever learns to cope.
-	_, err = st.readCommitHeader(oid)
-	require.Error(t, err, "expected the MaxHdr-capped header read to fail on a >4 KiB header")
-
-	// The payload path must succeed and match the oracle.
-	want := gitCatFile(t, repoDir, "commit", oid)
-	got, err := st.readCommitPayload(oid)
-	require.NoError(t, err)
-	require.Equal(t, want, got)
-
-	// Attribution end-to-end through the metaCache.
-	mc := newMetaCache(nil, st)
-	meta, err := mc.get(oid)
-	require.NoError(t, err)
-	require.Equal(t, "t", meta.Author.Name)
-	require.Equal(t, "t@e", meta.Author.Email)
-	require.Equal(t, "octopus of unusual size\n", meta.Message)
-}

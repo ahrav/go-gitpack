@@ -40,9 +40,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -231,9 +231,9 @@ func (f *hunkBenchFixtures) repo(tb testing.TB, name string, build func(tb testi
 	if err := os.MkdirAll(work, 0o755); err != nil {
 		tb.Fatalf("create fixture dir %s: %v", work, err)
 	}
-	gitTB(tb, work, "init", "--quiet")
+	runGit(tb, work, "init", "--quiet")
 	build(tb, work)
-	gitTB(tb, work, "repack", "-a", "-d", "--quiet", "--window=0", "--depth=0")
+	runGit(tb, work, "repack", "-a", "-d", "--quiet", "--window=0", "--depth=0")
 
 	gitDir := filepath.Join(work, ".git")
 	f.built[name] = gitDir
@@ -341,67 +341,16 @@ func pseudoBinary(size int, seed uint64) []byte {
 	return buf
 }
 
-// requireGit skips the caller unless the git CLI is available, matching the
-// convention in hunk_binary_test.go.
-func requireGit(tb testing.TB) {
-	tb.Helper()
-	if _, err := exec.LookPath("git"); err != nil {
-		tb.Skip("git executable not found in PATH")
-	}
-}
-
-// gitTB runs git in dir and fails the caller on a non-zero exit.
-//
-// It is the testing.TB twin of runGit in hunk_binary_test.go, which is bound
-// to *testing.T and therefore unusable from a benchmark.
-func gitTB(tb testing.TB, dir string, args ...string) {
-	tb.Helper()
-	gitEnvTB(tb, dir, nil, args...)
-}
-
-// gitEnvTB is gitTB with extra environment entries appended. Later entries win
-// for duplicate keys, per os/exec's documented Cmd.Env behavior.
-func gitEnvTB(tb testing.TB, dir string, extraEnv []string, args ...string) {
-	tb.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	cmd.Env = append(gitFixtureEnv(), extraEnv...)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		tb.Fatalf("git %v in %s failed: %v\n%s", args, dir, err, out)
-	}
-}
-
 // gitCommitTB stages file and commits it with a timestamp derived from rev.
 //
 // Pinning the timestamps keeps commit OIDs, and therefore pack layout,
 // identical across runs and machines.
 func gitCommitTB(tb testing.TB, dir, file string, rev int) {
 	tb.Helper()
-	gitTB(tb, dir, "add", "--", file)
+	runGit(tb, dir, "add", "--", file)
 	date := fmt.Sprintf("%d +0000", 1700000000+int64(rev)*60)
-	gitEnvTB(tb, dir,
-		[]string{"GIT_AUTHOR_DATE=" + date, "GIT_COMMITTER_DATE=" + date},
+	runGitEnv(tb, dir, gitFixtureEnvPinned(date),
 		"commit", "--quiet", "-m", fmt.Sprintf("rev %d", rev))
-}
-
-// gitFixtureEnv isolates fixture creation from the invoking user's Git
-// configuration and pins the commit identity, mirroring the hygiene in
-// generate_testdata.sh. Background auto-gc is disabled so nothing repacks the
-// fixture behind the benchmark's back.
-func gitFixtureEnv() []string {
-	return append(os.Environ(),
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
-		"GIT_TEMPLATE_DIR=",
-		"GIT_AUTHOR_NAME=bench",
-		"GIT_AUTHOR_EMAIL=bench@example.com",
-		"GIT_COMMITTER_NAME=bench",
-		"GIT_COMMITTER_EMAIL=bench@example.com",
-		"GIT_CONFIG_COUNT=3",
-		"GIT_CONFIG_KEY_0=gc.auto", "GIT_CONFIG_VALUE_0=0",
-		"GIT_CONFIG_KEY_1=maintenance.auto", "GIT_CONFIG_VALUE_1=false",
-		"GIT_CONFIG_KEY_2=commit.gpgsign", "GIT_CONFIG_VALUE_2=false",
-	)
 }
 
 // ---------------------------------------------------------------------------
@@ -423,7 +372,18 @@ func gitFixtureEnv() []string {
 // variant raises the budget for exactly that reason — see
 // TestScanHunksBench_DefaultPairCacheRefusesLargeBinaryHunks.
 func warmPairCacheBudget(hunkBytes int) int {
-	return 8 * pairCacheShards * hunkBytes
+	// int64 math: on a 32-bit build 8*pairCacheShards*(16<<20) is exactly 2^32
+	// and would wrap to 0, silently disabling the very cache this warms. Clamp
+	// instead. A 32-bit build cannot express the budget a 16 MiB hunk needs
+	// (4*pairCacheShards*hunkBytes already exceeds max int), so the warm
+	// variant degrades to a refused entry there rather than to no cache at all.
+	// No supported target is 32-bit; this keeps the helper honest if one is
+	// added or a fixture grows.
+	want := 8 * int64(pairCacheShards) * int64(hunkBytes)
+	if want > math.MaxInt {
+		return math.MaxInt
+	}
+	return int(want)
 }
 
 // pairCacheLen reports how many diff results the memo currently holds.

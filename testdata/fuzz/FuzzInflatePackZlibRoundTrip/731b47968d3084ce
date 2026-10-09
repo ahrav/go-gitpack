@@ -1,0 +1,3 @@
+go test fuzz v1
+[]byte("89Za1 2107 90ABb2Yx7cy͖\x93!\x89zXћ\"\xe9\xb5\xfa\x80C")
+byte('4')

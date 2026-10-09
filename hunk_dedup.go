@@ -57,7 +57,7 @@
 //     order.
 //
 // Cross-file dependencies:
-//   - firstParentTree, emitCommitBlobPairs, streamBlobPairHunks
+//   - firstParentTree, emitCommitBlobPairsTo, pairHunks
 //     (history_scanner.go): the reused diff machinery.
 //   - orderCommitsParentFirst (commit_order.go): the deterministic order.
 //   - farm.Hash64: the line fingerprint hash, matching the existing
@@ -767,7 +767,7 @@ func (hs *HistoryScanner) estimatePackedSize(oid Hash) uint64 {
 		best = max(best, size)
 		switch typ {
 		case ObjOfsDelta:
-			back, err := readOfsDeltaOffset(pack, int64(off)+int64(hdrLen))
+			back, _, err := readOfsDeltaOffset(pack, int64(off)+int64(hdrLen))
 			if err != nil || back == 0 || back > off {
 				return best
 			}
@@ -881,34 +881,6 @@ func prefilterHunk(h *HunkAddition, sn *fingerprintSnapshot, buf []uint64) []uin
 	return buf
 }
 
-// retainableHunks converts a pair's hunks for the reorder ring and returns
-// the bytes a retained result keeps alive. Text lines are views into the new
-// blob (aliased bytes), so a few added lines in a large blob pin the whole
-// blob while the result waits for fn; such hunks are copied into compact
-// storage (cloneAddedHunksForCache) and the blob is released. Hunks that
-// cover a quarter or more of the blob stay as views and are charged the
-// blob's size, which keeps the retained-byte cap honest either way.
-func retainableHunks(work blobPairWork, added []AddedHunk, aliased int) ([]HunkAddition, int64) {
-	charge := int64(aliased)
-	if aliased > 0 {
-		var lineBytes int
-		for i := range added {
-			for _, line := range added[i].Lines {
-				lineBytes += len(line)
-			}
-		}
-		if lineBytes*4 < aliased {
-			added = cloneAddedHunksForCache(added)
-			charge = 0
-		}
-	}
-	hunks := make([]HunkAddition, len(added))
-	for i := range added {
-		hunks[i] = newHunkAddition(work, added[i])
-	}
-	return hunks, charge
-}
-
 // pairCandidates runs the worker-side half of the split verdict over one
 // pair's hunks: it returns the hunks the decision stage must still look at
 // (see dedupCandidate), in hunk order, and the pair's hunkRetainedBytes
@@ -935,17 +907,18 @@ func pairCandidates(hunks []HunkAddition, sn *fingerprintSnapshot) (cands []dedu
 // collectCommitPairs resolves c's first-parent tree and collects the
 // commit's changed blob pairs in deterministic tree order. Errors come back
 // pre-wrapped with the same message formats the streaming pipeline uses, so
-// tree workers only record and propagate them.
-func (hs *HistoryScanner) collectCommitPairs(c commitInfo) ([]blobPairWork, error) {
+// tree workers only record and propagate them. A closed stopCh aborts the
+// tree walk with errScanAborted.
+func (hs *HistoryScanner) collectCommitPairs(c commitInfo, stopCh <-chan struct{}) ([]blobPairWork, error) {
 	parentTree, err := hs.firstParentTree(c)
 	if err != nil {
 		return nil, fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err)
 	}
 	var pairs []blobPairWork
-	if err := hs.emitCommitBlobPairs(c, parentTree, func(w blobPairWork) error {
+	if err := hs.emitCommitBlobPairsTo(c, parentTree, func(w blobPairWork) error {
 		pairs = append(pairs, w)
 		return nil
-	}); err != nil {
+	}, stopCh); err != nil {
 		return nil, fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err)
 	}
 	return pairs, nil
@@ -975,6 +948,10 @@ func (hs *HistoryScanner) collectCommitPairs(c commitInfo) ([]blobPairWork, erro
 // so no goroutine outlives the call.
 func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) error {
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
+	// The tree memo only pays off while this scan resolves first-parent
+	// trees; dropping it here keeps the scanner's steady-state memory
+	// independent of history size.
+	defer hs.treeOIDs.Clear()
 
 	if err := hs.startProfiling(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
@@ -1123,7 +1100,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 						return
 					}
 					slot := &slots[idx%lookahead]
-					pairs, err := hs.collectCommitPairs(order[idx])
+					pairs, err := hs.collectCommitPairs(order[idx], stopCh)
 					var expensive []dedupExpensivePair
 					if err == nil {
 						expensive = hs.expensivePairs(pairs)
@@ -1433,19 +1410,26 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				}
 				results := make([]dedupPairResult, 0, len(works))
 				for _, pw := range works {
-					added, aliased, err := hs.pairHunks(pw.work)
+					added, err := hs.pairHunks(pw.work)
 					if err != nil {
 						setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
 						return
 					}
-					hunks, charge := retainableHunks(pw.work, added, aliased)
+					// pairHunks returns lines that are either compacted into
+					// their own buffer or span the whole new blob, so the
+					// retained-byte charge below (line bytes) is what a
+					// result actually pins.
+					hunks := make([]HunkAddition, len(added))
+					for i := range added {
+						hunks[i] = newHunkAddition(pw.work, added[i])
+					}
 					// Hash and speculatively probe here, in parallel, so the
 					// decision goroutine only touches fingerprints the
 					// snapshot did not already hold.
 					cands, total := pairCandidates(hunks, set.snapshot())
 					results = append(results, dedupPairResult{
 						seq: pw.seq, hunks: hunks, candidates: cands,
-						earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(max(total, charge))),
+						earlyKiB: toKiB(pw.earlyBytes), retainedKiB: toKiB(uint64(total)),
 					})
 				}
 				deliver(results)

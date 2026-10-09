@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -32,46 +33,55 @@ import (
 	"golang.org/x/exp/mmap"
 )
 
-// createValidRidxFile creates a minimal reverse-index file for testing.
-// The file maps descending pack offsets to index positions.
-// For objCount=3, it writes [2, 1, 0] to map:
-//   - Bit 0 (largest offset) -> idx position 2
-//   - Bit 1 (middle offset)  -> idx position 1
-//   - Bit 2 (smallest offset) -> idx position 0
+// createValidRidxFile writes a Git .rev file: "RIDX", version 1, hash
+// function 1 (SHA-1), one .idx position per object in ascending pack-offset
+// order, the pack checksum, and the file's own SHA-1 trailer. A nil
+// packChecksum writes zeros, which tryLoadRidxFile accepts only when the pack
+// is not mapped.
 func createValidRidxFile(
 	t testing.TB,
 	ridxPath string,
-	objCount uint32,
+	positions []uint32,
 	packChecksum []byte,
-	idxChecksum []byte,
 ) error {
 	var buf bytes.Buffer
 
 	buf.WriteString(ridxMagic)
 	binary.Write(&buf, binary.BigEndian, uint32(1))
-
-	// Fanout table contains 256 entries.
-	for range 256 {
-		binary.Write(&buf, binary.BigEndian, objCount)
+	binary.Write(&buf, binary.BigEndian, uint32(ridxHashSHA1))
+	for _, pos := range positions {
+		binary.Write(&buf, binary.BigEndian, pos)
 	}
-
-	// Main table entries in descending order: (n-1, n-2, ..., 1, 0).
-	for i := objCount; i > 0; i-- {
-		binary.Write(&buf, binary.BigEndian, uint32(i-1))
-	}
-
 	if packChecksum != nil {
 		buf.Write(packChecksum)
 	} else {
 		buf.Write(make([]byte, hashSize))
 	}
-	if idxChecksum != nil {
-		buf.Write(idxChecksum)
-	} else {
-		buf.Write(make([]byte, hashSize))
-	}
+	self := sha1.Sum(buf.Bytes())
+	buf.Write(self[:])
 
 	return os.WriteFile(ridxPath, buf.Bytes(), 0644)
+}
+
+// ascendingPositions returns the .idx positions 0..n-1, the .rev table of a
+// pack whose objects sit in ascending offset order by idx position.
+func ascendingPositions(n int) []uint32 {
+	out := make([]uint32, n)
+	for i := range out {
+		out[i] = uint32(i)
+	}
+	return out
+}
+
+// revPositionsFor returns pf's .idx positions in ascending pack-offset
+// order, which is the table a .rev file carries for that pack.
+func revPositionsFor(pf *idxFile) []uint32 {
+	out := make([]uint32, len(pf.entries))
+	for i := range out {
+		out[i] = uint32(i)
+	}
+	sort.Slice(out, func(a, b int) bool { return pf.entries[out[a]].offset < pf.entries[out[b]].offset })
+	return out
 }
 
 // TestLoadReverseIndex_FromFile verifies that loadReverseIndex correctly reads
@@ -98,9 +108,7 @@ func TestLoadReverseIndex_FromFile(t *testing.T) {
 	pf, err := parseIdx(idxRA)
 	require.NoError(t, err)
 
-	packChecksum := sha1.Sum([]byte("pack"))
-	idxChecksum := sha1.Sum([]byte("idx"))
-	require.NoError(t, createValidRidxFile(t, ridxPath, 1, packChecksum[:], idxChecksum[:]))
+	require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{0}, nil))
 
 	ridx, err := loadReverseIndex(packPath, pf)
 	require.NoError(t, err)
@@ -186,7 +194,7 @@ func TestLoadReverseIndex_OldRevExtension(t *testing.T) {
 	pf, err := parseIdx(idxRA)
 	require.NoError(t, err)
 
-	require.NoError(t, createValidRidxFile(t, revPath, 1, nil, nil))
+	require.NoError(t, createValidRidxFile(t, revPath, []uint32{0}, nil))
 
 	// Should find and use .rev file for backward compatibility.
 	ridx, err := loadReverseIndex(packPath, pf)
@@ -217,6 +225,8 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		var buf bytes.Buffer
 		buf.WriteString("NOPE")
 		binary.Write(&buf, binary.BigEndian, uint32(1))
+		binary.Write(&buf, binary.BigEndian, uint32(ridxHashSHA1))
+		buf.Write(make([]byte, ridxTrailerSize))
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
 		defer os.Remove(ridxPath)
 
@@ -234,6 +244,8 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		var buf bytes.Buffer
 		buf.WriteString(ridxMagic)
 		binary.Write(&buf, binary.BigEndian, uint32(99))
+		binary.Write(&buf, binary.BigEndian, uint32(ridxHashSHA1))
+		buf.Write(make([]byte, ridxTrailerSize))
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
 		defer os.Remove(ridxPath)
 
@@ -248,7 +260,7 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 
 	t.Run("object_count_mismatch", func(t *testing.T) {
 		ridxPath := filepath.Join(dir, "test.ridx")
-		require.NoError(t, createValidRidxFile(t, ridxPath, 5, nil, nil))
+		require.NoError(t, createValidRidxFile(t, ridxPath, ascendingPositions(5), nil))
 		defer os.Remove(ridxPath)
 
 		_, err := tryLoadRidxFile(ridxPath, pf)
@@ -260,15 +272,34 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		assert.NotNil(t, ridx)
 	})
 
-	t.Run("truncated_fanout", func(t *testing.T) {
+	t.Run("unsupported_hash", func(t *testing.T) {
 		ridxPath := filepath.Join(dir, "test.ridx")
 		var buf bytes.Buffer
 		buf.WriteString(ridxMagic)
 		binary.Write(&buf, binary.BigEndian, uint32(1))
-		// Write only partial fanout table (100 entries instead of required 256).
-		for range 100 {
-			binary.Write(&buf, binary.BigEndian, uint32(1))
-		}
+		binary.Write(&buf, binary.BigEndian, uint32(2)) // SHA-256
+		binary.Write(&buf, binary.BigEndian, uint32(0))
+		buf.Write(make([]byte, ridxTrailerSize))
+		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
+		defer os.Remove(ridxPath)
+
+		_, err := tryLoadRidxFile(ridxPath, pf)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unsupported hash function")
+
+		ridx, err := loadReverseIndex(packPath, pf)
+		assert.NoError(t, err)
+		assert.NotNil(t, ridx)
+	})
+
+	t.Run("table_not_word_aligned", func(t *testing.T) {
+		ridxPath := filepath.Join(dir, "test.ridx")
+		var buf bytes.Buffer
+		buf.WriteString(ridxMagic)
+		binary.Write(&buf, binary.BigEndian, uint32(1))
+		binary.Write(&buf, binary.BigEndian, uint32(ridxHashSHA1))
+		buf.Write([]byte{0, 0, 0}) // three bytes of table
+		buf.Write(make([]byte, ridxTrailerSize))
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
 		defer os.Remove(ridxPath)
 
@@ -280,23 +311,36 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		assert.NotNil(t, ridx)
 	})
 
-	t.Run("truncated_entries", func(t *testing.T) {
+	// Positions at or above 1<<31 are negative as a 32-bit int; the bounds
+	// check must still reject them (exercised by GOARCH=386).
+	for _, pos := range []uint32{1, 1 << 31, 0xffffffff} {
+		t.Run(fmt.Sprintf("position_out_of_range_%#x", pos), func(t *testing.T) {
+			ridxPath := filepath.Join(dir, "test.ridx")
+			require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{pos}, nil))
+			defer os.Remove(ridxPath)
+
+			_, err := tryLoadRidxFile(ridxPath, pf)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "names idx position")
+
+			ridx, err := loadReverseIndex(packPath, pf)
+			require.NoError(t, err)
+			assert.Equal(t, []uint32{0}, ridx)
+		})
+	}
+
+	t.Run("bad_file_checksum", func(t *testing.T) {
 		ridxPath := filepath.Join(dir, "test.ridx")
-		var buf bytes.Buffer
-		buf.WriteString(ridxMagic)
-		binary.Write(&buf, binary.BigEndian, uint32(1))
-		// Write full fanout table claiming 10 objects but only provide 5 entries.
-		for range 256 {
-			binary.Write(&buf, binary.BigEndian, uint32(10))
-		}
-		for i := 0; i < 5; i++ {
-			binary.Write(&buf, binary.BigEndian, uint32(i))
-		}
-		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
+		require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{0}, nil))
+		data, err := os.ReadFile(ridxPath)
+		require.NoError(t, err)
+		data[len(data)-1] ^= 0xff
+		require.NoError(t, os.WriteFile(ridxPath, data, 0644))
 		defer os.Remove(ridxPath)
 
-		_, err := tryLoadRidxFile(ridxPath, pf)
+		_, err = tryLoadRidxFile(ridxPath, pf)
 		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "file checksum mismatch")
 
 		ridx, err := loadReverseIndex(packPath, pf)
 		assert.NoError(t, err)
@@ -308,9 +352,7 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		var buf bytes.Buffer
 		buf.WriteString(ridxMagic)
 		binary.Write(&buf, binary.BigEndian, uint32(1))
-		for range 256 {
-			binary.Write(&buf, binary.BigEndian, uint32(1))
-		}
+		binary.Write(&buf, binary.BigEndian, uint32(ridxHashSHA1))
 		binary.Write(&buf, binary.BigEndian, uint32(0))
 		// File ends here without trailer checksums.
 		require.NoError(t, os.WriteFile(ridxPath, buf.Bytes(), 0644))
@@ -321,7 +363,10 @@ func TestLoadReverseIndex_InvalidFiles(t *testing.T) {
 		defer packRA.Close()
 		pf.pack = packRA
 
-		// Should still load since trailer verification is best-effort.
+		_, err = tryLoadRidxFile(ridxPath, pf)
+		assert.Error(t, err)
+
+		// The truncated file is ignored and the mapping rebuilt from the idx.
 		ridx, err := loadReverseIndex(packPath, pf)
 		require.NoError(t, err)
 		assert.Len(t, ridx, 1)
@@ -360,30 +405,21 @@ func TestLoadReverseIndex_TrailerVerification(t *testing.T) {
 	pf.pack = packRA
 	pf.idx = idxRA
 
-	require.NoError(t, createValidRidxFile(t, ridxPath, 1, packChecksum[:], idxChecksum))
+	_ = idxChecksum
+	require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{0}, packChecksum[:]))
 
-	_, err = loadReverseIndex(packPath, pf)
+	ridx, err := tryLoadRidxFile(ridxPath, pf)
 	require.NoError(t, err)
+	assert.Equal(t, []uint32{0}, ridx)
 
 	// Test with wrong pack checksum.
 	os.Remove(ridxPath)
 	wrongChecksum := sha1.Sum([]byte("wrong"))
-	require.NoError(t, createValidRidxFile(t, ridxPath, 1, wrongChecksum[:], idxChecksum))
+	require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{0}, wrongChecksum[:]))
 
 	_, err = tryLoadRidxFile(ridxPath, pf)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "pack checksum mismatch")
-
-	_, err = loadReverseIndex(packPath, pf)
-	assert.NoError(t, err)
-
-	// Test with wrong idx checksum.
-	os.Remove(ridxPath)
-	require.NoError(t, createValidRidxFile(t, ridxPath, 1, packChecksum[:], wrongChecksum[:]))
-
-	_, err = tryLoadRidxFile(ridxPath, pf)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "idx checksum mismatch")
 
 	_, err = loadReverseIndex(packPath, pf)
 	assert.NoError(t, err)
@@ -519,7 +555,7 @@ func TestLoadReverseIndex_MissingPackAndIdx(t *testing.T) {
 	require.NoError(t, err)
 	pf.pack = nil // No pack handle
 
-	require.NoError(t, createValidRidxFile(t, ridxPath, 1, nil, nil))
+	require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{0}, nil))
 
 	// Should still load since trailer verification is skipped when pack is nil.
 	ridx, err := loadReverseIndex(packPath, pf)
@@ -550,7 +586,8 @@ func TestLoadReverseIndex_MidxOnlyPack(t *testing.T) {
 	packChecksum := packData[len(packData)-hashSize:]
 	idxData, _ := os.ReadFile(idxPath)
 	idxChecksum := idxData[len(idxData)-hashSize:]
-	require.NoError(t, createValidRidxFile(t, ridxPath, 1, packChecksum, idxChecksum))
+	_ = idxChecksum
+	require.NoError(t, createValidRidxFile(t, ridxPath, []uint32{0}, packChecksum))
 
 	// Remove idx to simulate midx-only scenario.
 	os.Remove(idxPath)
@@ -597,19 +634,19 @@ func BenchmarkLoadReverseIndex_FromFile(b *testing.B) {
 	packPath := filepath.Join(dir, "bench.pack")
 	ridxPath := filepath.Join(dir, "bench.ridx")
 
-	numObjects := uint32(1000)
-	require.NoError(b, createValidRidxFile(b, ridxPath, numObjects, nil, nil))
+	numObjects := 1000
+	require.NoError(b, createValidRidxFile(b, ridxPath, ascendingPositions(numObjects), nil))
 
-	// Create dummy idx file.
-	pf := &idxFile{
-		sortedOffsets: make([]uint64, numObjects),
-	}
-	for i := uint32(0); i < numObjects; i++ {
-		pf.sortedOffsets[i] = uint64(i * 100)
+	// Entries whose offsets ascend with idx position, so the ascending table
+	// above is the correct .rev content.
+	pf := &idxFile{entries: make([]idxEntry, numObjects)}
+	for i := range pf.entries {
+		pf.entries[i].offset = uint64(i * 100)
 	}
 
 	b.ResetTimer()
 	for b.Loop() {
+		pf.sortedOffsets = nil
 		ridx, err := loadReverseIndex(packPath, pf)
 		require.NoError(b, err)
 		_ = ridx
@@ -669,9 +706,9 @@ func TestLoadReverseIndex_Integration(t *testing.T) {
 	pf, err := parseIdx(idxRA)
 	require.NoError(t, err)
 
-	// Create ridx with proper mapping.
-	// offsets [12, 50, 100] -> descending [100, 50, 12] -> idx positions [2, 1, 0]
-	require.NoError(t, createValidRidxFile(t, ridxPath, 3, nil, nil))
+	// A .rev file lists idx positions in ascending offset order.
+	asc := revPositionsFor(pf)
+	require.NoError(t, createValidRidxFile(t, ridxPath, asc, nil))
 
 	ridx, err := loadReverseIndex(packPath, pf)
 	require.NoError(t, err)
@@ -679,13 +716,11 @@ func TestLoadReverseIndex_Integration(t *testing.T) {
 
 	pf.ridx = ridx
 
-	// Verify the mapping:
-	// Bit 0 (largest offset 100) -> idx position 2
-	// Bit 1 (middle offset 50) -> idx position 1
-	// Bit 2 (smallest offset 12) -> idx position 0
-	assert.Equal(t, uint32(2), pf.resolveIdxPos(0))
-	assert.Equal(t, uint32(1), pf.resolveIdxPos(1))
-	assert.Equal(t, uint32(0), pf.resolveIdxPos(2))
+	// In memory the table is descending: bit 0 is the largest offset.
+	for k := range 3 {
+		assert.Equal(t, asc[2-k], pf.resolveIdxPos(k), "bit %d", k)
+		assert.Equal(t, pf.sortedOffsets[2-k], pf.entries[pf.resolveIdxPos(k)].offset)
+	}
 }
 
 func TestSyntheticRidxCRCLookup(t *testing.T) {

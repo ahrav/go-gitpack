@@ -31,15 +31,22 @@ func TestInflatePackZlibGoMatchesLibdeflate(t *testing.T) {
 			cDst := make([]byte, size)
 			goConsumed, goErr := inflatePackZlibGo(encoded, goDst)
 			cConsumed, cErr := inflateZlibOneShot(encoded, cDst)
-			if (goErr == nil) != (cErr == nil) {
-				t.Fatalf("acceptance mismatch: Go=%v C=%v", goErr, cErr)
+			// Every input is a freshly generated valid stream, so both
+			// backends must accept it outright; a shared rejection is a
+			// failure, not agreement.
+			if goErr != nil || cErr != nil {
+				t.Fatalf("valid stream rejected: Go=%v C=%v", goErr, cErr)
 			}
-			if goErr != nil {
-				return
+			// Both backends consume the header plus deflate payload and
+			// leave the 4-byte adler32 trailer as trailing input.
+			wantConsumed := len(encoded) - 4
+			if goConsumed != wantConsumed || cConsumed != wantConsumed {
+				t.Fatalf("consumed mismatch: Go=%d C=%d want=%d",
+					goConsumed, cConsumed, wantConsumed)
 			}
-			if goConsumed != cConsumed || !bytes.Equal(goDst, cDst) {
-				t.Fatalf("result mismatch: Go consumed=%d C consumed=%d outputEqual=%v",
-					goConsumed, cConsumed, bytes.Equal(goDst, cDst))
+			if !bytes.Equal(goDst, payload) || !bytes.Equal(cDst, payload) {
+				t.Fatalf("output mismatch: goEqual=%v cEqual=%v",
+					bytes.Equal(goDst, payload), bytes.Equal(cDst, payload))
 			}
 		})
 	}

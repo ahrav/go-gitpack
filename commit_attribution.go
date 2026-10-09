@@ -14,11 +14,14 @@ package objstore
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math/bits"
 	"strconv"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // AuthorInfo describes the Git author metadata attached to a secret
@@ -51,20 +54,39 @@ type commitPayloadReader interface {
 	// strings sliced from it. It returns an error if the object cannot be
 	// found or is not a commit.
 	readCommitPayload(oid Hash) ([]byte, error)
+
+	// readCommitHeader retrieves the header lines of a commit through its
+	// committer line, as a fresh allocation owned by the caller. metaCache
+	// uses these headers when readCommitPayload reports
+	// errCommitPayloadTooLarge.
+	readCommitHeader(oid Hash) ([]byte, error)
+}
+
+// payloadSink hands out destination memory for a commit payload. reserve
+// returns a writable slice of exactly n bytes that the caller then fills; the
+// sink decides where those bytes live.
+type payloadSink interface {
+	reserve(n int) []byte
+}
+
+// commitPayloadReaderTo is an optional extension of commitPayloadReader for
+// stores that can decode a commit payload directly into sink-provided memory,
+// saving the per-commit allocation of readCommitPayload. The returned slice
+// is either sink memory filled by the store or a fresh allocation; either
+// way the caller owns it.
+type commitPayloadReaderTo interface {
+	readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error)
 }
 
 // metaEntry is one cached attribution record: the parsed author identity and
 // the raw commit message.
-//
-// Lifetime: ai.Name, ai.Email, and msg alias one caller-owned payload copy.
-// Entries are retained only while the configured byte budget permits.
 type metaEntry struct {
-	ai     AuthorInfo
-	msg    string
-	weight int
+	ai  AuthorInfo
+	msg string
+	// ts is the committer timestamp from the commit graph attached when the
+	// entry was inserted, else the parsed author timestamp.
+	ts int64
 }
-
-const defaultMetadataCacheBudget = 64 << 20
 
 // metaCache provides efficient access to Git commit metadata by caching author
 // information and commit messages. It coordinates with a commit graph for fast
@@ -81,23 +103,33 @@ type metaCache struct {
 	// This is an alias to graph.Timestamps - no data is copied.
 	ts []int64
 
-	// mu guards concurrent access to the cache map.
+	// mu guards every field below.
 	mu sync.RWMutex
 
 	// m caches attribution entries by commit hash to avoid repeated
 	// inflation and parsing of commit payloads.
-	m      map[Hash]metaEntry
-	used   int
-	budget int
+	m map[Hash]metaEntry
+
+	// Commit messages are attacker-controlled, so budget bounds the slab
+	// memory a crafted pack can pin through this cache.
+	slab      []byte
+	slabBytes int
+	budget    int
 }
+
+const metaSlabSize = 64 << 10
+
+const defaultMetaCacheBudget = 256 << 20
+
+// metaCacheInitialSize is the map capacity a fresh or cleared cache starts
+// with: a heuristic that avoids early rehashing for typical repository sizes
+// without over-allocating for very small repos.
+const metaCacheInitialSize = 1024
 
 // newMetaCache constructs a metaCache with the given commit graph (may be nil)
 // and commit payload reader. It is called once during NewHistoryScanner
-// initialization. The initial map capacity (1024) is a heuristic that avoids
-// early rehashing for typical repository sizes without over-allocating for
-// very small repos.
+// initialization.
 func newMetaCache(g *commitGraphData, s commitPayloadReader) *metaCache {
-	const cacheSize = 1024
 	var ts []int64
 	if g != nil {
 		ts = g.Timestamps
@@ -107,35 +139,22 @@ func newMetaCache(g *commitGraphData, s commitPayloadReader) *metaCache {
 		graph:  g,
 		store:  s,
 		ts:     ts,
-		m:      make(map[Hash]metaEntry, cacheSize),
-		budget: defaultMetadataCacheBudget,
+		m:      make(map[Hash]metaEntry, metaCacheInitialSize),
+		budget: defaultMetaCacheBudget,
 	}
-}
-
-func (c *metaCache) setBudget(budget int) {
-	if budget < 0 {
-		budget = 0
-	}
-	c.mu.Lock()
-	c.budget = budget
-	for oid, entry := range c.m {
-		if c.used <= c.budget {
-			break
-		}
-		delete(c.m, oid)
-		c.used -= entry.weight
-	}
-	c.mu.Unlock()
 }
 
 // attachGraph replaces the current commit-graph reference. This is used when
 // the scanner discovers a commit-graph file after initial construction, or
 // when the graph is invalidated. Passing nil clears both the graph and the
-// timestamp slice so subsequent lookups fall back to header parsing.
+// timestamp slice so subsequent lookups fall back to header parsing. Cached
+// entries carry the timestamp resolved against the graph current at insert
+// time, so the cache is emptied and entries are rebuilt on their next miss.
 func (c *metaCache) attachGraph(g *commitGraphData) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	c.clearLocked()
 	if g == nil {
 		c.graph = nil
 		c.ts = nil
@@ -145,84 +164,178 @@ func (c *metaCache) attachGraph(g *commitGraphData) {
 	c.ts = g.Timestamps
 }
 
+// setBudget replaces the slab budget. Slabs already allocated stay in place;
+// the new budget governs the next slab allocation.
+func (c *metaCache) setBudget(bytes int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.budget = max(bytes, 0)
+}
+
+func (c *metaCache) clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.clearLocked()
+}
+
+// clearLocked requires c.mu held for writing. The map is replaced rather
+// than emptied in place: clear(m) keeps the bucket array, which for a large
+// history is itself hundreds of MiB.
+func (c *metaCache) clearLocked() {
+	c.m = make(map[Hash]metaEntry, metaCacheInitialSize)
+	c.slab = nil
+	c.slabBytes = 0
+}
+
 // get returns the CommitMetadata for the given OID, using the cache when
 // possible and falling back to payload parsing on a miss.
 //
-// Concurrency protocol:
-//  1. Acquire RLock, probe the map. (fast path -- no allocation)
-//  2. On miss: release RLock, read and parse the payload (potentially
-//     expensive I/O), acquire write Lock, insert into map, release Lock.
-//  3. Read graph pointer and timestamp slice under RLock, then look up
-//     the precomputed timestamp.
-//
-// This two-phase locking pattern means the same OID may be parsed twice if
-// two goroutines miss concurrently, but that is safe because metaEntry is
-// an immutable value type and the second write simply overwrites with an
-// identical value.
+// Two goroutines missing the same OID may both parse it; the first insert
+// wins and the others return the winner's entry.
 func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
-	// Fast read-only path.
 	c.mu.RLock()
 	entry, ok := c.m[oid]
 	c.mu.RUnlock()
-
 	if !ok {
-		// Slow path -- inflate and parse the commit payload once.
-		payload, err := c.store.readCommitPayload(oid)
-		if err != nil {
+		var err error
+		if entry, err = c.miss(oid); err != nil {
 			return CommitMetadata{}, err
 		}
-		// Split BEFORE parsing: a commit message can legally contain a line
-		// starting with "author " at column 0, which would corrupt the
-		// parse if the full payload were scanned. Within the header half,
-		// continuation lines (gpgsig, mergetag) are space-prefixed, so no
-		// embedded line can false-match at column 0.
-		hdr, msg := splitCommitPayload(payload)
-		ai, err := parseAuthorHeader(hdr)
-		if err != nil {
-			return CommitMetadata{}, err
-		}
-		// ai already retains payload through its zero-copy strings, so the
-		// message can safely share that same owned allocation.
-		entry = metaEntry{ai: ai, msg: btostr(msg), weight: len(payload)}
+	}
+	if entry.ts == 0 {
+		// An entry inserted without a resolved timestamp (or whose author
+		// timestamp is the Unix epoch) resolves against the current graph.
+		c.mu.RLock()
+		entry.ts = c.timestampLocked(oid, entry.ai)
+		c.mu.RUnlock()
+	}
+	return CommitMetadata{
+		Author:    entry.ai,
+		Timestamp: entry.ts,
+		Message:   entry.msg,
+	}, nil
+}
 
-		// Promote to cache.
-		c.mu.Lock()
-		if existing, loaded := c.m[oid]; loaded {
-			entry = existing
-		} else if entry.weight <= c.budget-c.used {
-			c.m[oid] = entry
-			c.used += entry.weight
-		}
+// miss reads and parses the entry for a commit absent from the map, and caches
+// it when retainLocked grants a region.
+func (c *metaCache) miss(oid Hash) (metaEntry, error) {
+	sc := payloadScratchPool.Get().(*payloadScratch)
+	defer payloadScratchPool.Put(sc)
+	sc.inBuf = false
+
+	var payload []byte
+	var err error
+	if to, ok := c.store.(commitPayloadReaderTo); ok {
+		payload, err = to.readCommitPayloadTo(oid, sc)
+	} else {
+		payload, err = c.store.readCommitPayload(oid)
+	}
+	if errors.Is(err, errCommitPayloadTooLarge) {
+		sc.inBuf = false
+		payload, err = c.store.readCommitHeader(oid)
+	}
+	if err != nil {
+		return metaEntry{}, err
+	}
+	ai, msg, err := parseCommitPayload(payload)
+	if err != nil {
+		return metaEntry{}, err
+	}
+
+	c.mu.Lock()
+	if existing, ok := c.m[oid]; ok {
 		c.mu.Unlock()
+		return existing, nil
 	}
-	ai := entry.ai
+	ts := c.timestampLocked(oid, ai)
+	if region := c.retainLocked(len(payload)); region != nil {
+		copy(region, payload)
+		entry := rebaseEntry(ai, msg, payload, region, ts)
+		c.m[oid] = entry
+		c.mu.Unlock()
+		return entry, nil
+	}
+	c.mu.Unlock()
 
-	// Prefer the commit-graph timestamp when available because it avoids
-	// reparsing the header and is authoritative for the committer date.
+	if sc.inBuf {
+		owned := make([]byte, len(payload))
+		copy(owned, payload)
+		return rebaseEntry(ai, msg, payload, owned, ts), nil
+	}
+	return metaEntry{ai: ai, msg: btostr(msg), ts: ts}, nil
+}
+
+// retainLocked returns an n-byte slab region for a cached payload, or nil
+// when n exceeds metaSlabSize or a new slab would push slabBytes past budget.
+// It requires c.mu held for writing.
+func (c *metaCache) retainLocked(n int) []byte {
+	if n > metaSlabSize {
+		return nil
+	}
+	if n > cap(c.slab)-len(c.slab) {
+		if c.slabBytes+metaSlabSize > c.budget {
+			return nil
+		}
+		c.slab = make([]byte, 0, metaSlabSize)
+		c.slabBytes += metaSlabSize
+	}
+	start := len(c.slab)
+	c.slab = c.slab[:start+n]
+	return c.slab[start : start+n : start+n]
+}
+
+// rebaseEntry builds the entry for to, a byte-for-byte copy of from. ai's
+// strings and msg are views into from; msg is a suffix of it.
+func rebaseEntry(ai AuthorInfo, msg, from, to []byte, ts int64) metaEntry {
+	ai.Name = rebaseString(ai.Name, from, to)
+	ai.Email = rebaseString(ai.Email, from, to)
+	return metaEntry{ai: ai, msg: btostr(to[len(to)-len(msg):]), ts: ts}
+}
+
+// rebaseString maps s to the same offset in to. s must be a view into from.
+func rebaseString(s string, from, to []byte) string {
+	if len(s) == 0 {
+		return ""
+	}
+	off := int(uintptr(unsafe.Pointer(unsafe.StringData(s))) - uintptr(unsafe.Pointer(unsafe.SliceData(from))))
+	return btostr(to[off : off+len(s)])
+}
+
+// payloadScratch is a pooled payloadSink. inBuf reports whether the last
+// reserve returned buf, which the caller must copy out of before the scratch
+// returns to the pool.
+type payloadScratch struct {
+	buf   [metaSlabSize]byte
+	inBuf bool
+}
+
+func (s *payloadScratch) reserve(n int) []byte {
+	if n > len(s.buf) {
+		s.inBuf = false
+		return make([]byte, n)
+	}
+	s.inBuf = true
+	return s.buf[:n:n]
+}
+
+var payloadScratchPool = sync.Pool{New: func() any { return new(payloadScratch) }}
+
+// timestampLocked resolves the commit timestamp with c.mu held. The
+// commit-graph value is preferred because it is authoritative for the
+// committer date; ts == 0 (commit absent from the graph, or genuinely the
+// Unix epoch, which is astronomically unlikely for real commits) falls back
+// to the parsed author timestamp.
+func (c *metaCache) timestampLocked(oid Hash, ai AuthorInfo) int64 {
 	var ts int64
-	c.mu.RLock()
-	graph := c.graph
-	tsSlice := c.ts
-	c.mu.RUnlock()
-	if graph != nil {
-		if idx, ok := graph.OIDToIndex[oid]; ok && idx < len(tsSlice) {
-			ts = tsSlice[idx]
+	if c.graph != nil {
+		if idx, ok := c.graph.OIDToIndex[oid]; ok && idx < len(c.ts) {
+			ts = c.ts[idx]
 		}
 	}
-	// Fallback: ts == 0 can mean the commit is not in the graph, or the
-	// graph timestamp is genuinely the Unix epoch (1970-01-01T00:00:00Z).
-	// The epoch case is astronomically unlikely for real commits, so we
-	// treat 0 as "not available" and fall back to the parsed author
-	// timestamp.
 	if ts == 0 {
 		ts = ai.When.Unix()
 	}
-
-	return CommitMetadata{
-		Author:    ai,
-		Timestamp: ts,
-		Message:   entry.msg,
-	}, nil
+	return ts
 }
 
 // splitCommitPayload splits a raw commit payload into its header half and
@@ -234,10 +347,53 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 // A payload without a separator (header-only commit) yields the full payload
 // as header and a nil message. The returned slices alias payload.
 func splitCommitPayload(payload []byte) (header, message []byte) {
-	if i := bytes.Index(payload, []byte("\n\n")); i >= 0 {
+	if i := indexBlankLine(payload); i >= 0 {
 		return payload[:i], payload[i+2:]
 	}
 	return payload, nil
+}
+
+// indexBlankLine returns the index of the first "\n\n" in b, or -1.
+//
+// Signed commits carry a gpgsig block of ~64-byte lines, so a search that
+// stops at every newline pays a call per line. This walk instead tests
+// eight bytes per step. x holds the word XOR '\n', so a '\n' byte is a zero
+// byte of x: the cheap has-zero test rejects most words outright, and only
+// words containing a newline compute the exact per-byte mask m (0x80 in each
+// zero byte) to look for two adjacent marks, either within the word or across
+// the top byte of the previous word (carry) and the bottom byte of this one.
+func indexBlankLine(b []byte) int {
+	const (
+		lf  = 0x0a0a0a0a0a0a0a0a
+		lo7 = 0x7f7f7f7f7f7f7f7f
+		lo1 = 0x0101010101010101
+		hi  = 0x8080808080808080
+	)
+	carry := uint64(0)
+	i := 0
+	for ; i+8 <= len(b); i += 8 {
+		x := binary.LittleEndian.Uint64(b[i:]) ^ lf
+		if (x-lo1)&^x&hi == 0 {
+			carry = 0
+			continue
+		}
+		m := ^(((x & lo7) + lo7) | x | lo7)
+		pair := m & (m<<8 | carry)
+		if pair != 0 {
+			// pair marks the second '\n' of the first adjacent pair.
+			return i + bits.TrailingZeros64(pair)/8 - 1
+		}
+		carry = m >> 56
+	}
+	if carry != 0 && i < len(b) && b[i] == '\n' {
+		return i - 1
+	}
+	for ; i+1 < len(b); i++ {
+		if b[i] == '\n' && b[i+1] == '\n' {
+			return i
+		}
+	}
+	return -1
 }
 
 var (
@@ -250,10 +406,11 @@ var (
 // parseAuthorHeader extracts the author's name, e-mail, and timestamp from
 // an uncompressed Git commit header.
 //
-// The function scans the input line-by-line looking for the first "author "
-// header. If no author line exists it falls back to the first "committer "
-// line, because some tooling (e.g. filter-branch, BFG) can produce commits
-// where the author line is stripped but the committer line survives.
+// The function scans header lines up to and including the first "committer "
+// line, taking the last "author " line seen before it. If no author line
+// exists it falls back to the committer line, because some tooling (e.g.
+// filter-branch, BFG) can produce commits where the author line is stripped
+// but the committer line survives.
 //
 // It does zero-allocation substring slicing wherever possible and returns a
 // descriptive error when the header is missing or malformed.
@@ -263,50 +420,84 @@ var (
 // caller's hdr slice is pooled or reused, the strings must be copied before
 // the slice is returned to the pool.
 func parseAuthorHeader(hdr []byte) (AuthorInfo, error) {
-	authorStart := -1
-	authorEnd := -1
-	isAuthor := false
-
-	i := 0
-	for i < len(hdr) {
-		// We are at the beginning of a line if i == 0
-		// or the previous byte is a newline.
-		if i == 0 || (i > 0 && hdr[i-1] == '\n') {
-			lineStart := i
-
-			// Find the end of the current line.
-			lineEnd := i
-			for lineEnd < len(hdr) && hdr[lineEnd] != '\n' {
-				lineEnd++
-			}
-
-			line := hdr[lineStart:lineEnd]
-
-			switch {
-			case len(line) >= 7 && bytes.Equal(line[:7], []byte("author ")):
-				authorStart = lineStart + 7
-				authorEnd = lineEnd
-				isAuthor = true
-			case !isAuthor && len(line) >= 10 && bytes.Equal(line[:10], []byte("committer ")):
-				// Fallback to "committer " only if no "author " was seen yet.
-				authorStart = lineStart + 10
-				authorEnd = lineEnd
-				// Continue scanning – there might be a genuine author line later.
-			}
-
-			i = lineEnd + 1
-		} else {
-			i++
-		}
-	}
-
-	if authorStart == -1 {
+	line, _, _ := walkCommitHeader(hdr)
+	if line == nil {
 		return AuthorInfo{}, ErrAuthorLineNotFound
 	}
+	return parseAuthorLine(line)
+}
 
-	// Slice that contains everything after "author " / "committer " up to
-	// the newline.  Format: "<name> <email> <timestamp> <tz>".
-	line := hdr[authorStart:authorEnd]
+// parseCommitPayload is splitCommitPayload followed by parseAuthorHeader on
+// the header half, in one pass over the payload. The identity walk stops at
+// the committer line or at the blank separator line, whichever comes first,
+// so a message line starting with "author " at column 0 is never read as a
+// header; the separator search then resumes after the committer line.
+func parseCommitPayload(payload []byte) (AuthorInfo, []byte, error) {
+	line, next, sep := walkCommitHeader(payload)
+	if sep < 0 && next > 0 && next <= len(payload) {
+		// next is the offset after the committer line's newline, so the
+		// separator's first byte can be that newline itself.
+		if j := indexBlankLine(payload[next-1:]); j >= 0 {
+			sep = next - 1 + j
+		}
+	}
+	var msg []byte
+	if sep >= 0 {
+		msg = payload[sep+2:]
+	}
+	if line == nil {
+		return AuthorInfo{}, nil, ErrAuthorLineNotFound
+	}
+	ai, err := parseAuthorLine(line)
+	if err != nil {
+		return AuthorInfo{}, nil, err
+	}
+	return ai, msg, nil
+}
+
+// walkCommitHeader scans header lines and returns the identity line to
+// parse (the last "author " line, else the first "committer " line, else
+// nil) without its key. The committer line closes the identity section of
+// the object format (gpgsig, mergetag, and encoding follow it, and their
+// continuation lines are space-prefixed), so the walk ends there with next
+// set to the offset after that line's newline. A blank line also ends the
+// walk: sep is the offset of the "\n\n" separator, or -1 when the walk saw
+// none. The pre-payload header reader truncated at the committer line too.
+func walkCommitHeader(b []byte) (line []byte, next int, sep int) {
+	var author []byte
+	i := 0
+	for i < len(b) {
+		lineEnd := len(b)
+		if nl := bytes.IndexByte(b[i:], '\n'); nl >= 0 {
+			lineEnd = i + nl
+		}
+		if lineEnd == i && i > 0 {
+			return author, i, i - 1
+		}
+		cur := b[i:lineEnd]
+		if bytes.HasPrefix(cur, []byte("author ")) {
+			author = cur[7:]
+		} else if bytes.HasPrefix(cur, []byte("committer ")) {
+			return pick(author, cur[10:]), lineEnd + 1, -1
+		}
+		i = lineEnd + 1
+	}
+	return author, i, -1
+}
+
+// pick prefers the author line and falls back to the committer line, because
+// some tooling (e.g. filter-branch, BFG) strips the author line while the
+// committer line survives.
+func pick(author, committer []byte) []byte {
+	if author != nil {
+		return author
+	}
+	return committer
+}
+
+// parseAuthorLine parses the remainder of an identity line:
+// "<name> <email> <timestamp> <tz>".
+func parseAuthorLine(line []byte) (AuthorInfo, error) {
 
 	// Locate the terminating '>' of the email address (scan from the end
 	// because the author's name can contain '>').

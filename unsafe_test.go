@@ -1,18 +1,18 @@
 // unsafe_test.go pins the safety-critical invariants of the zero-copy
-// conversion helpers in unsafe.go (introduced with the mmap/zero-copy inflate
-// optimization in 4f9f796). These helpers bypass Go's copy semantics, so the
-// invariants they promise — exact aliasing, correct length, and value
+// conversion helpers in unsafe.go, which let pack reads alias the mmap'd file
+// instead of copying out of it. These helpers bypass Go's copy semantics, so
+// the invariants they promise — exact aliasing, correct length, and value
 // equality — must be asserted directly rather than left to indirect coverage.
+//
+// This file stays free of build constraints, so everything here must compile on
+// every target the library supports. The mmapData assertions live in
+// unsafe_mmap_test.go under the same constraint as their subject.
 
 package objstore
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 	"unsafe"
-
-	"golang.org/x/exp/mmap"
 
 	"github.com/stretchr/testify/require"
 )
@@ -52,29 +52,4 @@ func TestBtostr_ZeroCopyAliasing(t *testing.T) {
 func TestBtostr_EmptyReturnsEmpty(t *testing.T) {
 	require.Equal(t, "", btostr(nil))
 	require.Equal(t, "", btostr([]byte{}))
-}
-
-// TestMmapData_AliasesMappedRegion validates the struct-layout assumption that
-// mmapData depends on: the returned slice must alias the mapped file and expose
-// exactly its bytes. Any change to golang.org/x/exp/mmap's internal layout (the
-// pinned dependency) would surface here immediately.
-func TestMmapData_AliasesMappedRegion(t *testing.T) {
-	want := []byte("memory-mapped file contents \x00\xff with binary bytes")
-	path := filepath.Join(t.TempDir(), "mmapped.bin")
-	require.NoError(t, os.WriteFile(path, want, 0o644))
-
-	r, err := mmap.Open(path)
-	require.NoError(t, err)
-	defer r.Close()
-
-	got := mmapData(r)
-	require.Equal(t, len(want), r.Len(), "sanity: mmap reports file length")
-	require.Equal(t, len(want), len(got), "mmapData length must equal file size")
-	require.Equal(t, want, got, "mmapData must expose the file's bytes")
-
-	// Cross-check a byte read through the public API matches the aliased slice.
-	var one [1]byte
-	_, err = r.ReadAt(one[:], 3)
-	require.NoError(t, err)
-	require.Equal(t, got[3], one[0], "aliased slice must agree with ReadAt")
 }

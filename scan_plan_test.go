@@ -10,6 +10,7 @@ package objstore
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -488,4 +489,133 @@ func TestScanBlobsStreaming_ParallelDecodeMatchesSerialOrder(t *testing.T) {
 			t.Fatalf("scan order mismatch at %d: serial=%+v parallel=%+v", i, serial[i], parallel[i])
 		}
 	}
+}
+
+// TestPlanScanJobs_DeterministicAttribution proves that blob attribution is
+// stable across runs. planScanJobs dedupes blobs first-wins, so the
+// (Commit, Path) a shared blob is reported under is decided by commit visit
+// order; that order must not depend on goroutine scheduling. The repository
+// introduces one identical blob from several branch commits (and again
+// through each merge's first-parent diff), so any order nondeterminism
+// surfaces as attribution churn.
+func TestPlanScanJobs_DeterministicAttribution(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git executable not found in PATH")
+	}
+
+	repo := t.TempDir()
+	git := func(args ...string) {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t",
+			"GIT_AUTHOR_EMAIL=t@example.com",
+			"GIT_COMMITTER_NAME=t",
+			"GIT_COMMITTER_EMAIL=t@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v failed: %v\n%s", args, err, out)
+		}
+	}
+	write := func(name, content string) {
+		if err := os.WriteFile(filepath.Join(repo, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	git("init", "--quiet")
+	write("base.txt", "base\n")
+	git("add", "base.txt")
+	git("commit", "-m", "base", "--quiet")
+	git("branch", "-M", "main")
+
+	// Introduce the same blob content on several branches under distinct
+	// paths, then merge each branch. Every branch commit and every merge's
+	// first-parent diff re-introduces the shared blob OID.
+	const shared = "identical content\n"
+	for i := range 6 {
+		branch := fmt.Sprintf("side%d", i)
+		git("checkout", "--quiet", "-b", branch, "main")
+		write(fmt.Sprintf("f%d.txt", i), shared)
+		git("add", ".")
+		git("commit", "-m", branch, "--quiet")
+		git("checkout", "--quiet", "main")
+		git("merge", "--quiet", "--no-ff", "-m", "merge "+branch, branch)
+	}
+	git("repack", "-adq")
+
+	gitDir := filepath.Join(repo, ".git")
+	attribution := func() map[Hash][2]string {
+		scanner, err := NewHistoryScanner(gitDir)
+		if err != nil {
+			t.Fatalf("NewHistoryScanner: %v", err)
+		}
+		defer scanner.Close()
+
+		jobsByPack, err := scanner.planScanJobs(nil)
+		if err != nil {
+			t.Fatalf("planScanJobs: %v", err)
+		}
+
+		got := make(map[Hash][2]string)
+		for _, job := range flattenJobs(jobsByPack) {
+			got[job.Blob] = [2]string{job.Commit.String(), job.Path}
+		}
+		return got
+	}
+
+	baseline := attribution()
+	if len(baseline) == 0 {
+		t.Fatalf("expected scheduled blobs")
+	}
+	for i := range 14 {
+		got := attribution()
+		if len(got) != len(baseline) {
+			t.Fatalf("run %d scheduled %d blobs, baseline %d", i+1, len(got), len(baseline))
+		}
+		for blob, attr := range got {
+			if baseline[blob] != attr {
+				t.Fatalf("run %d attributes blob %s to %v, baseline %v",
+					i+1, blob, attr, baseline[blob])
+			}
+		}
+	}
+}
+
+// TestScanPlanWalks_ReleaseTreeMemo proves the commit->tree memo populated
+// while planning does not outlive the planning call on the long-lived
+// scanner.
+func TestScanPlanWalks_ReleaseTreeMemo(t *testing.T) {
+	countMemo := func(hs *HistoryScanner) int {
+		entries := 0
+		hs.treeOIDs.Range(func(_, _ any) bool {
+			entries++
+			return true
+		})
+		return entries
+	}
+
+	t.Run("walkBlobCandidates", func(t *testing.T) {
+		scanner := createScannerForRepo(t, "simple-linear")
+		defer scanner.Close()
+
+		if err := scanner.walkBlobCandidates(func(blobRecord) error { return nil }); err != nil {
+			t.Fatalf("walkBlobCandidates: %v", err)
+		}
+		if n := countMemo(scanner); n != 0 {
+			t.Fatalf("tree memo holds %d entries after walkBlobCandidates", n)
+		}
+	})
+
+	t.Run("planScanJobs", func(t *testing.T) {
+		scanner := createScannerForRepo(t, "simple-linear")
+		defer scanner.Close()
+
+		if _, err := scanner.planScanJobs(nil); err != nil {
+			t.Fatalf("planScanJobs: %v", err)
+		}
+		if n := countMemo(scanner); n != 0 {
+			t.Fatalf("tree memo holds %d entries after planScanJobs", n)
+		}
+	})
 }

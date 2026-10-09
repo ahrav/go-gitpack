@@ -1,15 +1,18 @@
-// diff_blob_test.go tests the core addedHunksWithPos diff algorithm and the
-// fuseHunks hunk-merging logic. It covers basic additions, multiple hunks,
-// replacements, edge cases (unicode, whitespace, CRLF), the EndLine invariant,
-// and fuzz testing for state invariant validation.
+// diff_blob_test.go tests the core addedHunksWithPos diff algorithm. It
+// covers basic additions, multiple hunks, replacements, edge cases (unicode,
+// whitespace, CRLF), the EndLine invariant, and fuzz testing for state
+// invariant validation.
 
 package objstore
 
 import (
 	"bytes"
+	"fmt"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -333,120 +336,62 @@ func FuzzAddedHunks(f *testing.F) {
 	})
 }
 
-// TestFuseHunks validates the fuseHunks function which merges adjacent hunks
-// whose inter-hunk gap is small enough. The merging threshold is determined by
-// the ctx (context lines) and inter (inter-hunk gap allowance) parameters:
-// hunks are merged when the gap between them is <= 2*ctx + inter.
-// Each subtest also validates the monotone, non-overlapping invariant on the
-// resulting hunk list.
-func TestFuseHunks(t *testing.T) {
-	type args struct {
-		hunks []AddedHunk
-		ctx   int
-		inter int
-	}
-	// makeH is a helper that constructs an AddedHunk for table-driven tests.
-	// NOTE: The variable b below computes total byte length but is unused;
-	// it appears to be a leftover from when AddedHunk tracked byte size.
-	makeH := func(start uint32, lines ...string) AddedHunk {
-		b := 0
-		for _, l := range lines {
-			b += len(l)
+// Clearing line-table headers past a recycled table's new length releases
+// their references to source blobs.
+func TestLineScratchClearsShrunkTail(t *testing.T) {
+	// Each side starts with a distinct line, so commonPrefixLineBoundary
+	// returns 0.
+	lines := func(first string, n int) []byte {
+		var b bytes.Buffer
+		b.WriteString(first + "\n")
+		for i := 1; i < n; i++ {
+			fmt.Fprintf(&b, "%s-%d\n", first, i)
 		}
-		_ = b // silence unused-variable linter; see note above.
-		return AddedHunk{StartLine: start, Lines: lines}
+		return b.Bytes()
 	}
 
-	tests := []struct {
-		name string
-		args args
-		want []AddedHunk
-	}{
-		{
-			name: "merge_defaultCtx",
-			args: args{
-				// gaps: 2 & 4  -> total 6  (<= 2*3+0) so merge
-				hunks: []AddedHunk{
-					makeH(1, "a"),
-					makeH(4, "b"), // gap = 4‑1‑1 = 2
-					makeH(7, "c"), // gap = 7‑4‑1 = 2
-				},
-				ctx: 3, inter: 0,
-			},
-			want: []AddedHunk{
-				makeH(1, "a", "b", "c"),
-			},
-		},
-		{
-			name: "no_merge_defaultCtx",
-			args: args{
-				hunks: []AddedHunk{
-					makeH(1, "a"),
-					makeH(9, "b"), // gap = 9‑1‑1 = 7  (>6) so keep split
-				},
-				ctx: 3, inter: 0,
-			},
-			want: []AddedHunk{
-				makeH(1, "a"),
-				makeH(9, "b"),
-			},
-		},
-		{
-			name: "merge_zeroCtx_inter",
-			args: args{
-				hunks: []AddedHunk{
-					makeH(1, "a"),
-					makeH(3, "b"), // gap = 1 (<= inter=2) – merge
-				},
-				ctx: 0, inter: 2,
-			},
-			want: []AddedHunk{
-				makeH(1, "a", "b"),
-			},
-		},
-		{
-			name: "cascade_merge",
-			args: args{
-				// 1↔2 gap 2   2↔3 gap 2   all within maxGap 4
-				hunks: []AddedHunk{
-					makeH(10, "x"),
-					makeH(13, "y"),
-					makeH(16, "z"),
-				},
-				ctx: 2, inter: 0, // maxGap = 4
-			},
-			want: []AddedHunk{
-				makeH(10, "x", "y", "z"),
-			},
-		},
-		{
-			name: "preserve_bytes_and_lines",
-			args: args{
-				hunks: []AddedHunk{
-					makeH(1, "123"),
-					makeH(3, "45"),
-				},
-				ctx: 1, inter: 1, // gap = 1 <= 3
-			},
-			want: []AddedHunk{
-				{StartLine: 1, Lines: []string{"123", "45"}},
-			},
-		},
+	sc := &lineScratch{}
+	_ = addedHunksWithPosScratch(lines("old-a", 400), lines("new-a", 500), sc)
+	_ = addedHunksWithPosScratch(lines("old-b", 40), lines("new-b", 50), sc)
+
+	for name, table := range map[string][]string{"old": sc.old, "new": sc.new} {
+		for i, s := range table[len(table):cap(table)] {
+			require.Nil(t, unsafe.StringData(s),
+				"%s table slot %d past len %d still views an earlier blob", name, len(table)+i, len(table))
+		}
 	}
+}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := fuseHunks(tt.args.hunks, tt.args.ctx, tt.args.inter)
-			assert.Equal(t, tt.want, got, "FuseHunks result mismatch")
+// TestAddedHunksWithPosDoesNotPoolOversizedIndex proves the lineIndex pool
+// retention invariant: after diffing a file whose lineIndex exceeds
+// maxPooledLineIndexBytes, the pool must never hand back an oversized index.
+//
+// Without a retention cap, build() only ever grows slots/next and the defer
+// in addedHunksWithPos re-pools the index unconditionally, so one ~2^20-line
+// file ratchets a pooled index to ~20 MiB (16 MiB slots + 4 MiB next) that
+// sync.Pool then retains across GC cycles — once per scan worker. GC is
+// disabled for the duration of the test so the pool cannot shed entries
+// between the Put (inside addedHunksWithPos) and the Get below, making the
+// pre-fix failure deterministic when run in isolation.
+func TestAddedHunksWithPosDoesNotPoolOversizedIndex(t *testing.T) {
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
 
-			// Additional invariant: StartLine/EndLine monotone and non‑overlapping.
-			prevEnd := uint32(0)
-			for i, h := range got {
-				assert.Greater(t, h.StartLine, uint32(0), "hunk %d StartLine <= 0", i)
-				assert.GreaterOrEqual(t, h.EndLine(), h.StartLine, "hunk %d EndLine < StartLine", i)
-				assert.Greater(t, h.StartLine, prevEnd, "hunks overlap or unordered")
-				prevEnd = h.EndLine()
-			}
-		})
+	// 2^20 one-byte lines. The first line of new differs, so the common-prefix
+	// skip elides nothing and the index is built over the full old side:
+	// want = 2^21 slots (16 MiB) + 2^20 int32 next entries (4 MiB).
+	oldB := bytes.Repeat([]byte("a\n"), 1<<20)
+	newB := []byte("b\n")
+
+	for range 4 {
+		_ = addedHunksWithPos(oldB, newB)
+
+		ix := lineIndexPool.Get().(*lineIndex)
+		retained := len(ix.slots)*8 + cap(ix.next)*4
+		// Return whatever we got so later diffs can still reuse small indexes.
+		lineIndexPool.Put(ix)
+
+		require.LessOrEqual(t, retained, maxPooledLineIndexBytes,
+			"pool returned an oversized lineIndex (%d bytes retained); "+
+				"oversized indexes must be dropped, not pooled", retained)
 	}
 }

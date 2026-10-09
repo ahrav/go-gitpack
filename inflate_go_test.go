@@ -11,6 +11,19 @@ import (
 	"testing"
 )
 
+// Shared static pack-zlib stream vectors (2-byte header + DEFLATE stream +
+// 4-byte Adler-32 trailer), referenced by the static-vector, truncation,
+// ARM64 differential, and concurrent pool-reuse tests.
+//
+// fixedHuffmanVectorHex decodes to "goodbye, world" via a single fixed-
+// Huffman (BTYPE=1) block; dynamicHuffmanVectorHex decodes to
+// bytes.Repeat([]byte("abcabc"), 1000) via a single dynamic-Huffman
+// (BTYPE=2) block.
+const (
+	fixedHuffmanVectorHex   = "789c4bcfcf4f49aa4cd55128cf2fca49010028a5055e"
+	dynamicHuffmanVectorHex = "789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959"
+)
+
 func TestInflatePackZlibStaticVectors(t *testing.T) {
 	tests := []struct {
 		name string
@@ -29,12 +42,12 @@ func TestInflatePackZlibStaticVectors(t *testing.T) {
 		},
 		{
 			name: "fixed huffman",
-			hex:  "789c4bcfcf4f49aa4cd55128cf2fca49010028a5055e",
+			hex:  fixedHuffmanVectorHex,
 			want: []byte("goodbye, world"),
 		},
 		{
 			name: "dynamic huffman",
-			hex:  "789cedc2411100000c02a0ac6aff0e0bb12f1ce9a2aaaaaaaaaafe1e2f01f959",
+			hex:  dynamicHuffmanVectorHex,
 			want: bytes.Repeat([]byte("abcabc"), 1000),
 		},
 	}
@@ -293,6 +306,16 @@ func TestInflatePackZlibAdversarialDynamicStreams(t *testing.T) {
 			size: 1,
 		},
 		{
+			name: "reserved HLIT count",
+			raw:  reservedAlphabetCountStream(true),
+			size: 0,
+		},
+		{
+			name: "reserved HDIST count",
+			raw:  reservedAlphabetCountStream(false),
+			size: 0,
+		},
+		{
 			name: "truncated all-zero literal codeword",
 			raw:  overreadStream(),
 			size: 256,
@@ -435,8 +458,10 @@ func TestGoInflaterInvalidatesFixedCacheBeforeDynamicParse(t *testing.T) {
 	}
 
 	r := deflateBits{}
-	if d.loadDynamicTables(&r) {
+	if err := d.loadDynamicTables(&r); err == nil {
 		t.Fatal("truncated dynamic header accepted")
+	} else if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated dynamic header reported %v, want unexpected-EOF identity", err)
 	}
 	if d.static {
 		t.Fatal("failed dynamic parse left fixed-table cache valid")
@@ -487,9 +512,9 @@ func TestDecodeTableEntryUsesLongCodeSubtable(t *testing.T) {
 				byte(reverseCode(next[n]+sym-11, int(n)) >> 8),
 			}
 			r := deflateBits{src: raw}
-			entry, _, ok := decodeTableEntry(&r, d.litlen[:], uint(tableBits))
-			if !ok || entry&huffLiteral == 0 || int(byte(entry>>16)) != sym {
-				t.Fatalf("symbol %d: entry=%08x ok=%v", sym, entry, ok)
+			entry, _, err := decodeTableEntry(&r, d.litlen[:], uint(tableBits))
+			if err != nil || entry&huffLiteral == 0 || int(byte(entry>>16)) != sym {
+				t.Fatalf("symbol %d: entry=%08x err=%v", sym, entry, err)
 			}
 		}
 	}
@@ -808,10 +833,147 @@ func TestInflatePackZlibSingleBitDifferential(t *testing.T) {
 	}
 }
 
+// TestInflateStoredBlockOverrunTruncationClassification pins the error class
+// for a stored block that is both truncated (LEN exceeds the remaining
+// input) and overrunning (its payload crosses the declared size). The bytes
+// actually present decide: payload in the input crossing the declared size
+// is the overrun class, matching what the streaming backends observe, while
+// a declared LEN whose bytes are absent stays a truncation.
+func TestInflateStoredBlockOverrunTruncationClassification(t *testing.T) {
+	// Stored final block: LEN=5, NLEN=^5, but only 3 payload bytes present.
+	src := []byte{0x78, 0x9c, 0x01, 0x05, 0x00, 0xfa, 0xff, 0x41, 0x42, 0x43}
+
+	// Declared size 2: the third stored byte already crosses it.
+	_, _, err := guardedGoInflate(t, src, 2)
+	if !errors.Is(err, errZlibStreamOverrun) {
+		t.Fatalf("overrun-evident stream got %v, want the stream-overrun class", err)
+	}
+
+	// Declared size 10: the 3 present bytes fit; the missing 2 are a
+	// truncation, not an overrun.
+	_, _, err = guardedGoInflate(t, src, 10)
+	if errors.Is(err, errZlibStreamOverrun) {
+		t.Fatalf("truncated stored block misclassified as overrun: %v", err)
+	}
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("truncated stored block got %v, want unexpected-EOF identity", err)
+	}
+
+	// Both classifications must satisfy the full differential oracle.
+	assertGoMatchesReference(t, src, 2)
+	assertGoMatchesReference(t, src, 10)
+}
+
+// TestInflateMatchAtFullDestinationClassification pins the error class when
+// the destination is already full and the next symbol is a length code: the
+// overrun class applies only after the whole match decodes as structurally
+// valid. A missing distance code is truncation; only a complete match that
+// would exceed dst is an overrun.
+func TestInflateMatchAtFullDestinationClassification(t *testing.T) {
+	// Five 9-bit literals plus the 8-bit length-258 code end exactly on a
+	// byte boundary (3+45+8 = 56 bits), so the distance code is entirely
+	// absent from the input.
+	t.Run("truncated distance", func(t *testing.T) {
+		var w deflateTestBits
+		w.write(1, 1) // BFINAL
+		w.write(1, 2) // BTYPE = fixed
+		for i := 0; i < 5; i++ {
+			w.writeFixedLitlen(200)
+		}
+		w.writeFixedLength(258)
+		src := append([]byte{0x78, 0x9c}, w.bytes()...)
+
+		_, _, err := guardedGoInflate(t, src, 5)
+		if err == nil {
+			t.Fatal("truncated match accepted")
+		}
+		if errors.Is(err, errZlibStreamOverrun) {
+			t.Fatalf("got overrun class, want truncation: %v", err)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("got %v, want unexpected-EOF identity", err)
+		}
+	})
+
+	// The same layout with a complete, valid distance code must report the
+	// overrun class.
+	t.Run("valid match overrun", func(t *testing.T) {
+		var w deflateTestBits
+		w.write(1, 1)
+		w.write(1, 2)
+		for i := 0; i < 5; i++ {
+			w.writeFixedLitlen(200)
+		}
+		w.writeFixedLength(258)
+		w.writeFixedOffset(0) // distance 1
+		w.writeFixedLitlen(256)
+		src := append([]byte{0x78, 0x9c}, w.bytes()...)
+
+		_, _, err := guardedGoInflate(t, src, 5)
+		if !errors.Is(err, errZlibStreamOverrun) {
+			t.Fatalf("got %v, want the stream-overrun class", err)
+		}
+	})
+}
+
+// TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF pins the
+// truncation-error contract: every strict prefix of a valid member (cut
+// anywhere in the deflate payload, including mid-header, mid-dynamic-table,
+// and mid-codeword) must classify as truncation via
+// errors.Is(err, io.ErrUnexpectedEOF), never as generic bad data.
+func TestInflatePackZlibTruncatedPrefixesReportUnexpectedEOF(t *testing.T) {
+	type fixture struct {
+		encoded []byte
+		size    int
+	}
+	var fixtures []fixture
+
+	payloads := [][]byte{
+		[]byte("fixed fixture"),
+		bytes.Repeat([]byte("dynamic fixture "), 40),
+		makeDeterministicBytes(512),
+	}
+	levels := []int{zlib.HuffmanOnly, zlib.DefaultCompression, zlib.NoCompression}
+	for i, payload := range payloads {
+		fixtures = append(fixtures, fixture{encodeZlib(t, payload, levels[i]), len(payload)})
+	}
+
+	// A dynamic-block member (BTYPE=2), so cuts land inside the 14-bit
+	// counts, the precode lengths, and the code-length symbol stream.
+	dynamic, err := hex.DecodeString(dynamicHuffmanVectorHex)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixtures = append(fixtures, fixture{dynamic, 6000})
+
+	for i, f := range fixtures {
+		memberEnd := len(f.encoded) - 4
+		for cut := 2; cut < memberEnd; cut++ {
+			_, consumed, err := guardedGoInflate(t, f.encoded[:cut], f.size)
+			if err == nil {
+				t.Fatalf("fixture=%d cut=%d: truncated stream accepted", i, cut)
+			}
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("fixture=%d cut=%d: got %v, want unexpected-EOF identity",
+					i, cut, err)
+			}
+			if consumed != 0 {
+				t.Fatalf("fixture=%d cut=%d: error returned consumed=%d, want 0",
+					i, cut, consumed)
+			}
+		}
+	}
+}
+
 func guardedGoInflate(tb testing.TB, src []byte, size int) ([]byte, int, error) {
 	tb.Helper()
 
-	const guardSize = 32
+	// guardSize must be >= deflateFastMatchCopy: the fast loop's worst-case
+	// whole-word match copy can overwrite up to that many bytes at once, so
+	// a narrower guard would let an out-of-dst overrun land entirely past
+	// the pattern and go undetected on platforms without the mprotect
+	// guard-page test.
+	const guardSize = 2 * deflateFastMatchCopy
 	guarded := bytes.Repeat([]byte{0xa5}, guardSize+size+guardSize)
 	dst := guarded[guardSize : guardSize+size : guardSize+size]
 	srcBefore := append([]byte(nil), src...)
@@ -888,6 +1050,92 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 		if consumed != 0 {
 			t.Fatalf("error returned consumed=%d, want 0", consumed)
 		}
+		// Both backends reject; compare the error class where the
+		// backends define it compatibly. Truncation carries the
+		// io.ErrUnexpectedEOF identity on both sides: our decoder via
+		// the errDeflateTruncated and errDeflateShortOutput wrappers,
+		// compress/flate by converting an io.EOF read mid-stream.
+		//
+		// Exemption 1 (granted only on the reference's evidence): a
+		// stream that produces more than the declared object size AND
+		// fails later has two independent defects, and the backends
+		// legitimately report different ones. Our one-shot decoder
+		// rejects in output order the moment the destination would
+		// overflow, while compress/flate decodes ahead and may latch
+		// whichever defect it reaches. The exemption is keyed on the
+		// reference observing output past the declared size, never on
+		// this decoder's own overrun claim, so a regression that
+		// misclassifies other failures as overrun cannot exempt itself.
+		if errors.Is(wantErr, errReferenceOverrun) {
+			return
+		}
+		// An overrun claim by this decoder cannot be validated against
+		// compress/flate's byte COUNT: at a truncation boundary flate
+		// may stop one symbol short of the bytes zlib and libdeflate
+		// decode from the final bits, so requiring reference-side
+		// overrun evidence here would fail on streams whose overrun is
+		// genuine. The claim is validated by two independent checks
+		// instead:
+		//
+		//  1. Self-consistency: overrun asserts the stream validly
+		//     produces more than the declared size, so re-decoding
+		//     into a destination sized past DEFLATE's ~1032x maximum
+		//     expansion (a 258-byte match from a 2-bit degenerate
+		//     dynamic code) — where overrun is impossible — must cross
+		//     the declared size before any terminal condition. This
+		//     catches destination-dependent early exits.
+		//  2. Content corroboration: compress/flate is correct on
+		//     every byte it does produce, so everything it decodes of
+		//     the same stream must match the headroom output
+		//     byte-for-byte — and flate may stop short of the headroom
+		//     production only at a truncation boundary (it can stop
+		//     one symbol shy of the final bits). A shorter reference
+		//     decode ending in a clean EOB or a structural rejection
+		//     means the surplus bytes were fabricated. This catches
+		//     regressions that fabricate output from misbuilt tables
+		//     or invalid codewords, which reproduce identically in
+		//     check 1 but cannot be corroborated by the reference.
+		if errors.Is(gotErr, errZlibStreamOverrun) {
+			probe := make([]byte, 1032*len(src)+64)
+			d := goInflaterPool.Get().(*goInflater)
+			_, produced, probeErr := d.inflateRaw(src[2:], probe)
+			goInflaterPool.Put(d)
+			if produced <= size {
+				t.Fatalf("unsupported overrun claim for %x size=%d: go err=%v, but headroom decode produced only %d bytes (err=%v)",
+					src, size, gotErr, produced, probeErr)
+			}
+			fr := stdflate.NewReader(bytes.NewReader(src[2:]))
+			flateOut, flateErr := io.ReadAll(io.LimitReader(fr, int64(produced)))
+			fr.Close()
+			corroborated := len(flateOut) == produced ||
+				errors.Is(flateErr, io.ErrUnexpectedEOF)
+			if !corroborated || !bytes.Equal(flateOut, probe[:len(flateOut)]) {
+				t.Fatalf("uncorroborated overrun claim for %x size=%d: headroom decode produced %d bytes, reference corroborates %d (contentMatch=%v, refErr=%v)",
+					src, size, produced, len(flateOut),
+					bytes.Equal(flateOut, probe[:len(flateOut)]), flateErr)
+			}
+			return
+		}
+		// Exemption 2 (one-sided comparison): compress/flate reporting
+		// truncation does not prove the input is merely truncated,
+		// because it defers some structural validation past the end of
+		// input. One such family: a dynamic table that assigns no code
+		// to the end-of-block symbol is rejected by this decoder at
+		// header time (bad data, matching zlib's "invalid code --
+		// missing end-of-block" check; libdeflate defers the detection
+		// to body decode but has no truncation class at all, so it too
+		// never reports this family as truncated), while compress/flate
+		// accepts the header, decodes until input runs out, and reports
+		// truncation. The reverse direction is strict: whenever our
+		// decoder claims the truncation identity, the reference must
+		// agree, so structurally invalid data can never hide behind
+		// io.ErrUnexpectedEOF on our side.
+		gotTruncated := errors.Is(gotErr, io.ErrUnexpectedEOF)
+		wantTruncated := errors.Is(wantErr, io.ErrUnexpectedEOF)
+		if gotTruncated && !wantTruncated {
+			t.Fatalf("error class mismatch for %x size=%d: go err=%v claims truncation, reference err=%v does not",
+				src, size, gotErr, wantErr)
+		}
 		return
 	}
 	if consumed != wantConsumed || !bytes.Equal(got, want) {
@@ -895,6 +1143,11 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 			consumed, wantConsumed, bytes.Equal(got, want))
 	}
 }
+
+// errReferenceOverrun classifies reference-harness rejections of streams
+// that produce more than the declared object size, mirroring the
+// errZlibStreamOverrun class on the Go decoder side.
+var errReferenceOverrun = errors.New("reference: output exceeds declared size")
 
 func referencePackInflate(src []byte, size int) ([]byte, int, error) {
 	if len(src) < 2 || !validPackZlibHeader(src[0], src[1]) {
@@ -905,14 +1158,27 @@ func referencePackInflate(src []byte, size int) ([]byte, int, error) {
 	fr := stdflate.NewReader(br)
 	out, err := io.ReadAll(io.LimitReader(fr, int64(size)+1))
 	closeErr := fr.Close()
+	if len(out) > size {
+		// Overrun takes precedence over any decode error: the stream
+		// exceeded the declared size before whatever failure flate may
+		// have latched while decoding ahead of the limit.
+		return nil, 0, fmt.Errorf("output size %d, want %d: %w",
+			len(out), size, errReferenceOverrun)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
 	if closeErr != nil {
 		return nil, 0, closeErr
 	}
-	if len(out) != size {
-		return nil, 0, fmt.Errorf("output size %d, want %d", len(out), size)
+	if len(out) < size {
+		// A structurally complete stream that stops short of the declared
+		// object size is a truncation-class failure: reading size bytes
+		// from the decompressed stream hits EOF early, exactly what
+		// io.ReadFull would report. This mirrors errDeflateShortOutput,
+		// which carries the same identity on the Go decoder side.
+		return nil, 0, fmt.Errorf("output size %d, want %d: %w",
+			len(out), size, io.ErrUnexpectedEOF)
 	}
 	return out, 2 + len(src[2:]) - br.Len(), nil
 }
@@ -1115,6 +1381,58 @@ func incompleteSingletonOffsetStream(nonzero bool) []byte {
 	w.write(3, 2)
 	w.write(0, 1)
 	w.write(1, 2)
+	return w.bytes()
+}
+
+// reservedAlphabetCountStream builds a dynamic block whose HLIT or HDIST
+// field carries a reserved value (HLIT=30 encodes 287 literal/length codes;
+// HDIST=30 encodes 31 distance codes). Everything else in the stream is
+// well-formed and the unused trailing code lengths are zero, so only the
+// reserved count itself makes the stream invalid (RFC 1951 section 3.2.7).
+func reservedAlphabetCountStream(litlen bool) []byte {
+	var w deflateTestBits
+	w.write(1, 1) // BFINAL
+	w.write(2, 2) // BTYPE = dynamic
+	if litlen {
+		w.write(30, 5) // HLIT = 30 -> 287 litlen codes (valid max is 29 -> 286)
+		w.write(0, 5)  // HDIST = 0 -> 1 offset code
+	} else {
+		w.write(0, 5)  // HLIT = 0 -> 257 litlen codes
+		w.write(30, 5) // HDIST = 30 -> 31 offset codes (valid max is 29 -> 30)
+	}
+	w.write(14, 4) // HCLEN = 14 -> 18 precode lengths
+
+	// Precode lengths in precodeOrder: sym18=1, sym0=2, sym1=2.
+	w.write(0, 3) // 16
+	w.write(0, 3) // 17
+	w.write(1, 3) // 18
+	w.write(2, 3) // 0
+	for range 13 {
+		w.write(0, 3)
+	}
+	w.write(2, 3) // 1
+
+	// Canonical precode, bit-reversed for the stream: sym18 -> 0 (1 bit),
+	// sym1 -> 3 (2 bits). Code lengths for all litlen+offset entries:
+	// lit 0 and EOB get 1-bit codes; every other litlen length is zero.
+	w.write(3, 2) // lens[0] = 1 (literal 0)
+	w.write(0, 1)
+	w.write(127, 7) // repeat-zero 138 (symbols 1..138)
+	w.write(0, 1)
+	w.write(106, 7) // repeat-zero 117 (symbols 139..255)
+	w.write(3, 2)   // lens[256] = 1 (end of block)
+	if litlen {
+		w.write(0, 1)
+		w.write(19, 7) // repeat-zero 30 (reserved litlen symbols 257..286)
+		w.write(3, 2)  // singleton offset symbol 0
+	} else {
+		w.write(3, 2) // offset symbol 0 = 1 bit
+		w.write(0, 1)
+		w.write(19, 7) // repeat-zero 30 (reserved offset symbols 1..30)
+	}
+
+	// Block body: immediate end of block (1-bit code 1).
+	w.write(1, 1)
 	return w.bytes()
 }
 

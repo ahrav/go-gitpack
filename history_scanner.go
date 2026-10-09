@@ -55,6 +55,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // commitInfo holds the minimal subset of commit metadata needed for
@@ -118,7 +120,9 @@ type HistoryScanner struct {
 
 	// treeOIDs memoizes commit OID -> root tree OID. Every commit header
 	// is otherwise inflated twice per scan: once when the walk visits the
-	// commit and once when its child resolves firstParentTree.
+	// commit and once when its child resolves firstParentTree. The memo is
+	// scoped to one walk: each scan entry point clears it on return so a
+	// long-lived scanner does not hold O(commit-count) memory.
 	treeOIDs sync.Map
 
 	// profiling holds optional profiling configuration.
@@ -148,6 +152,9 @@ type HistoryScanner struct {
 	// hunkDedupBudget bounds fingerprint storage for deduplicating scans.
 	hunkDedupBudget int
 
+	// dedupLimits holds the dedup pipeline's bounds; tests shrink them to
+	// exercise window edges on small repositories. dedupProbe, when set,
+	// records pipeline observations for tests.
 	dedupLimits dedupLimits
 	dedupProbe  *dedupProbe
 
@@ -185,6 +192,45 @@ func (e *ScanError) Error() string {
 // ErrCommitGraphRequired is kept for backward compatibility.
 // HistoryScanner now always builds commit metadata in memory from ref walks.
 var ErrCommitGraphRequired = errors.New("commit‑graph required but not found")
+
+// WithOffsetCacheBudget bounds the bytes of materialized pack objects the
+// scanner's (pack, offset) cache may retain (default 256 MiB). Each scanner
+// owns an independent cache, so processes that open many repositories
+// concurrently should lower the budget to bound aggregate memory growth.
+// A budget <= 0 disables the cache entirely.
+func WithOffsetCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.store.offCache.setBudget(bytes)
+	}
+}
+
+// WithPairCacheBudget bounds the bytes of computed diff hunks the scanner's
+// (oldOID, newOID) memo may retain (default 128 MiB). Each scanner owns an
+// independent cache, so processes that open many repositories concurrently
+// should lower the budget to bound aggregate memory growth. A budget <= 0
+// disables the memo entirely: every pair is recomputed.
+//
+// Disabling costs throughput on histories with merges — the memo exists
+// because ~1/3 of pair diffs in a typical walk are repeats — but it does not
+// change delivered hunks or their retention: a hunk's lines are compacted into
+// their own buffer whether or not the memo stores them.
+func WithPairCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.pairs.setBudget(bytes)
+	}
+}
+
+// WithMetaCacheBudget bounds the bytes of commit payloads (author lines and
+// messages) the scanner's GetCommitMetadata cache may retain (default
+// 256 MiB). Each scanner owns an independent cache, so processes that open
+// many repositories concurrently should lower the budget to bound aggregate
+// memory growth. A budget <= 0 disables the cache entirely: every call
+// re-reads and re-parses the commit.
+func WithMetaCacheBudget(bytes int) ScannerOption {
+	return func(hs *HistoryScanner) {
+		hs.meta.setBudget(bytes)
+	}
+}
 
 // NewHistoryScanner opens gitDir and returns a HistoryScanner that streams
 // commit data concurrently.
@@ -265,6 +311,9 @@ func (h *HunkAddition) String() string {
 }
 
 // Lines returns all added lines without leading '+' markers.
+//
+// The returned slice and its strings are shared with internal caches and
+// other deliveries of the same content; callers must not modify them.
 func (h *HunkAddition) Lines() []string { return h.lines }
 
 // StartLine returns the first line number (1‑based) of the hunk.
@@ -283,34 +332,85 @@ func (h *HunkAddition) Path() string { return h.path }
 // IsBinary returns whether this hunk contains binary data.
 func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 
-// DiffHistoryHunks streams every added hunk from all commits, diffing each
+// DiffHistoryHunks streams added hunks from all commits, diffing each
 // commit against its first parent only (i.e. merge commits are treated as a
 // single diff against the first parent, matching `git log --first-parent`
-// semantics). This keeps output deterministic and avoids duplicate hunks from
-// merge base reconstruction.
+// semantics). This avoids duplicate hunks from merge base reconstruction.
+//
+// Exact-OID moves are suppressed: when a commit's entry produces bytes whose
+// blob identity -- the OID plus the tree entry's type -- matches an unmatched
+// deletion in that commit, its added lines are omitted because those
+// content-addressed bytes are unchanged. This covers a pure addition and a move
+// that overwrites a tracked destination alike. Matching is one-for-one, so each
+// deletion suppresses at most one entry. No hunk is emitted for the destination
+// path or moving commit.
+//
+// Renames are detected within each first-parent diff, mirroring Git. A
+// delete+add pair carrying identical blob content (an exact-OID rename,
+// preferring same-basename matches) emits no hunks, since no line changed.
+// When at least two exact renames establish a directory rename, an added
+// file under the new directory whose old-path counterpart was deleted is
+// diffed against that old blob instead of being reported as a whole-file
+// addition. That path-based pairing is content-validated: it is kept only
+// when the lines common to both files are at least half of the larger file,
+// matching Git's rename similarity threshold. All rename pairing is scoped
+// to a single commit's first-parent diff; renames are never tracked across
+// commits.
 //
 // It returns two buffered channels: one for HunkAddition values and one for a
-// single error. The function never blocks the caller; all writes to the
-// channels are non-blocking.
+// single error.
 //
 // Goroutine ownership: DiffHistoryHunks spawns a background goroutine that
 // owns the returned channels and closes them when the walk completes. The
-// caller MUST drain the HunkAddition channel to completion (or read until the
-// errC channel delivers a value) to avoid leaking goroutines. Failing to
-// drain will block the internal worker pool indefinitely.
+// caller MUST drain the HunkAddition channel to completion. Draining is what
+// lets the walk finish: the forwarding send has no escape from a full queue,
+// so errC delivers its single value only after every produced hunk has been
+// forwarded. Waiting on errC without draining the hunk channel deadlocks as
+// soon as the queue fills, and abandoning the drain blocks the internal worker
+// pool indefinitely.
 //
-// The HunkAddition channel is buffered to runtime.NumCPU() to allow workers
-// to make progress without waiting for the consumer on every hunk. The errC
-// channel is buffered to 1 so the producer goroutine can always send its
-// final error without blocking.
+// The HunkAddition channel holds one slot per blob worker, so a worker can
+// deposit its current hunk and start its next diff without a rendezvous with
+// the consumer, and the queue buffers nothing beyond that. A buffered hunk
+// retains its own line bytes and nothing beyond them (see pairCache.add), so
+// the queue pins the payload in flight rather than the decompressed blobs the
+// hunks were diffed from. The errC channel is buffered to 1 so the producer
+// goroutine can always send its final error without blocking.
+//
+// Memory bound: the queue is bounded in hunk COUNT, not in bytes. Worst-case
+// in-flight payload is approximately (queue depth + blobWorkers +
+// consumer-held) times the per-hunk payload ceiling, and that ceiling is
+// MaxDiffSize because a whole-file addition or a binary result carries the
+// entire blob as its payload. The queue is not the dominant term: a queue slot
+// holds one finished hunk, while each blob worker holds the hunks it just
+// produced plus the decompressed blobs it diffed them from.
+// DiffHistoryHunksFunc removes the queue term and only that term — the
+// blob-worker term follows from the pipeline width — so it is the API for
+// callers who want no queue between a worker and the consumer. Neither API
+// lets a caller measure a hunk's retained payload: compactHunks gives all
+// hunks of one pair a single shared backing array, so the lengths reported by
+// Lines() do not sum to the bytes retained.
+//
+// Ordering: hunks for one (commit, path) pair are produced in ascending line
+// order by a single blob worker, but that worker's sends interleave with every
+// other worker's, so a pair's hunks are not contiguous in the stream. No order
+// is guaranteed across files or commits. A consumer that groups by
+// (commit, path) must key on the pair rather than flush on key change;
+// DiffHistoryHunksFunc delivers a pair's hunks back to back and is the API for
+// consumers that need that.
+//
+// Hunk lines may be shared with internal caches and other deliveries of the
+// same content; callers must treat Lines() as read-only.
 //
 // A nil error sent on errC signals a graceful end-of-stream.
 func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error) {
-	// A deep output buffer decouples producer bursts (a whale commit can
-	// emit tens of thousands of hunks) from consumer scheduling; at ~100
-	// bytes per HunkAddition header the buffer costs single-digit MiB and
-	// removes the futex traffic that a small buffer caused.
-	out := make(chan HunkAddition, 16384)
+	// One slot per blob worker: DiffHistoryHunksFunc runs runtime.NumCPU blob
+	// workers, and a slot each lets every worker deposit its current hunk and
+	// resume its next diff without a rendezvous with the consumer. The queue
+	// buffers nothing beyond that. What it can pin is the sum of the buffered
+	// hunks' retained line bytes; see the memory-bound paragraph on the method
+	// for the byte consequence and for the API that avoids the queue entirely.
+	out := make(chan HunkAddition, runtime.NumCPU())
 	errC := make(chan error, 1)
 
 	go func() {
@@ -325,8 +425,9 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 	return out, errC
 }
 
-// DiffHistoryHunksFunc streams every added hunk from all commits to fn,
-// using the same first-parent semantics as DiffHistoryHunks.
+// DiffHistoryHunksFunc streams added hunks from all commits to fn, using the
+// same first-parent semantics, one-for-one exact-OID move suppression, and
+// rename detection as DiffHistoryHunks.
 //
 // fn is invoked CONCURRENTLY from multiple internal workers (up to
 // runtime.NumCPU simultaneous calls) and must be safe for concurrent use.
@@ -336,20 +437,37 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // lets hunk processing scale across every worker — the preferred API for
 // CPU-bound consumers.
 //
-// When the scanner was constructed with WithHunkLineDedup(true), emissions
-// are filtered to each line's first introduction; see WithHunkLineDedup.
+// Ordering: fn receives the hunks for one (commit, path) pair sequentially
+// in ascending line order. No order is guaranteed across files or commits.
+//
+// Hunk lines may be shared with internal caches and other deliveries of the
+// same content; fn must treat HunkAddition.Lines() as read-only.
+//
+// A nil fn is rejected before any worker starts. The workers call fn without
+// a nil check on the hot path, so admitting one would surface as a panic in a
+// worker goroutine — unrecoverable for the calling process — rather than as
+// this method's error return.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
+	if fn == nil {
+		return errors.New("DiffHistoryHunksFunc: fn must not be nil")
+	}
 	if hs.hunkLineDedup {
 		return hs.diffHistoryHunksDedup(fn)
 	}
 
-	numWorkers := runtime.NumCPU()
-	// Tree diffing is a producer stage and much cheaper than hunk scanning.
-	// Capping it prevents one 32 MiB delta arena per CPU from becoming a
-	// hidden RSS floor on machines with many cores.
-	treeWorkers := min(numWorkers, maxTreeDiffWorkers)
+	// Stage widths. Stage 2 gets one worker per CPU because it carries the
+	// expensive work (blob inflation plus line diff); stage 1 runs at half
+	// that, capped at maxTreeDiffWorkers. Tree diffing is cheap relative to
+	// blob diffing, so stage 1 keeps stage 2 fed at a fraction of its width;
+	// see the measured basis on maxTreeDiffWorkers.
+	blobWorkers := runtime.NumCPU()
+	treeWorkers := min(max(2, blobWorkers/2), maxTreeDiffWorkers)
 
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
+	// The tree memo only pays off while this walk resolves first-parent
+	// trees; dropping it here keeps the scanner's steady-state memory
+	// independent of history size.
+	defer hs.treeOIDs.Clear()
 
 	if err := hs.startProfiling(); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
@@ -368,13 +486,26 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// (cheap) and fans out per-file blob pairs; stage 2 computes hunks
 		// (expensive: inflation + line diff) at blob-pair granularity, which
 		// spreads a whale commit across every worker.
-		// workChan is deep because the commit-walk's visit callback sends
-		// here while holding the walk's internal visit mutex: if the send
-		// blocks, every walk worker serializes behind it. A few thousand
-		// commitInfo headers (~100 bytes each) buy full walk/tree-stage
+		// workChan is deep so that the walk's visit callback, which runs on
+		// a walk worker, hands off without waiting on the tree stage: a few
+		// thousand commitInfo headers (~100 bytes each) buy full walk/tree
 		// decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
-		blobChan := make(chan blobPairWork, 4096)
+		blobChan := make(chan []blobPairWork, 1024)
+		// outstanding counts records sent on blobChan and not yet diffed.
+		// blobDone closes once stage 1 has finished sending and outstanding
+		// reaches zero, or when the scan stops on an error; it is the only
+		// exit signal the blob workers wait on. blobChan itself stays open,
+		// so a worker can push part of its batch back onto it at any time.
+		var outstanding atomic.Int64
+		var stage1Done atomic.Bool
+		blobDone := make(chan struct{})
+		var blobDoneOnce sync.Once
+		finishIfDrained := func() {
+			if stage1Done.Load() && outstanding.Load() == 0 {
+				blobDoneOnce.Do(func() { close(blobDone) })
+			}
+		}
 		stopCh := make(chan struct{})
 		var (
 			stopOnce sync.Once
@@ -382,6 +513,11 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			blobWG   sync.WaitGroup
 			firstErr error
 		)
+		// Whale blobs inflate for tens of milliseconds each and the walk
+		// may reach them last; inflating them from the start overlaps that
+		// work with the rest of the scan (see prefetchWhales).
+		waitWhales := hs.store.prefetchWhales()
+		defer waitWhales()
 		setError := func(err error) {
 			if err == nil {
 				return
@@ -389,6 +525,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			stopOnce.Do(func() {
 				firstErr = err
 				close(stopCh)
+				blobDoneOnce.Do(func() { close(blobDone) })
 			})
 		}
 
@@ -414,14 +551,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 							setError(fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err))
 							return
 						}
-						if err := hs.emitCommitBlobPairs(work.commit, parentTree, func(w blobPairWork) error {
-							select {
-							case <-stopCh:
-								return errScanAborted
-							case blobChan <- w:
-								return nil
-							}
-						}); err != nil {
+						if err := hs.emitCommitBlobPairs(work.commit, parentTree, blobChan, &outstanding, stopCh); err != nil {
 							c := work.commit
 							setError(fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err))
 							return
@@ -431,20 +561,51 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			}()
 		}
 
-		for range numWorkers {
+		for range blobWorkers {
 			blobWG.Add(1)
 			go func() {
 				defer blobWG.Done()
-				for {
-					select {
-					case <-stopCh:
-						return
-					case work, ok := <-blobChan:
-						if !ok {
-							return
+				// runBatch pushes half of its remaining records back onto an
+				// empty blobChan once the record it just finished took at
+				// least blobPairStealAfter, so a history with fewer batches
+				// than workers can use waiting workers to share a batch of
+				// expensive pairs while cheap pairs stay batched and a queue
+				// with work already waiting is left alone.
+				runBatch := func(batch []blobPairWork) bool {
+					slow := false
+					done := 0
+					for len(batch) > 0 {
+						if slow && len(batch) > 1 && len(blobChan) == 0 {
+							half := len(batch) / 2
+							select {
+							case blobChan <- batch[half:]:
+								batch = batch[:half]
+							default:
+							}
 						}
+						work := batch[0]
+						batch = batch[1:]
+						start := time.Now()
 						if err := hs.streamBlobPairHunks(work, fn); err != nil {
 							setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
+							return false
+						}
+						slow = time.Since(start) >= blobPairStealAfter
+						done++
+					}
+					// One counter update per chunk keeps the shared counter
+					// off the per-record path.
+					if outstanding.Add(-int64(done)) == 0 {
+						finishIfDrained()
+					}
+					return true
+				}
+				for {
+					select {
+					case <-blobDone:
+						return
+					case batch := <-blobChan:
+						if !runBatch(batch) {
 							return
 						}
 					}
@@ -468,7 +629,8 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		})
 		close(workChan)
 		treeWG.Wait()
-		close(blobChan)
+		stage1Done.Store(true)
+		finishIfDrained()
 		blobWG.Wait()
 
 		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
@@ -479,6 +641,16 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 	}
 }
 
+// maxTreeDiffWorkers is the absolute ceiling on the stage-1 tree-diff worker
+// pool, applied on top of the NumCPU/2 halving in DiffHistoryHunksFunc.
+//
+// Measured on a stage-1-bound history (BenchmarkDiffHistoryHunksManySmallCommits,
+// 3000 single-file commits over a 200-file tree, 32-core arm64): raising the
+// cap to NumCPU was ~7% slower, so the cap costs no throughput even when
+// stage 1 dominates: stage-2 hunk workers, which are uncapped, set pipeline
+// throughput. On the trufflehog history at 16 logical CPUs, caps of 16 and
+// 32 measured within noise of 8. Re-run those benchmarks before changing
+// this value.
 const maxTreeDiffWorkers = 8
 
 // errScanAborted marks an internal early-stop condition used to unwind commit walks.
@@ -529,44 +701,213 @@ func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
 // DiffHistoryHunks pipeline.
 type blobPairWork struct {
 	commit Hash
-	// renameCandidate marks a pair whose oldOID came from a deleted path
-	// matched only by directory-rename evidence; the hunk stage pairs it
-	// against oldOID only when the contents are similar. It sits in the
-	// padding after commit, so the struct stays 80 bytes.
-	renameCandidate bool
-	path            string
-	oldOID          Hash
-	newOID          Hash
+	path   string
+	oldOID Hash
+	newOID Hash
+
+	// inferredRename marks a pairing produced by directory-rename inference
+	// rather than an in-place modification seen in the tree diff. Inferred
+	// pairings are path-based guesses, so stage 2 validates them by content
+	// before trusting the pair diff (see gateInferredRenameHunks).
+	inferredRename bool
 }
 
+// blobIdentity names the content a tree entry contributes: the blob OID plus
+// the entry's type nibble. Suppression pairs entries by identity rather than
+// by OID alone because an OID match is not a content match across types. A
+// regular file whose bytes are exactly a path string hashes identically to a
+// symlink pointing at that path, so keying on the OID alone lets a deleted
+// regular file suppress an added symlink and drop that symlink's target from
+// hunk output. Permission bits are masked off: they are not blob content, so
+// an exec-bit change does not defeat a move whose bytes are unchanged.
+type blobIdentity struct {
+	oid  Hash
+	kind uint32
+}
+
+func makeBlobIdentity(oid Hash, mode uint32) blobIdentity {
+	return blobIdentity{oid: oid, kind: mode & modeTypeMask}
+}
+
+// blobPairCandidate is one buffered suppression candidate: the stage-2 work
+// record plus the type nibble of the entry that produced it. Only the nibble is
+// retained rather than a whole blobIdentity because the record already carries
+// newOID, and the deletion pool is consulted once per candidate.
+type blobPairCandidate struct {
+	work blobPairWork
+	kind uint32
+}
+
+// identity names the bytes this candidate introduces. kind is already masked to
+// the type nibble, so this does not re-mask.
+func (c blobPairCandidate) identity() blobIdentity {
+	return blobIdentity{oid: c.work.newOID, kind: c.kind}
+}
+
+// deletedEntry is one deletion observed in a commit's first-parent diff: the
+// bytes that left the tree plus the path they left. The path is what makes
+// directory-rename inference possible, so it is retained even though
+// suppression alone would need only a per-identity credit count.
+type deletedEntry struct {
+	path string
+	oid  Hash
+	kind uint32
+}
+
+func (d deletedEntry) identity() blobIdentity {
+	return blobIdentity{oid: d.oid, kind: d.kind}
+}
+
+// Buffering these many suppression candidates and path bytes keeps the
+// per-worker record/path budget below 1 MiB while preserving a single tree
+// walk for ordinary commits. Commits beyond either limit replay candidates
+// instead.
+const (
+	maxBufferedBlobPairCandidates = 4096
+	maxBufferedBlobPairPathBytes  = 512 << 10
+)
+
+// maxRetainedDeletePathBytes bounds the deleted PATH bytes one commit may
+// retain for directory-rename inference, separately from the candidate budget.
+//
+// Suppression itself needs only a per-identity credit count, which is O(1) for
+// the shape that dominates mass deletions: thousands of byte-identical
+// placeholder files (empty __init__.py, .gitkeep, generated boilerplate) all
+// collapse to one credit. Inference is what needs the paths, and paths are
+// O(deleted files) with no such collapse. Retaining them unconditionally would
+// make a deletion-only vendor-tree cleanup — a commit where no candidate exists
+// for inference to help — allocate per deleted file for nothing. Past this
+// bound the paths are dropped and only the credits are kept.
+//
+// It is a variable only so tests can reach the drop path without building a
+// half-megabyte of paths, matching maxDiffSize. Overriding it is safe only from
+// a test that does not call t.Parallel().
+var maxRetainedDeletePathBytes = 512 << 10
+
+// exactRenameEvidence records one exact-OID rename observed within a single
+// commit's first-parent diff: the deleted old path and the added new path
+// carry identical blob content. Accumulated evidence drives
+// inferDirectoryRenames.
 type exactRenameEvidence struct {
 	oldPath string
 	newPath string
 }
 
+// directoryRenameCandidate is one inferred (oldDir -> newDir) directory
+// rename, weighted by the number of exact-OID renames observed between the
+// two directories.
 type directoryRenameCandidate struct {
 	oldDir string
 	newDir string
 	count  int
 }
 
-const minDirectoryRenameEvidence = 2
+const (
+	// minDirectoryRenameEvidence is the number of exact-OID renames between
+	// one (oldDir, newDir) pair required before a directory rename is
+	// inferred. A single rename is no evidence of a directory-level move.
+	// Because same-identity pairing prefers same-basename matches, requiring
+	// two corroborating renames also bounds the false positives that
+	// placeholder churn (empty __init__.py, .gitkeep, generated
+	// boilerplate) would otherwise produce.
+	minDirectoryRenameEvidence = 2
+
+	// maxDirectoryRenameCandidates caps the per-commit candidate set;
+	// commits exceeding it skip directory inference entirely (see
+	// inferDirectoryRenames).
+	maxDirectoryRenameCandidates = 1024
+)
 
 // emitCommitBlobPairs walks the first-parent tree diff of a single commit and
-// fans out one blobPairWork per changed blob through emit. Tree walking is
-// cheap relative to blob diffing, so this stage keeps the expensive stage-2
-// workers supplied with fine-grained work even when one commit touches
-// thousands of files.
+// fans out one blobPairWork per content-changing blob entry. It filters
+// deletions, unchanged and mode-only entries, and entries whose resulting bytes
+// are paired one-for-one with a same-commit deletion of the same blob identity
+// (exact-OID moves). Both pure additions and modifications are suppression
+// candidates: a move that overwrites a tracked destination surfaces as a
+// modification whose resulting blob is the deleted blob. An addition left
+// unsuppressed under an inferred directory rename is rewritten into a modify
+// pair against the deleted blob, flagged inferredRename so stage 2 can
+// content-validate the guess. Tree walking is cheap relative to blob diffing,
+// so this stage keeps the expensive stage-2 workers supplied with fine-grained
+// work even when one commit touches thousands of files.
 //
-// emit is invoked once per surviving pair, in deterministic sorted-tree
-// order; returning a non-nil error aborts the walk and is returned as-is.
-// The streaming pipeline passes a channel send guarded by its stop channel,
-// while the dedup pipeline collects pairs into a per-commit slice.
+// Root and shallow-parent commits stream in one pass. Non-root commits index
+// deletions in the first pass and retain candidates within a bounded budget,
+// replaying them in a second walk only when that budget is exceeded. Replay
+// emits inline, so it applies exact-OID suppression but not directory-rename
+// inference: inference needs every unsuppressed candidate in hand before it can
+// pair any of them, which is exactly the retention the budget refused.
+func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- []blobPairWork, outstanding *atomic.Int64, stopCh <-chan struct{}) error {
+	e := blobPairEmitter{out: blobs, outstanding: outstanding, stopCh: stopCh}
+	if err := hs.emitCommitBlobPairsTo(c, parentTree, e.emit, stopCh); err != nil {
+		return err
+	}
+	return e.flush()
+}
+
+// blobPairBatchSize is the largest number of stage-2 records one channel
+// send carries. Measured on the trufflehog history (63,729 pairs over 6,164
+// commits), a batch of this size holds a whole commit in the common case
+// while a whale commit is split into full batches. With one record per send,
+// sixteen blob workers and eight tree workers contend on the channel's
+// single lock for every record; the mutex profiler showed that lock wait as
+// the pipeline's largest blocking source at 16 workers.
+const blobPairBatchSize = 32
+
+// blobPairStealAfter gates the batch hand-off in runBatch: after a record
+// takes at least this long, the worker pushes half of its remaining batch
+// back onto an empty blobChan. Shorter records stay in their batch.
+const blobPairStealAfter = 500 * time.Microsecond
+
+// blobPairEmitter accumulates stage-2 records into batches of at most
+// blobPairBatchSize for the hand-off channel. A non-nil outstanding is raised
+// by the size of every batch sent.
+type blobPairEmitter struct {
+	out         chan<- []blobPairWork
+	outstanding *atomic.Int64
+	stopCh      <-chan struct{}
+	batch       []blobPairWork
+}
+
+func (e *blobPairEmitter) emit(work blobPairWork) error {
+	if e.batch == nil {
+		e.batch = make([]blobPairWork, 0, blobPairBatchSize)
+	}
+	e.batch = append(e.batch, work)
+	if len(e.batch) == blobPairBatchSize {
+		return e.flush()
+	}
+	return nil
+}
+
+// flush sends the pending partial batch.
+func (e *blobPairEmitter) flush() error {
+	if len(e.batch) == 0 {
+		return nil
+	}
+	batch := e.batch
+	e.batch = nil
+	if e.outstanding != nil {
+		e.outstanding.Add(int64(len(batch)))
+	}
+	select {
+	case <-e.stopCh:
+		if e.outstanding != nil {
+			e.outstanding.Add(-int64(len(batch)))
+		}
+		return errScanAborted
+	case e.out <- batch:
+		return nil
+	}
+}
+
+// emitCommitBlobPairsTo performs the tree diff of emitCommitBlobPairs and
+// hands each stage-2 record to emit.
 //
-// When hunkPathFilter is set, pairs it reports true for are dropped here —
-// before any blob is loaded or diffed — so filtered paths cost no diff work
+// When hunkPathFilter is set, pairs it reports true for are dropped here,
+// before any blob is loaded or diffed, so filtered paths cost no diff work
 // and, in dedup mode, never mark the fingerprint set.
-func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, emit func(blobPairWork) error) error {
+func (hs *HistoryScanner) emitCommitBlobPairsTo(c commitInfo, parentTree Hash, emit func(blobPairWork) error, stopCh <-chan struct{}) error {
 	if skip := hs.hunkPathFilter; skip != nil {
 		inner := emit
 		emit = func(w blobPairWork) error {
@@ -578,105 +919,410 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, emi
 			return inner(w)
 		}
 	}
+
+	// A zero parent tree (root commit, shallow history) has no old side:
+	// every entry is an addition and no deletion can exist, so no rename is
+	// possible. Emit during the walk to preserve channel backpressure and
+	// avoid retaining one work record per file.
+	if parentTree.IsZero() {
+		return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+			// Ahead of the filters, matching the non-root and replay
+			// callbacks: entries that fall out here never reach emit, so
+			// without this a tree of nothing but gitlinks would traverse to
+			// completion after another worker had already failed.
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
+			}
+			if !isBlobMode(mode) || old == newH || newH.IsZero() {
+				return nil
+			}
+			return emit(blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
+		})
+	}
+
 	var (
-		adds         []blobPairWork
-		deletes      []blobPairWork
-		deletesByOID map[Hash][]int
+		candidates []blobPairCandidate
+
+		// deletes and deletesByIdentity are the deletion pool. Every deletion
+		// contributes a credit to its identity's group, which is all
+		// suppression needs. The path-bearing deletes slice exists only so a
+		// suppressed candidate can name the exact path its bytes came from --
+		// the evidence directory-rename inference runs on -- and is dropped
+		// past maxRetainedDeletePathBytes.
+		deletes                     []deletedEntry
+		deletesByIdentity           map[blobIdentity]*deleteGroup
+		deletePathBytes             int
+		deletePathsDroppedForCommit bool
+
+		retainedPathBytes int
+		replayCandidates  bool
 	)
 	err := walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		select {
+		case <-stopCh:
+			return errScanAborted
+		default:
+		}
 		if !isBlobMode(mode) {
 			return nil
 		}
 		if old == newH {
 			return nil
 		}
-		work := blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH}
-		switch {
-		case newH.IsZero():
-			if deletesByOID == nil {
-				deletesByOID = make(map[Hash][]int, 4)
+		if newH.IsZero() {
+			// walkDiff reports a deletion with the deleted entry's own mode,
+			// so this identity describes the bytes that left the tree.
+			if deletesByIdentity == nil {
+				deletesByIdentity = make(map[blobIdentity]*deleteGroup, 4)
 			}
-			deletesByOID[old] = append(deletesByOID[old], len(deletes))
-			deletes = append(deletes, work)
+			entry := deletedEntry{path: path, oid: old, kind: mode & modeTypeMask}
+			g := deletesByIdentity[entry.identity()]
+			if g == nil {
+				g = &deleteGroup{}
+				deletesByIdentity[entry.identity()] = g
+			}
+			g.remaining++
+
+			if !deletePathsDroppedForCommit &&
+				len(path) > maxRetainedDeletePathBytes-deletePathBytes {
+				// Give up naming sources for this commit rather than grow the
+				// path pool. Credits already collected stay valid; the indices
+				// that pointed into the discarded slice must not.
+				for _, other := range deletesByIdentity {
+					other.indices = nil
+				}
+				deletes = nil
+				deletePathBytes = 0
+				deletePathsDroppedForCommit = true
+			}
+			if deletePathsDroppedForCommit {
+				return nil
+			}
+			g.indices = append(g.indices, len(deletes))
+			deletes = append(deletes, entry)
+			deletePathBytes += len(path)
 			return nil
-		case old.IsZero():
-			adds = append(adds, work)
-			return nil
-		default:
-			return emit(work)
 		}
+		// Every surviving entry contributes new bytes at this path and is a
+		// suppression candidate, including a modification: when a move
+		// overwrites a tracked destination the destination's resulting blob is
+		// byte-identical to the blob deleted in the same commit, so its added
+		// lines are bytes the history already carries. Neither kind can be
+		// judged until the walk has seen every deletion, so both defer.
+		if replayCandidates {
+			return nil
+		}
+		if len(candidates) >= maxBufferedBlobPairCandidates ||
+			len(path) > maxBufferedBlobPairPathBytes-retainedPathBytes {
+			clear(candidates)
+			candidates = nil
+			retainedPathBytes = 0
+			replayCandidates = true
+			return nil
+		}
+		candidates = append(candidates, blobPairCandidate{
+			work: blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH},
+			kind: mode & modeTypeMask,
+		})
+		retainedPathBytes += len(path)
+		return nil
 	})
 	if err != nil {
 		return err
 	}
 
+	// usedDeletes tracks which deletions have already been named as a move's
+	// source. The credit counts on each group, not this slice, decide
+	// suppression; this only keeps one delete from being named twice.
 	usedDeletes := make([]bool, len(deletes))
-	unmatchedAdds := adds[:0]
-	var evidence []exactRenameEvidence
-	for i := range adds {
-		deleteIdx, ok := takeExactRenameDelete(adds[i], deletes, usedDeletes, deletesByOID)
-		if ok {
-			usedDeletes[deleteIdx] = true
-			evidence = append(evidence, exactRenameEvidence{
-				oldPath: deletes[deleteIdx].path,
-				newPath: adds[i].path,
-			})
-			continue // exact-OID rename: content-addressed bytes are unchanged.
+
+	if !replayCandidates {
+		// Inference needs to name each suppressed candidate's source, so it is
+		// available only while the delete paths are retained. Without them the
+		// pass still suppresses; it just has no evidence to infer from.
+		var emitted []blobPairCandidate
+		if deletePathsDroppedForCommit {
+			emitted = suppressExactMoves(candidates, deletes, deletesByIdentity, usedDeletes)
+		} else {
+			emitted = pairCommitRenames(candidates, deletes, deletesByIdentity, usedDeletes)
 		}
-		unmatchedAdds = append(unmatchedAdds, adds[i])
+		for _, cand := range emitted {
+			select {
+			case <-stopCh:
+				return errScanAborted
+			default:
+			}
+			if err := emit(cand.work); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
-	unusedDeletesByPath := make(map[string]int, len(deletes))
+	// The bounded buffer was discarded, so nothing is held long enough to
+	// infer a directory rename from. Replay only the candidates, consuming one
+	// deletion credit per matching identity and emitting the rest inline.
+	return walkDiff(hs.store, parentTree, c.TreeOID, "", func(path string, old, newH Hash, mode uint32) error {
+		select {
+		case <-stopCh:
+			return errScanAborted
+		default:
+		}
+		if !isBlobMode(mode) || newH.IsZero() || old == newH {
+			return nil
+		}
+		id := makeBlobIdentity(newH, mode)
+		if _, ok := takeExactRenameDelete(id, path, deletes, usedDeletes, deletesByIdentity); ok {
+			return nil // exact-OID move: content-addressed bytes are unchanged.
+		}
+		return emit(blobPairWork{commit: c.OID, path: path, oldOID: old, newOID: newH})
+	})
+}
+
+// pairCommitRenames classifies one commit's buffered suppression candidates
+// into the blob pairs that must flow to the hunk stage. A candidate whose
+// resulting bytes match an unconsumed same-identity deletion is an exact-OID
+// move and is dropped; a surviving pure addition under an inferred directory
+// rename becomes a modify pair against the deleted blob (flagged
+// inferredRename so stage 2 can content-validate the guess); every other
+// candidate passes through unchanged, in input order.
+//
+// Pure over its inputs — no I/O, no store access — which keeps it directly
+// unit-testable and benchmarkable. It filters candidates in place, reusing the
+// backing array, and consumes deletesByIdentity and used.
+// suppressExactMoves filters out the candidates whose bytes an unconsumed
+// same-identity deletion already accounts for, and returns the rest in input
+// order. It is pairCommitRenames without the inference half, for commits whose
+// delete paths were dropped: suppression needs only the credits, so it stays
+// exact where inference cannot run at all.
+//
+// Filters in place, reusing the candidates backing array.
+func suppressExactMoves(
+	candidates []blobPairCandidate,
+	deletes []deletedEntry,
+	deletesByIdentity map[blobIdentity]*deleteGroup,
+	used []bool,
+) []blobPairCandidate {
+	unmatched := candidates[:0]
+	for i := range candidates {
+		_, suppressed := takeExactRenameDelete(
+			candidates[i].identity(), candidates[i].work.path, deletes, used, deletesByIdentity)
+		if suppressed {
+			continue // exact-OID move: content-addressed bytes are unchanged.
+		}
+		unmatched = append(unmatched, candidates[i])
+	}
+	return unmatched
+}
+
+func pairCommitRenames(
+	candidates []blobPairCandidate,
+	deletes []deletedEntry,
+	deletesByIdentity map[blobIdentity]*deleteGroup,
+	used []bool,
+) []blobPairCandidate {
+	unmatched := candidates[:0]
+	var evidence []exactRenameEvidence
+	for i := range candidates {
+		deleteIdx, ok := takeExactRenameDelete(
+			candidates[i].identity(), candidates[i].work.path, deletes, used, deletesByIdentity)
+		if ok {
+			evidence = append(evidence, exactRenameEvidence{
+				oldPath: deletes[deleteIdx].path,
+				newPath: candidates[i].work.path,
+			})
+			continue // exact-OID move: content-addressed bytes are unchanged.
+		}
+		unmatched = append(unmatched, candidates[i])
+	}
+
+	// A commit whose every candidate was an exact-OID move — a plain directory
+	// move — leaves nothing for directory inference to pair, so skip both the
+	// inference and the by-path index it feeds.
+	if len(unmatched) == 0 {
+		return unmatched
+	}
+
+	dirRenames := inferDirectoryRenames(evidence)
+	if len(dirRenames.ordered) == 0 {
+		return unmatched
+	}
+
+	// Exactly one delete was consumed per evidence entry, so this sizes the
+	// index to the deletes still available rather than to every delete.
+	unusedDeletesByPath := make(map[string]int, len(deletes)-len(evidence))
 	for i := range deletes {
-		if !usedDeletes[i] {
+		if !used[i] {
 			unusedDeletesByPath[deletes[i].path] = i
 		}
 	}
-	dirRenames := inferDirectoryRenames(evidence)
 
-	for i := range unmatchedAdds {
-		if deleteIdx, ok := matchDirectoryRename(unmatchedAdds[i].path, dirRenames, unusedDeletesByPath, usedDeletes); ok {
-			usedDeletes[deleteIdx] = true
-			delete(unusedDeletesByPath, deletes[deleteIdx].path)
-			work := unmatchedAdds[i]
-			work.oldOID = deletes[deleteIdx].oldOID
-			work.renameCandidate = true
-			if err := emit(work); err != nil {
-				return err
-			}
+	for i := range unmatched {
+		// Only a pure addition can be re-paired. A modification already has a
+		// real old side from the tree diff, and overwriting it with a
+		// path-inferred guess would replace observed history with a guess.
+		if !unmatched[i].work.oldOID.IsZero() {
 			continue
 		}
-		if err := emit(unmatchedAdds[i]); err != nil {
-			return err
+		deleteIdx, ok := matchDirectoryRename(
+			unmatched[i].work.path, unmatched[i].kind,
+			dirRenames, deletes, unusedDeletesByPath, used)
+		if !ok {
+			continue
 		}
+		used[deleteIdx] = true
+		delete(unusedDeletesByPath, deletes[deleteIdx].path)
+		unmatched[i].work.oldOID = deletes[deleteIdx].oid
+		unmatched[i].work.inferredRename = true
 	}
-	return nil
+	return unmatched
 }
 
-func takeExactRenameDelete(add blobPairWork, deletes []blobPairWork, used []bool, deletesByOID map[Hash][]int) (int, bool) {
-	candidates := deletesByOID[add.newOID]
-	best := -1
-	addBase := pathBase(add.path)
-	for _, idx := range candidates {
-		if used[idx] {
-			continue
-		}
-		if pathBase(deletes[idx].path) == addBase {
-			return idx, true
-		}
-		if best == -1 {
-			best = idx
-		}
-	}
-	if best == -1 {
+// deleteGroup tracks the deletes sharing one blob identity within a single
+// commit, structured so that pairing A candidates against D same-identity
+// deletes costs O(A+D) overall instead of rescanning the group per candidate:
+// consumed candidates are never revisited (basename chains pop from the head;
+// the fallback cursor only advances).
+//
+// remaining, not indices, is the suppression authority. The two agree while
+// paths are retained, but a commit past maxRetainedDeletePathBytes drops
+// indices and keeps remaining, so suppression survives at O(distinct
+// identities) while inference is given up.
+type deleteGroup struct {
+	// remaining is the number of this identity's deletions that have not yet
+	// silenced a candidate. It is the only field suppression consults.
+	remaining int
+
+	// indices into the commit's deletes slice, in tree-walk order. Nil once
+	// the commit's delete paths have been dropped, which is what makes a
+	// consumed delete unnameable and therefore inference unavailable.
+	indices []int
+
+	// cursor is the first-available fallback scan position over indices.
+	// Entries consumed through the basename chains are skipped via the used
+	// flags when the cursor reaches them, so total cursor movement is
+	// O(len(indices)).
+	cursor int
+
+	// baseHead/baseNext form per-basename FIFO chains over positions in
+	// indices (head+next representation rather than map[string][]int so a
+	// group with thousands of distinct basenames costs two allocations, not
+	// one slice per basename). Built lazily on the first lookup that sees
+	// more than one candidate: singleton groups — the overwhelmingly common
+	// case — never pay for it. baseNext[pos] == -1 terminates a chain.
+	baseHead map[string]int
+	baseNext []int
+}
+
+// takeExactRenameDelete consumes one deletion credit for the bytes identified
+// by id, arriving at newPath, and reports the index of the delete that was
+// consumed. Matching is one-for-one, so each deletion silences at most one
+// candidate.
+//
+// The returned index names the consumed delete for rename evidence and is
+// valid only while the commit's delete paths are retained; it is
+// deletePathsDropped when they are not, which callers that infer renames must
+// not see because inference is disabled in that case. With paths, the choice
+// prefers a same-basename delete and falls back to the first unconsumed one in
+// tree-walk order. Amortized O(1) per call.
+func takeExactRenameDelete(
+	id blobIdentity,
+	newPath string,
+	deletes []deletedEntry,
+	used []bool,
+	deletesByIdentity map[blobIdentity]*deleteGroup,
+) (int, bool) {
+	g := deletesByIdentity[id]
+	if g == nil || g.remaining == 0 {
 		return 0, false
 	}
-	return best, true
+	g.remaining--
+
+	if g.indices == nil {
+		// Paths were dropped: the credit is spent but the source is unnameable.
+		return deletePathsDropped, true
+	}
+	if len(g.indices) == 1 {
+		// Basename preference is irrelevant with a single candidate.
+		idx := g.indices[0]
+		used[idx] = true
+		return idx, true
+	}
+
+	if g.baseHead == nil {
+		g.baseHead = make(map[string]int, len(g.indices))
+		g.baseNext = make([]int, len(g.indices))
+		// Built in reverse so each chain head is the earliest position and
+		// the chain walks forward in tree-walk order.
+		for pos := len(g.indices) - 1; pos >= 0; pos-- {
+			base := pathBase(deletes[g.indices[pos]].path)
+			if head, ok := g.baseHead[base]; ok {
+				g.baseNext[pos] = head
+			} else {
+				g.baseNext[pos] = -1
+			}
+			g.baseHead[base] = pos
+		}
+	}
+	if base := pathBase(newPath); len(base) > 0 {
+		pos, ok := g.baseHead[base]
+		for ok && pos >= 0 {
+			idx := g.indices[pos]
+			pos = g.baseNext[pos]
+			// Advance the head past this entry whether it is consumed now
+			// (matched) or was consumed earlier via the fallback cursor, so
+			// no position is ever visited twice.
+			g.baseHead[base] = pos
+			if !used[idx] {
+				used[idx] = true
+				return idx, true
+			}
+		}
+	}
+
+	// Fallback: first unconsumed candidate in tree-walk order. Entries
+	// already taken through the basename chains are skipped here exactly
+	// once.
+	for g.cursor < len(g.indices) {
+		idx := g.indices[g.cursor]
+		g.cursor++
+		if !used[idx] {
+			used[idx] = true
+			return idx, true
+		}
+	}
+	// remaining was positive, so an unconsumed index must exist while indices
+	// is populated. If the two ever disagree, hand the credit back and report
+	// no match: the candidate is then emitted rather than suppressed, which
+	// can only over-report added lines. Panicking here instead would take down
+	// the caller's process from inside a scan worker.
+	g.remaining++
+	return 0, false
 }
 
-func inferDirectoryRenames(evidence []exactRenameEvidence) []directoryRenameCandidate {
+// deletePathsDropped is the index takeExactRenameDelete returns when a credit
+// was spent but the commit's delete paths are no longer retained.
+const deletePathsDropped = -1
+
+// directoryRenameIndex holds the inferred directory-rename candidates both in
+// global priority order (for deterministic first-match-wins pairing) and
+// chained by newDir, so per-add candidate lookup costs O(path depth) instead
+// of a linear scan over every candidate.
+type directoryRenameIndex struct {
+	ordered []directoryRenameCandidate
+
+	// headByNewDir/nextSameDir form per-newDir chains over positions in
+	// ordered, each chain ascending by position (= global priority rank).
+	// nextSameDir[pos] == -1 terminates a chain.
+	headByNewDir map[string]int
+	nextSameDir  []int
+}
+
+func inferDirectoryRenames(evidence []exactRenameEvidence) directoryRenameIndex {
 	if len(evidence) < minDirectoryRenameEvidence {
-		return nil
+		return directoryRenameIndex{}
 	}
 	counts := make(map[[2]string]int, len(evidence))
 	for _, ev := range evidence {
@@ -691,7 +1337,7 @@ func inferDirectoryRenames(evidence []exactRenameEvidence) []directoryRenameCand
 		counts[[2]string{oldDir, newDir}]++
 	}
 	if len(counts) == 0 {
-		return nil
+		return directoryRenameIndex{}
 	}
 	candidates := make([]directoryRenameCandidate, 0, len(counts))
 	for dirs, count := range counts {
@@ -703,7 +1349,20 @@ func inferDirectoryRenames(evidence []exactRenameEvidence) []directoryRenameCand
 			newDir: dirs[1],
 			count:  count,
 		})
+		if len(candidates) > maxDirectoryRenameCandidates {
+			// Directory inference is an optimization. Falling back to pure
+			// additions keeps work bounded without hiding new content.
+			return directoryRenameIndex{}
+		}
 	}
+	if len(candidates) == 0 {
+		return directoryRenameIndex{}
+	}
+	// matchDirectoryRename is first-match-wins over this priority order and
+	// the backing map's iteration order is randomized, so the comparator
+	// must be a TOTAL order: any tie would let scheduler/map noise pick
+	// which delete an ambiguous add pairs with, changing emitted hunks
+	// between runs and breaking the determinism DiffHistoryHunks documents.
 	sort.Slice(candidates, func(i, j int) bool {
 		if candidates[i].count != candidates[j].count {
 			return candidates[i].count > candidates[j].count
@@ -711,31 +1370,90 @@ func inferDirectoryRenames(evidence []exactRenameEvidence) []directoryRenameCand
 		if len(candidates[i].newDir) != len(candidates[j].newDir) {
 			return len(candidates[i].newDir) > len(candidates[j].newDir)
 		}
-		// Name order settles ties so matchDirectoryRename picks the same
-		// source on every scan.
 		if candidates[i].newDir != candidates[j].newDir {
 			return candidates[i].newDir < candidates[j].newDir
 		}
+		// (oldDir, newDir) pairs are unique map keys, so this final
+		// comparison makes the order total.
 		return candidates[i].oldDir < candidates[j].oldDir
 	})
-	return candidates
+
+	headByNewDir := make(map[string]int, len(candidates))
+	nextSameDir := make([]int, len(candidates))
+	// Built in reverse so each chain head is the lowest position (highest
+	// global priority) and chains walk in ascending priority order.
+	for pos := len(candidates) - 1; pos >= 0; pos-- {
+		if head, ok := headByNewDir[candidates[pos].newDir]; ok {
+			nextSameDir[pos] = head
+		} else {
+			nextSameDir[pos] = -1
+		}
+		headByNewDir[candidates[pos].newDir] = pos
+	}
+	return directoryRenameIndex{
+		ordered:      candidates,
+		headByNewDir: headByNewDir,
+		nextSameDir:  nextSameDir,
+	}
 }
 
-func matchDirectoryRename(addPath string, candidates []directoryRenameCandidate, deletesByPath map[string]int, used []bool) (int, bool) {
-	for _, candidate := range candidates {
+// matchDirectoryRename returns the unconsumed delete whose path reconstructs
+// this add under the highest-priority applicable directory-rename candidate.
+// Only candidates whose newDir is an ancestor directory of addPath can apply,
+// so the lookup walks the add's O(depth) ancestor chain against the byNewDir
+// index instead of scanning every candidate; applicable candidates are then
+// tried in global priority order, preserving the first-match-wins semantics
+// of a linear scan over the ordered slice.
+//
+// A delete only reconstructs the add if its entry TYPE matches kind as well as
+// its path. Path alone would let a deleted regular file whose bytes are a path
+// string be paired with an added symlink to that path: the two share a blob
+// OID, so the resulting pair diff is old == new and emits nothing, dropping the
+// symlink's target from the stream. That is the same conflation blobIdentity
+// rejects for exact-OID suppression, and inference must not reintroduce it.
+func matchDirectoryRename(
+	addPath string,
+	kind uint32,
+	renames directoryRenameIndex,
+	deletes []deletedEntry,
+	deletesByPath map[string]int,
+	used []bool,
+) (int, bool) {
+	// Collect the priority ranks of candidates rooted at each ancestor dir.
+	// Typical paths are a handful of levels deep and few ancestors are
+	// candidate roots, so the fixed buffer keeps this allocation-free.
+	var ranksBuf [16]int
+	ranks := ranksBuf[:0]
+	for dir := pathDir(addPath); dir != ""; dir = pathDir(dir) {
+		pos, ok := renames.headByNewDir[dir]
+		for ok && pos >= 0 {
+			ranks = append(ranks, pos)
+			pos = renames.nextSameDir[pos]
+		}
+	}
+	if len(ranks) == 0 {
+		return 0, false
+	}
+	sort.Ints(ranks)
+
+	for _, rank := range ranks {
+		candidate := renames.ordered[rank]
 		rel, ok := trimPathPrefix(addPath, candidate.newDir)
 		if !ok {
 			continue
 		}
 		oldPath := joinPath(candidate.oldDir, rel)
 		idx, ok := deletesByPath[oldPath]
-		if ok && !used[idx] {
+		if ok && !used[idx] && deletes[idx].kind == kind {
 			return idx, true
 		}
 	}
 	return 0, false
 }
 
+// pathDir returns the directory portion of a '/'-separated git tree path.
+// Unlike path.Dir it returns "" (not ".") for a rootless path, letting
+// callers treat "" as "no parent directory" in ancestor walks.
 func pathDir(p string) string {
 	i := strings.LastIndexByte(p, '/')
 	if i < 0 {
@@ -744,6 +1462,8 @@ func pathDir(p string) string {
 	return p[:i]
 }
 
+// pathBase returns the final element (the basename) of a '/'-separated git
+// tree path.
 func pathBase(p string) string {
 	i := strings.LastIndexByte(p, '/')
 	if i < 0 {
@@ -752,6 +1472,9 @@ func pathBase(p string) string {
 	return p[i+1:]
 }
 
+// trimPathPrefix returns the remainder of the '/'-separated git tree path p
+// beneath the directory prefix, reporting whether p lies strictly beneath
+// it; an empty prefix denotes the tree root and matches every path.
 func trimPathPrefix(p, prefix string) (string, bool) {
 	if prefix == "" {
 		return p, true
@@ -763,17 +1486,16 @@ func trimPathPrefix(p, prefix string) (string, bool) {
 }
 
 // streamBlobPairHunks computes the added hunks for one changed file and
-// delivers them to fn.
+// delivers them to fn. Results are memoized by OID pair: the diff depends
+// only on the two blob contents, and histories with merges replay the same
+// transition repeatedly.
 func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAddition) error) error {
-	hunks, _, err := hs.pairHunks(work)
+	hunks, err := hs.pairHunks(work)
 	if err != nil {
 		return err
 	}
-
-	// Emit each hunk on its own; fusing a single hunk is a no-op
-	// (fuseHunks leaves slices shorter than 2 unchanged). Cross-hunk
-	// fusion, if ever wanted, must run over the whole per-file hunk
-	// slice instead.
+	// Emit each hunk exactly as computeAddedHunks produced it; adjacent
+	// hunks are not merged.
 	for _, hunk := range hunks {
 		if err := fn(newHunkAddition(work, hunk)); err != nil {
 			return err
@@ -782,35 +1504,20 @@ func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAdd
 	return nil
 }
 
-// pairHunks computes the added hunks for one changed file. Results are
-// memoized by OID pair: the diff depends only on the two blob contents, and
-// histories with merges replay the same transition repeatedly.
-//
-// aliased is the size of the new blob the returned text lines are views
-// into (see computeAddedHunks), and 0 when they are not: a memo hit returns
-// the memo's compacted copy, and binary and placeholder hunks are charged
-// by their own length.
-func (hs *HistoryScanner) pairHunks(work blobPairWork) (hunks []AddedHunk, aliased int, err error) {
-	if work.renameCandidate {
-		// The pair memo is keyed by (old, new) and holds a plain diff; a
-		// candidate's result also depends on its similarity verdict, so
-		// candidates bypass the memo in both directions.
-		hunks, aliased, err = computeRenameCandidateHunks(hs.store, work.oldOID, work.newOID)
-		if err != nil {
-			return nil, 0, fmt.Errorf("compute added hunks: %w", err)
-		}
-		return hunks, aliased, nil
-	}
-	pk := makePairKey(work.oldOID, work.newOID)
-	if hunks, cached := hs.pairs.get(pk); cached {
-		return hunks, 0, nil
-	}
-	hunks, aliased, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
+// pairHunks returns the added hunks for one changed file: the memoized pair
+// diff, content-validated when the pairing was inferred from a directory
+// rename. Every returned hunk's lines are either compacted into their own
+// buffer or span the whole new blob (see pairCache.add), so the bytes a
+// retained hunk keeps alive equal its line bytes.
+func (hs *HistoryScanner) pairHunks(work blobPairWork) ([]AddedHunk, error) {
+	hunks, err := hs.pairAddedHunks(work.oldOID, work.newOID)
 	if err != nil {
-		return nil, 0, fmt.Errorf("compute added hunks: %w", err)
+		return nil, err
 	}
-	hs.pairs.add(pk, hunks)
-	return hunks, aliased, nil
+	if work.inferredRename {
+		return hs.gateInferredRenameHunks(work.oldOID, work.newOID, hunks)
+	}
+	return hunks, nil
 }
 
 // newHunkAddition attributes one computed hunk to the commit and path of
@@ -836,6 +1543,138 @@ func newHunkAddition(work blobPairWork, hunk AddedHunk) HunkAddition {
 	}
 }
 
+// pairAddedHunks returns the added hunks for one (old,new) blob transition,
+// memoized by OID pair. The cached value is the raw pair diff, independent of
+// how the pairing was discovered, so genuine modifications and inferred
+// renames of the same transition share one entry.
+func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, error) {
+	pk := makePairKey(oldOID, newOID)
+	hunks, cached := hs.pairs.get(pk)
+	if cached {
+		return hunks, nil
+	}
+	sc := getLineScratch()
+	computed, err := computeAddedHunksScratch(hs.store, oldOID, newOID, sc)
+	if err != nil {
+		putLineScratch(sc)
+		return nil, fmt.Errorf("compute added hunks: %w", err)
+	}
+	// Return what the cache hands back, not what computeAddedHunks produced:
+	// the computed Lines are zero-copy views into the whole decompressed new
+	// blob, so a HunkAddition built from them keeps that blob alive for as long
+	// as any consumer holds the hunk. add also copies every header out of the
+	// scratch tables, which is what lets them go back to the pool here.
+	stored := hs.pairs.add(pk, computed)
+	putLineScratch(sc)
+	return stored, nil
+}
+
+// gateInferredRenameHunks validates a directory-rename pairing by content.
+// The pairing was inferred purely from paths, so the two blobs may be
+// unrelated; trusting the pair diff would silently drop any coincidentally
+// shared lines from the added-hunk stream. Mirroring Git's rename detection,
+// the pair is kept only when the lines common to both files are at least half
+// of the larger file; otherwise the file is reported as a whole-file addition.
+//
+// The decision is made from the two blobs rather than from the hunks, because
+// computeAddedHunks has three outcomes and only one of them describes this
+// file's added lines:
+//
+//   - New side oversized or binary: the whole new content is emitted without
+//     consulting the old blob at all, so the guess cannot have shaped it and a
+//     pure-add fallback would be identical. Kept as-is.
+//   - Old side oversized or binary: the result is a size placeholder or a
+//     single binary hunk, a shape chosen by the guessed half. It says nothing
+//     about this file, and its one line passes any similarity threshold, so it
+//     must be rejected rather than measured.
+//   - Either side over SmallFileThreshold: computeAddedHunks used the line-set
+//     or hashing algorithm, which is a set-membership test rather than a
+//     multiplicity-aware diff, so its added-line count cannot be turned into a
+//     similarity score. Measured directly from the blobs with
+//     renameLinesSimilar instead.
+//   - Both sides small text: a real line diff, which the similarity test below
+//     can measure.
+//
+// An empty hunk list is not a shortcut to "trustworthy". Exact-OID moves never
+// reach here — stage 1 suppresses them — so a pairing that arrives with zero
+// added lines has two different blobs whose new side is a line-wise subset of
+// the old one. That is what an unrelated pairing looks like when the new file
+// is much smaller, so it is measured like any other.
+func (hs *HistoryScanner) gateInferredRenameHunks(oldOID, newOID Hash, hunks []AddedHunk) ([]AddedHunk, error) {
+	if oldOID.IsZero() {
+		// Not actually a pairing: nothing was guessed.
+		return hunks, nil
+	}
+
+	newBytes, err := loadBlob(hs.store, newOID)
+	if err != nil {
+		return nil, fmt.Errorf("load new blob for rename gate: %w", err)
+	}
+	if int64(len(newBytes)) > maxDiffSize || isBinary(newBytes) {
+		return hunks, nil // New-side-determined; old blob was never consulted.
+	}
+
+	oldBytes, err := loadBlob(hs.store, oldOID)
+	if err != nil {
+		return nil, fmt.Errorf("load old blob for rename gate: %w", err)
+	}
+	if int64(len(oldBytes)) > maxDiffSize || isBinary(oldBytes) {
+		// The pair diff was shaped by the guessed side, so it cannot be
+		// measured. Report the file on its own terms.
+		return hs.pairAddedHunks(Hash{}, newOID)
+	}
+	if int64(len(oldBytes)) > SmallFileThreshold || int64(len(newBytes)) > SmallFileThreshold {
+		// Past SmallFileThreshold computeAddedHunks switches to the line-set
+		// and hashing algorithms, which are set-membership tests: one
+		// occurrence of a line in the old blob marks EVERY occurrence of it in
+		// the new blob as not added, so the added count below would overstate
+		// similarity (a one-line old file paired with a megabyte of that same
+		// line repeated would score as fully common). The gate therefore
+		// measures the blobs directly with renameLinesSimilar, a
+		// multiplicity-aware hashed line count that costs one map entry per
+		// distinct old line.
+		if renameLinesSimilar(oldBytes, newBytes) {
+			return hunks, nil
+		}
+		return hs.pairAddedHunks(Hash{}, newOID)
+	}
+
+	newTotal := tokenizedLineCount(newBytes)
+	oldTotal := tokenizedLineCount(oldBytes)
+	added := 0
+	for i := range hunks {
+		added += len(hunks[i].Lines)
+	}
+
+	// Similarity gate, mirroring Git's rename score: the lines the new file
+	// shares with the old one must be at least half of the LARGER side.
+	//
+	// The denominator has to be max(oldTotal, newTotal) and not newTotal
+	// alone, because a new-side-only score cannot see a pairing that merely
+	// shrinks. An unrelated one-line new file whose single line happens to
+	// occur somewhere in a 100-line deleted file produces ZERO added lines, so
+	// scoring added-over-newTotal keeps the pairing and emits no hunk at all —
+	// the new file's only line never reaches the stream. Git treats that case
+	// as a delete plus a create for the same reason: its similarity
+	// denominator is max(src, dst), so a large deletion counts against the
+	// pairing.
+	common := newTotal - added
+	if common*2 >= max(oldTotal, newTotal) {
+		return hunks, nil
+	}
+	return hs.pairAddedHunks(Hash{}, newOID)
+}
+
+// tokenizedLineCount counts the lines tokenize would produce for b, so
+// similarity arithmetic is expressed in the same units as a hunk's Lines.
+func tokenizedLineCount(b []byte) int {
+	n := bytes.Count(b, nlByte)
+	if len(b) > 0 && b[len(b)-1] != '\n' {
+		n++ // Trailing line without a newline, matching tokenize.
+	}
+	return n
+}
+
 // get returns the fully materialized (i.e. delta-resolved, decompressed)
 // object identified by oid plus its type. "Materialized" means that all
 // delta chains have been walked and applied, producing the final byte content
@@ -858,12 +1697,31 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 
 // Close releases any mmap handles or file descriptors held by the scanner.
 // It is idempotent; subsequent calls are no‑ops.
-func (hs *HistoryScanner) Close() error { return hs.store.Close() }
+//
+// The pair cache is cleared as well. Callers may retain a HistoryScanner value
+// after Close, and a hunk scan leaves that cache holding up to its full budget
+// of hunk lines — plus, for whole-blob entries, the object buffers those lines
+// view — which would otherwise stay reachable until the scanner itself does.
+// This mirrors store.Close releasing the offset cache's object bytes.
+func (hs *HistoryScanner) Close() error {
+	hs.pairs.clear()
+	if hs.meta != nil {
+		hs.meta.clear()
+	}
+	return hs.store.Close()
+}
 
 // CommitMetadata bundles the author identity, commit timestamp, and commit
 // message for a single commit.
 //
 // Instances are immutable and therefore safe for concurrent reads.
+//
+// For a cached commit, the strings in Author and Message reference a 64 KiB
+// metaCache slab shared with other commits (metaCache.miss builds them with
+// rebaseEntry), so a retained CommitMetadata keeps that slab reachable,
+// including after Close has dropped the cache's own reference. Callers that
+// keep values beyond the scan should copy the fields they need with
+// strings.Clone.
 type CommitMetadata struct {
 	// Author records the commit author exactly as stored in the commit header.
 	Author AuthorInfo
@@ -881,15 +1739,17 @@ type CommitMetadata struct {
 }
 
 // GetCommitMetadata returns (and caches) the commit's author, timestamp, and
-// message.
+// message. A commit whose payload exceeds maxCommitPayload is attributed from
+// its header, with an empty Message.
 func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
 // loadAllCommits enumerates every reachable commit, caching the result for
-// as long as the repository's ref tips stay unchanged. The streaming hunk
-// pipeline uses walkCommitsFromRefs directly; this materialized form serves
-// the dedup pipeline (which needs a total order up front) and package tests.
+// as long as the repository's ref tips and shallow boundary stay unchanged.
+// The streaming hunk pipeline uses walkCommitsFromRefs directly; this
+// materialized form serves the dedup pipeline (which needs a total order up
+// front) and package tests.
 //
 // Every call reads the ref tips and the shallow file. A scanner reused after
 // new commits land, or after a shallow clone is deepened, re-walks the

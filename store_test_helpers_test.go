@@ -1,8 +1,14 @@
-// store_test_helpers.go provides test helpers for accessing unexported store functionality.
+// store_test_helpers_test.go provides test helpers for accessing unexported
+// store functionality.
 //
 // This file contains functions that are only intended for use in tests to access
-// the unexported store type and open function. These helpers should not be used
-// in production code.
+// the unexported store type and open function. The _test.go suffix keeps them —
+// and the os/exec, testing, and testify dependencies they pull in — out of the
+// library build, so consumers never inherit them.
+//
+// Everything here is therefore visible only to this package's tests, including
+// OpenForTesting: it is not part of the package's exported surface. Callers
+// outside this package use the package's own exported API.
 
 package objstore
 
@@ -32,6 +38,13 @@ func gitTestCommand(repoDir string, args ...string) *exec.Cmd {
 		"-C", repoDir,
 	}
 	return exec.Command("git", append(gitArgs, args...)...)
+}
+
+func gitCatFile(t *testing.T, repoDir, typ string, oid Hash) []byte {
+	t.Helper()
+	out, err := gitTestCommand(repoDir, "cat-file", typ, oid.String()).Output()
+	require.NoErrorf(t, err, "git cat-file %s %s", typ, oid)
+	return out
 }
 
 // createTempFileWithData creates a temporary file with the given data.
@@ -447,21 +460,19 @@ func buildSelfContainedDelta(blobBase, blobDelta []byte) []byte {
 }
 
 func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]byte, error) {
-	// Build the delta instructions that transform baseData into targetData.
-	deltaInstructions := buildSelfContainedDelta(baseData, targetData)
+	return packRefDeltaObject(baseOID, buildSelfContainedDelta(baseData, targetData))
+}
 
-	// For REF_DELTA, the size in the header is the size of the delta instructions only.
+// packRefDeltaObject wraps a raw delta instruction stream in a REF_DELTA pack
+// object: [header] [20-byte base OID uncompressed] [zlib(instructions)]. The
+// header size field is the length of the instruction stream.
+func packRefDeltaObject(baseOID Hash, deltaInstructions []byte) ([]byte, error) {
 	header := encodeObjHeader(uint8(ObjRefDelta), uint64(len(deltaInstructions)))
 
-	// Build the complete object: [header] [20-byte base OID uncompressed] [compressed delta instructions].
 	var buf bytes.Buffer
-
 	buf.Write(header)
-
-	// The base OID is stored uncompressed (20 bytes).
 	buf.Write(baseOID[:])
 
-	// Only the delta instructions are compressed using zlib.
 	var compressedDelta bytes.Buffer
 	zw := zlib.NewWriter(&compressedDelta)
 	if _, err := zw.Write(deltaInstructions); err != nil {
@@ -470,7 +481,6 @@ func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]b
 	if err := zw.Close(); err != nil {
 		return nil, err
 	}
-
 	buf.Write(compressedDelta.Bytes())
 
 	return buf.Bytes(), nil
@@ -481,4 +491,14 @@ func createRefDeltaObject(baseOID Hash, targetData []byte, baseData []byte) ([]b
 // functionality. Production code should use NewHistoryScanner instead.
 func OpenForTesting(dir string) (*store, error) {
 	return open(dir)
+}
+
+// drainBlobPairBatches flattens a closed stage-2 hand-off channel into the
+// records it carried, in send order.
+func drainBlobPairBatches(blobs <-chan []blobPairWork) []blobPairWork {
+	var out []blobPairWork
+	for batch := range blobs {
+		out = append(out, batch...)
+	}
+	return out
 }

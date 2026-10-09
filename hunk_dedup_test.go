@@ -709,13 +709,13 @@ func serialDedupReference(t *testing.T, gitDir string, skipMergeDiffs bool, skip
 		require.NoError(t, err)
 
 		var pairs []blobPairWork
-		require.NoError(t, s.emitCommitBlobPairs(c, parentTree, func(w blobPairWork) error {
+		require.NoError(t, s.emitCommitBlobPairsTo(c, parentTree, func(w blobPairWork) error {
 			if skipPair != nil && skipPair(w.commit, filepath.ToSlash(w.path)) {
 				return nil
 			}
 			pairs = append(pairs, w)
 			return nil
-		}))
+		}, nil))
 
 		for _, p := range pairs {
 			var hunks []HunkAddition
@@ -1439,7 +1439,7 @@ func TestDiffHistoryHunksDedup_LargeBlobEarlyForward(t *testing.T) {
 	require.NoError(t, err)
 	flagged := 0
 	for _, c := range orderCommitsParentFirst(commits) {
-		pairs, err := s.collectCommitPairs(c)
+		pairs, err := s.collectCommitPairs(c, nil)
 		require.NoError(t, err)
 		for _, e := range s.expensivePairs(pairs) {
 			require.Equal(t, "big.txt", pairs[e.index].path)

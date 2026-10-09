@@ -53,3 +53,18 @@ func inflateExact(r *mmap.ReaderAt, pos int64, dst []byte) error {
 // checkMmapLayout is a no-op on platforms where x/exp/mmap has no mapped byte
 // slice; inflateExact above never uses the unsafe mmapData cast here.
 func checkMmapLayout(*mmap.ReaderAt) error { return nil }
+
+// openCommitHeaderStream positions a pooled zlib reader at the deflate
+// payload of the object starting at off. On this fallback build every read
+// is real file I/O through a SectionReader; the returned release func
+// recycles the pooled zlib reader and must be invoked exactly once.
+func openCommitHeaderStream(p *mmap.ReaderAt, off int64) (io.Reader, func(), error) {
+	if off < 0 || off > int64(p.Len()) {
+		return nil, nil, io.ErrUnexpectedEOF
+	}
+	zr, err := getZlibReader(io.NewSectionReader(p, off, int64(p.Len())-off))
+	if err != nil {
+		return nil, nil, err
+	}
+	return zr, func() { putZlibReader(zr) }, nil
+}

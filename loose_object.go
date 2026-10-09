@@ -15,6 +15,7 @@
 package objstore
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
@@ -24,78 +25,80 @@ import (
 	"strconv"
 )
 
-// readLooseObject loads and decompresses the loose object identified by oid
-// from the on-disk object store.
-//
-// How it works:
-//  1. Constructs the filesystem path via looseObjectPath.
-//  2. Opens the file, wraps it in a pooled zlib reader and a pooled
-//     bufio.Reader.
-//  3. Reads the NUL-terminated header to extract the object type and
-//     declared size.
-//  4. Reads the remaining body and verifies its length matches the declared
-//     size.
-//
-// Pool discipline: both the zlib reader (getZlibReader / putZlibReader) and
-// the bufio.Reader (getBR / putBR) are obtained from sync.Pools and returned
-// via deferred calls, so they are recycled even on error paths.
-//
-// Thread safety: readLooseObject is safe for concurrent use because it
-// operates only on local variables and pooled readers; no shared mutable
-// state is accessed.
-func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
-	return s.readLooseObjectLimited(oid, 0)
-}
-
 // "<type> <size>\0" is at most 6 type bytes, a space, 20 decimal digits of a
 // uint64 size, and the NUL, so a stream with no NUL in its first 32 bytes is
 // malformed and is rejected before the body read.
 const maxLooseHeaderLen = 32
 
-// readLooseObjectLimited is readLooseObject with an optional decompressed
-// body limit. A positive limit is enforced from the declared header before
-// body allocation and again while inflating malformed streams.
-func (s *store) readLooseObjectLimited(oid Hash, maxBodySize uint64) ([]byte, ObjectType, error) {
+// looseObjectStream is an open loose object positioned at the first body
+// byte: the "<type> <size>\0" header has been consumed and parsed. body
+// yields the inflated body; release returns the pooled readers and closes
+// the file, and must be called exactly once.
+type looseObjectStream struct {
+	body    *bufio.Reader
+	typ     ObjectType
+	size    uint64
+	release func()
+}
+
+// openLooseObject opens the loose object identified by oid, inflates and
+// parses its header, and returns the stream positioned at the body. The body
+// is left uninflated so callers can bound how much of it they read:
+// readLooseObject reads it whole, readCommitHeader stops at the committer
+// line, and readCommitPayloadTo checks size against its cap first.
+//
+// Pool discipline: both the zlib reader (getZlibReader / putZlibReader) and
+// the bufio.Reader (getBR / putBR) come from sync.Pools and are recycled by
+// release, or here on an error path.
+//
+// Thread safety: openLooseObject is safe for concurrent use because it
+// operates only on local variables and pooled readers.
+func (s *store) openLooseObject(oid Hash) (*looseObjectStream, error) {
 	if s == nil || s.objectsDir == "" {
-		return nil, ObjBad, objectNotFoundError(oid)
+		return nil, objectNotFoundError(oid)
 	}
 
 	path := looseObjectPath(s.objectsDir, oid)
 	f, err := os.Open(path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, ObjBad, objectNotFoundError(oid)
+			return nil, objectNotFoundError(oid)
 		}
-		return nil, ObjBad, err
+		return nil, err
 	}
-	defer f.Close()
 
 	zr, err := getZlibReader(f)
 	if err != nil {
-		return nil, ObjBad, err
+		f.Close()
+		return nil, err
 	}
-	defer putZlibReader(zr)
-
 	br := getBR(zr)
-	defer putBR(br)
+	release := func() {
+		putBR(br)
+		putZlibReader(zr)
+		f.Close()
+	}
 
 	hdr, err := br.Peek(maxLooseHeaderLen)
 	nul := bytes.IndexByte(hdr, 0)
 	if nul < 0 {
+		release()
 		if err != nil {
-			return nil, ObjBad, err
+			return nil, err
 		}
-		return nil, ObjBad, fmt.Errorf("loose object header exceeds %d bytes for %x", maxLooseHeaderLen, oid)
+		return nil, fmt.Errorf("loose object header exceeds %d bytes for %x", maxLooseHeaderLen, oid)
 	}
 	// hdr aliases the bufio buffer: parse it before reading the body.
 	hdr = hdr[:nul]
 	if _, err := br.Discard(nul + 1); err != nil {
-		return nil, ObjBad, err
+		release()
+		return nil, err
 	}
 
 	sp := bytes.IndexByte(hdr, ' ')
 	if sp <= 0 || sp+1 >= len(hdr) {
-		return nil, ObjBad, fmt.Errorf("invalid loose object header for %x", oid)
+		release()
+		return nil, fmt.Errorf("invalid loose object header for %x", oid)
 	}
 
 	// btostr safety: hdr is a local slice owned by this call frame and will
@@ -103,37 +106,79 @@ func (s *store) readLooseObjectLimited(oid Hash, maxBodySize uint64) ([]byte, Ob
 	// conversion is safe for the lifetime of the parseLooseObjectType call.
 	typ, ok := parseLooseObjectType(btostr(hdr[:sp]))
 	if !ok {
-		return nil, ObjBad, fmt.Errorf("unsupported loose object type %q for %x", btostr(hdr[:sp]), oid)
+		err := fmt.Errorf("unsupported loose object type %q for %x", btostr(hdr[:sp]), oid)
+		release()
+		return nil, err
 	}
 
 	size, err := strconv.ParseUint(btostr(hdr[sp+1:]), 10, 64)
 	if err != nil {
-		return nil, ObjBad, fmt.Errorf("invalid loose object size for %x: %w", oid, err)
-	}
-	if maxBodySize > 0 && size > maxBodySize {
-		return nil, ObjBad, fmt.Errorf("loose object body %d bytes exceeds %d byte limit for %x", size, maxBodySize, oid)
+		release()
+		return nil, fmt.Errorf("invalid loose object size for %x: %w", oid, err)
 	}
 
-	var body []byte
-	if maxBodySize > 0 {
-		body, err = io.ReadAll(io.LimitReader(br, int64(maxBodySize)+1))
-	} else {
-		body, err = io.ReadAll(br)
+	return &looseObjectStream{body: br, typ: typ, size: size, release: release}, nil
+}
+
+// readLooseObject loads and decompresses the loose object identified by oid
+// from the on-disk object store: openLooseObject parses the header, then the
+// whole body is read and its length verified against the declared size.
+//
+// Thread safety: readLooseObject is safe for concurrent use; see
+// openLooseObject.
+func (s *store) readLooseObject(oid Hash) ([]byte, ObjectType, error) {
+	obj, err := s.openLooseObject(oid)
+	if err != nil {
+		return nil, ObjBad, err
 	}
+	defer obj.release()
+
+	body, err := io.ReadAll(obj.body)
 	if err != nil {
 		return nil, ObjBad, err
 	}
 	// Size verification: the decompressed body length must match the size
 	// declared in the header. A mismatch indicates a truncated or corrupted
 	// object file.
-	if uint64(len(body)) != size {
+	if uint64(len(body)) != obj.size {
 		return nil, ObjBad, fmt.Errorf(
 			"loose object size mismatch for %x: want %d, got %d",
-			oid, size, len(body),
+			oid, obj.size, len(body),
 		)
 	}
 
-	return body, typ, nil
+	// Hand back a slice whose capacity is its length. io.ReadAll grows by
+	// append and commonly returns spare capacity, and callers treat an object
+	// buffer as costing exactly the bytes it reports: the offset cache admits
+	// on len(data), and pairCache.add aliases a whole-blob buffer instead of
+	// copying it precisely because a blob's capacity is its size. Slack here
+	// would be retained by both while being charged by neither.
+	//
+	// The read stays bounded by the bytes zlib actually produces rather than
+	// by the size the header declares, so a corrupt or hostile header cannot
+	// turn this into a large allocation; the copy happens only after the
+	// declared size is confirmed against what was read.
+	if cap(body) > len(body) {
+		exact := make([]byte, len(body))
+		copy(exact, body)
+		body = exact
+	}
+
+	return body, obj.typ, nil
+}
+
+// openLooseCommit is openLooseObject for a commit: any other type fails
+// with ErrObjectNotCommit.
+func (s *store) openLooseCommit(oid Hash) (*looseObjectStream, error) {
+	obj, err := s.openLooseObject(oid)
+	if err != nil {
+		return nil, err
+	}
+	if obj.typ != ObjCommit {
+		obj.release()
+		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
+	}
+	return obj, nil
 }
 
 // looseObjectPath returns the filesystem path for a loose object given the

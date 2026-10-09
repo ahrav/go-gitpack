@@ -60,7 +60,7 @@ func BenchmarkInflateDynamicTables(b *testing.B) {
 	}
 
 	var d goInflater
-	if probe := r; !d.loadDynamicTables(&probe) {
+	if probe := r; d.loadDynamicTables(&probe) != nil {
 		b.Fatal("failed to parse benchmark dynamic tables")
 	}
 
@@ -68,7 +68,7 @@ func BenchmarkInflateDynamicTables(b *testing.B) {
 	b.ResetTimer()
 	for b.Loop() {
 		next := r
-		if !d.loadDynamicTables(&next) {
+		if d.loadDynamicTables(&next) != nil {
 			b.Fatal("failed to parse benchmark dynamic tables")
 		}
 	}

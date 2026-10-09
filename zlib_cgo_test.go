@@ -1,36 +1,120 @@
 //go:build cgo && gitpack_libdeflate
 
-// zlib_cgo_test.go is the differential correctness proof for the libdeflate
-// one-shot inflate backend (4f9f796). It only compiles/runs under the
-// `gitpack_libdeflate` build tag, so it must be exercised explicitly:
+// zlib_cgo_test.go covers the libdeflate one-shot inflate backend. It only
+// compiles under the `gitpack_libdeflate` build tag, so it must be exercised
+// explicitly:
 //
 //	go test -tags gitpack_libdeflate ./...
 //
-// The oracle is the pure-Go klauspost zlib reader (the default backend): for
-// every input, libdeflate's whole-buffer decode must produce byte-identical
-// output. Because the two backends are selected at build time, a single build
-// can only run one via the store; this test invokes both directly and compares
-// them, closing the gap that the backend is otherwise never differentially
-// validated.
+// Two complementary proofs live here. The error-class tests pin the
+// cross-backend contract by calling inflatePackZlibGo directly, for the two
+// classes the backends genuinely agree on: output overrun (the stream continues
+// past the declared size) and short output (a valid stream ending before the
+// declared size). Both must classify identically under errors.Is regardless of
+// build tag. Parity is NOT claimed for every malformed stream: libdeflate
+// reports BAD_DATA for truncated and structurally invalid input alike, so those
+// two collapse into errLibdeflateBadData, while the pure-Go decoder can still
+// distinguish them and surface io.ErrUnexpectedEOF (see the failure-mapping
+// comment in zlib_cgo.go). The differential tests use the pure-Go klauspost
+// zlib reader as an output oracle: for every input, libdeflate's whole-buffer
+// decode must produce byte-identical output. Because the two backends are
+// selected at build time, a single build can only reach one through the store;
+// these tests invoke both directly and compare them.
+//
+// The klauspost reader is aliased as kpzlib to mark it as an independent
+// reference decoder, not the code under test. The default build's one-shot path
+// is zlib_purego.go delegating to this package's own inflatePackZlibGo
+// (inflate_go.go), which drives a hand-rolled bit reader rather than klauspost's
+// reader — so kpzlib is a genuinely separate implementation, which is what makes
+// it worth comparing against. Stdlib compress/zlib writes the fixtures for the
+// error-class tests.
 
 package objstore
 
 import (
 	"bytes"
+	"compress/zlib"
+	"errors"
 	"io"
 	"math/rand"
 	"testing"
 
-	"github.com/klauspost/compress/zlib"
+	kpzlib "github.com/klauspost/compress/zlib"
 	"github.com/stretchr/testify/require"
 )
+
+func TestInflateZlibOneShotValidatesEmptyOutput(t *testing.T) {
+	var encoded bytes.Buffer
+	zw := zlib.NewWriter(&encoded)
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := inflateZlibOneShot(encoded.Bytes(), nil); err != nil {
+		t.Fatalf("valid empty stream rejected: %v", err)
+	}
+	if _, err := inflateZlibOneShot([]byte{0x78, 0x9c}, nil); err == nil {
+		t.Fatal("truncated empty stream accepted")
+	}
+}
+
+// TestInflateZlibOneShotErrorClassesMatchPureGo pins the cross-backend error
+// contract for the two classes both backends can distinguish: a stream
+// continuing past the declared size is the overrun class, and a stream ending
+// before the declared size is the short-output (unexpected-EOF) class. Each must
+// classify identically under errors.Is regardless of build tag. Truncated versus
+// structurally-invalid input is deliberately not covered — libdeflate cannot
+// separate them (see the file header).
+func TestInflateZlibOneShotErrorClassesMatchPureGo(t *testing.T) {
+	payload := []byte("hello world hello world")
+	var encoded bytes.Buffer
+	zw := zlib.NewWriter(&encoded)
+	if _, err := zw.Write(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("overrun", func(t *testing.T) {
+		dst := make([]byte, len(payload)-6)
+		_, cErr := inflateZlibOneShot(encoded.Bytes(), dst)
+		if cErr == nil {
+			t.Fatal("stream continuing past declared size accepted")
+		}
+		if !errors.Is(cErr, errZlibStreamOverrun) {
+			t.Fatalf("libdeflate backend got %v, want the stream-overrun class", cErr)
+		}
+		goDst := make([]byte, len(payload)-6)
+		_, goErr := inflatePackZlibGo(encoded.Bytes(), goDst)
+		if !errors.Is(goErr, errZlibStreamOverrun) {
+			t.Fatalf("pure-Go backend got %v, want the stream-overrun class", goErr)
+		}
+	})
+
+	t.Run("short output", func(t *testing.T) {
+		dst := make([]byte, len(payload)+6)
+		_, cErr := inflateZlibOneShot(encoded.Bytes(), dst)
+		if cErr == nil {
+			t.Fatal("stream ending before declared size accepted")
+		}
+		if !errors.Is(cErr, io.ErrUnexpectedEOF) {
+			t.Fatalf("libdeflate backend got %v, want the short-output class", cErr)
+		}
+		goDst := make([]byte, len(payload)+6)
+		_, goErr := inflatePackZlibGo(encoded.Bytes(), goDst)
+		if !errors.Is(goErr, io.ErrUnexpectedEOF) {
+			t.Fatalf("pure-Go backend got %v, want the short-output class", goErr)
+		}
+	})
+}
 
 // zlibDeflate returns a real zlib stream for data, matching what Git writes
 // into packs.
 func zlibDeflate(t *testing.T, data []byte) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	zw := zlib.NewWriter(&buf)
+	zw := kpzlib.NewWriter(&buf)
 	_, err := zw.Write(data)
 	require.NoError(t, err)
 	require.NoError(t, zw.Close())
@@ -41,7 +125,7 @@ func zlibDeflate(t *testing.T, data []byte) []byte {
 // serving as the differential oracle.
 func pureGoInflate(t *testing.T, src []byte) []byte {
 	t.Helper()
-	zr, err := zlib.NewReader(bytes.NewReader(src))
+	zr, err := kpzlib.NewReader(bytes.NewReader(src))
 	require.NoError(t, err)
 	out, err := io.ReadAll(zr)
 	require.NoError(t, err)
@@ -57,11 +141,18 @@ func requireLibdeflateMatches(t *testing.T, want, compressed []byte) {
 	consumed, err := inflateZlibOneShot(compressed, dst)
 	require.NoError(t, err)
 	require.Equal(t, want, dst, "libdeflate output differs from pure-Go oracle")
-	if len(want) > 0 {
-		require.Positive(t, consumed, "consumed byte count should be positive for non-empty output")
-		require.LessOrEqual(t, consumed, len(compressed))
-	}
+	require.Equal(t, len(compressed)-adler32TrailerSize, consumed,
+		"must consume the zlib header and deflate payload but stop before the adler32 trailer")
 }
+
+// adler32TrailerSize is the width of the adler32 checksum that closes a zlib
+// stream. inflateZlibOneShot deliberately does not consume or verify it, so for
+// a well-formed fixture the consumed count is exactly the stream length minus
+// this. Asserting the exact boundary rather than a range is what pins that
+// contract: a decoder that swallowed the trailer would still satisfy
+// "positive and not past the end", and the pure-Go backend agrees on the
+// same boundary for every payload shape tested here.
+const adler32TrailerSize = 4
 
 // TestLibdeflate_DifferentialAgainstPureGo verifies that the libdeflate backend
 // agrees with the pure-Go backend across payload shapes that stress different
@@ -106,8 +197,8 @@ func TestLibdeflate_EmptyOutputContract(t *testing.T) {
 	compressed := zlibDeflate(t, nil)
 	n, err := inflateZlibOneShot(compressed, nil)
 	require.NoError(t, err)
-	require.Positive(t, n)
-	require.LessOrEqual(t, n, len(compressed))
+	require.Equal(t, len(compressed)-adler32TrailerSize, n,
+		"an empty payload still consumes the header and the empty deflate block, and no trailer")
 
 	_, err = inflateZlibOneShot([]byte{0x78, 0x9c}, nil)
 	require.Error(t, err, "truncated empty stream must be rejected")

@@ -81,7 +81,7 @@ func testCoreFunctionality(t *testing.T) {
 		assert.False(t, ok, "acquire should return false for a non-existent object")
 	})
 
-	t.Run("Data Mutability", func(t *testing.T) {
+	t.Run("Add Does Not Copy Input", func(t *testing.T) {
 		w := newRefCountedDeltaWindow()
 		oid := makeHash("mutable")
 		originalData := []byte("original")
@@ -89,13 +89,15 @@ func testCoreFunctionality(t *testing.T) {
 		err := w.add(oid, originalData, ObjBlob)
 		require.NoError(t, err, "add should not fail")
 
+		// Deliberately violate add's ownership-transfer convention to prove the
+		// window retains the supplied buffer rather than making a defensive copy.
 		originalData[0] = 'X'
 
 		h, ok := w.acquire(oid)
 		require.True(t, ok, "acquire should succeed")
 		defer h.Release()
 
-		assert.Equal(t, []byte("Xriginal"), h.Data(), "cache data should reflect external changes to the source slice")
+		assert.Equal(t, []byte("Xriginal"), h.Data(), "add unexpectedly copied its input buffer")
 	})
 
 	// TestReleasedViewsAreNeverRecycled pins the never-recycle half of the
@@ -132,7 +134,11 @@ func testCoreFunctionality(t *testing.T) {
 		he.Release()
 
 		for i := range 64 {
-			_ = w2.add(makeHash(fmt.Sprintf("churn-%d", i)), bytes.Repeat([]byte{byte(i)}, 512), ObjBlob)
+			// add can only fail here by refusing the entry (over budget, or a
+			// full window with nothing evictable). Either would leave the
+			// evictee resident and make the checks below vacuous, so assert
+			// rather than discard.
+			require.NoError(t, w2.add(makeHash(fmt.Sprintf("churn-%d", i)), bytes.Repeat([]byte{byte(i)}, 512), ObjBlob))
 		}
 
 		assert.Equal(t, bytes.Repeat([]byte{0xAB}, 512), evictedView,
@@ -410,6 +416,100 @@ func testConcurrency(t *testing.T) {
 			cnt := entry.refCnt.Load()
 			assert.Equal(t, int32(0), cnt, "no leaked reference counts should remain")
 		}
+	})
+
+	// A Handle's Data and Type must describe one generation of an entry while
+	// add repeatedly replaces that entry's data, size, and type as a group.
+	// Both values are copied out under mu by acquire; reading either one
+	// through the shared entry instead both races with the update and lets the
+	// pair straddle two generations.
+	t.Run("Handle Reports One Generation During Update", func(t *testing.T) {
+		t.Parallel()
+
+		w := newRefCountedDeltaWindow()
+		oid := makeHash("generation-swap")
+
+		// The two payloads stand for whole generations: a Handle may only ever
+		// report one of these (payload, type) pairs. Distinct lengths and fill
+		// bytes make any mixture visible without the race detector.
+		generation := map[ObjectType][]byte{
+			ObjBlob: bytes.Repeat([]byte{'b'}, 512),
+			ObjTree: bytes.Repeat([]byte{'t'}, 256),
+		}
+		require.NoError(t, w.add(oid, generation[ObjBlob], ObjBlob))
+
+		var (
+			wg      sync.WaitGroup
+			reads   atomic.Int64
+			mixed   atomic.Int64
+			once    sync.Once
+			example string
+		)
+		stop := make(chan struct{})
+
+		// The writer's iteration count bounds the whole test: it closes stop on
+		// the way out, so the work done does not vary with wall-clock
+		// scheduling the way a sleep would.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer close(stop)
+			const updates = 20_000
+			for i := range updates {
+				typ := ObjBlob
+				if i%2 == 1 {
+					typ = ObjTree
+				}
+				// Handing the same buffers to add repeatedly respects the
+				// ownership transfer: neither payload is ever mutated, so a
+				// copy an earlier handle took stays intact.
+				_ = w.add(oid, generation[typ], typ)
+			}
+		}()
+
+		readers := max(2, runtime.GOMAXPROCS(0))
+		for range readers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for {
+					if h, ok := w.acquire(oid); ok {
+						// Yield between the acquire and the reads so an
+						// update lands inside the handle's lifetime, which is
+						// the interleaving the copies exist to survive.
+						runtime.Gosched()
+						data, typ := h.Data(), h.Type()
+						h.Release()
+
+						reads.Add(1)
+						if want, known := generation[typ]; !known || !bytes.Equal(data, want) {
+							mixed.Add(1)
+							once.Do(func() {
+								example = fmt.Sprintf("type %v with %d bytes", typ, len(data))
+							})
+						}
+					}
+					// Read first, then test for the writer's exit, so every
+					// reader records at least one read and reads > 0 holds by
+					// construction rather than by the scheduler starting a
+					// reader before the writer's bounded loop retires. The
+					// entry is resident for the whole test -- add updates this
+					// OID in place and never removes it, and one payload is
+					// far below the window budget -- so that first acquire
+					// cannot miss.
+					select {
+					case <-stop:
+						return
+					default:
+					}
+				}
+			}()
+		}
+
+		wg.Wait()
+
+		assert.Zero(t, mixed.Load(), "handle mixed two generations (%s)", example)
+		assert.Positive(t, reads.Load(), "readers never acquired the entry")
 	})
 }
 

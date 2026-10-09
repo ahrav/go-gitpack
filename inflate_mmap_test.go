@@ -37,10 +37,36 @@ func TestCheckMmapLayout(t *testing.T) {
 	}
 }
 
-func TestGetZlibReaderAtRejectsOversizedWindow(t *testing.T) {
+// TestInflateExactTruncatedHeaderClassification pins the error class when a
+// pack ends inside the 2-byte zlib header: the mmap path must report the
+// unexpected-EOF identity like the non-mmap fallback, not the one-shot
+// decoder's generic bad-data error.
+func TestInflateExactTruncatedHeaderClassification(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "truncated-header")
+	if err := os.WriteFile(path, []byte{0x78}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := mmap.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	for _, pos := range []int64{0, 1} {
+		err := inflateExact(r, pos, make([]byte, 4))
+		if err == nil {
+			t.Fatalf("pos=%d: truncated header accepted", pos)
+		}
+		if !errors.Is(err, io.ErrUnexpectedEOF) {
+			t.Fatalf("pos=%d: got %v, want unexpected-EOF identity", pos, err)
+		}
+	}
+}
+
+func TestInflateOneShotRejectsOversizedWindow(t *testing.T) {
 	// CM=deflate and FCHECK is valid, but CINFO=8 exceeds RFC 1950's limit.
 	data := []byte{0x88, 0x1c}
-	if _, _, err := getZlibReaderAt(data, 0); err == nil {
+	if _, err := inflateZlibOneShot(data, nil); err == nil {
 		t.Fatal("expected invalid CINFO to be rejected")
 	}
 }
@@ -77,22 +103,15 @@ func TestInflateIgnoresAdler32Trailer(t *testing.T) {
 	}
 }
 
-// inflatePureGo mirrors the pure-Go branch of inflateExact: fill dst from the
-// deflate payload, then require the stream to terminate at the declared size.
+// inflatePureGo drives the production pure-Go pack decode path
+// (inflatePackZlibGo, the inflateZlibOneShot backend in non-libdeflate
+// builds): fill dst from the zlib stream and require the DEFLATE stream to
+// terminate exactly at the declared size.
 func inflatePureGo(t *testing.T, src []byte, declaredSize int) error {
 	t.Helper()
-	zr, br, err := getZlibReaderAt(src, 0)
-	if err != nil {
-		t.Fatalf("open zlib stream: %v", err)
-	}
-	defer putBytesReader(br)
-	defer putFlateReader(zr)
-
 	dst := make([]byte, declaredSize)
-	if _, err := io.ReadFull(zr, dst); err != nil {
-		return err
-	}
-	return ensureZlibStreamEnd(zr)
+	_, err := inflatePackZlibGo(src, dst)
+	return err
 }
 
 func TestInflateAcceptsExactlyTerminatedStream(t *testing.T) {
@@ -122,10 +141,16 @@ func TestInflateRejectsStreamContinuingPastDeclaredSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Declare fewer bytes than the stream actually inflates to. io.ReadFull
-	// stops once dst is full, so only the end-of-stream check can catch this.
-	if err := inflatePureGo(t, buf.Bytes(), len(payload)-6); err == nil {
+	// Declare fewer bytes than the stream actually inflates to. The decoder
+	// fills dst and then finds more compressed data where it expects the
+	// stream to end, which must classify as the overrun error, not a
+	// generic failure.
+	err := inflatePureGo(t, buf.Bytes(), len(payload)-6)
+	if err == nil {
 		t.Fatal("stream continuing past the declared size was accepted")
+	}
+	if !errors.Is(err, errZlibStreamOverrun) {
+		t.Fatalf("got %v, want the stream-overrun class", err)
 	}
 }
 
@@ -138,9 +163,10 @@ func TestInflateRejectsStreamMissingTerminator(t *testing.T) {
 	//   NLEN=^4
 	//   4 payload bytes, then nothing — no final block ever arrives.
 	//
-	// io.ReadFull fills dst with exactly the declared 4 bytes, so only the
-	// end-of-stream check can notice that the deflate stream is truncated
-	// rather than terminated.
+	// The decoder produces the declared 4 bytes while decoding the stored
+	// block, then reads the next block header and hits end of input: the
+	// missing terminator is detected as truncation, not as an output
+	// mismatch.
 	payload := []byte("abcd")
 	stream := []byte{0x78, 0x9c, 0x00, 0x04, 0x00, 0xfb, 0xff}
 	stream = append(stream, payload...)
@@ -154,7 +180,7 @@ func TestInflateRejectsStreamMissingTerminator(t *testing.T) {
 	if errors.Is(err, errZlibStreamOverrun) {
 		t.Fatalf("got overrun error, want truncation: %v", err)
 	}
-	if !errors.Is(err, io.ErrUnexpectedEOF) && !errors.Is(err, io.EOF) {
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
 		t.Fatalf("got %v, want an unexpected-EOF truncation error", err)
 	}
 }

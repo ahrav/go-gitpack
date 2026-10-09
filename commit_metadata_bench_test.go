@@ -12,8 +12,8 @@
 //   - Warm: pure cache hits after a pre-warming pass; guards the fast-path
 //     map probe against regressions from entry-shape changes.
 //
-// Both use the very-large-repo-1k fixture (1000 packed commits) so the
-// per-wrap cache reset amortizes to noise (~0.1% of iterations).
+// Both use the very-large-repo-1k fixture (1000 packed commits). The cold
+// benchmark's per-wrap cache reset runs with the timer stopped.
 package objstore
 
 import (
@@ -54,11 +54,11 @@ func BenchmarkGetCommitMetadataCold(b *testing.B) {
 	i := 0
 	for b.Loop() {
 		if i%len(oids) == 0 {
-			// clear (not re-make) keeps this compiling across metaCache
-			// entry-type changes and avoids map re-allocation noise.
-			scanner.meta.mu.Lock()
-			clear(scanner.meta.m)
-			scanner.meta.mu.Unlock()
+			// Clearing the map and dropping the slabs is O(entries); keep
+			// that cache maintenance out of the per-lookup number.
+			b.StopTimer()
+			scanner.meta.attachGraph(scanner.graphData)
+			b.StartTimer()
 		}
 		_, err := scanner.GetCommitMetadata(oids[i%len(oids)])
 		if err != nil {
@@ -129,9 +129,15 @@ func BenchmarkReadCommitPayload(b *testing.B) {
 // BenchmarkHunkScanWithAttribution is the consumer-shaped end-to-end
 // measurement: a DiffHistoryHunksFunc scan whose callback attributes every
 // hunk's commit via GetCommitMetadata, exactly like a secret-scanner joining
-// findings to commits. It reports peak-RSS growth alongside wall time so an
-// unbounded-cache regression is visible, and runs against a real repository
-// named by GITPACK_BENCH_REPO (skipped otherwise, keeping CI hermetic).
+// findings to commits. It reports the attribution count and the process peak
+// RSS alongside wall time so an unbounded-cache regression is visible, and
+// runs against a real repository named by GITPACK_BENCH_REPO (skipped
+// otherwise, keeping CI hermetic).
+//
+// VmHWM is a process-lifetime high-water mark, so the RSS figure is only
+// attributable to this benchmark when it runs alone in its process:
+//
+//	GITPACK_BENCH_REPO=/path/.git go test -run '^$' -bench HunkScanWithAttribution
 func BenchmarkHunkScanWithAttribution(b *testing.B) {
 	repo := os.Getenv("GITPACK_BENCH_REPO")
 	if repo == "" {
@@ -154,12 +160,17 @@ func BenchmarkHunkScanWithAttribution(b *testing.B) {
 		require.NoError(b, err)
 		require.NoError(b, scanner.Close())
 	}
+	// A repository that yields no added hunks measures nothing; refuse the
+	// number instead of reporting a fast empty run.
+	require.Positive(b, metaCalls.Load(), "benchmark repository produced no attributions")
 	b.ReportMetric(float64(hunks.Load())/float64(b.N), "hunks/op")
-	b.ReportMetric(peakRSSMiB(), "peakRSS-MiB")
+	b.ReportMetric(float64(metaCalls.Load())/float64(b.N), "metaCalls/op")
+	b.ReportMetric(peakRSSMiB(), "procPeakRSS-MiB")
 }
 
-// peakRSSMiB reads VmHWM (peak resident set) from /proc/self/status. Linux
-// only; returns 0 elsewhere, which benchstat simply reports as zero.
+// peakRSSMiB reads VmHWM (process-lifetime peak resident set) from
+// /proc/self/status. Linux only; returns 0 elsewhere, which benchstat simply
+// reports as zero.
 func peakRSSMiB() float64 {
 	f, err := os.Open("/proc/self/status")
 	if err != nil {
