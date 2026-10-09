@@ -1435,15 +1435,20 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 	if cached {
 		return hunks, nil
 	}
-	computed, err := computeAddedHunks(hs.store, oldOID, newOID)
+	sc := getLineScratch()
+	computed, err := computeAddedHunksScratch(hs.store, oldOID, newOID, sc)
 	if err != nil {
+		putLineScratch(sc)
 		return nil, fmt.Errorf("compute added hunks: %w", err)
 	}
 	// Return what the cache hands back, not what computeAddedHunks produced:
 	// the computed Lines are zero-copy views into the whole decompressed new
 	// blob, so a HunkAddition built from them keeps that blob alive for as long
-	// as any consumer holds the hunk.
-	return hs.pairs.add(pk, computed), nil
+	// as any consumer holds the hunk. add also copies every header out of the
+	// scratch tables, which is what lets them go back to the pool here.
+	stored := hs.pairs.add(pk, computed)
+	putLineScratch(sc)
+	return stored, nil
 }
 
 // gateInferredRenameHunks validates a directory-rename pairing by content.

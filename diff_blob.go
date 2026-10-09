@@ -298,6 +298,46 @@ func isBinary(data []byte) bool {
 // pairCache.add reads that shape to decide when copying the lines out would
 // only retain the bytes they already alias.
 func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
+	return computeAddedHunksScratch(store, oldOID, newOID, nil)
+}
+
+// lineScratch holds the two tokenized line tables a text diff works over.
+// Neither table outlives the pair's compaction (pairCache.add copies the
+// headers of every hunk a positional diff reports), so the tables are
+// recycled across diffs instead of being allocated and zeroed per pair:
+// those two arrays were about a fifth of all bytes a scan allocated.
+//
+// A recycled table is overwritten up to the new line count; headers beyond
+// that length are stale views from an earlier diff and keep that diff's
+// blob reachable until they are overwritten. addedHunksWithPos only runs on
+// blobs up to SmallFileThreshold, so a pooled table pins at most a few MiB.
+type lineScratch struct {
+	old, new []string
+}
+
+var lineScratchPool = sync.Pool{New: func() any { return &lineScratch{} }}
+
+func getLineScratch() *lineScratch { return lineScratchPool.Get().(*lineScratch) }
+
+// putLineScratch returns sc to the pool. Tables that grew past
+// maxPooledLineTable entries are dropped so one huge diff cannot pin a large
+// table in the pool for the process lifetime.
+func putLineScratch(sc *lineScratch) {
+	const maxPooledLineTable = 1 << 18 // 4 MiB of headers
+	if cap(sc.old) > maxPooledLineTable {
+		sc.old = nil
+	}
+	if cap(sc.new) > maxPooledLineTable {
+		sc.new = nil
+	}
+	lineScratchPool.Put(sc)
+}
+
+// computeAddedHunksScratch is computeAddedHunks with caller-owned line
+// tables for the positional diff; a nil sc allocates fresh tables. Hunks
+// returned for a positional diff alias sc.new until pairCache.add compacts
+// them, so sc must stay untouched until then.
+func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch) ([]AddedHunk, error) {
 	// Pure deletion (or nothing at all): no added-line side exists, so the
 	// blobs never need to be loaded. This matters for history walks where
 	// large binaries get deleted — inflating a multi-MB blob only to
@@ -402,7 +442,7 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 
 	// Both files are text — choose the diff algorithm by size.
 	if oldSize <= SmallFileThreshold && newSize <= SmallFileThreshold {
-		return addedHunksWithPos(oldBytes, newBytes), nil
+		return addedHunksWithPosScratch(oldBytes, newBytes, sc), nil
 	}
 
 	return addedHunksForLargeFiles(oldBytes, newBytes), nil
@@ -437,6 +477,13 @@ func loadBlob(s *store, oid Hash) ([]byte, error) {
 // Returns nil if the byte slices are identical.
 // Returns a slice of AddedHunk structs representing all additions found in newB.
 func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
+	return addedHunksWithPosScratch(oldB, newB, nil)
+}
+
+// addedHunksWithPosScratch is addedHunksWithPos with caller-owned line
+// tables; a nil sc allocates fresh ones. The returned hunks' Lines alias the
+// new-side table.
+func addedHunksWithPosScratch(oldB, newB []byte, sc *lineScratch) []AddedHunk {
 	// First, check for the trivial case where the files are identical.
 	if bytes.Equal(oldB, newB) {
 		return nil
@@ -457,7 +504,14 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 
 	// Tokenize the old and new byte slices into lines for comparison.
 	// This is a zero-copy operation, creating string views into the original slices.
-	oldLines, newLines := tokenize(oldB), tokenize(newB)
+	var oldLines, newLines []string
+	if sc != nil {
+		sc.old = tokenizeInto(sc.old, oldB)
+		sc.new = tokenizeInto(sc.new, newB)
+		oldLines, newLines = sc.old, sc.new
+	} else {
+		oldLines, newLines = tokenize(oldB), tokenize(newB)
+	}
 
 	// For larger files, a hash index over old lines provides O(1) lookups.
 	// It is built lazily at the first mismatch: prefix-trimmed inputs

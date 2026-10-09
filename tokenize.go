@@ -19,11 +19,24 @@ import (
 // mispredictions; the block mask pays those costs once per 64 bytes instead
 // of once per line and stays portable across architectures.
 func tokenize(src []byte) []string {
+	return tokenizeInto(nil, src)
+}
+
+// tokenizeInto is tokenize writing into dst's backing array when it has the
+// capacity, so a caller can recycle one table across many splits. The
+// result's len is the line count; its contents beyond that are unspecified.
+func tokenizeInto(dst []string, src []byte) []string {
 	if len(src) == 0 {
-		return nil
+		return dst[:0]
 	}
 
-	lines := make([]string, bytes.Count(src, nlByte)+1)
+	need := bytes.Count(src, nlByte) + 1
+	var lines []string
+	if cap(dst) >= need {
+		lines = dst[:need]
+	} else {
+		lines = make([]string, need)
+	}
 	n := 0
 	start := 0 // start of the current line
 	i := 0
