@@ -146,8 +146,11 @@ func (ctx *deltaContext) enterRefDelta(hash Hash) {
 	ctx.depth++
 }
 
-// deltaArena holds two equally‑sized byte slices so the resolver can ping‑pong
-// between *source* and *destination* buffers while walking a delta chain.
+// deltaArena is a large scratch buffer that callers slice into *source* and
+// *destination* halves to ping-pong between while applying a delta chain. The
+// store's own chain resolution (applyDeltaStackCached) writes each hop into
+// an exact-size buffer instead; the pooled arena remains for callers that
+// drive applyDeltaStreaming with their own output buffers.
 type deltaArena struct{ data []byte }
 
 // defaultDeltaArenaSize is the standard allocation for pooled ping-pong arenas:
@@ -275,64 +278,39 @@ type inflationParams struct {
 }
 
 // inflateDeltaChainStreaming reconstructs an object that is stored as a
-// chain of pack-file deltas.  The algorithm is deliberately split into two
-// distinct phases so that it can run with a *single* bounded memory
-// allocation:
+// chain of pack-file deltas. The algorithm runs in two phases:
 //
 //  1. WALK-UP PHASE
 //     Starting at (p, off) the function climbs *up* the delta chain until it
-//     reaches a non-delta "base" object.  For every hop it:
-//
-//     • pushes a deltaInfo onto deltaStack (for later application),
-//     • enforces the caller-supplied recursion / cycle-detection rules, and
-//     • peeks at the delta header just far enough to know the size of the
-//     *future* result so that we can compute an upper bound for memory
-//     requirements.
+//     reaches a non-delta "base" object, or an offset the offset cache has
+//     already materialized. For every hop it pushes a deltaInfo onto
+//     deltaStack (for later application) and enforces the caller-supplied
+//     recursion / cycle-detection rules.
 //
 //     When the loop finishes we have:
 //     – baseData     – the fully inflated base object,
 //     – baseType     – its type (blob, tree …),
 //     – deltaStack   – the list of deltas that still need to be applied.
 //
-//  2. APPLY-DOWN (PING-PONG) PHASE
-//     With the chain analyzed we can allocate exactly the amount of memory
-//     we will ever need: the maximum of
+//  2. APPLY-DOWN PHASE
+//     deltaStack is walked backwards (from the hop nearest the base down to
+//     the requested object). Each hop inflates its delta payload, reads the
+//     target size from the delta header, and applies the instructions into a
+//     fresh buffer of exactly that size:
 //
-//     • len(baseData) and
-//     • the largest target size advertised by any delta in deltaStack.
-//
-//     One arena twice that size is borrowed from the free-list and sliced
-//     into two equal halves:
-//
-//     +----------------------+----------------------+
-//     |  buffer A (input)    |  buffer B (output)   |
-//     +----------------------+----------------------+
-//
-//     The first delta reads baseData in place – it is never copied into the
-//     arena – and writes its result into buffer A.  The function then walks
-//     deltaStack backwards (from the oldest delta down to the newest),
-//     calling applyDeltaStreaming for each element:
-//
-//     current, out = baseData, bufferA
-//     for delta := range reverse(deltaStack) {           // pseudo code
-//     current = applyDeltaStreaming(delta, current, out) // writes into 'out'
-//     out     = otherHalf(current)                   // ping-pong A<->B
+//     current = baseData
+//     for delta := range reverse(deltaStack) {        // pseudo code
+//     current = applyDeltaStreaming(delta, current)  // fresh exact-size out
+//     offsetCache.add(delta.offset, current)         // shared, immutable
 //     }
 //
-//     Each hop writes into whichever half is not holding current – hence the
-//     *ping-pong* terminology – guaranteeing that reads and writes never
-//     overlap and that no further allocations or copies are required.
-//
-//     When the loop terminates the fully reconstructed object lives in the
-//     slice currently referenced by 'current'.  A final copy is made into a
-//     fresh slice so callers may retain the result after the arena has been
-//     returned to the free-list.
+//     The result of every hop is published to the offset cache without a
+//     copy and serves as the next hop's read-only base, so a chain allocates
+//     the bytes it materializes and nothing more. Callers may retain the
+//     returned slice; it aliases only the cache entry for its own offset.
 //
 // The function fails with an error when the chain is too deep, cyclic, the
 // pack-file is corrupted, or any delta instruction is invalid.
-// IMPORTANT: Because the slice is mutated in-place it MUST NOT be reused once
-// resolution is complete.  applyDeltaStack treats the slice as read-only and
-// does not retain it after the call returns.
 func inflateDeltaChainStreaming(s *store, params inflationParams) ([]byte, ObjectType, error) {
 	stack := make(deltaStack, 0, 16) // pre-size for typical chain depths
 	base, baseType, err := walkUpDeltaChain(s, params, &stack)
@@ -449,14 +427,11 @@ func walkUpDeltaChain(
 	return nil, ObjBad, fmt.Errorf("delta chain too deep (max %d)", params.ctx.maxDepth)
 }
 
-// applyDeltaStack consumes the *same* deltaStack that was filled by
-// walkUpDeltaChain. The slice is treated as read-only here; no mutations are
-// performed after the walk-up phase has completed. The function then resolves
-// the chain using the established ping-pong arena strategy.
+// applyDeltaStack treats stack, the deltaStack filled by walkUpDeltaChain, as
+// read-only.
 //
 // borrowed preserves the historical call-site intent for consume-and-discard
-// paths. For correctness, the final bytes are always detached from the pooled
-// arena before the function returns.
+// paths.
 //
 // Ordering invariant: the stack is iterated from len(stack)-1 down to 0.
 // walkUpDeltaChain pushes deltas in walk-up order (child first, base last),
@@ -477,6 +452,14 @@ func applyDeltaStack(
 // when oc is non-nil, every materialized hop (intermediate and final) is
 // recorded under its pack offset so later chains sharing the same tail can
 // short-circuit in walkUpDeltaChain.
+//
+// Every hop writes into a fresh buffer sized exactly to the target length its
+// delta header declares (applyDeltaStreaming with allocExact). The buffer is
+// the hop's result: it is published to the offset cache as-is and read as the
+// next hop's base without copying. applyDeltaStreaming never writes its base,
+// so a buffer shared with the cache stays immutable. Allocation per chain is
+// therefore the sum of the hop targets, which matches the bytes the chain
+// materializes, and no buffer is ever zeroed beyond its target length.
 func applyDeltaStackCached(
 	oc *offsetCache,
 	stack deltaStack,
@@ -495,123 +478,35 @@ func applyDeltaStackCached(
 		return result, baseType, nil
 	}
 
-	// Single-hop fast path (the majority of chains once the offset cache
-	// short-circuits walk-up): apply the one delta into a fresh exact-size
-	// buffer and return it directly — no arena, no detach copy.
-	if len(stack) == 1 {
-		d := stack[0]
-		final, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, baseData, nil, maxObjectSize, true)
+	// Ordering invariant: walkUpDeltaChain pushed deltas child first, so the
+	// hop closest to the base is applied first and stack[0] produces the
+	// requested object.
+	current := baseData
+	for i := len(stack) - 1; i >= 0; i-- {
+		d := stack[i]
+		result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, current, nil, maxObjectSize, true)
 		if err != nil {
 			var tooSmall *errDeltaOutputTooSmall
 			// allocExact never under-allocates, so errDeltaOutputTooSmall
-			// here would indicate a logic error; handle size-limit checks
-			// explicitly below either way.
+			// here would indicate a logic error; map it onto the size
+			// limit when that is what it reports either way.
 			if errors.As(err, &tooSmall) && maxObjectSize > 0 && tooSmall.need > maxObjectSize {
 				return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
 			}
 			return nil, ObjBad, err
 		}
-		if maxObjectSize > 0 && uint64(len(final)) > maxObjectSize {
-			return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, len(final), maxObjectSize)
+		if maxObjectSize > 0 && uint64(len(result)) > maxObjectSize {
+			return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, len(result), maxObjectSize)
 		}
+		// Publish the hop under its pack offset so later chains sharing
+		// this tail stop climbing here. The cache takes shared ownership
+		// of the buffer; nothing writes it after this point.
 		if oc != nil {
-			oc.add(d.pack, d.offset, final, baseType)
+			oc.add(d.pack, d.offset, result, baseType)
 		}
-		return final, baseType, nil
+		current = result
 	}
-
-	arena := getDeltaArena()
-	defer putDeltaArena(arena)
-
-	maxTarget := uint64(len(baseData))
-	poolHalf := uint64(cap(arena.data) / 2)
-	if poolHalf > maxTarget && (maxObjectSize == 0 || poolHalf <= maxObjectSize) {
-		maxTarget = poolHalf
-	}
-	if maxObjectSize > 0 && maxTarget > maxObjectSize {
-		return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, maxTarget, maxObjectSize)
-	}
-	if maxTarget > uint64(cap(arena.data)/2) {
-		arena.data = make([]byte, maxTarget*2)
-	}
-
-	// Let's ping-pong!
-	bufA := arena.data[:maxTarget]
-	bufB := arena.data[maxTarget : maxTarget*2]
-
-	// The first application reads the base directly — applyDeltaStreaming
-	// never writes its input, so copying baseData into the arena first was
-	// pure overhead (one memmove per materialized object). usingA=false
-	// makes the first hop write into bufA; the ping-pong then proceeds
-	// normally and baseData is never written.
-	current := baseData
-	usingA := false
-
-	for i := len(stack) - 1; i >= 0; i-- {
-		d := stack[i]
-
-		for {
-			// Choose output buffer (the one we're NOT currently using).
-			var out []byte
-			if usingA {
-				out = bufB[:0]
-			} else {
-				out = bufA[:0]
-			}
-
-			result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, d.hdrLen, current, out, maxObjectSize, false)
-			if err != nil {
-				var tooSmall *errDeltaOutputTooSmall
-				if errors.As(err, &tooSmall) {
-					if maxObjectSize > 0 && tooSmall.need > maxObjectSize {
-						return nil, ObjBad, fmt.Errorf("%w: target=%d limit=%d", ErrDeltaTargetTooLarge, tooSmall.need, maxObjectSize)
-					}
-					if tooSmall.need <= maxTarget {
-						return nil, ObjBad, err
-					}
-
-					maxTarget = tooSmall.need
-					arena.data = make([]byte, maxTarget*2)
-					bufA = arena.data[:maxTarget]
-					bufB = arena.data[maxTarget : maxTarget*2]
-
-					// Re-anchor current into the new arena and retry this delta.
-					rebased := bufA[:len(current)]
-					copy(rebased, current)
-					current = rebased
-					usingA = true
-					continue
-				}
-				return nil, ObjBad, err
-			}
-
-			// The result is now in 'out' buffer, make it the current for next iteration.
-			current = result
-			usingA = !usingA // Switch which buffer we're using
-			break
-		}
-
-		// Publish intermediate materializations (every hop except the final
-		// target, which callers cache by OID) into the offset cache so that
-		// later chains sharing this tail stop climbing here. The copy is
-		// required because 'current' aliases the recycled ping-pong arena;
-		// a memmove is far cheaper than the inflate+apply work it saves.
-		if i > 0 && oc.canAdd(len(current)) {
-			detached := make([]byte, len(current))
-			copy(detached, current)
-			oc.add(d.pack, d.offset, detached, baseType)
-		}
-	}
-
-	// Always copy final result out of the arena so the arena can be safely
-	// recycled without invalidating returned bytes.
-	final := make([]byte, len(current))
-	copy(final, current)
-	_ = borrowed // call-site signal is currently informational only.
-	if len(stack) > 0 {
-		oc.add(stack[0].pack, stack[0].offset, final, baseType)
-	}
-	return final, baseType, nil
+	return current, baseType, nil
 }
 
 // readOfsDeltaOffset reads a variable-length backward offset from an
