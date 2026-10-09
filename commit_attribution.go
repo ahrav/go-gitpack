@@ -55,11 +55,28 @@ type commitPayloadReader interface {
 	readCommitPayload(oid Hash) ([]byte, error)
 }
 
+// payloadSink hands out destination memory for a commit payload. reserve
+// returns a writable slice of exactly n bytes that the caller then fills; the
+// sink decides where those bytes live.
+type payloadSink interface {
+	reserve(n int) []byte
+}
+
+// commitPayloadReaderTo is an optional extension of commitPayloadReader for
+// stores that can decode a commit payload directly into sink-provided memory,
+// saving the per-commit allocation of readCommitPayload. The returned slice
+// is either sink memory filled by the store or a fresh allocation; either
+// way the caller owns it.
+type commitPayloadReaderTo interface {
+	readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error)
+}
+
 // metaEntry is one cached attribution record: the parsed author identity and
 // the raw commit message.
 //
 // Lifetime: ai.Name, ai.Email, and msg are views into the payload the entry
-// was parsed from, so each entry retains one payload's worth of bytes.
+// was parsed from, which lives in a metaCache slab (see reserve), so each
+// entry retains one payload's worth of bytes.
 // The cache is insert-only and unbounded — typical messages are ~200-700 B,
 // so even 10k commits cost only a few MB, comparable to the header bytes the
 // cache has always retained. Monorepo-scale histories (~1M+ commits) would
@@ -94,7 +111,18 @@ type metaCache struct {
 	// m caches attribution entries by commit hash to avoid repeated
 	// inflation and parsing of commit payloads.
 	m map[Hash]metaEntry
+
+	// slab is the bump allocator behind cached payloads: reserve carves
+	// regions from it under slabMu and replaces a full slab rather than
+	// growing it, so regions handed out earlier stay valid. Entries are
+	// never evicted, so a slab lives exactly as long as its entries would.
+	slabMu sync.Mutex
+	slab   []byte
 }
+
+// metaSlabSize is the backing-array size of metaCache.slab. Payloads larger
+// than this get their own allocation.
+const metaSlabSize = 64 << 10
 
 // newMetaCache constructs a metaCache with the given commit graph (may be nil)
 // and commit payload reader. It is called once during NewHistoryScanner
@@ -176,7 +204,13 @@ func (c *metaCache) get(oid Hash) (CommitMetadata, error) {
 
 // miss reads, parses, and caches the entry for a commit absent from the map.
 func (c *metaCache) miss(oid Hash) (metaEntry, error) {
-	payload, err := c.store.readCommitPayload(oid)
+	var payload []byte
+	var err error
+	if to, ok := c.store.(commitPayloadReaderTo); ok {
+		payload, err = to.readCommitPayloadTo(oid, c)
+	} else {
+		payload, err = c.store.readCommitPayload(oid)
+	}
 	if err != nil {
 		return metaEntry{}, err
 	}
@@ -191,6 +225,25 @@ func (c *metaCache) miss(oid Hash) (metaEntry, error) {
 	c.m[oid] = entry
 	c.mu.Unlock()
 	return entry, nil
+}
+
+// reserve implements payloadSink: it returns the next n bytes of the slab,
+// starting a new slab when the current one cannot hold them. The region is
+// exclusively the caller's; a failed decode leaves it unused until the slab
+// is released with its entries.
+func (c *metaCache) reserve(n int) []byte {
+	if n > metaSlabSize {
+		return make([]byte, n)
+	}
+	c.slabMu.Lock()
+	if n > cap(c.slab)-len(c.slab) {
+		c.slab = make([]byte, 0, metaSlabSize)
+	}
+	start := len(c.slab)
+	c.slab = c.slab[:start+n]
+	region := c.slab[start : start+n : start+n]
+	c.slabMu.Unlock()
+	return region
 }
 
 // timestampLocked resolves the commit timestamp with c.mu held. The
@@ -337,7 +390,7 @@ func parseCommitPayload(payload []byte) (AuthorInfo, []byte, error) {
 // walk: sep is the offset of the "\n\n" separator, or -1 when the walk saw
 // none. The pre-payload header reader truncated at the committer line too.
 func walkCommitHeader(b []byte) (line []byte, next int, sep int) {
-	var author, committer []byte
+	var author []byte
 	i := 0
 	for i < len(b) {
 		lineEnd := len(b)
@@ -345,20 +398,17 @@ func walkCommitHeader(b []byte) (line []byte, next int, sep int) {
 			lineEnd = i + nl
 		}
 		if lineEnd == i && i > 0 {
-			return pick(author, committer), i, i - 1
+			return author, i, i - 1
 		}
 		cur := b[i:lineEnd]
 		if bytes.HasPrefix(cur, []byte("author ")) {
 			author = cur[7:]
 		} else if bytes.HasPrefix(cur, []byte("committer ")) {
-			if committer == nil {
-				committer = cur[10:]
-			}
-			return pick(author, committer), lineEnd + 1, -1
+			return pick(author, cur[10:]), lineEnd + 1, -1
 		}
 		i = lineEnd + 1
 	}
-	return pick(author, committer), i, -1
+	return author, i, -1
 }
 
 // pick prefers the author line and falls back to the committer line, because

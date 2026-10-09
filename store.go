@@ -782,6 +782,19 @@ const maxCommitPayload = 64 << 20 // 64 MiB
 // shared cache entries, so callers may retain it (or strings sliced from it)
 // indefinitely.
 func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
+	return s.readCommitPayloadTo(oid, heapSink{})
+}
+
+// heapSink is the payloadSink that gives every payload its own allocation.
+type heapSink struct{}
+
+func (heapSink) reserve(n int) []byte { return make([]byte, n) }
+
+// readCommitPayloadTo is readCommitPayload with the destination chosen by
+// sink: plain packed commits inflate straight into sink memory and delta
+// commits are copied into it, while loose commits return the fresh buffer
+// readLooseObject already produced.
+func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) {
 	p, off, ok := s.findPackedObject(oid)
 	if !ok {
 		// Loose fallback: readLooseObject inflates into a fresh buffer, so
@@ -817,13 +830,13 @@ func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
 
 	switch typ {
 	case ObjCommit:
-		// Plain packed commit: one exact-size allocation, one-shot inflate.
-		// The size comes from the pack header, so the cap check precedes
-		// the allocation.
+		// Plain packed commit: one exact-size destination, one-shot
+		// inflate. The size comes from the pack header, so the cap check
+		// precedes the reservation.
 		if size > maxCommitPayload {
 			return nil, fmt.Errorf("commit payload %d bytes exceeds %d cap for %x", size, maxCommitPayload, oid)
 		}
-		payload := make([]byte, size)
+		payload := sink.reserve(int(size))
 		if err := inflateExact(p, int64(off)+int64(hdrLen), payload); err != nil {
 			return nil, err
 		}
@@ -842,7 +855,9 @@ func (s *store) readCommitPayload(oid Hash) ([]byte, error) {
 		}
 		// The copy is mandatory: materialized bytes may alias shared cache
 		// buffers, and the caller retains the payload.
-		return append([]byte(nil), full...), nil
+		payload := sink.reserve(len(full))
+		copy(payload, full)
+		return payload, nil
 
 	default:
 		return nil, fmt.Errorf("%w: %x", ErrObjectNotCommit, oid)
