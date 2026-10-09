@@ -340,6 +340,22 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
 	}
 
+	// Commits are diffed in parent-first timestamp order. Consecutive
+	// commits in that order touch consecutive versions of the same files,
+	// so their delta chains share tails that are still in the offset cache;
+	// the ref-walk visit order interleaves unrelated lineages and roughly
+	// triples the bytes materialized on a rails scan.
+	commits, err := hs.loadAllCommits()
+	if err != nil {
+		return err
+	}
+	// Publish every commit's tree OID up front so firstParentTree never
+	// re-inflates a header, including for skipped merge commits that are
+	// another commit's first parent.
+	for _, c := range commits {
+		hs.treeOIDs.Store(c.OID, c.TreeOID)
+	}
+
 	{
 		type workItem struct {
 			commit commitInfo
@@ -353,11 +369,9 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// (cheap) and fans out per-file blob pairs; stage 2 computes hunks
 		// (expensive: inflation + line diff) at blob-pair granularity, which
 		// spreads a whale commit across every worker.
-		// workChan is deep because the commit-walk's visit callback sends
-		// here while holding the walk's internal visit mutex: if the send
-		// blocks, every walk worker serializes behind it. A few thousand
-		// commitInfo headers (~100 bytes each) buy full walk/tree-stage
-		// decoupling for typical repositories.
+		// workChan is deep so the dispatcher stays ahead of the tree
+		// workers: a few thousand commitInfo headers (~100 bytes each) buy
+		// full dispatch/tree-stage decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
 		blobChan := make(chan blobPairWork, 4096)
 		stopCh := make(chan struct{})
@@ -437,28 +451,21 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			}()
 		}
 
-		walkErr := hs.walkCommitsFromRefs(func(c commitInfo) error {
-			// Publish the tree OID before dispatch so children resolving
-			// firstParentTree find it without re-inflating the header.
-			hs.treeOIDs.Store(c.OID, c.TreeOID)
+	dispatch:
+		for _, c := range commits {
 			if hs.skipMergeDiffs && len(c.ParentOIDs) > 1 {
-				return nil
+				continue
 			}
 			select {
 			case <-stopCh:
-				return errScanAborted
+				break dispatch
 			case workChan <- workItem{commit: c}:
-				return nil
 			}
-		})
+		}
 		close(workChan)
 		treeWG.Wait()
 		close(blobChan)
 		blobWG.Wait()
-
-		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
-			setError(walkErr)
-		}
 
 		return firstErr
 	}
@@ -883,9 +890,9 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 }
 
 // loadAllCommits enumerates every reachable commit, caching the result for
-// the scanner's lifetime. The streaming hunk pipeline uses walkCommitsFromRefs
-// directly; this materialized form serves the dedup pipeline (which needs a
-// total order up front) and package tests.
+// the scanner's lifetime. Both hunk pipelines diff commits in this order; the
+// blob-mode plan builder uses walkCommitsFromRefs directly. Both the ref-walk
+// and the commit-graph paths return commits in orderCommitsParentFirst order.
 //
 // The method uses sync.Once to ensure the expensive commit enumeration is
 // performed at most once, even under concurrent calls. After the first
