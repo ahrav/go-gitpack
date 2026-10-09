@@ -911,17 +911,45 @@ func toKiB(n uint64) uint32 {
 // hunk's position in the total order. A miss is only a hint and is resolved
 // authoritatively by the decision stage.
 func prefilterHunk(h *HunkAddition, sn *fingerprintSnapshot, buf []uint64) []uint64 {
+	start := len(buf)
 	for _, line := range h.lines {
 		fp := lineFingerprint(line)
 		if fp == 0 {
 			fp = dedupZeroFingerprint
 		}
-		if !sn.contains(fp) {
-			buf = append(buf, fp)
-		}
+		buf = append(buf, fp)
 	}
-	return buf
+	// Probe in a second pass over the hunk's fingerprints, touching each
+	// group's home slots first. The table is far larger than L2 and a
+	// hunk's lines land on unrelated lines of it, so issuing the loads of
+	// a group together overlaps their cache misses; probing each line
+	// right after hashing it would serialize one miss per line.
+	fps := buf[start:]
+	kept := start
+	var touched uint64
+	for len(fps) > 0 {
+		n := min(len(fps), dedupProbePrefetch)
+		for _, fp := range fps[:n] {
+			touched += atomic.LoadUint64(&sn.slots[fp&sn.mask])
+		}
+		for _, fp := range fps[:n] {
+			if !sn.contains(fp) {
+				buf[kept] = fp
+				kept++
+			}
+		}
+		fps = fps[n:]
+	}
+	consumeTouched(touched)
+	return buf[:kept]
 }
+
+// consumeTouched keeps the touch loads of prefilterHunk observable without a
+// shared variable: workers run prefilterHunk concurrently, so a global sink
+// would be a data race.
+//
+//go:noinline
+func consumeTouched(uint64) {}
 
 // collectCommitPairs resolves c's first-parent tree and collects the
 // commit's changed blob pairs in deterministic tree order. Errors come back
