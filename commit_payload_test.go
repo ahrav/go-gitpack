@@ -283,6 +283,17 @@ func TestReadCommitPayload_HonorsVerifyCRC(t *testing.T) {
 	_, err = st.readCommitPayload(delta)
 	require.Error(t, err, "delta commit must fail CRC verification")
 	require.Contains(t, err.Error(), "crc mismatch")
+
+	// An over-cap plain commit must still be verified, so the header
+	// fallback never attributes a record whose CRC disagrees with the index.
+	saved := maxCommitPayload
+	maxCommitPayload = 64
+	t.Cleanup(func() { maxCommitPayload = saved })
+	_, err = st.readCommitPayload(plain)
+	require.Error(t, err)
+	require.Containsf(t, err.Error(), "crc mismatch", "over-cap plain commit returned %v before CRC verification", err)
+	_, err = newMetaCache(nil, st).get(plain)
+	require.Error(t, err, "attribution must fail CRC verification for an over-cap commit")
 }
 
 // looseCommitWithMessage writes a well-formed loose commit whose message is

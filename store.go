@@ -869,10 +869,12 @@ func (s *store) readCommitPayloadTo(oid Hash, sink payloadSink) ([]byte, error) 
 		// Plain packed commit: one exact-size destination, one-shot
 		// inflate. The size comes from the pack header, so the cap check
 		// precedes the reservation.
-		if err := checkCommitPayloadSize(size, oid); err != nil {
+		// Verification precedes the cap check so an over-cap record reaches
+		// the header fallback only after its CRC has passed.
+		if err := s.verifyPackObjectCRCIfEnabled(p, off, oid); err != nil {
 			return nil, err
 		}
-		if err := s.verifyPackObjectCRCIfEnabled(p, off, oid); err != nil {
+		if err := checkCommitPayloadSize(size, oid); err != nil {
 			return nil, err
 		}
 		payload := sink.reserve(int(size))
