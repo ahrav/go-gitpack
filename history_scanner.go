@@ -1585,6 +1585,27 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 	return stored, nil
 }
 
+// pairHunksUncached is pairHunks for the dedup pipeline: the diff is
+// computed and compacted exactly as the pair memo would store it, so every
+// returned hunk owns its line bytes, but the memo is neither consulted nor
+// filled. In first-introduction order a repeated (old, new) transition
+// contributes no text lines, so the dedup pipeline tracks repeats by key
+// (pairFirstSeen) and has no use for memoized hunks.
+func (hs *HistoryScanner) pairHunksUncached(work blobPairWork) ([]AddedHunk, error) {
+	sc := getLineScratch()
+	computed, err := computeAddedHunksScratch(hs.store, work.oldOID, work.newOID, sc)
+	if err != nil {
+		putLineScratch(sc)
+		return nil, fmt.Errorf("compute added hunks: %w", err)
+	}
+	hunks := compactPairHunks(makePairKey(work.oldOID, work.newOID), computed)
+	putLineScratch(sc)
+	if work.inferredRename {
+		return hs.gateInferredRenameHunks(work.oldOID, work.newOID, hunks)
+	}
+	return hunks, nil
+}
+
 // gateInferredRenameHunks validates a directory-rename pairing by content.
 // The pairing was inferred purely from paths, so the two blobs may be
 // unrelated; trusting the pair diff would silently drop any coincidentally

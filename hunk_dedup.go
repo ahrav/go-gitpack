@@ -822,7 +822,15 @@ type dedupPairWork struct {
 	seq        uint64
 	work       blobPairWork
 	earlyBytes uint64
+
+	// pos orders pairs like seq does, as commit index << 32 | pair index,
+	// so the first-seen pair table can compare hand-out positions.
+	pos uint64
 }
+
+// dedupPairPos is the hand-out position of pair index i of the commit at
+// order index c; positions order exactly like seqs.
+func dedupPairPos(c, i int) uint64 { return uint64(c)<<32 | uint64(uint32(i)) }
 
 // kib is the retainedKiB total of the pairs whose hunks are in the batch.
 type dedupYieldBatch struct {
@@ -848,8 +856,14 @@ type dedupCandidate struct {
 // present in the snapshot, so it is a duplicate at its position unless the
 // set is saturated when the pair is reached (see decideResult).
 type dedupPairResult struct {
-	seq        uint64
-	hunks      []HunkAddition
+	seq   uint64
+	hunks []HunkAddition
+	// candidates is dedupSkippedMarker when the worker found the pair
+	// registered at an earlier position with a text-only result and
+	// skipped the diff: every line of its hunks is in the set when this
+	// seq is decided, so the result is empty unless the set is saturated,
+	// in which case the decision stage recomputes the hunks from the work
+	// item kept in dedupSkippedWork to honor fail-open.
 	candidates []dedupCandidate
 
 	// earlyKiB is the pair's dedupPairWork.earlyBytes in KiB. retainedKiB
@@ -860,6 +874,41 @@ type dedupPairResult struct {
 	// on every scan.
 	earlyKiB    uint32
 	retainedKiB uint32
+}
+
+// dedupSkippedMarker is the candidates value of a result whose diff the
+// worker skipped as a repeat; see dedupPairResult.candidates. The marker is
+// shared between results; its single entry has a nil unresolved list, which
+// prepBacklog leaves untouched.
+var dedupSkippedMarker = []dedupCandidate{{hunk: -1}}
+
+func (r *dedupPairResult) skipped() bool {
+	return len(r.candidates) == 1 && r.candidates[0].hunk < 0
+}
+
+// dedupSkippedWork keeps the work item of every skipped repeat from its
+// delivery until the decision stage reaches its seq, so a saturated set can
+// still diff the repeat and emit its hunks.
+type dedupSkippedWork struct {
+	mu sync.Mutex
+	m  map[uint64]blobPairWork
+}
+
+func (w *dedupSkippedWork) put(seq uint64, work blobPairWork) {
+	w.mu.Lock()
+	if w.m == nil {
+		w.m = make(map[uint64]blobPairWork, 256)
+	}
+	w.m[seq] = work
+	w.mu.Unlock()
+}
+
+func (w *dedupSkippedWork) take(seq uint64) (blobPairWork, bool) {
+	w.mu.Lock()
+	work, ok := w.m[seq]
+	delete(w.m, seq)
+	w.mu.Unlock()
+	return work, ok
 }
 
 // toKiB rounds n bytes up to whole KiB, saturating at the uint32 range.
@@ -877,17 +926,54 @@ func toKiB(n uint64) uint32 {
 // hunk's position in the total order. A miss is only a hint and is resolved
 // authoritatively by the decision stage.
 func prefilterHunk(h *HunkAddition, sn *fingerprintSnapshot, buf []uint64) []uint64 {
+	scratch := fingerprintScratchPool.Get().(*[]uint64)
+	fps := (*scratch)[:0]
 	for _, line := range h.lines {
 		fp := lineFingerprint(line)
 		if fp == 0 {
 			fp = dedupZeroFingerprint
 		}
-		if !sn.contains(fp) {
-			buf = append(buf, fp)
+		fps = append(fps, fp)
+	}
+	// Probe in a second pass over the hunk's fingerprints, touching each
+	// group's home slots first. The table is far larger than L2 and a
+	// hunk's lines land on unrelated lines of it, so issuing the loads of
+	// a group together overlaps their cache misses; probing each line
+	// right after hashing it would serialize one miss per line.
+	var touched uint64
+	for rest := fps; len(rest) > 0; {
+		n := min(len(rest), dedupProbePrefetch)
+		for _, fp := range rest[:n] {
+			touched += atomic.LoadUint64(&sn.slots[fp&sn.mask])
 		}
+		for _, fp := range rest[:n] {
+			if !sn.contains(fp) {
+				buf = append(buf, fp)
+			}
+		}
+		rest = rest[n:]
+	}
+	consumeTouched(touched)
+	if cap(fps) <= fingerprintScratchMaxCap {
+		*scratch = fps[:0]
+		fingerprintScratchPool.Put(scratch)
 	}
 	return buf
 }
+
+// fingerprintScratchPool holds the per-hunk fingerprint buffers prefilterHunk
+// hashes into before probing; a buffer that grew past
+// fingerprintScratchMaxCap entries is dropped instead of pooled.
+var fingerprintScratchPool = sync.Pool{New: func() any { s := make([]uint64, 0, 256); return &s }}
+
+const fingerprintScratchMaxCap = 1 << 16
+
+// consumeTouched keeps the touch loads of prefilterHunk observable without a
+// shared variable: workers run prefilterHunk concurrently, so a global sink
+// would be a data race.
+//
+//go:noinline
+func consumeTouched(uint64) {}
 
 // pairCandidates runs the worker-side half of the split verdict over one
 // pair's hunks: it returns the hunks the decision stage must still look at
@@ -1081,6 +1167,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// The fingerprint set is owned by the decision goroutine; hunk workers
 	// only read its published snapshot.
 	set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
+	firstSeen := newPairFirstSeen()
+	var skippedWork dedupSkippedWork
 	inFlight := newDedupInFlightWindow(window, hs.dedupProbe)
 	// releaseRetained wakes the sequencer only when the release brings the
 	// charge back under the cap, the one transition stampable waits on.
@@ -1311,7 +1399,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					break
 				}
 				select {
-				case expensiveChan <- []dedupPairWork{{seq: seq + uint64(e.index), work: slot.pairs[e.index], earlyBytes: e.bytes}}:
+				case expensiveChan <- []dedupPairWork{{seq: seq + uint64(e.index), work: slot.pairs[e.index], earlyBytes: e.bytes, pos: dedupPairPos(stamp, e.index)}}:
 					slot.early = append(slot.early, e.index)
 					earlyBytes.Add(uint64(toKiB(e.bytes)) << 10)
 				default:
@@ -1402,7 +1490,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				if batch == nil {
 					batch = make([]dedupPairWork, 0, dedupPairBatchSize)
 				}
-				batch = append(batch, dedupPairWork{seq: s, work: slot.pairs[emitPair]})
+				batch = append(batch, dedupPairWork{seq: s, work: slot.pairs[emitPair], pos: dedupPairPos(emitCommit, emitPair)})
 				// In the final stretch, single-pair batches spread the
 				// remaining work across workers. The stretch begins once every
 				// commit is dispatched and the pairs still ahead of the cursor
@@ -1457,17 +1545,35 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// process materializes one pair and delivers its result. It reports
 	// false after recording an error.
 	process := func(pw dedupPairWork) bool {
-		added, err := hs.pairHunks(pw.work)
+		// A pair already computed at an earlier position adds no text
+		// lines in first-introduction order; register each computed pair
+		// and skip later repeats. A result with a dedup-exempt hunk is
+		// recomputed because exempt hunks are emitted at every occurrence.
+		var key pairKey
+		if !pw.work.inferredRename {
+			key = makePairKey(pw.work.oldOID, pw.work.newOID)
+			if e, ok := firstSeen.lookup(key); ok && !e.exempt && e.pos < pw.pos {
+				skippedWork.put(pw.seq, pw.work)
+				deliver(dedupPairResult{seq: pw.seq, candidates: dedupSkippedMarker, earlyKiB: toKiB(pw.earlyBytes)})
+				return true
+			}
+		}
+		added, err := hs.pairHunksUncached(pw.work)
 		if err != nil {
 			setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
 			return false
 		}
-		// pairHunks returns lines that are either compacted into their own
-		// buffer or span the whole new blob, so the retained-byte charge
-		// below (line bytes) is what a result actually pins.
+		// pairHunksUncached returns lines that are either compacted into
+		// their own buffer or span the whole new blob, so the retained-byte
+		// charge below (line bytes) is what a result actually pins.
 		hunks := make([]HunkAddition, len(added))
+		exempt := false
 		for i := range added {
 			hunks[i] = newHunkAddition(pw.work, added[i])
+			exempt = exempt || hunks[i].dedupExempt()
+		}
+		if !pw.work.inferredRename {
+			firstSeen.registerMin(key, pw.pos, exempt)
 		}
 		// Hash and speculatively probe here, in parallel, so the decision
 		// goroutine only touches fingerprints the snapshot did not already
@@ -1602,7 +1708,29 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					earlyBytes.Add(^(uint64(r.earlyKiB)<<10 - 1))
 				}
 				before := len(batch.hunks)
-				batch.hunks = set.decideResult(r, batch.hunks)
+				if r.skipped() {
+					work, ok := skippedWork.take(r.seq)
+					if !ok {
+						setError(fmt.Errorf("dedup skipped repeat seq %d has no work item", r.seq))
+						return false
+					}
+					if set.saturated {
+						// Fail-open: a saturated set emits every non-empty
+						// hunk, so the skipped repeat is diffed here.
+						added, err := hs.pairHunksUncached(work)
+						if err != nil {
+							setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
+							return false
+						}
+						hunks := make([]HunkAddition, len(added))
+						for i := range added {
+							hunks[i] = newHunkAddition(work, added[i])
+						}
+						batch.hunks = set.decideResult(dedupPairResult{seq: r.seq, hunks: hunks}, batch.hunks)
+					}
+				} else {
+					batch.hunks = set.decideResult(r, batch.hunks)
+				}
 				switch {
 				case len(batch.hunks) > before:
 					batch.kib += int64(r.retainedKiB)

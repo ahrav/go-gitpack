@@ -326,6 +326,23 @@ func coversWholeNewBlob(k *pairKey, hunks []AddedHunk) bool {
 	return len(hunks) == 1 && hunks[0].IsBinary
 }
 
+// compactPairHunks returns hunks that own their line bytes under the same
+// rule add applies before admission: a whole-new-blob result keeps its
+// aliasing views, every other result is compacted.
+func compactPairHunks(k pairKey, hunks []AddedHunk) []AddedHunk {
+	if coversWholeNewBlob(&k, hunks) {
+		return hunks
+	}
+	lineBytes := 0
+	for i := range hunks {
+		for _, l := range hunks[i].Lines {
+			lineBytes += len(l)
+		}
+	}
+	stored, _ := compactHunks(hunks, lineBytes)
+	return stored
+}
+
 // compactHunks deep-copies hunks so that no line aliases its source blob.
 // All line bytes share one backing buffer sized to lineBytes, so the copy
 // costs a single allocation for the text plus the slice headers. It returns
@@ -437,4 +454,65 @@ func aliasingEntry(hunks []AddedHunk) pairCacheEntry {
 	// the same blob buffer, so the slice stays within that allocation.
 	data := unsafe.Slice(loPtr, int(hi-lo))
 	return pairCacheEntry{data: data, spans: spans, hunks: shapes}
+}
+
+// pairFirstSeen records, per (old, new) blob pair, the lowest hand-out
+// position (see dedupPairPos) whose hunks have been computed and whether
+// that result is a binary hunk. The dedup pipeline consults it before
+// diffing: a pair already computed at an earlier position contributes no
+// new text lines in first-introduction order (its lines were inserted, or
+// already present, when the earlier position was decided), so the later
+// position skips the diff. Results with a dedup-exempt hunk are recomputed
+// because exempt hunks are emitted at every occurrence.
+//
+// Entries are written after a result is computed, so a reader that finds an
+// entry with a lower position knows that result reaches the decision stage
+// first. A reader that finds no entry, or an entry with a higher position,
+// computes its own result and registers it; registerMin keeps the minimum.
+type pairFirstSeen struct {
+	shards [pairCacheShards]pairFirstSeenShard
+}
+
+type pairFirstSeenShard struct {
+	mu sync.Mutex
+	m  map[pairKey]pairFirstSeenEntry
+}
+
+type pairFirstSeenEntry struct {
+	pos uint64
+	// exempt marks a result with a dedup-exempt hunk (binary or oversize
+	// placeholder), which repeats must recompute.
+	exempt bool
+}
+
+func newPairFirstSeen() *pairFirstSeen {
+	r := &pairFirstSeen{}
+	for i := range r.shards {
+		r.shards[i].m = make(map[pairKey]pairFirstSeenEntry, 1024)
+	}
+	return r
+}
+
+func (r *pairFirstSeen) shard(k *pairKey) *pairFirstSeenShard {
+	return &r.shards[int(k[0])&(pairCacheShards-1)]
+}
+
+// lookup returns the registered entry for k.
+func (r *pairFirstSeen) lookup(k pairKey) (pairFirstSeenEntry, bool) {
+	s := r.shard(&k)
+	s.mu.Lock()
+	e, ok := s.m[k]
+	s.mu.Unlock()
+	return e, ok
+}
+
+// registerMin records pos for k when k is new or pos is lower than the
+// registered position.
+func (r *pairFirstSeen) registerMin(k pairKey, pos uint64, exempt bool) {
+	s := r.shard(&k)
+	s.mu.Lock()
+	if e, ok := s.m[k]; !ok || pos < e.pos {
+		s.m[k] = pairFirstSeenEntry{pos: pos, exempt: exempt}
+	}
+	s.mu.Unlock()
 }
