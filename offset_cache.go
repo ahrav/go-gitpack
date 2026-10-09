@@ -480,19 +480,71 @@ func (s *store) whaleCandidates() []whaleCandidate {
 	return out
 }
 
-// prefetchWhales inflates the pack's whale blobs in the background, largest
-// first, until the budget is spent or stop closes. The returned wait function
-// blocks until the prefetch goroutine has exited; callers invoke it before
-// releasing the cache, keeping inflation within the scan's lifetime.
-// store.get reads the whale cache after an offset-cache miss, so a store
-// whose offset cache is disabled skips the prefetch.
-func (s *store) prefetchWhales(stop <-chan struct{}) (wait func()) {
+// whalePrefetch coordinates the scans that share store.whales. The first
+// scan publishes the cache and starts the prefetch goroutine, concurrent
+// scans join it, and the last scan to finish stops the goroutine and clears
+// the cache. mu guards every field.
+type whalePrefetch struct {
+	mu   sync.Mutex
+	refs int
+	// stop closes when the last scan releases the cache.
+	stop chan struct{}
+	// done closes when the prefetch goroutine has exited.
+	done chan struct{}
+}
+
+// prefetchWhales starts, or joins, the store's background whale prefetch.
+// The returned wait function releases this scan's share; the last release
+// stops the goroutine and blocks until it has exited. A disabled offset
+// cache skips the prefetch.
+func (s *store) prefetchWhales() (wait func()) {
 	if !s.offCache.enabled() {
 		return func() {}
 	}
+	p := &s.whalePrefetch
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.refs > 0 {
+		p.refs++
+		return s.releaseWhales
+	}
+	c := s.newWhaleCache()
+	if c == nil {
+		return func() {}
+	}
+	p.refs = 1
+	p.stop = make(chan struct{})
+	p.done = make(chan struct{})
+	s.whales.Store(c)
+	go func(stop, done chan struct{}) {
+		defer close(done)
+		c.run(stop)
+	}(p.stop, p.done)
+	return s.releaseWhales
+}
+
+// releaseWhales drops one scan's share of the whale cache. The last release
+// stops the prefetch goroutine, waits for it to exit, and clears store.whales
+// while holding the lock, so a scan starting in that window publishes its
+// cache only after the old one is gone.
+func (s *store) releaseWhales() {
+	p := &s.whalePrefetch
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.refs--
+	if p.refs > 0 {
+		return
+	}
+	close(p.stop)
+	<-p.done
+	p.stop, p.done = nil, nil
+	s.whales.Store((*whaleCache)(nil))
+}
+
+func (s *store) newWhaleCache() *whaleCache {
 	cands := s.whaleCandidates()
 	if len(cands) == 0 {
-		return func() {}
+		return nil
 	}
 	c := &whaleCache{
 		m: make(map[offCacheKey]*whaleEntry, len(cands)),
@@ -522,17 +574,7 @@ func (s *store) prefetchWhales(stop <-chan struct{}) (wait func()) {
 		c.order = append(c.order, key)
 	}
 	if len(c.order) == 0 {
-		return func() {}
+		return nil
 	}
-	s.whales.Store(c)
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		c.run(stop)
-	}()
-	return func() {
-		<-done
-		s.whales.Store((*whaleCache)(nil))
-	}
+	return c
 }

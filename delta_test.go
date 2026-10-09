@@ -805,3 +805,51 @@ func TestApplyDeltaStackEmptyStackIgnoresLimit(t *testing.T) {
 	_, _, err = applyDeltaStackCached(nil, nil, hugeBase, ObjBlob, 0, false)
 	assert.NoError(t, err, "empty stack should always succeed regardless of base size")
 }
+
+// TestApplyDeltaStackReturnsPooledBufferOnError pins that a multi-hop chain
+// whose intermediate hop fails mid-application returns the pooled buffer it
+// borrowed for that hop. The hop borrows from getDeltaBuf because a nil
+// offset cache admits nothing; a truncated copy instruction then fails the
+// application after the borrow. A marked buffer seeded into the pool class
+// must come back out of the pool after the failed call.
+func TestApplyDeltaStackReturnsPooledBufferOnError(t *testing.T) {
+	base := []byte("base content for the pooled error path")
+	baseOID := calculateHash(ObjBlob, base)
+	const targetSize = 6000 // 8 KiB pool class
+
+	var instructions bytes.Buffer
+	writeVarInt(&instructions, uint64(len(base)))
+	writeVarInt(&instructions, targetSize)
+	instructions.WriteByte(0x81) // copy with a one-byte offset operand, truncated
+	obj, err := packRefDeltaObject(baseOID, instructions.Bytes())
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "truncated.packobj")
+	require.NoError(t, os.WriteFile(path, obj, 0o644))
+	pack, err := mmap.Open(path)
+	require.NoError(t, err)
+	defer pack.Close()
+
+	// Two hops so the first applied hop (stack[1]) is an intermediate hop
+	// that borrows a pooled buffer; stack[0] is never reached.
+	stack := deltaStack{
+		{pack: pack, offset: 0, typ: ObjRefDelta},
+		{pack: pack, offset: 0, typ: ObjRefDelta},
+	}
+
+	const marker = 0xA5
+	reused := false
+	for attempt := 0; attempt < 20 && !reused; attempt++ {
+		seed := getDeltaBuf(targetSize)
+		seed[:cap(seed)][cap(seed)-1] = marker
+		putDeltaBuf(seed)
+
+		_, _, err := applyDeltaStackCached(nil, stack, base, ObjBlob, 0, false)
+		require.Error(t, err, "truncated copy instruction fails the hop")
+
+		again := getDeltaBuf(targetSize)
+		reused = again[:cap(again)][cap(again)-1] == marker
+		putDeltaBuf(again)
+	}
+	require.True(t, reused, "the buffer borrowed for the failed hop returns to its pool")
+}

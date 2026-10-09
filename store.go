@@ -184,6 +184,8 @@ type store struct {
 	// they are too large for offCache (see prefetchWhales). It is nil
 	// outside a scan.
 	whales atomic.Pointer[whaleCache]
+	// whalePrefetch coordinates the scans sharing whales.
+	whalePrefetch whalePrefetch
 
 	// maxDeltaDepth limits delta chain traversal depth.
 	// The default value is 100 (see defaultMaxDeltaDepth).

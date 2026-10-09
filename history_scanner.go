@@ -54,6 +54,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
 
 // commitInfo holds the minimal subset of commit metadata needed for
@@ -438,6 +440,20 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
 		blobChan := make(chan []blobPairWork, 1024)
+		// outstanding counts records sent on blobChan and not yet diffed.
+		// blobDone closes once stage 1 has finished sending and outstanding
+		// reaches zero, or when the scan stops on an error; it is the only
+		// exit signal the blob workers wait on. blobChan itself stays open,
+		// so a worker can push part of its batch back onto it at any time.
+		var outstanding atomic.Int64
+		var stage1Done atomic.Bool
+		blobDone := make(chan struct{})
+		var blobDoneOnce sync.Once
+		finishIfDrained := func() {
+			if stage1Done.Load() && outstanding.Load() == 0 {
+				blobDoneOnce.Do(func() { close(blobDone) })
+			}
+		}
 		stopCh := make(chan struct{})
 		var (
 			stopOnce sync.Once
@@ -448,7 +464,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// Whale blobs inflate for tens of milliseconds each and the walk
 		// may reach them last; inflating them from the start overlaps that
 		// work with the rest of the scan (see prefetchWhales).
-		waitWhales := hs.store.prefetchWhales(stopCh)
+		waitWhales := hs.store.prefetchWhales()
 		defer waitWhales()
 		setError := func(err error) {
 			if err == nil {
@@ -457,6 +473,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			stopOnce.Do(func() {
 				firstErr = err
 				close(stopCh)
+				blobDoneOnce.Do(func() { close(blobDone) })
 			})
 		}
 
@@ -482,7 +499,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 							setError(fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err))
 							return
 						}
-						if err := hs.emitCommitBlobPairs(work.commit, parentTree, blobChan, stopCh); err != nil {
+						if err := hs.emitCommitBlobPairs(work.commit, parentTree, blobChan, &outstanding, stopCh); err != nil {
 							c := work.commit
 							setError(fmt.Errorf("failed processing commit %s (tree: %s): %w", c.OID, c.TreeOID, err))
 							return
@@ -496,19 +513,48 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			blobWG.Add(1)
 			go func() {
 				defer blobWG.Done()
+				// runBatch pushes half of its remaining records back onto an
+				// empty blobChan once the record it just finished took at
+				// least blobPairStealAfter, so a history with fewer batches
+				// than workers can use waiting workers to share a batch of
+				// expensive pairs while cheap pairs stay batched and a queue
+				// with work already waiting is left alone.
+				runBatch := func(batch []blobPairWork) bool {
+					slow := false
+					done := 0
+					for len(batch) > 0 {
+						if slow && len(batch) > 1 && len(blobChan) == 0 {
+							half := len(batch) / 2
+							select {
+							case blobChan <- batch[half:]:
+								batch = batch[:half]
+							default:
+							}
+						}
+						work := batch[0]
+						batch = batch[1:]
+						start := time.Now()
+						if err := hs.streamBlobPairHunks(work, fn); err != nil {
+							setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
+							return false
+						}
+						slow = time.Since(start) >= blobPairStealAfter
+						done++
+					}
+					// One counter update per chunk keeps the shared counter
+					// off the per-record path.
+					if outstanding.Add(-int64(done)) == 0 {
+						finishIfDrained()
+					}
+					return true
+				}
 				for {
 					select {
-					case <-stopCh:
+					case <-blobDone:
 						return
-					case batch, ok := <-blobChan:
-						if !ok {
+					case batch := <-blobChan:
+						if !runBatch(batch) {
 							return
-						}
-						for _, work := range batch {
-							if err := hs.streamBlobPairHunks(work, fn); err != nil {
-								setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
-								return
-							}
 						}
 					}
 				}
@@ -531,7 +577,8 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		})
 		close(workChan)
 		treeWG.Wait()
-		close(blobChan)
+		stage1Done.Store(true)
+		finishIfDrained()
 		blobWG.Wait()
 
 		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
@@ -738,8 +785,8 @@ const (
 // emits inline, so it applies exact-OID suppression but not directory-rename
 // inference: inference needs every unsuppressed candidate in hand before it can
 // pair any of them, which is exactly the retention the budget refused.
-func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- []blobPairWork, stopCh <-chan struct{}) error {
-	e := blobPairEmitter{out: blobs, stopCh: stopCh}
+func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blobs chan<- []blobPairWork, outstanding *atomic.Int64, stopCh <-chan struct{}) error {
+	e := blobPairEmitter{out: blobs, outstanding: outstanding, stopCh: stopCh}
 	if err := hs.emitCommitBlobPairsTo(c, parentTree, e.emit, stopCh); err != nil {
 		return err
 	}
@@ -755,12 +802,19 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, blo
 // the pipeline's largest blocking source at 16 workers.
 const blobPairBatchSize = 32
 
+// blobPairStealAfter gates the batch hand-off in runBatch: after a record
+// takes at least this long, the worker pushes half of its remaining batch
+// back onto an empty blobChan. Shorter records stay in their batch.
+const blobPairStealAfter = 500 * time.Microsecond
+
 // blobPairEmitter accumulates stage-2 records into batches of at most
-// blobPairBatchSize for the hand-off channel.
+// blobPairBatchSize for the hand-off channel. A non-nil outstanding is raised
+// by the size of every batch sent.
 type blobPairEmitter struct {
-	out    chan<- []blobPairWork
-	stopCh <-chan struct{}
-	batch  []blobPairWork
+	out         chan<- []blobPairWork
+	outstanding *atomic.Int64
+	stopCh      <-chan struct{}
+	batch       []blobPairWork
 }
 
 func (e *blobPairEmitter) emit(work blobPairWork) error {
@@ -781,8 +835,14 @@ func (e *blobPairEmitter) flush() error {
 	}
 	batch := e.batch
 	e.batch = nil
+	if e.outstanding != nil {
+		e.outstanding.Add(int64(len(batch)))
+	}
 	select {
 	case <-e.stopCh:
+		if e.outstanding != nil {
+			e.outstanding.Add(-int64(len(batch)))
+		}
 		return errScanAborted
 	case e.out <- batch:
 		return nil

@@ -491,6 +491,7 @@ func applyDeltaStackCached(
 		d := stack[i]
 
 		var publish bool
+		var hop []byte // the pooled buffer this hop borrowed, if any
 		alloc := func(n int) []byte {
 			if i == 0 {
 				return make([]byte, 0, n)
@@ -499,7 +500,8 @@ func applyDeltaStackCached(
 				publish = true
 				return make([]byte, 0, n)
 			}
-			return getDeltaBuf(n)
+			hop = getDeltaBuf(n)
+			return hop
 		}
 		result, err := applyDeltaStreaming(d.pack, d.offset, d.typ, current, alloc, maxObjectSize)
 		if pooled != nil {
@@ -507,6 +509,11 @@ func applyDeltaStackCached(
 			pooled = nil
 		}
 		if err != nil {
+			// On failure this call still owns hop, so it goes back to its
+			// size-class pool.
+			if hop != nil {
+				putDeltaBuf(hop)
+			}
 			return nil, ObjBad, err
 		}
 		current = result

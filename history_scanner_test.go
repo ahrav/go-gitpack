@@ -759,7 +759,7 @@ func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
 
 	blobs := make(chan []blobPairWork, 64)
 	stopCh := make(chan struct{})
-	require.NoError(t, scanner.emitCommitBlobPairs(child, parentTree, blobs, stopCh))
+	require.NoError(t, scanner.emitCommitBlobPairs(child, parentTree, blobs, nil, stopCh))
 	close(blobs)
 
 	var paths []string
@@ -801,7 +801,7 @@ func TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob(t *testing.T) {
 
 		blobs := make(chan []blobPairWork, 64)
 		stopCh := make(chan struct{})
-		require.NoError(t, scanner.emitCommitBlobPairs(c, parentTree, blobs, stopCh))
+		require.NoError(t, scanner.emitCommitBlobPairs(c, parentTree, blobs, nil, stopCh))
 		close(blobs)
 
 		for _, w := range drainBlobPairBatches(blobs) {
@@ -923,4 +923,45 @@ func TestBlobPairEmitterBatches(t *testing.T) {
 	e2 := blobPairEmitter{out: full, stopCh: stopped}
 	require.NoError(t, e2.emit(blobPairWork{path: "x"}))
 	require.ErrorIs(t, e2.flush(), errScanAborted)
+}
+
+// TestDiffHistoryHunksFunc_SmallHistorySpreadsPairsAcrossWorkers pins that
+// a history whose blob pairs fit in fewer batches than there are blob workers
+// still runs expensive pairs on several workers at once. One commit touching
+// blobPairBatchSize files fills exactly one batch; fn holds each pair for
+// longer than blobPairStealAfter, so the worker holding the batch hands part
+// of it to a waiting worker and two calls to fn overlap.
+func TestDiffHistoryHunksFunc_SmallHistorySpreadsPairsAcrossWorkers(t *testing.T) {
+	if runtime.NumCPU() < 2 {
+		t.Skip("needs at least two blob workers")
+	}
+	requireGit(t)
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	for i := range blobPairBatchSize {
+		name := filepath.Join(repo, fmt.Sprintf("f%02d.txt", i))
+		require.NoError(t, os.WriteFile(name, []byte(fmt.Sprintf("line %d\n", i)), 0o644))
+	}
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "add", "--quiet")
+
+	scanner, err := NewHistoryScanner(filepath.Join(repo, ".git"))
+	require.NoError(t, err)
+	defer scanner.Close()
+
+	var inFn, maxInFn atomic.Int32
+	err = scanner.DiffHistoryHunksFunc(func(HunkAddition) error {
+		n := inFn.Add(1)
+		defer inFn.Add(-1)
+		for {
+			seen := maxInFn.Load()
+			if n <= seen || maxInFn.CompareAndSwap(seen, n) {
+				break
+			}
+		}
+		time.Sleep(4 * blobPairStealAfter)
+		return nil
+	})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, maxInFn.Load(), int32(2), "expensive pairs of a single batch must reach more than one worker")
 }

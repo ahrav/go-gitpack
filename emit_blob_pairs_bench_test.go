@@ -221,7 +221,7 @@ func runEmitCommitBlobPairsBench(b *testing.B, hs *HistoryScanner, commit commit
 		}()
 		<-ready
 		start = time.Now()
-		if err := hs.emitCommitBlobPairs(commit, parentTree, blobs, stopCh); err != nil {
+		if err := hs.emitCommitBlobPairs(commit, parentTree, blobs, nil, stopCh); err != nil {
 			b.Fatalf("emitCommitBlobPairs: %v", err)
 		}
 		close(blobs)

@@ -111,7 +111,7 @@ func TestWhalePrefetchSkippedWhenOffsetCacheDisabled(t *testing.T) {
 	s.offCache.setBudget(0)
 	require.NotEmpty(t, s.whaleCandidates())
 
-	wait := s.prefetchWhales(make(chan struct{}))
+	wait := s.prefetchWhales()
 	defer wait()
 	require.Nil(t, s.whales.Load(), "a disabled offset cache must not start a prefetch")
 
@@ -204,8 +204,7 @@ func TestWhaleCandidatesAndPrefetch(t *testing.T) {
 	require.Equal(t, cands[0].off, off)
 	require.Same(t, cands[0].pack, pack)
 
-	stop := make(chan struct{})
-	wait := s.prefetchWhales(stop)
+	wait := s.prefetchWhales()
 	w := s.whales.Load()
 	require.NotNil(t, w, "prefetch registers a whale cache")
 	data, typ, found := w.get(pack, off, nil)
@@ -223,9 +222,13 @@ func TestWhaleCandidatesAndPrefetch(t *testing.T) {
 
 	// A stop before the prefetch runs marks the entry failed; store.get then
 	// materializes normally.
+	stop := make(chan struct{})
 	close(stop)
-	wait = s.prefetchWhales(stop)
-	wait()
+	c := s.newWhaleCache()
+	require.NotNil(t, c)
+	c.run(stop)
+	_, _, found = c.get(pack, off, nil)
+	require.False(t, found, "a stopped prefetch marks unstarted entries failed")
 	got, _, err = s.get(bigOID)
 	require.NoError(t, err)
 	require.Equal(t, big, got)
@@ -244,7 +247,7 @@ func TestWhaleCandidatesEmptyForSmallPacks(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 	require.Empty(t, s.whaleCandidates())
-	wait := s.prefetchWhales(make(chan struct{}))
+	wait := s.prefetchWhales()
 	wait()
 	require.Nil(t, s.whales.Load())
 }
@@ -322,4 +325,30 @@ func TestOffTableMatchesMapOracle(t *testing.T) {
 		require.Equal(t, d, v.data)
 	}
 	require.LessOrEqual(t, 2*tbl.n, len(tbl.keys), "load factor stays at or below one half")
+}
+
+// TestWhalePrefetchSharedAcrossConcurrentScans pins that concurrent scans on
+// one store share a single whale cache: the second scan joins the published
+// cache, the first scan to finish leaves it in place for the scan still
+// running, and the last scan to finish releases it.
+func TestWhalePrefetchSharedAcrossConcurrentScans(t *testing.T) {
+	s, big := openWhaleStore(t)
+	bigOID := calculateHash(ObjBlob, big)
+
+	waitA := s.prefetchWhales()
+	c := s.whales.Load()
+	require.NotNil(t, c, "the first scan publishes the whale cache")
+
+	waitB := s.prefetchWhales()
+	require.Same(t, c, s.whales.Load(), "a concurrent scan joins the published cache")
+
+	waitA()
+	require.Same(t, c, s.whales.Load(), "the first scan to finish leaves the cache to the running scan")
+	got, typ, err := s.get(bigOID)
+	require.NoError(t, err)
+	require.Equal(t, ObjBlob, typ)
+	require.Equal(t, big, got)
+
+	waitB()
+	require.Nil(t, s.whales.Load(), "the last scan releases the cache")
 }
