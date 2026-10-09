@@ -144,3 +144,86 @@ func TestDiffHistoryHunksDedup_WideCommitParksUntilDrained(t *testing.T) {
 	require.Lessf(t, probe.windowWaits.Load(), uint64(100),
 		"the sequencer re-polled the window instead of parking")
 }
+
+// A blocked consumer retains materialized pair lists and hunk bytes. Both
+// must stay near their caps while the consumer is stalled, and the scan
+// must still emit the serial reference once it resumes.
+func TestDiffHistoryHunksDedup_StalledConsumerBoundsRetention(t *testing.T) {
+	const (
+		commits = 60
+		files   = 30
+		lines   = 16
+	)
+	b := newDedupRepoBuilder(t)
+	for c := range commits {
+		for f := range files {
+			name := fmt.Sprintf("f%02d.txt", f)
+			b.write(name, uniqueText(fmt.Sprintf("c%02d%s", c, name), lines))
+		}
+		b.commit(fmt.Sprintf("rewrite %d", c))
+	}
+	gitDir := b.finish()
+	want := serialDedupReference(t, gitDir, false, nil)
+
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
+	require.NoError(t, err)
+	defer s.Close()
+	s.dedupLimits.inFlightPairs = 32
+	s.dedupLimits.workers = 2
+	s.dedupLimits.yieldChanCap = 1
+	s.dedupLimits.pendingPairsCap = 40
+	s.dedupLimits.retainedBytesCap = 8 << 10
+	probe := &dedupProbe{}
+	s.dedupProbe = probe
+
+	release := make(chan struct{})
+	var (
+		mu  sync.Mutex
+		got []string
+	)
+	done := make(chan error, 1)
+	go func() {
+		done <- s.DiffHistoryHunksFunc(func(h HunkAddition) error {
+			<-release
+			mu.Lock()
+			got = append(got, canonicalHunkAddition(h))
+			mu.Unlock()
+			return nil
+		})
+	}()
+
+	var lastPairs, lastBytes int64
+	stableSince := time.Now()
+	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); {
+		time.Sleep(20 * time.Millisecond)
+		p, by := probe.peakPendingPairs.Load(), probe.peakRetainedBytes.Load()
+		if p != lastPairs || by != lastBytes {
+			lastPairs, lastBytes = p, by
+			stableSince = time.Now()
+			continue
+		}
+		if time.Since(stableSince) > 300*time.Millisecond {
+			break
+		}
+	}
+
+	treeWorkers := int64(min(s.dedupLimits.workers, maxTreeDiffWorkers))
+	maxPairs := s.dedupLimits.pendingPairsCap + 2*treeWorkers*files
+	hunk := mkTestHunk(1, strings.Split(strings.TrimSuffix(uniqueText("c00f00.txt", lines), "\n"), "\n")...)
+	maxBytes := s.dedupLimits.retainedBytesCap + int64(s.dedupLimits.inFlightPairs)*hunkRetainedBytes(&hunk)
+	pairs, bytes := probe.peakPendingPairs.Load(), probe.peakRetainedBytes.Load()
+
+	close(release)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("dedup scan did not finish after the consumer resumed")
+	}
+	sort.Strings(got)
+	require.Equal(t, want, got)
+
+	t.Logf("peak pending pairs %d (bound %d), peak retained bytes %d (bound %d)", pairs, maxPairs, bytes, maxBytes)
+	require.LessOrEqualf(t, pairs, maxPairs, "pending pair lists outgrew the look-ahead budget")
+	require.LessOrEqualf(t, bytes, maxBytes, "retained hunk bytes outgrew the budget")
+}

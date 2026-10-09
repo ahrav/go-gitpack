@@ -133,6 +133,18 @@ const (
 	// measurably idled the workers behind it.
 	dedupMaxInFlightPairs = 65536
 
+	// dedupPendingPairsCap bounds blob pairs held in tree-diffed slots
+	// ahead of the emit cursor.
+	dedupPendingPairsCap = 4 * dedupMaxInFlightPairs
+
+	// dedupDispatchDepth is how many commits per tree worker may wait in
+	// the tree stage at once.
+	dedupDispatchDepth = 2
+
+	// dedupRetainedBytesCap bounds hunk bytes held from delivery to the
+	// decision stage until the consumer callback has seen them.
+	dedupRetainedBytesCap = 512 << 20
+
 	// dedupYieldChanCap decouples the serial decision stage from fn
 	// scheduling: a whale pair can release thousands of hunks at once, and
 	// a shallow buffer would stall the decision loop (and transitively
@@ -160,6 +172,8 @@ type dedupLimits struct {
 	earlyBytesCap      uint64
 	yieldChanCap       int
 	workers            int
+	pendingPairsCap    int64
+	retainedBytesCap   int64
 }
 
 func defaultDedupLimits() dedupLimits {
@@ -169,6 +183,8 @@ func defaultDedupLimits() dedupLimits {
 		expensivePairBytes: dedupExpensivePairBytes,
 		earlyBytesCap:      dedupEarlyBytesCap,
 		yieldChanCap:       dedupYieldChanCap,
+		pendingPairsCap:    dedupPendingPairsCap,
+		retainedBytesCap:   dedupRetainedBytesCap,
 	}
 }
 
@@ -177,6 +193,28 @@ type dedupProbe struct {
 	// windowWaits counts sequencer waits on the in-flight window that
 	// returned ready.
 	windowWaits atomic.Uint64
+
+	peakPendingPairs  atomic.Int64
+	peakRetainedBytes atomic.Int64
+}
+
+func notePeak(peak *atomic.Int64, v int64) {
+	for {
+		cur := peak.Load()
+		if v <= cur || peak.CompareAndSwap(cur, v) {
+			return
+		}
+	}
+}
+
+// hunkRetainedBytes estimates line storage using a 16-byte string header
+// per line.
+func hunkRetainedBytes(h *HunkAddition) int64 {
+	n := int64(len(h.lines)) * 16
+	for _, line := range h.lines {
+		n += int64(len(line))
+	}
+	return n
 }
 
 // lineFingerprint hashes one added line (without its trailing newline —
@@ -406,8 +444,9 @@ var prefetchSink uint64
 // saturates (at entry or during a candidate's probe) the single-pass rule
 // emits every later non-empty hunk, candidates or not, so the tail of the
 // pair is scanned in full from that point.
-func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition) []HunkAddition {
+func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition) ([]HunkAddition, int64) {
 	hunks := r.hunks
+	var kept int64
 	i := 0 // hunks[:i] are decided
 	for _, c := range r.candidates {
 		if s.saturated {
@@ -416,6 +455,9 @@ func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition)
 		h := &hunks[c.hunk]
 		if h.isBinary || s.verdictUnresolved(c.unresolved, len(h.lines)) {
 			out = append(out, *h)
+			if r.hunkBytes != nil {
+				kept += r.hunkBytes[c.hunk]
+			}
 		}
 		i = c.hunk + 1
 	}
@@ -424,10 +466,13 @@ func (s *lineFingerprintSet) decideResult(r dedupPairResult, out []HunkAddition)
 			h := &hunks[i]
 			if h.isBinary || len(h.lines) > 0 {
 				out = append(out, *h)
+				if r.hunkBytes != nil {
+					kept += r.hunkBytes[i]
+				}
 			}
 		}
 	}
-	return out
+	return out, kept
 }
 
 // contains reports whether fp (zero already remapped) is in the set. It is
@@ -771,6 +816,12 @@ type dedupPairWork struct {
 	earlyBytes uint64
 }
 
+// bytes is the hunkRetainedBytes total of hunks.
+type dedupYieldBatch struct {
+	hunks []HunkAddition
+	bytes int64
+}
+
 // dedupCandidate names one hunk of a pair that the decision stage must
 // still look at: a binary hunk (always emitted, never marked) or a text
 // hunk with at least one line the worker's snapshot probe did not find.
@@ -793,6 +844,10 @@ type dedupPairResult struct {
 	hunks      []HunkAddition
 	candidates []dedupCandidate
 	earlyBytes uint64
+
+	// hunkBytes[i] is hunkRetainedBytes(&hunks[i]); bytes is their sum.
+	hunkBytes []int64
+	bytes     int64
 }
 
 // prefilterHunk hashes h's lines and probes sn for each, returning the
@@ -913,6 +968,11 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// the in-flight window itself.
 	ring := make([]dedupPairResult, window)
 	present := make([]atomic.Bool, window)
+	// pendingPairs counts pairs in tree-diffed slots the emit cursor has
+	// not passed; retainedBytes counts result bytes from delivery until fn
+	// has seen every surviving hunk (dropped hunks release at decision).
+	var pendingPairs, retainedBytes atomic.Int64
+	probe := hs.dedupProbe
 	// arrived collects delivered seqs for the decision goroutine's backlog
 	// pre-processing; resultsReady wakes it (without blocking the sender).
 	var (
@@ -921,6 +981,13 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		resultsReady = make(chan struct{}, 1)
 	)
 	deliver := func(results []dedupPairResult) {
+		var charged int64
+		for _, res := range results {
+			charged += res.bytes
+		}
+		if v := retainedBytes.Add(charged); probe != nil {
+			notePeak(&probe.peakRetainedBytes, v)
+		}
 		for _, res := range results {
 			i := res.seq & ringMask
 			ring[i] = res
@@ -939,7 +1006,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// slotReady is pinged (without blocking) by tree workers when a slot
 	// completes so the sequencer can stamp ahead while it waits elsewhere.
 	slotReady := make(chan struct{}, 1)
-	yieldChan := make(chan []HunkAddition, limits.yieldChanCap)
+	yieldChan := make(chan dedupYieldBatch, limits.yieldChanCap)
 	stopCh := make(chan struct{})
 	slots := make([]dedupCommitSlot, lookahead)
 
@@ -965,6 +1032,18 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		})
 	}
 
+	// Dispatch state, guarded by dispatchMu. dispatched mirrors
+	// nextDispatch and emitted mirrors the emit cursor for readers outside
+	// the lock; outstanding counts commits dispatched but not yet diffed.
+	var (
+		dispatchMu   sync.Mutex
+		nextDispatch int
+		dispatched   atomic.Int64
+		emitted      atomic.Int64
+		outstanding  atomic.Int64
+		dispatch     func()
+	)
+
 	for range treeWorkers {
 		treeWG.Add(1)
 		go func() {
@@ -987,6 +1066,9 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					// err must be visible before done closes: the
 					// sequencer reads both after <-slot.done.
 					slot.pairs, slot.err = pairs, err
+					if p := pendingPairs.Add(int64(len(pairs))); probe != nil {
+						notePeak(&probe.peakPendingPairs, p)
+					}
 					close(slot.done)
 					select {
 					case slotReady <- struct{}{}:
@@ -996,6 +1078,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 						setError(err)
 						return
 					}
+					outstanding.Add(-1)
+					dispatch()
 				}
 			}
 		}()
@@ -1018,20 +1102,34 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// of order and not yet decided (see dedupEarlyBytesCap).
 	var earlyBytes atomic.Uint64
 	var (
-		seqMu        sync.Mutex
-		nextDispatch int    // commits [0, nextDispatch) are in the tree stage
-		stamp        int    // commits [0, stamp) have seqs assigned
-		seq          uint64 // next seq to assign
-		emitCommit   int    // emit cursor: commit index
-		emitPair     int    // emit cursor: index into slot.pairs
-		emitEarly    []int  // emitCommit's early list, consumed as we pass
-		seqDone      bool   // every pair has been handed out
+		seqMu      sync.Mutex
+		stamp      int    // commits [0, stamp) have seqs assigned
+		seq        uint64 // next seq to assign
+		emitCommit int    // emit cursor: commit index
+		emitPair   int    // emit cursor: index into slot.pairs
+		emitEarly  []int  // emitCommit's early list, consumed as we pass
+		seqDone    bool   // every pair has been handed out
 	)
-	// dispatch keeps up to dedupLookaheadCommits commits in the tree stage
-	// ahead of the emit cursor. treeIdxChan's capacity equals the window,
-	// so the send never blocks.
-	dispatch := func() {
-		for nextDispatch < len(order) && nextDispatch-emitCommit < lookahead {
+	// dispatch keeps the tree stage at most dispatchDepth commits deep and
+	// at most lookahead commits ahead of the emit cursor, and stops adding
+	// commits while pendingPairs is at its cap. The commit under the emit
+	// cursor is always dispatched, so the emit cursor never waits on a
+	// budget only it can release. Tree workers call dispatch after each
+	// commit and takeOrdered calls it as the emit cursor moves; both run
+	// it under dispatchMu, which nests inside seqMu. treeIdxChan's capacity
+	// equals lookahead, so the send never blocks.
+	dispatchDepth := int64(dedupDispatchDepth * treeWorkers)
+	dispatch = func() {
+		dispatchMu.Lock()
+		defer dispatchMu.Unlock()
+		for nextDispatch < len(order) {
+			passed := int(emitted.Load())
+			if nextDispatch-passed >= lookahead {
+				return
+			}
+			if nextDispatch > passed && (outstanding.Load() >= dispatchDepth || pendingPairs.Load() >= limits.pendingPairsCap) {
+				return
+			}
 			slot := &slots[nextDispatch%lookahead]
 			// Re-arm only the done channel: the tree worker overwrites
 			// pairs and err wholesale (adopting collectCommitPairs'
@@ -1040,13 +1138,18 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			// was fully consumed before the window allowed this dispatch.
 			slot.done = make(chan struct{})
 			slot.early = slot.early[:0]
+			outstanding.Add(1)
 			treeIdxChan <- nextDispatch
 			nextDispatch++
+			dispatched.Store(int64(nextDispatch))
 		}
 	}
 	stampable := func(n uint64) bool {
 		if n == 0 {
 			return true
+		}
+		if retainedBytes.Load() > limits.retainedBytesCap {
+			return false
 		}
 		decided := inFlight.decided.Load()
 		if n > window {
@@ -1059,7 +1162,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// expensiveChan has room. It stops at the first incomplete slot, at
 	// the in-flight window, or at a tree-stage error (reported as false).
 	stampAhead := func() bool {
-		for stamp < nextDispatch {
+		for stamp < int(dispatched.Load()) {
 			slot := &slots[stamp%lookahead]
 			select {
 			case <-slot.done:
@@ -1181,13 +1284,18 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				// final window; single-pair batches there spread the last
 				// pairs across workers instead of leaving one worker with a
 				// sixteen-pair tail.
-				if len(batch) == dedupPairBatchSize || nextDispatch == len(order) {
+				if len(batch) == dedupPairBatchSize || dispatched.Load() == int64(len(order)) {
 					emitPair++
 					return batch, true
 				}
 			}
+			pendingPairs.Add(-int64(len(slot.pairs)))
+			// The emit cursor is the slot's last reader; dropping the lists
+			// lets the pairs be collected before the slot is reused.
+			slot.pairs, slot.expensive = nil, nil
 			emitPair = 0
 			emitCommit++
+			emitted.Store(int64(emitCommit))
 		}
 		seqDone = true
 		if len(batch) > 0 {
@@ -1245,8 +1353,15 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					// allocation.
 					var buf []uint64
 					var cands []dedupCandidate
+					var hunkBytes []int64
+					var total int64
+					if len(hunks) > 0 {
+						hunkBytes = make([]int64, len(hunks))
+					}
 					for i := range hunks {
 						h := &hunks[i]
+						hunkBytes[i] = hunkRetainedBytes(h)
+						total += hunkBytes[i]
 						if h.isBinary {
 							cands = append(cands, dedupCandidate{hunk: i})
 							continue
@@ -1257,7 +1372,10 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 							cands = append(cands, dedupCandidate{hunk: i, unresolved: buf[start:len(buf):len(buf)]})
 						}
 					}
-					results = append(results, dedupPairResult{seq: pw.seq, hunks: hunks, candidates: cands, earlyBytes: pw.earlyBytes})
+					results = append(results, dedupPairResult{
+						seq: pw.seq, hunks: hunks, candidates: cands, earlyBytes: pw.earlyBytes,
+						hunkBytes: hunkBytes, bytes: total,
+					})
 				}
 				deliver(results)
 			}
@@ -1277,7 +1395,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		defer close(decisionDone)
 		defer close(yieldChan)
 		next := uint64(0)
-		batch := make([]HunkAddition, 0, dedupYieldBatchHunks)
+		batch := dedupYieldBatch{hunks: make([]HunkAddition, 0, dedupYieldBatchHunks)}
 		// backlog holds delivered seqs not yet pre-processed by prepBacklog;
 		// it is worked through only while next is missing and no new
 		// results are waiting, i.e. while this goroutine would otherwise
@@ -1287,7 +1405,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		// flush hands the current batch to the yield pool and starts a
 		// fresh one. It reports false when the pipeline is stopping.
 		flush := func() bool {
-			if len(batch) == 0 {
+			if len(batch.hunks) == 0 {
 				return true
 			}
 			select {
@@ -1295,7 +1413,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				return false
 			case yieldChan <- batch:
 			}
-			batch = make([]HunkAddition, 0, dedupYieldBatchHunks)
+			batch = dedupYieldBatch{hunks: make([]HunkAddition, 0, dedupYieldBatchHunks)}
 			return true
 		}
 		// drain settles every pair that is ready in seq order. It reports
@@ -1318,8 +1436,14 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				if r.earlyBytes != 0 {
 					earlyBytes.Add(^(r.earlyBytes - 1))
 				}
-				batch = set.decideResult(r, batch)
-				if len(batch) >= dedupYieldBatchHunks && !flush() {
+				var kept int64
+				batch.hunks, kept = set.decideResult(r, batch.hunks)
+				batch.bytes += kept
+				if dropped := r.bytes - kept; dropped != 0 {
+					retainedBytes.Add(-dropped)
+					inFlight.notify()
+				}
+				if len(batch.hunks) >= dedupYieldBatchHunks && !flush() {
 					return false
 				}
 			}
@@ -1399,12 +1523,14 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					if !ok {
 						return
 					}
-					for _, h := range batch {
+					for _, h := range batch.hunks {
 						if err := fn(h); err != nil {
 							setError(err)
 							return
 						}
 					}
+					retainedBytes.Add(-batch.bytes)
+					inFlight.notify()
 				}
 			}
 		}()
