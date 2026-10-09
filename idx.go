@@ -246,6 +246,25 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		return nil, ErrBadIdxChecksum
 	}
 
+	// The checksum over the whole file takes about as long as parsing its
+	// tables, and neither depends on the other, so the two overlap. The
+	// channel is buffered, so an error return below leaves the goroutine
+	// free to finish and exit on its own.
+	checksumOK := make(chan bool, 1)
+	go func() {
+		var want [hashSize]byte
+		if _, err := ix.ReadAt(want[:], size-hashSize); err != nil {
+			checksumOK <- false
+			return
+		}
+		h := sha1.New()
+		if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-hashSize)); err != nil {
+			checksumOK <- false
+			return
+		}
+		checksumOK <- bytes.Equal(h.Sum(nil), want[:])
+	}()
+
 	// Fanout table: fanout[i] = total number of objects whose first byte is ≤ i.
 	// This enables O(1) range queries for object lookup by hash prefix.
 	fanoutData := make([]byte, fanoutSize)
@@ -408,20 +427,9 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		}
 	}
 
-	// Trailer verification.
-	trailer := make([]byte, 40)
-	if _, err := ix.ReadAt(trailer, int64(ix.Len()-40)); err != nil {
-		return nil, err
-	}
-
-	wantIdxSHA := trailer[hashSize:]
-
-	// Recompute idx‑SHA over everything **except** the final idx hash itself.
-	h := sha1.New()
-	if _, err := io.Copy(h, io.NewSectionReader(ix, 0, size-int64(hashSize))); err != nil {
-		return nil, err
-	}
-	if !bytes.Equal(h.Sum(nil), wantIdxSHA) {
+	// Trailer verification: the file's own SHA-1 covers everything before
+	// it. The hash ran concurrently with the table parsing above.
+	if !<-checksumOK {
 		return nil, ErrBadIdxChecksum
 	}
 

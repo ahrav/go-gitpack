@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"slices"
 	"strings"
@@ -134,7 +135,7 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 	// this trailer as SHA-1 (the pack and idx trailers use the same hash);
 	// it detects corruption and is not a security boundary.
 	h := sha1.New() //nolint:gosec // Git .rev trailer format mandates SHA-1.
-	if _, err := h.Write(mmapData(mr)[:size-hashSize]); err != nil {
+	if _, err := io.Copy(h, io.NewSectionReader(mr, 0, size-hashSize)); err != nil {
 		return nil, err
 	}
 	var wantSelf [hashSize]byte
@@ -155,7 +156,10 @@ func tryLoadRidxFile(ridxPath string, pf *idxFile) ([]uint32, error) {
 		}
 	}
 
-	table := mmapData(mr)[ridxHeaderSize : ridxHeaderSize+tableLen]
+	table := make([]byte, tableLen)
+	if _, err := mr.ReadAt(table, ridxHeaderSize); err != nil {
+		return nil, err
+	}
 	ridx := make([]uint32, objCount)
 	offs := make([]uint64, objCount)
 	var prev uint64
