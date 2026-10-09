@@ -1698,16 +1698,25 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 // Close releases any mmap handles or file descriptors held by the scanner.
 // It is idempotent; subsequent calls are no‑ops.
 //
-// The pair cache is cleared as well. Callers may retain a HistoryScanner value
-// after Close, and a hunk scan leaves that cache holding up to its full budget
-// of hunk lines — plus, for whole-blob entries, the object buffers those lines
-// view — which would otherwise stay reachable until the scanner itself does.
-// This mirrors store.Close releasing the offset cache's object bytes.
+// The pair cache and the commit cache are cleared as well. Callers may retain
+// a HistoryScanner value after Close, and a hunk scan leaves the pair cache
+// holding up to its full budget of hunk lines — plus, for whole-blob entries,
+// the object buffers those lines view — and a dedup scan leaves the commit
+// list and graph for the whole history; both would otherwise stay reachable
+// until the scanner itself does. This mirrors store.Close releasing the
+// offset cache's object bytes.
 func (hs *HistoryScanner) Close() error {
 	hs.pairs.clear()
 	if hs.meta != nil {
 		hs.meta.clear()
+		hs.meta.attachGraph(nil)
 	}
+	// A dedup scan materializes the commit list and the graph built from
+	// it (loadAllCommits); both scale with history and have no use after
+	// the object store is closed.
+	hs.commitsMu.Lock()
+	hs.commits, hs.commitsTips, hs.commitsShallow, hs.graphData = nil, nil, nil, nil
+	hs.commitsMu.Unlock()
 	return hs.store.Close()
 }
 

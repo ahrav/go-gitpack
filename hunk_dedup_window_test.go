@@ -339,11 +339,11 @@ func TestDiffHistoryHunksDedup_StalledConsumerReleasesLargeBlobs(t *testing.T) {
 		"stalled consumer pinned one %d-byte blob per in-flight one-line hunk", blobSize)
 }
 
-// A worker's batch is admitted as a whole, so a wide commit of large pairs
-// that are not forwarded early can materialize a full batch per worker
-// before any of it is charged. The charge must land per pair, and a worker
-// must hold off its next pair while the cap is exceeded, so the stalled heap
-// stays within a few blobs of the cap.
+// A worker's batch is admitted as a whole, and early-forwarded expensive
+// pairs are queued ahead of order, so a wide commit of large pairs can
+// materialize many results before any is charged. The charge must land per
+// pair, and a worker must hold its next pair while the cap is exceeded, so
+// the stalled heap stays within a few blobs of the cap on both paths.
 func TestDiffHistoryHunksDedup_StalledConsumerBoundsWideBatch(t *testing.T) {
 	const (
 		files    = 24
@@ -362,37 +362,81 @@ func TestDiffHistoryHunksDedup_StalledConsumerBoundsWideBatch(t *testing.T) {
 	want := serialDedupReference(t, gitDir, false, nil)
 	require.Len(t, want, files)
 
-	// Pure additions alias their whole blob, and the pair memo would retain
-	// them up to its budget; disabling it leaves the reorder ring as the
-	// only holder.
-	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true), WithPairCacheBudget(0))
+	for name, expensive := range map[string]uint64{"ordered": 1 << 40, "early": dedupExpensivePairBytes} {
+		t.Run(name, func(t *testing.T) {
+			// Pure additions alias their whole blob, and the pair memo would
+			// retain them up to its budget; disabling it leaves the reorder
+			// ring as the only holder.
+			s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true), WithPairCacheBudget(0))
+			require.NoError(t, err)
+			defer s.Close()
+			s.dedupLimits.inFlightPairs = 512
+			s.dedupLimits.workers = 1
+			s.dedupLimits.yieldChanCap = 1
+			s.dedupLimits.retainedBytesCap = 1 << 20
+			s.dedupLimits.expensivePairBytes = expensive
+			probe := &dedupProbe{}
+			s.dedupProbe = probe
+
+			// Every emission here is a whole 8 MiB file, so the collected
+			// output itself is blob-sized; the baseline is taken before the
+			// scan, while the stalled consumer has collected nothing yet.
+			var before, stalled runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&before)
+			got, _, charged := stalledScanPeaksThen(t, s, probe, func() {
+				runtime.GC()
+				runtime.ReadMemStats(&stalled)
+			})
+			require.Equal(t, want, got)
+
+			retained := int64(stalled.HeapAlloc) - int64(before.HeapAlloc)
+			t.Logf("heap while stalled exceeds pre-scan heap by %d bytes (%.1f blobs); peak charge %d bytes",
+				retained, float64(retained)/float64(blobSize), charged)
+			require.Lessf(t, retained, int64(dedupPairBatchSize/2*blobSize),
+				"a stalled consumer let %d-byte blobs materialize uncharged past the cap", blobSize)
+		})
+	}
+}
+
+// A commit wider than the pending-pair cap is collected whole only while
+// it is the commit under the emit cursor; tree workers collecting later
+// commits hold at the cap, so the dispatch floor cannot stack several wide
+// commits' pair lists at once.
+func TestDiffHistoryHunksDedup_WideCommitsCollectWithinPendingCap(t *testing.T) {
+	const (
+		commits = 3
+		files   = 100
+	)
+	b := newDedupRepoBuilder(t)
+	for c := range commits {
+		for f := range files {
+			name := fmt.Sprintf("c%d_f%03d.txt", c, f)
+			b.write(name, uniqueText(name, 2))
+		}
+		b.commit(fmt.Sprintf("wide %d", c))
+	}
+	gitDir := b.finish()
+	want := serialDedupReference(t, gitDir, false, nil)
+
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
 	require.NoError(t, err)
 	defer s.Close()
 	s.dedupLimits.inFlightPairs = 512
-	s.dedupLimits.workers = 1
+	s.dedupLimits.workers = 2
 	s.dedupLimits.yieldChanCap = 1
-	s.dedupLimits.retainedBytesCap = 1 << 20
-	s.dedupLimits.expensivePairBytes = 1 << 40 // every pair travels the ordered batch path
+	s.dedupLimits.pendingPairsCap = 40
+	s.dedupLimits.retainedBytesCap = 4 << 10
 	probe := &dedupProbe{}
 	s.dedupProbe = probe
 
-	// Every emission here is a whole 8 MiB file, so the collected output
-	// itself is blob-sized; the baseline is taken before the scan, while
-	// the stalled consumer has collected nothing yet.
-	var before, stalled runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	got, _, charged := stalledScanPeaksThen(t, s, probe, func() {
-		runtime.GC()
-		runtime.ReadMemStats(&stalled)
-	})
+	got, pairs, _ := stalledScanPeaks(t, s, probe)
 	require.Equal(t, want, got)
 
-	retained := int64(stalled.HeapAlloc) - int64(before.HeapAlloc)
-	t.Logf("heap while stalled exceeds pre-scan heap by %d bytes (%.1f blobs); peak charge %d bytes",
-		retained, float64(retained)/float64(blobSize), charged)
-	require.Lessf(t, retained, int64(dedupPairBatchSize/2*blobSize),
-		"a stalled consumer let a whole worker batch of %d-byte blobs materialize uncharged", blobSize)
+	treeWorkers := int64(min(s.dedupLimits.workers, maxTreeDiffWorkers))
+	maxPairs := int64(files) + s.dedupLimits.pendingPairsCap + treeWorkers
+	t.Logf("peak pending pairs %d (bound %d; %d commits of %d pairs, cap %d)", pairs, maxPairs, commits, files, s.dedupLimits.pendingPairsCap)
+	require.LessOrEqualf(t, pairs, maxPairs, "pair lists for commits beyond the cursor were collected past the cap")
 }
 
 // The reorder ring holds one dedupPairResult per in-flight pair and is

@@ -916,14 +916,20 @@ func pairCandidates(hunks []HunkAddition, sn *fingerprintSnapshot) (cands []dedu
 // commit's changed blob pairs in deterministic tree order. Errors come back
 // pre-wrapped with the same message formats the streaming pipeline uses, so
 // tree workers only record and propagate them. A closed stopCh aborts the
-// tree walk with errScanAborted.
-func (hs *HistoryScanner) collectCommitPairs(c commitInfo, stopCh <-chan struct{}) ([]blobPairWork, error) {
+// tree walk with errScanAborted. admit, when non-nil, runs before each pair
+// is appended and may block or return an error to abort.
+func (hs *HistoryScanner) collectCommitPairs(c commitInfo, stopCh <-chan struct{}, admit func() error) ([]blobPairWork, error) {
 	parentTree, err := hs.firstParentTree(c)
 	if err != nil {
 		return nil, fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err)
 	}
 	var pairs []blobPairWork
 	if err := hs.emitCommitBlobPairsTo(c, parentTree, func(w blobPairWork) error {
+		if admit != nil {
+			if err := admit(); err != nil {
+				return err
+			}
+		}
 		pairs = append(pairs, w)
 		return nil
 	}, stopCh); err != nil {
@@ -1046,24 +1052,27 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		default:
 		}
 	}
-	// retainWake is closed and replaced whenever the retained charge drops
-	// back under its cap or the decided count advances, so a worker holding
-	// off its next pair can wait for either without polling.
+	// wakeCh is closed and replaced whenever the retained charge drops back
+	// under its cap, the decided count advances, or the emit cursor passes
+	// a commit, so a goroutine holding at one of those bounds can wait
+	// without polling.
 	var (
-		retainWakeMu sync.Mutex
-		retainWake   = make(chan struct{})
+		wakeMu sync.Mutex
+		wakeCh = make(chan struct{})
 	)
-	wakeRetainWaiters := func() {
-		retainWakeMu.Lock()
-		close(retainWake)
-		retainWake = make(chan struct{})
-		retainWakeMu.Unlock()
+	wakeWaiters := func() {
+		wakeMu.Lock()
+		close(wakeCh)
+		wakeCh = make(chan struct{})
+		wakeMu.Unlock()
 	}
-	currentRetainWake := func() <-chan struct{} {
-		retainWakeMu.Lock()
-		defer retainWakeMu.Unlock()
-		return retainWake
+	currentWake := func() <-chan struct{} {
+		wakeMu.Lock()
+		defer wakeMu.Unlock()
+		return wakeCh
 	}
+	// emitCursor mirrors the sequencer's emitCommit for tree workers.
+	var emitCursor atomic.Int64
 	// slotReady is pinged (without blocking) by tree workers when a slot
 	// completes so the sequencer can stamp ahead while it waits elsewhere.
 	slotReady := make(chan struct{}, 1)
@@ -1083,7 +1092,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		}
 		if after := retainedKiB.Add(-n); after+n > retainedKiBCap && after <= retainedKiBCap {
 			inFlight.notify()
-			wakeRetainWaiters()
+			wakeWaiters()
 		}
 	}
 
@@ -1122,7 +1131,34 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 						return
 					}
 					slot := &slots[idx%lookahead]
-					pairs, err := hs.collectCommitPairs(order[idx], stopCh)
+					// Each pair is charged to pendingPairs as it is
+					// collected, and collection holds at the cap for every
+					// commit except the one under the emit cursor, which
+					// alone can release the pairs ahead of it. A held
+					// commit therefore adds at most one pair past the cap.
+					var charged int64
+					admit := func() error {
+						if p := pendingPairs.Add(1); probe != nil {
+							notePeak(&probe.peakPendingPairs, p)
+						}
+						charged++
+						for pendingPairs.Load() > limits.pendingPairsCap && int64(idx) != emitCursor.Load() {
+							wake := currentWake()
+							if pendingPairs.Load() <= limits.pendingPairsCap || int64(idx) == emitCursor.Load() {
+								break
+							}
+							select {
+							case <-stopCh:
+								return errScanAborted
+							case <-wake:
+							}
+						}
+						return nil
+					}
+					pairs, err := hs.collectCommitPairs(order[idx], stopCh, admit)
+					if err != nil {
+						pendingPairs.Add(-charged)
+					}
 					var expensive []dedupExpensivePair
 					if err == nil {
 						expensive = hs.expensivePairs(pairs)
@@ -1131,9 +1167,6 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					// err must be visible before done closes: the
 					// sequencer reads both after <-slot.done.
 					slot.pairs, slot.err = pairs, err
-					if p := pendingPairs.Add(int64(len(pairs))); probe != nil {
-						notePeak(&probe.peakPendingPairs, p)
-					}
 					diffedPairs.Add(int64(len(pairs)))
 					diffedCommits.Add(1)
 					outstanding.Add(-1)
@@ -1390,6 +1423,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			slot.pairs, slot.expensive = nil, nil
 			emitPair = 0
 			emitCommit++
+			emitCursor.Store(int64(emitCommit))
+			wakeWaiters()
 		}
 		seqDone = true
 		if len(batch) > 0 {
@@ -1448,12 +1483,54 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	}
 	// admitted reports whether a worker may materialize seq s now: the
 	// batch it belongs to was handed out under the cap, but earlier pairs
-	// of the batch may have pushed the charge past it since. The seq the
-	// decision stage waits for always passes, which keeps that stage
-	// draining. While it waits, the worker takes early-forwarded expensive
-	// work, which may be what the decision stage needs next.
+	// may have pushed the charge past it since. The seq the decision stage
+	// waits for always passes, which keeps that stage draining.
 	admitted := func(s uint64) bool {
 		return retainedKiB.Load() <= retainedKiBCap || s == inFlight.decided.Load()
+	}
+	// runBatch materializes every pair in queue, each once admitted. While
+	// none is admitted it waits for the charge to drop or the decided count
+	// to move, taking early-forwarded expensive work into the same queue so
+	// that work is gated too and the decision stage's next seq is never left
+	// in the channel. It reports false when the pipeline is stopping.
+	anyAdmitted := func(queue []dedupPairWork) bool {
+		for _, pw := range queue {
+			if admitted(pw.seq) {
+				return true
+			}
+		}
+		return false
+	}
+	runBatch := func(queue []dedupPairWork) bool {
+		for len(queue) > 0 {
+			for i := 0; i < len(queue); {
+				if !admitted(queue[i].seq) {
+					i++
+					continue
+				}
+				if !process(queue[i]) {
+					return false
+				}
+				queue = append(queue[:i], queue[i+1:]...)
+			}
+			if len(queue) == 0 {
+				return true
+			}
+			// Take the wake channel before re-checking so a wake between
+			// the check and the select is still seen.
+			wake := currentWake()
+			if anyAdmitted(queue) {
+				continue
+			}
+			select {
+			case <-stopCh:
+				return false
+			case early := <-expensiveChan:
+				queue = append(queue, early...)
+			case <-wake:
+			}
+		}
+		return true
 	}
 
 	for range numWorkers {
@@ -1465,27 +1542,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 				if !ok {
 					return
 				}
-				for _, pw := range works {
-					for !admitted(pw.seq) {
-						wake := currentRetainWake()
-						if admitted(pw.seq) {
-							break
-						}
-						select {
-						case <-stopCh:
-							return
-						case early := <-expensiveChan:
-							for _, e := range early {
-								if !process(e) {
-									return
-								}
-							}
-						case <-wake:
-						}
-					}
-					if !process(pw) {
-						return
-					}
+				if !runBatch(works) {
+					return
 				}
 			}
 		}()
@@ -1559,7 +1617,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 			}
 			if next != start {
 				inFlight.advanced(next - start)
-				wakeRetainWaiters()
+				wakeWaiters()
 				if next == inFlight.stamped() {
 					// Nothing undecided remains, so the backlog is empty
 					// in effect; forget it and the scratch it fed.

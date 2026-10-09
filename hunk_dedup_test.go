@@ -856,6 +856,24 @@ func TestDiffHistoryHunksDedup_ReusedScannerSeesDeepenedHistory(t *testing.T) {
 	require.Equal(t, want, collectHunkScanWith(t, s), "reused scanner must see the deepened history")
 }
 
+// Close drops the commit list and graph a dedup scan materialized, so a
+// retained closed scanner holds no history-sized state.
+func TestDiffHistoryHunksDedup_CloseReleasesCommitCache(t *testing.T) {
+	gitDir := buildDedupOracleRepo(t)
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true))
+	require.NoError(t, err)
+	collectHunkScanWith(t, s)
+	require.NotNil(t, s.commits, "a dedup scan populates the commit cache")
+	require.NotNil(t, s.graphData)
+	require.NoError(t, s.Close())
+	require.Nil(t, s.commits)
+	require.Nil(t, s.commitsTips)
+	require.Nil(t, s.graphData)
+	s.meta.mu.RLock()
+	defer s.meta.mu.RUnlock()
+	require.Nil(t, s.meta.graph, "Close detaches the metadata cache's graph")
+}
+
 func TestDiffHistoryHunksDedup_ReusedScannerSeesNewCommits(t *testing.T) {
 	b := newDedupRepoBuilder(t)
 	b.write("a.txt", "alpha\nbravo\n")
@@ -1450,7 +1468,7 @@ func TestDiffHistoryHunksDedup_LargeBlobEarlyForward(t *testing.T) {
 	require.NoError(t, err)
 	flagged := 0
 	for _, c := range orderCommitsParentFirst(commits) {
-		pairs, err := s.collectCommitPairs(c, nil)
+		pairs, err := s.collectCommitPairs(c, nil, nil)
 		require.NoError(t, err)
 		for _, e := range s.expensivePairs(pairs) {
 			require.Equal(t, "big.txt", pairs[e.index].path)
