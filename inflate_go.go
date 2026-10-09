@@ -474,58 +474,93 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) error {
 
 	total := numLitlen + numOffset
 	clear(d.lens[:total])
-	for i := 0; i < total; {
-		entry, _, err := decodeTableEntry(r, d.precode[:], uint(preBits))
-		if err != nil {
-			return err
+
+	// Code lengths are tallied as they are decoded so buildTable can skip
+	// its counting pass. Runs that cross the litlen/offset boundary split
+	// their tally between the two histograms.
+	var litlenCount, offsetCount [maxCodeLen + 1]int
+	tally := func(i, n int, v uint8) {
+		if v == 0 {
+			return
 		}
+		if i < numLitlen {
+			k := min(n, numLitlen-i)
+			litlenCount[v] += k
+			n -= k
+		}
+		offsetCount[v] += n
+	}
+
+	// The precode alphabet never needs a subtable: its longest codeword is
+	// precodeTableBits wide, so one main-table probe resolves every symbol.
+	// Each iteration needs at most precodeTableBits code bits plus 7 extra
+	// bits, which one refill of the 64-bit buffer always covers.
+	precode := d.precode[:]
+	preMask := bitMask(uint(preBits))
+	for i := 0; i < total; {
+		if r.nbits < 14 {
+			r.refill()
+		}
+		entry := precode[int(r.buf&preMask)]
+		n := uint(entry & huffBitCountMask)
+		if entry == 0 || r.nbits < n {
+			if r.nbits < uint(preBits) || (entry != 0 && r.nbits < n) {
+				return errDeflateTruncated
+			}
+			return errDeflateBadData
+		}
+		r.buf >>= n
+		r.nbits -= n
 		sym := int(entry >> 16)
 		switch {
 		case sym < 16:
 			d.lens[i] = uint8(sym)
+			tally(i, 1, uint8(sym))
 			i++
 
 		case sym == 16:
 			if i == 0 {
 				return errDeflateBadData
 			}
-			extra, ok := r.read(2)
-			if !ok {
+			if r.nbits < 2 {
 				return errDeflateTruncated
 			}
-			n := 3 + int(extra)
-			if n > total-i {
+			run := 3 + int(r.buf&3)
+			r.buf >>= 2
+			r.nbits -= 2
+			if run > total-i {
 				return errDeflateBadData
 			}
 			v := d.lens[i-1]
-			for j := 0; j < n; j++ {
+			for j := 0; j < run; j++ {
 				d.lens[i+j] = v
 			}
-			i += n
+			tally(i, run, v)
+			i += run
 
 		case sym == 17:
-			extra, ok := r.read(3)
-			if !ok {
+			if r.nbits < 3 {
 				return errDeflateTruncated
 			}
-			n := 3 + int(extra)
-			if n > total-i {
+			run := 3 + int(r.buf&7)
+			r.buf >>= 3
+			r.nbits -= 3
+			if run > total-i {
 				return errDeflateBadData
 			}
-			clear(d.lens[i : i+n])
-			i += n
+			i += run
 
 		case sym == 18:
-			extra, ok := r.read(7)
-			if !ok {
+			if r.nbits < 7 {
 				return errDeflateTruncated
 			}
-			n := 11 + int(extra)
-			if n > total-i {
+			run := 11 + int(r.buf&127)
+			r.buf >>= 7
+			r.nbits -= 7
+			if run > total-i {
 				return errDeflateBadData
 			}
-			clear(d.lens[i : i+n])
-			i += n
+			i += run
 
 		default:
 			return errDeflateBadData
@@ -536,14 +571,14 @@ func (d *goInflater) loadDynamicTables(r *deflateBits) error {
 		return errDeflateBadData
 	}
 
-	offsetBits, ok := d.buildTable(
-		d.offset[:], d.lens[numLitlen:total], offsetTable, offsetTableBits, maxCodeLen, true,
+	offsetBits, ok := d.buildTableCounted(
+		d.offset[:], d.lens[numLitlen:total], &offsetCount, offsetTable, offsetTableBits, maxCodeLen, true,
 	)
 	if !ok {
 		return errDeflateBadData
 	}
-	litlenBits, ok := d.buildTable(
-		d.litlen[:], d.lens[:numLitlen], litlenTable, litlenTableBits, maxCodeLen, false,
+	litlenBits, ok := d.buildTableCounted(
+		d.litlen[:], d.lens[:numLitlen], &litlenCount, litlenTable, litlenTableBits, maxCodeLen, false,
 	)
 	if !ok {
 		return errDeflateBadData
@@ -925,20 +960,51 @@ func (d *goInflater) buildTable(
 	}
 
 	var count [maxCodeLen + 1]int
-	used := 0
-	actualMax := 0
-	singleSym := 0
-	for sym, n := range lens {
+	for _, n := range lens {
 		if int(n) > maxLen {
 			return 0, false
 		}
-		if n != 0 {
-			count[n]++
-			used++
-			singleSym = sym
-			if int(n) > actualMax {
-				actualMax = int(n)
-			}
+		count[n]++
+	}
+	count[0] = 0
+	return d.buildTableCounted(table, lens, &count, kind, maxTableBits, maxLen, allowEmpty)
+}
+
+// buildTableCounted is buildTable with the code-length histogram supplied by
+// the caller: count[n] is the number of symbols in lens with length n, for
+// 1 <= n <= maxLen, and every length in lens is at most maxLen.
+func (d *goInflater) buildTableCounted(
+	table []uint32,
+	lens []uint8,
+	count *[maxCodeLen + 1]int,
+	kind huffmanTableKind,
+	maxTableBits int,
+	maxLen int,
+	allowEmpty bool,
+) (int, bool) {
+	var decodeResults []uint32
+	switch kind {
+	case precodeTable:
+		decodeResults = precodeDecodeResults[:]
+	case litlenTable:
+		decodeResults = litlenDecodeResults[:]
+	case offsetTable:
+		decodeResults = offsetDecodeResults[:]
+	default:
+		return 0, false
+	}
+	if len(table) == 0 || len(lens) > len(decodeResults) ||
+		maxLen < 1 || maxLen > maxCodeLen ||
+		maxTableBits < 1 || maxTableBits > maxLen {
+		return 0, false
+	}
+
+	used := 0
+	actualMax := 0
+	for n := 1; n <= maxLen; n++ {
+		if count[n] != 0 {
+			used += count[n]
+			actualMax = n
 		}
 	}
 
@@ -970,6 +1036,13 @@ func (d *goInflater) buildTable(
 		// A permitted singleton code uses only half its one-bit table.
 		// Keep the other half explicitly invalid so fast decoders never
 		// need a separate zero-entry check.
+		singleSym := 0
+		for sym, n := range lens {
+			if n != 0 {
+				singleSym = sym
+				break
+			}
+		}
 		table[0] = decodeResults[singleSym] + 0x101
 		table[1] = huffInvalid
 		return mainBits, true
