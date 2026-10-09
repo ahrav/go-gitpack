@@ -20,8 +20,12 @@ import (
 )
 
 // offsetCacheShards must be a power of two; offsets are distributed by their
-// low bits (pack entries are byte-aligned, so low bits are well mixed).
-const offsetCacheShards = 256
+// low bits (pack entries are byte-aligned, so low bits are well mixed). With
+// the default budget each shard holds 8 MiB, twice maxCacheableSize, so one
+// large object shares its shard with others; a shard budget at or below
+// maxCacheableSize evicts a whole shard for each large object and on the
+// kubernetes history raised allocation by a third and peak RSS by 2 GiB.
+const offsetCacheShards = 32
 
 // defaultOffsetCacheBudget bounds the total bytes retained across all shards.
 const defaultOffsetCacheBudget = 256 << 20
