@@ -425,13 +425,18 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 		}
 		ctx := getDeltaContext(s.maxDeltaDepth)
 		defer putDeltaContext(ctx)
-		return s.inflateFromPack(inflationParams{
+		// The result is published under its pack offset by the inflation
+		// path, which is the cache this method reads; the delta window
+		// serves the loose-object and getMaterialized paths, so filling
+		// it here would cost one entry allocation and lock per object
+		// that no reader of this path consults.
+		return s.inflateFromPackWithOptions(inflationParams{
 			p:             p,
 			off:           off,
 			oid:           oid,
 			ctx:           ctx,
 			maxObjectSize: s.maxDeltaObjectSize,
-		})
+		}, true, false)
 	}
 
 	// Loose-object path: delta window first, then the ARC cache.

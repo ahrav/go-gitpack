@@ -617,17 +617,23 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 		}
 	}()
 
-	var hunks []AddedHunk
+	// Added lines accumulate in hunkLines across the whole diff; each hunk
+	// records its start line and its span in that buffer, and the hunks'
+	// Lines are carved from one copy of the buffer at the end, so a diff
+	// allocates one line array however many hunks it yields.
+	type hunkSpan struct {
+		startLine  uint32
+		start, end int
+	}
+	var spans []hunkSpan
 	hunkStartLine := uint32(0)
+	hunkStart := -1
 	flushHunk := func() {
-		if len(hunkLines) == 0 {
+		if hunkStart < 0 {
 			return
 		}
-		hunks = append(hunks, AddedHunk{
-			StartLine: hunkStartLine,
-			Lines:     append([]string(nil), hunkLines...),
-		})
-		hunkLines = hunkLines[:0]
+		spans = append(spans, hunkSpan{startLine: hunkStartLine, start: hunkStart, end: len(hunkLines)})
+		hunkStart = -1
 	}
 	// oldIdx is the old cursor as a line index; oldOff is the byte offset of
 	// that line in oldB, advanced with the cursor so the suffix check can
@@ -703,9 +709,8 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 		}
 
 		if isAdded {
-			// Start a compact hunk view; clone its line headers once when
-			// the contiguous added run ends.
-			if len(hunkLines) == 0 {
+			if hunkStart < 0 {
+				hunkStart = len(hunkLines)
 				hunkStartLine = lineNum
 			}
 			hunkLines = append(hunkLines, newLine)
@@ -722,7 +727,15 @@ func addedHunksWithPos(oldB, newB []byte) []AddedHunk {
 	// This handles cases where the file ends with a block of added lines.
 	flushHunk()
 	scratch.new = hunkLines
-
+	if len(spans) == 0 {
+		return nil
+	}
+	lines := make([]string, len(hunkLines))
+	copy(lines, hunkLines)
+	hunks := make([]AddedHunk, len(spans))
+	for i, sp := range spans {
+		hunks[i] = AddedHunk{StartLine: sp.startLine, Lines: lines[sp.start:sp.end:sp.end]}
+	}
 	return hunks
 }
 
