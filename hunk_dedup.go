@@ -24,27 +24,32 @@
 // downstream of itself:
 //
 //  1. Ordered commit source: orderCommitsParentFirst(loadAllCommits()),
-//     dispatched by the sequencer with a bounded look-ahead window.
+//     dispatched to the tree stage up to dedupLookaheadCommits ahead of
+//     the emit cursor.
 //  2. Parallel tree diff: workers resolve each dispatched commit's pair
-//     list into a per-commit ring slot (no channel sends, so tree workers
-//     can never block).
-//  3. Sequencer (the calling goroutine): walks commits in order, waits for
-//     each slot, and forwards pairs to blobChan stamped with a monotonic
-//     seq, dedupPairBatchSize pairs per message. Dispatch order == seq
-//     order, and the sequencer parks on dedupInFlightWindow once
-//     dedupMaxInFlightPairs seqs are undecided, so the decision stage's
-//     reorder buffer is bounded by construction however long one pair
-//     takes.
+//     list into a per-commit ring slot and estimate each pair's blob size
+//     from pack headers (no channel sends, so tree workers never block).
+//  3. Sequencer: state under seqMu that hunk workers advance when they
+//     need work (takeOrdered), so the in-order producer never competes
+//     with its consumers for a P. A stamp cursor assigns seqs to commits
+//     as soon as their slots complete and forwards expensive pairs at
+//     once on expensiveChan, so a multi-MB blob's materialization
+//     overlaps ordinary work; an emit cursor hands out every remaining
+//     pair in order, dedupPairBatchSize at a time. Stamping parks on
+//     dedupInFlightWindow once dedupMaxInFlightPairs seqs are undecided,
+//     so the reorder ring is bounded by construction however long one
+//     pair takes.
 //  4. Parallel hunk workers -> serial decision stage -> parallel yield:
-//     hunk workers compute each pair's hunks and run prefilterHunk against
-//     the set's published snapshot, so the decision goroutine receives
-//     (seq, hunks, unresolved fingerprints). It reorders by seq, settles
-//     each whole-hunk verdict with decideResult (serial, but over the
-//     unresolved fingerprints only), pre-processes the backlog with
-//     prepBacklog while it waits behind a straggling pair, and fans
-//     surviving hunks out in batches to a pool of yield workers that
-//     invoke fn concurrently. Only dedup decisions are serialized; output
-//     is deterministic as a multiset, never as an order.
+//     hunk workers compute each pair's hunks, run prefilterHunk against
+//     the set's published snapshot, and deliver (seq, hunks, unresolved
+//     fingerprints) into the reorder ring without blocking. The decision
+//     goroutine settles each whole-hunk verdict in seq order with
+//     decideResult (serial, but over the unresolved fingerprints only),
+//     pre-processes the backlog with prepBacklog while it waits behind a
+//     straggling pair, and fans surviving hunks out in batches to a pool
+//     of yield workers that invoke fn concurrently. Only dedup decisions
+//     are serialized; output is deterministic as a multiset, never as an
+//     order.
 //
 // Cross-file dependencies:
 //   - firstParentTree, emitCommitBlobPairs, streamBlobPairHunks
@@ -78,39 +83,55 @@ const (
 	// most one suppressed emission.
 	dedupZeroFingerprint = 0x9e3779b97f4a7c15
 
-	// dedupLookaheadCommits bounds how many commits ahead of the
-	// sequencer's cursor may be tree-diffed concurrently. It is also the
-	// size of the per-commit slot ring: an index is dispatched only while
-	// it is fewer than dedupLookaheadCommits ahead of the cursor, so a
-	// ring slot is never reused before the sequencer has consumed its
-	// previous occupant.
-	dedupLookaheadCommits = 256
+	// dedupLookaheadCommits bounds how many commits ahead of the emit
+	// cursor may be tree-diffed. It is also the size of the per-commit slot
+	// ring: an index is dispatched only while it is fewer than
+	// dedupLookaheadCommits ahead of the cursor, so a ring slot is never
+	// reused before the sequencer has consumed its previous occupant. The
+	// stamp cursor can run this far ahead, which is how far in advance an
+	// expensive pair can start: 8192 commits is several hundred
+	// milliseconds of ordinary work on a 32-core host, enough to hide a
+	// 100 ms blob materialization completely.
+	dedupLookaheadCommits = 8192
 
-	// dedupPairBatchSize is how many seq-stamped pairs travel per channel
-	// message on blobChan and resultChan. The sequencer is a single
-	// producer feeding every hunk worker, and each per-pair send under
-	// receiver contention cost several microseconds of its time (1.2s of a
-	// 1.4s scan on a 154k-pair repository), so pairs move in batches. The
-	// sequencer flushes a partial batch before it would block on a tree
-	// slot, so batching never starves the workers.
+	// dedupExpensiveChanCap bounds pairs forwarded ahead of order on
+	// expensiveChan. The sequencer only forwards early while the channel
+	// has room, so the channel never blocks it.
+	dedupExpensiveChanCap = 64
+
+	// dedupExpensivePairBytes is the estimated blob size from which a pair
+	// counts as expensive: materializing a blob this large takes tens of
+	// milliseconds and the store never caches it (maxCacheableSize), so
+	// the pair would hold the in-order decision stage for that long.
+	// Expensive pairs are forwarded as soon as their commit is tree-diffed,
+	// up to dedupLookaheadCommits ahead of order, so that latency overlaps
+	// ordinary work instead.
+	dedupExpensivePairBytes = 4 << 20
+
+	// dedupSizeProbeHops bounds the delta-chain headers estimatePackedSize
+	// follows; a long chain's early hops already reveal a large base.
+	dedupSizeProbeHops = 8
+
+	// dedupEarlyBytesCap bounds the estimated blob bytes of expensive pairs
+	// forwarded ahead of order and not yet decided. Their results, and the
+	// blobs their lines reference, sit in the reorder ring until their
+	// turn, so the cap keeps that retention to a few blobs' worth.
+	dedupEarlyBytesCap = 256 << 20
+
+	// dedupPairBatchSize is how many in-order pairs a hunk worker takes per
+	// takeOrdered call. One pair per call put the seqMu hand-off on every
+	// pair's critical path; sixteen amortizes it while keeping a worker's
+	// share small enough that the last batches finish together.
 	dedupPairBatchSize = 16
 
-	// dedupMaxInFlightPairs bounds seqs stamped but not yet decided. The
-	// decision stage drains resultChan into its reorder buffer
-	// unconditionally (so a straggling pair's result can always arrive),
-	// which means the buffer is bounded by what the sequencer stamps; the
-	// sequencer parks on dedupInFlightWindow once this many seqs are
-	// undecided. 65536 is about half a second of worker throughput on a
-	// 32-core host: a single whale pair (a 40 MB binary, a multi-MB
+	// dedupMaxInFlightPairs bounds seqs stamped but not yet decided, and
+	// therefore the reorder ring and the hunks it retains. Delivery into
+	// the ring never blocks, so this window is the pipeline's only
+	// backpressure. 65536 is about half a second of worker throughput on a
+	// 32-core host: a single expensive pair (a 40 MB binary, a multi-MB
 	// generated file) holds the order for 50-100 ms, and parking earlier
 	// measurably idled the workers behind it.
 	dedupMaxInFlightPairs = 65536
-
-	// dedupBlobChanCap is in batches: 32 batches of dedupPairBatchSize
-	// pairs keep every hunk worker supplied through the sequencer's
-	// own scheduling gaps without queueing much work ahead of the
-	// decision stage.
-	dedupBlobChanCap = 32
 
 	// dedupYieldChanCap decouples the serial decision stage from fn
 	// scheduling: a whale pair can release thousands of hunks at once, and
@@ -501,16 +522,22 @@ func (b *backlogScratch) seenBefore(fp, pos uint64) bool {
 // the next wait.
 type dedupInFlightWindow struct {
 	decided atomic.Uint64
-	wake    chan struct{}
+	// stampedSeqs mirrors the sequencer's seq counter for the decision
+	// stage's bookkeeping.
+	stampedSeqs atomic.Uint64
+	wake        chan struct{}
 }
+
+// stamped returns how many seqs the sequencer has assigned so far.
+func (w *dedupInFlightWindow) stamped() uint64 { return w.stampedSeqs.Load() }
 
 func newDedupInFlightWindow() *dedupInFlightWindow {
 	return &dedupInFlightWindow{wake: make(chan struct{}, 1)}
 }
 
-// advanced records that one more pair, in seq order, has been decided.
-func (w *dedupInFlightWindow) advanced() {
-	w.decided.Add(1)
+// advanced records that n more pairs, in seq order, have been decided.
+func (w *dedupInFlightWindow) advanced(n uint64) {
+	w.decided.Add(n)
 	select {
 	case w.wake <- struct{}{}:
 	default:
@@ -520,14 +547,17 @@ func (w *dedupInFlightWindow) advanced() {
 // wait blocks until fewer than dedupMaxInFlightPairs seqs below seq remain
 // undecided, or stopCh closes (reported as false).
 func (w *dedupInFlightWindow) wait(seq uint64, stopCh <-chan struct{}) bool {
-	for seq-w.decided.Load() >= dedupMaxInFlightPairs {
+	for {
+		decided := w.decided.Load()
+		if seq < decided || seq-decided < dedupMaxInFlightPairs {
+			return true
+		}
 		select {
 		case <-stopCh:
 			return false
 		case <-w.wake:
 		}
 	}
-	return true
 }
 
 // dedupHunkEmission decides whether one hunk survives dedup, marking every
@@ -598,12 +628,98 @@ type dedupCommitSlot struct {
 
 	// done is closed by the tree worker once pairs/err are final.
 	done chan struct{}
+
+	// firstSeq is the seq of pairs[0]; the sequencer sets it when it
+	// stamps the commit, which may happen well before the commit's
+	// ordinary pairs are forwarded.
+	firstSeq uint64
+
+	// expensive lists the pairs whose blobs the tree worker estimated at
+	// dedupExpensivePairBytes or more (see estimatePackedSize), in
+	// increasing index order, with the estimate.
+	expensive []dedupExpensivePair
+
+	// early lists the indices into pairs the sequencer already forwarded
+	// ahead of order as expensive pairs, in increasing order.
+	early []int
+}
+
+// estimatePackedSize returns an estimate of oid's materialized size from pack
+// headers alone, without inflating anything: the header size of a
+// non-delta object, or for a delta the largest header size seen while
+// following up to dedupSizeProbeHops base links. It reports 0 for objects it
+// cannot find or follow (loose objects, broken chains); the estimate is a
+// scheduling hint and never affects results.
+func (hs *HistoryScanner) estimatePackedSize(oid Hash) uint64 {
+	if oid.IsZero() {
+		return 0
+	}
+	pack, off, ok := hs.store.findPackedObject(oid)
+	if !ok {
+		return 0
+	}
+	var best uint64
+	for hop := 0; hop < dedupSizeProbeHops; hop++ {
+		var buf [32]byte
+		n, err := pack.ReadAt(buf[:], int64(off))
+		if n == 0 || (err != nil && n < 1) {
+			return best
+		}
+		typ, size, hdrLen := parseObjectHeaderUnsafe(buf[:n])
+		if hdrLen <= 0 {
+			return best
+		}
+		best = max(best, size)
+		switch typ {
+		case ObjOfsDelta:
+			back, err := readOfsDeltaOffset(pack, int64(off)+int64(hdrLen))
+			if err != nil || back == 0 || back > off {
+				return best
+			}
+			off -= back
+		case ObjRefDelta:
+			var base Hash
+			if _, err := pack.ReadAt(base[:], int64(off)+int64(hdrLen)); err != nil {
+				return best
+			}
+			if pack, off, ok = hs.store.findPackedObject(base); !ok {
+				return best
+			}
+		default:
+			return best
+		}
+	}
+	return best
+}
+
+// dedupExpensivePair names one pair of a commit whose blobs are estimated
+// large, with the larger of the two estimates.
+type dedupExpensivePair struct {
+	index int
+	bytes uint64
+}
+
+// expensivePairs returns the pairs whose old or new blob estimatePackedSize
+// puts at dedupExpensivePairBytes or more.
+func (hs *HistoryScanner) expensivePairs(pairs []blobPairWork) []dedupExpensivePair {
+	var out []dedupExpensivePair
+	for i := range pairs {
+		w := &pairs[i]
+		est := max(hs.estimatePackedSize(w.newOID), hs.estimatePackedSize(w.oldOID))
+		if est >= dedupExpensivePairBytes {
+			out = append(out, dedupExpensivePair{index: i, bytes: est})
+		}
+	}
+	return out
 }
 
 // dedupPairWork is one blob pair stamped with its global sequence number.
+// earlyBytes is the size estimate charged against dedupEarlyBytesCap when
+// the pair was forwarded ahead of order, and zero otherwise.
 type dedupPairWork struct {
-	seq  uint64
-	work blobPairWork
+	seq        uint64
+	work       blobPairWork
+	earlyBytes uint64
 }
 
 // dedupCandidate names one hunk of a pair that the decision stage must
@@ -627,6 +743,7 @@ type dedupPairResult struct {
 	seq        uint64
 	hunks      []HunkAddition
 	candidates []dedupCandidate
+	earlyBytes uint64
 }
 
 // prefilterHunk hashes h's lines and probes sn for each, returning the
@@ -676,23 +793,22 @@ func (hs *HistoryScanner) collectCommitPairs(c commitInfo) ([]blobPairWork, erro
 //
 // Goroutine/channel layout (N = runtime.NumCPU()):
 //
-//	caller goroutine        sequencer: dispatches slot indices, forwards
-//	                        seq-stamped pairs, then runs the shutdown chain
+//	caller goroutine        starts the stages, then runs the shutdown chain
 //	tree workers            min(N, maxTreeDiffWorkers), consume treeIdxChan,
 //	                        fill slots, never block
-//	hunk workers            N, consume blobChan, hash each line and probe
-//	                        the published fingerprint snapshot, produce
-//	                        resultChan with only the unresolved fingerprints
-//	decision goroutine      1, reorders by seq, owns the fingerprint set,
-//	                        settles verdicts from the unresolved fingerprints
-//	                        and produces batched yieldChan (closed on exit)
+//	hunk workers            N, take batches through takeWork (expensiveChan
+//	                        first, then the seqMu-guarded sequencer), hash
+//	                        each line, probe the published fingerprint
+//	                        snapshot, and deliver into the reorder ring
+//	decision goroutine      1, settles verdicts in seq order from the ring,
+//	                        owns the fingerprint set, produces batched
+//	                        yieldChan (closed on exit)
 //	yield workers           N, consume yieldChan batches, call fn concurrently
 //
 // On any error (setError closes stopCh) every stage unblocks via its stopCh
-// select and the shutdown chain — close(treeIdxChan), treeWG.Wait(),
-// close(blobChan), hunkWG.Wait(), close(resultChan), <-decisionDone,
-// yieldWG.Wait() — still runs to completion, so no goroutine outlives the
-// call.
+// select and the shutdown chain — hunkWG.Wait(), close(treeIdxChan),
+// treeWG.Wait(), <-decisionDone, yieldWG.Wait() — still runs to completion,
+// so no goroutine outlives the call.
 func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) error {
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
 
@@ -732,8 +848,41 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	treeWorkers := min(numWorkers, maxTreeDiffWorkers)
 
 	treeIdxChan := make(chan int, dedupLookaheadCommits)
-	blobChan := make(chan []dedupPairWork, dedupBlobChanCap)
-	resultChan := make(chan []dedupPairResult, numWorkers)
+	expensiveChan := make(chan []dedupPairWork, dedupExpensiveChanCap)
+	// Results travel through a reorder ring indexed by seq: the sequencer
+	// never stamps a seq that is dedupMaxInFlightPairs or more ahead of the
+	// decided count, so every undecided seq maps to a distinct slot, each
+	// written by exactly one worker and read by the decision goroutine.
+	// Workers therefore never block on delivery; the only backpressure is
+	// the in-flight window itself.
+	ring := make([]dedupPairResult, dedupMaxInFlightPairs)
+	present := make([]atomic.Bool, dedupMaxInFlightPairs)
+	// arrived collects delivered seqs for the decision goroutine's backlog
+	// pre-processing; resultsReady wakes it (without blocking the sender).
+	var (
+		arrivedMu    sync.Mutex
+		arrived      []uint64
+		resultsReady = make(chan struct{}, 1)
+	)
+	deliver := func(results []dedupPairResult) {
+		for _, res := range results {
+			i := res.seq & (dedupMaxInFlightPairs - 1)
+			ring[i] = res
+			present[i].Store(true)
+		}
+		arrivedMu.Lock()
+		for _, res := range results {
+			arrived = append(arrived, res.seq)
+		}
+		arrivedMu.Unlock()
+		select {
+		case resultsReady <- struct{}{}:
+		default:
+		}
+	}
+	// slotReady is pinged (without blocking) by tree workers when a slot
+	// completes so the sequencer can stamp ahead while it waits elsewhere.
+	slotReady := make(chan struct{}, 1)
 	yieldChan := make(chan []HunkAddition, dedupYieldChanCap)
 	stopCh := make(chan struct{})
 	slots := make([]dedupCommitSlot, dedupLookaheadCommits)
@@ -774,10 +923,19 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 					}
 					slot := &slots[idx%dedupLookaheadCommits]
 					pairs, err := hs.collectCommitPairs(order[idx])
+					var expensive []dedupExpensivePair
+					if err == nil {
+						expensive = hs.expensivePairs(pairs)
+					}
+					slot.expensive = expensive
 					// err must be visible before done closes: the
 					// sequencer reads both after <-slot.done.
 					slot.pairs, slot.err = pairs, err
 					close(slot.done)
+					select {
+					case slotReady <- struct{}{}:
+					default:
+					}
 					if err != nil {
 						setError(err)
 						return
@@ -787,73 +945,276 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		}()
 	}
 
+	// Sequencer state, advanced by whichever hunk worker needs work under
+	// seqMu. Running the sequencer on the consumers' own goroutines keeps
+	// the in-order producer from competing with them for a P: a dedicated
+	// producer goroutine on a saturated machine spent more time runnable
+	// than running and starved the workers it fed.
+	//
+	// Two cursors move over the commit order. The stamp cursor assigns seqs
+	// to commits as soon as their slots complete (contiguously, within the
+	// in-flight window) and forwards expensive pairs at once on
+	// expensiveChan, so their latency overlaps ordinary work. The emit
+	// cursor follows behind and hands out every remaining pair in order.
+	// Both read seqs from the slot, so seq order is commit order regardless
+	// of which path a pair travelled.
+	// earlyBytes is the estimated size of expensive pairs forwarded ahead
+	// of order and not yet decided (see dedupEarlyBytesCap).
+	var earlyBytes atomic.Uint64
+	var (
+		seqMu        sync.Mutex
+		nextDispatch int    // commits [0, nextDispatch) are in the tree stage
+		stamp        int    // commits [0, stamp) have seqs assigned
+		seq          uint64 // next seq to assign
+		emitCommit   int    // emit cursor: commit index
+		emitPair     int    // emit cursor: index into slot.pairs
+		emitEarly    []int  // emitCommit's early list, consumed as we pass
+		seqDone      bool   // every pair has been handed out
+	)
+	// dispatch keeps up to dedupLookaheadCommits commits in the tree stage
+	// ahead of the emit cursor. treeIdxChan's capacity equals the window,
+	// so the send never blocks.
+	dispatch := func() {
+		for nextDispatch < len(order) && nextDispatch-emitCommit < dedupLookaheadCommits {
+			slot := &slots[nextDispatch%dedupLookaheadCommits]
+			// Re-arm only the done channel: the tree worker overwrites
+			// pairs and err wholesale (adopting collectCommitPairs'
+			// returned slice) before closing done, and the ring slot's
+			// previous occupant (nextDispatch - dedupLookaheadCommits)
+			// was fully consumed before the window allowed this dispatch.
+			slot.done = make(chan struct{})
+			slot.early = slot.early[:0]
+			treeIdxChan <- nextDispatch
+			nextDispatch++
+		}
+	}
+	// stampAhead assigns seqs to every further commit whose slot is done,
+	// without blocking, and forwards its expensive pairs while
+	// expensiveChan has room. It stops at the first incomplete slot, at
+	// the in-flight window, or at a tree-stage error (reported as false).
+	stampAhead := func() bool {
+		for stamp < nextDispatch {
+			slot := &slots[stamp%dedupLookaheadCommits]
+			select {
+			case <-slot.done:
+			default:
+				return true
+			}
+			if slot.err != nil {
+				return false
+			}
+			n := uint64(len(slot.pairs))
+			// Stamping needs every seq of the commit inside the window so
+			// the decision ring can hold them. A commit wider than the
+			// window is stamped only once nothing else is in flight; the
+			// emit path then hands it out pair by pair under the same
+			// bound.
+			if n > 0 {
+				decided := inFlight.decided.Load()
+				if seq+n-decided > dedupMaxInFlightPairs && !(seq == decided && n > dedupMaxInFlightPairs) {
+					return true
+				}
+			}
+			slot.firstSeq = seq
+			for _, e := range slot.expensive {
+				if earlyBytes.Load()+e.bytes > dedupEarlyBytesCap {
+					break
+				}
+				select {
+				case expensiveChan <- []dedupPairWork{{seq: seq + uint64(e.index), work: slot.pairs[e.index], earlyBytes: e.bytes}}:
+					slot.early = append(slot.early, e.index)
+					earlyBytes.Add(e.bytes)
+				default:
+					// No room ahead of order; the emit cursor hands this
+					// pair out in its turn.
+				}
+			}
+			seq += n
+			inFlight.stampedSeqs.Store(seq)
+			stamp++
+		}
+		return true
+	}
+	// takeOrdered hands out the next batch of in-order pairs, blocking (with
+	// seqMu held) only while nothing can be handed out: the emit cursor's
+	// slot is still in the tree stage, or the in-flight window is full.
+	// Nothing it waits on needs seqMu, so holding it is safe: tree workers
+	// and the decision goroutine run independently of the sequencer. It
+	// returns nil, false once every pair has been handed out or the
+	// pipeline is stopping.
+	takeOrdered := func() ([]dedupPairWork, bool) {
+		seqMu.Lock()
+		defer seqMu.Unlock()
+		if seqDone {
+			return nil, false
+		}
+		var batch []dedupPairWork
+		for emitCommit < len(order) {
+			dispatch()
+			if !stampAhead() {
+				setError(slots[stamp%dedupLookaheadCommits].err)
+				return nil, false
+			}
+			slot := &slots[emitCommit%dedupLookaheadCommits]
+			if stamp <= emitCommit {
+				// Not stamped yet: stampAhead stopped at slot(stamp),
+				// which is either still in the tree stage or blocked by
+				// the window. Hand out what we have first so the caller
+				// stays busy, then wait for whichever it is.
+				if len(batch) > 0 {
+					return batch, true
+				}
+				blocked := &slots[stamp%dedupLookaheadCommits]
+				select {
+				case <-blocked.done:
+				default:
+					select {
+					case <-stopCh:
+						return nil, false
+					case <-blocked.done:
+					case <-slotReady:
+					}
+					continue
+				}
+				// Done but unstamped, so the window is full (stampAhead
+				// stamps empty commits unconditionally, so n >= 1): park
+				// until the decision stage frees room for the commit, or
+				// for one pair of a commit wider than the window.
+				want := seq + uint64(len(blocked.pairs)) - 1
+				if uint64(len(blocked.pairs)) > dedupMaxInFlightPairs {
+					want = seq
+				}
+				if !inFlight.wait(want, stopCh) {
+					return nil, false
+				}
+				continue
+			}
+			if emitPair == 0 {
+				emitEarly = slot.early
+			}
+			for ; emitPair < len(slot.pairs); emitPair++ {
+				if len(emitEarly) > 0 && emitEarly[0] == emitPair {
+					emitEarly = emitEarly[1:]
+					continue
+				}
+				s := slot.firstSeq + uint64(emitPair)
+				if s-inFlight.decided.Load() >= dedupMaxInFlightPairs {
+					// Only reachable inside a commit wider than the window.
+					if len(batch) > 0 {
+						return batch, true
+					}
+					if !inFlight.wait(s, stopCh) {
+						return nil, false
+					}
+				}
+				if batch == nil {
+					batch = make([]dedupPairWork, 0, dedupPairBatchSize)
+				}
+				batch = append(batch, dedupPairWork{seq: s, work: slot.pairs[emitPair]})
+				// Once every commit is in the tree stage the scan is in its
+				// final window; single-pair batches there spread the last
+				// pairs across workers instead of leaving one worker with a
+				// sixteen-pair tail.
+				if len(batch) == dedupPairBatchSize || nextDispatch == len(order) {
+					emitPair++
+					return batch, true
+				}
+			}
+			emitPair = 0
+			emitCommit++
+		}
+		seqDone = true
+		if len(batch) > 0 {
+			return batch, true
+		}
+		return nil, false
+	}
+	// takeWork returns the next batch for a hunk worker. Early-forwarded
+	// expensive pairs take priority: they were sent ahead of order
+	// precisely so their latency overlaps the ordinary stream. Once the
+	// ordered stream is exhausted a worker drains whatever is still queued
+	// on expensiveChan before it exits.
+	takeWork := func() ([]dedupPairWork, bool) {
+		select {
+		case <-stopCh:
+			return nil, false
+		case works := <-expensiveChan:
+			return works, true
+		default:
+		}
+		if works, ok := takeOrdered(); ok {
+			return works, true
+		}
+		select {
+		case works := <-expensiveChan:
+			return works, true
+		default:
+			return nil, false
+		}
+	}
+
 	for range numWorkers {
 		hunkWG.Add(1)
 		go func() {
 			defer hunkWG.Done()
 			for {
-				select {
-				case <-stopCh:
+				works, ok := takeWork()
+				if !ok {
 					return
-				case works, ok := <-blobChan:
-					if !ok {
-						return
-					}
-					results := make([]dedupPairResult, 0, len(works))
-					for _, pw := range works {
-						var hunks []HunkAddition
-						if err := hs.streamBlobPairHunks(pw.work, func(h HunkAddition) error {
-							hunks = append(hunks, h)
-							return nil
-						}); err != nil {
-							setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
-							return
-						}
-						// Hash and speculatively probe here, in parallel, so
-						// the decision goroutine only touches fingerprints the
-						// snapshot did not already hold. One buffer per pair
-						// keeps the unresolved lists as sub-slices of a single
-						// allocation.
-						var buf []uint64
-						var cands []dedupCandidate
-						for i := range hunks {
-							h := &hunks[i]
-							if h.isBinary {
-								cands = append(cands, dedupCandidate{hunk: i})
-								continue
-							}
-							start := len(buf)
-							buf = prefilterHunk(h, set.snapshot(), buf)
-							if len(buf) > start {
-								cands = append(cands, dedupCandidate{hunk: i, unresolved: buf[start:len(buf):len(buf)]})
-							}
-						}
-						results = append(results, dedupPairResult{seq: pw.seq, hunks: hunks, candidates: cands})
-					}
-					select {
-					case <-stopCh:
-						return
-					case resultChan <- results:
-					}
 				}
+				results := make([]dedupPairResult, 0, len(works))
+				for _, pw := range works {
+					var hunks []HunkAddition
+					if err := hs.streamBlobPairHunks(pw.work, func(h HunkAddition) error {
+						hunks = append(hunks, h)
+						return nil
+					}); err != nil {
+						setError(fmt.Errorf("failed diffing %s in commit %s: %w", pw.work.path, pw.work.commit, err))
+						return
+					}
+					// Hash and speculatively probe here, in parallel, so the
+					// decision goroutine only touches fingerprints the
+					// snapshot did not already hold. One buffer per pair
+					// keeps the unresolved lists as sub-slices of a single
+					// allocation.
+					var buf []uint64
+					var cands []dedupCandidate
+					for i := range hunks {
+						h := &hunks[i]
+						if h.isBinary {
+							cands = append(cands, dedupCandidate{hunk: i})
+							continue
+						}
+						start := len(buf)
+						buf = prefilterHunk(h, set.snapshot(), buf)
+						if len(buf) > start {
+							cands = append(cands, dedupCandidate{hunk: i, unresolved: buf[start:len(buf):len(buf)]})
+						}
+					}
+					results = append(results, dedupPairResult{seq: pw.seq, hunks: hunks, candidates: cands, earlyBytes: pw.earlyBytes})
+				}
+				deliver(results)
 			}
 		}()
 	}
+
+	// hunkersDone closes once every hunk worker has exited, so the decision
+	// goroutine can tell a quiet ring from a finished scan.
+	hunkersDone := make(chan struct{})
+	go func() {
+		hunkWG.Wait()
+		close(hunkersDone)
+	}()
 
 	decisionDone := make(chan struct{})
 	go func() {
 		defer close(decisionDone)
 		defer close(yieldChan)
-		// In-flight seqs are bounded by (cap(blobChan) + numWorkers +
-		// cap(resultChan)) * dedupPairBatchSize, so the reorder buffer
-		// stays small; it only grows toward that bound when pair completion
-		// times are skewed.
-		pending := make(map[uint64]dedupPairResult, 64)
 		next := uint64(0)
 		batch := make([]HunkAddition, 0, dedupYieldBatchHunks)
-		// backlog holds seqs of pending results not yet pre-processed by
-		// prepBacklog; it is worked through only while next is missing and
-		// resultChan is empty, i.e. while this goroutine would otherwise
+		// backlog holds delivered seqs not yet pre-processed by prepBacklog;
+		// it is worked through only while next is missing and no new
+		// results are waiting, i.e. while this goroutine would otherwise
 		// idle behind a straggling pair.
 		var backlog []uint64
 		scratch := newBacklogScratch()
@@ -874,72 +1235,84 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		// drain settles every pair that is ready in seq order. It reports
 		// false when the pipeline is stopping.
 		drain := func() bool {
+			start := next
 			for {
-				r, ok := pending[next]
-				if !ok {
+				i := next & (dedupMaxInFlightPairs - 1)
+				if !present[i].Load() {
 					break
 				}
-				delete(pending, next)
+				r := ring[i]
+				ring[i] = dedupPairResult{}
+				present[i].Store(false)
 				next++
+				if r.earlyBytes != 0 {
+					earlyBytes.Add(^(r.earlyBytes - 1))
+				}
 				batch = set.decideResult(r, batch)
 				if len(batch) >= dedupYieldBatchHunks && !flush() {
 					return false
 				}
-				inFlight.advanced()
 			}
-			if len(pending) == 0 {
-				backlog = backlog[:0]
-				scratch.reset()
+			if next != start {
+				inFlight.advanced(next - start)
+				if next == inFlight.stamped() {
+					// Nothing undecided remains, so the backlog is empty
+					// in effect; forget it and the scratch it fed.
+					backlog = backlog[:0]
+					scratch.reset()
+				}
 			}
 			// Release what is ready rather than holding a partial batch
 			// until the next result arrives.
 			return flush()
 		}
-		accept := func(results []dedupPairResult) {
-			for _, res := range results {
-				pending[res.seq] = res
-				backlog = append(backlog, res.seq)
-			}
+		// collect moves newly delivered seqs into the backlog and reports
+		// whether there were any.
+		collect := func() bool {
+			arrivedMu.Lock()
+			n := len(arrived)
+			backlog = append(backlog, arrived...)
+			arrived = arrived[:0]
+			arrivedMu.Unlock()
+			return n > 0
 		}
 		for {
-			// Prefer new results; they may carry next.
 			select {
 			case <-stopCh:
 				return
-			case results, ok := <-resultChan:
-				if !ok {
-					flush()
-					return
-				}
-				accept(results)
+			case <-resultsReady:
+				collect()
 				if !drain() {
 					return
 				}
 				continue
 			default:
 			}
-			// Nothing ready: pre-process one backlog entry so the drain
-			// after the straggler has little left to probe, then block.
+			// Nothing new: pre-process one backlog entry so the drain after
+			// the straggler has little left to probe, then block.
 			if len(backlog) > 0 {
 				seq := backlog[len(backlog)-1]
 				backlog = backlog[:len(backlog)-1]
-				if r, ok := pending[seq]; ok {
-					set.prepBacklog(r, scratch)
+				if seq >= next {
+					if i := seq & (dedupMaxInFlightPairs - 1); present[i].Load() {
+						set.prepBacklog(ring[i], scratch)
+					}
 				}
 				continue
 			}
 			select {
 			case <-stopCh:
 				return
-			case results, ok := <-resultChan:
-				if !ok {
-					flush()
-					return
-				}
-				accept(results)
+			case <-resultsReady:
+				collect()
 				if !drain() {
 					return
 				}
+			case <-hunkersDone:
+				// Late deliveries may have raced the close; one last pass.
+				collect()
+				drain()
+				return
 			}
 		}
 	}()
@@ -967,98 +1340,12 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		}()
 	}
 
-	// Sequencer: runs on the calling goroutine. dispatch keeps up to
-	// dedupLookaheadCommits commits in flight ahead of the cursor; the
-	// wait-then-forward loop below imposes the global pair order.
-	nextDispatch := 0
-	dispatch := func(cursor int) bool {
-		for nextDispatch < len(order) && nextDispatch-cursor < dedupLookaheadCommits {
-			slot := &slots[nextDispatch%dedupLookaheadCommits]
-			// Re-arm only the done channel: the tree worker overwrites
-			// pairs and err wholesale (adopting collectCommitPairs'
-			// returned slice) before closing done, and the ring slot's
-			// previous occupant (nextDispatch - dedupLookaheadCommits)
-			// was fully consumed before the window allowed this dispatch.
-			slot.done = make(chan struct{})
-			select {
-			case <-stopCh:
-				return false
-			case treeIdxChan <- nextDispatch:
-			}
-			nextDispatch++
-		}
-		return true
-	}
-
-	var seq uint64
-	batch := make([]dedupPairWork, 0, dedupPairBatchSize)
-	// flushBatch hands the accumulated pairs to the hunk workers. It
-	// reports false when the pipeline is stopping.
-	flushBatch := func() bool {
-		if len(batch) == 0 {
-			return true
-		}
-		select {
-		case <-stopCh:
-			return false
-		case blobChan <- batch:
-		}
-		batch = make([]dedupPairWork, 0, dedupPairBatchSize)
-		return true
-	}
-seqLoop:
-	for i := range order {
-		if !dispatch(i) {
-			break
-		}
-		slot := &slots[i%dedupLookaheadCommits]
-		select {
-		case <-slot.done:
-		default:
-			// The tree stage has not finished this commit: release the
-			// partial batch so hunk workers stay busy while we wait.
-			if !flushBatch() {
-				break seqLoop
-			}
-			select {
-			case <-stopCh:
-				break seqLoop
-			case <-slot.done:
-			}
-		}
-		if slot.err != nil {
-			// The tree worker already routed the error through setError.
-			break
-		}
-		for _, w := range slot.pairs {
-			if seq-inFlight.decided.Load() >= dedupMaxInFlightPairs {
-				// Window full: release what we hold so the decision stage
-				// can make progress, then park until it does.
-				if !flushBatch() || !inFlight.wait(seq, stopCh) {
-					break seqLoop
-				}
-			}
-			batch = append(batch, dedupPairWork{seq: seq, work: w})
-			seq++
-			// Once every commit has been dispatched to the tree stage the
-			// scan is in its final window; single-pair batches there spread
-			// the last pairs across workers instead of leaving one worker
-			// with a sixteen-pair tail.
-			if (len(batch) == dedupPairBatchSize || nextDispatch == len(order)) && !flushBatch() {
-				break seqLoop
-			}
-		}
-	}
-	flushBatch()
-
 	// Shutdown chain: close each stage's input only after its upstream
 	// senders have exited, and wait for every goroutine so none outlives
 	// this call — on the error path stopCh has every stage unblocked.
+	hunkWG.Wait()
 	close(treeIdxChan)
 	treeWG.Wait()
-	close(blobChan)
-	hunkWG.Wait()
-	close(resultChan)
 	<-decisionDone
 	yieldWG.Wait()
 
