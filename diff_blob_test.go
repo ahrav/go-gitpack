@@ -7,10 +7,12 @@ package objstore
 
 import (
 	"bytes"
+	"fmt"
 	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
+	"unsafe"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -332,6 +334,32 @@ func FuzzAddedHunks(f *testing.F) {
 			assert.Nil(t, result, "expected nil for equal inputs")
 		}
 	})
+}
+
+// Clearing line-table headers past a recycled table's new length releases
+// their references to source blobs.
+func TestLineScratchClearsShrunkTail(t *testing.T) {
+	// Each side starts with a distinct line, so commonPrefixLineBoundary
+	// returns 0.
+	lines := func(first string, n int) []byte {
+		var b bytes.Buffer
+		b.WriteString(first + "\n")
+		for i := 1; i < n; i++ {
+			fmt.Fprintf(&b, "%s-%d\n", first, i)
+		}
+		return b.Bytes()
+	}
+
+	sc := &lineScratch{}
+	_ = addedHunksWithPosScratch(lines("old-a", 400), lines("new-a", 500), sc)
+	_ = addedHunksWithPosScratch(lines("old-b", 40), lines("new-b", 50), sc)
+
+	for name, table := range map[string][]string{"old": sc.old, "new": sc.new} {
+		for i, s := range table[len(table):cap(table)] {
+			require.Nil(t, unsafe.StringData(s),
+				"%s table slot %d past len %d still views an earlier blob", name, len(table)+i, len(table))
+		}
+	}
 }
 
 // TestAddedHunksWithPosDoesNotPoolOversizedIndex proves the lineIndex pool

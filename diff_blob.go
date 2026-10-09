@@ -307,12 +307,20 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 // recycled across diffs instead of being allocated and zeroed per pair:
 // those two arrays were about a fifth of all bytes a scan allocated.
 //
-// A recycled table is overwritten up to the new line count; headers beyond
-// that length are stale views from an earlier diff and keep that diff's
-// blob reachable until they are overwritten. addedHunksWithPos only runs on
-// blobs up to SmallFileThreshold, so a pooled table pins at most a few MiB.
+// Each table views only the blob of its latest diff (see retokenize).
 type lineScratch struct {
 	old, new []string
+}
+
+// Headers the previous split wrote past the new line count would keep the
+// previous blob reachable, so retokenize clears them.
+func retokenize(table []string, src []byte) []string {
+	prev := len(table)
+	out := tokenizeInto(table, src)
+	if n := len(out); n < prev {
+		clear(table[n:prev])
+	}
+	return out
 }
 
 var lineScratchPool = sync.Pool{New: func() any { return &lineScratch{} }}
@@ -506,8 +514,8 @@ func addedHunksWithPosScratch(oldB, newB []byte, sc *lineScratch) []AddedHunk {
 	// This is a zero-copy operation, creating string views into the original slices.
 	var oldLines, newLines []string
 	if sc != nil {
-		sc.old = tokenizeInto(sc.old, oldB)
-		sc.new = tokenizeInto(sc.new, newB)
+		sc.old = retokenize(sc.old, oldB)
+		sc.new = retokenize(sc.new, newB)
 		oldLines, newLines = sc.old, sc.new
 	} else {
 		oldLines, newLines = tokenize(oldB), tokenize(newB)
