@@ -12,9 +12,9 @@ import (
 // and a trailing line without a newline is included. Empty input returns
 // nil.
 //
-// Newlines are located 64 bytes at a time: eight word-sized SWAR tests fold
-// into one 64-bit mask with a bit per newline, and the lines are then cut at
-// the set bits. Source lines average a few dozen bytes, where a per-line
+// Newlines are located 64 bytes at a time: newlineMask64 (SSE2 compares on
+// amd64, word-sized SWAR tests elsewhere) yields one 64-bit mask with a bit
+// per newline, and the lines are then cut at the set bits. Source lines average a few dozen bytes, where a per-line
 // IndexByte call spends most of its time in call overhead and loop-exit
 // mispredictions; the block mask pays those costs once per 64 bytes instead
 // of once per line and stays portable across architectures.
@@ -40,15 +40,7 @@ func tokenizeInto(dst []string, src []byte) []string {
 	start := 0 // start of the current line
 	i := 0
 	for ; i+64 <= len(src); i += 64 {
-		p := unsafe.Pointer(unsafe.SliceData(src[i : i+64]))
-		m := newlineMask8(*(*uint64)(p)) |
-			newlineMask8(*(*uint64)(unsafe.Add(p, 8)))<<8 |
-			newlineMask8(*(*uint64)(unsafe.Add(p, 16)))<<16 |
-			newlineMask8(*(*uint64)(unsafe.Add(p, 24)))<<24 |
-			newlineMask8(*(*uint64)(unsafe.Add(p, 32)))<<32 |
-			newlineMask8(*(*uint64)(unsafe.Add(p, 40)))<<40 |
-			newlineMask8(*(*uint64)(unsafe.Add(p, 48)))<<48 |
-			newlineMask8(*(*uint64)(unsafe.Add(p, 56)))<<56
+		m := newlineMask64(unsafe.SliceData(src[i : i+64]))
 		for m != 0 {
 			nl := i + bits.TrailingZeros64(m)
 			lines = append(lines, btostr(src[start:nl]))

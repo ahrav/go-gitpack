@@ -621,7 +621,13 @@ var nlByte = []byte{'\n'}
 func commonPrefixLineBoundary(a, b []byte) int {
 	n := min(len(a), len(b))
 	i := 0
-	// Word-at-a-time comparison; falls back to byte steps near the end.
+	// Consecutive versions usually share kilobytes of prefix, so the bulk
+	// of it is compared a chunk at a time through the runtime's vectorized
+	// equality, then the mismatching chunk is narrowed word- and byte-wise.
+	const chunk = 256
+	for i+chunk <= n && bytes.Equal(a[i:i+chunk], b[i:i+chunk]) {
+		i += chunk
+	}
 	for i+8 <= n && le64(a[i:]) == le64(b[i:]) {
 		i += 8
 	}
