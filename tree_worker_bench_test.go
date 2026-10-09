@@ -2,7 +2,7 @@
 // history shaped to bind on stage 1 (tree diffing + parent-header inflation):
 // thousands of commits that each change one small file in a moderately wide
 // tree. Stage-2 hunk work per commit is trivial, so pipeline throughput
-// tracks the tree-worker stage — the stage capped by maxTreeDiffWorkers.
+// tracks the tree-worker stage: the stage capped by maxTreeDiffWorkers.
 //
 // This is the harness behind the measured choice of maxTreeDiffWorkers; see
 // the constant's comment in history_scanner.go.

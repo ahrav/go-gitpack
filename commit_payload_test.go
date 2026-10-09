@@ -1,7 +1,7 @@
 // commit_payload_test.go verifies store.readCommitPayload against the
 // authoritative Git implementation: for every commit in a repository built to
-// contain all three storage shapes — plain packed (non-delta), delta-chained,
-// and loose — the payload must byte-equal `git cat-file commit` output.
+// contain all three storage shapes (plain packed non-delta, delta-chained,
+// and loose), the payload must byte-equal `git cat-file commit` output.
 //
 // The oracle is deliberately `git cat-file commit` (raw object bytes, no
 // "commit <size>\0" prefix) and NOT `git log --format=%B`, which re-encodes

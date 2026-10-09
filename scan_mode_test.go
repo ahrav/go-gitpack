@@ -347,7 +347,7 @@ func TestReleaseOversizedPayload(t *testing.T) {
 // TestHistoryScanner_Scan_HunkModeDeliversPayloadAfterRelease drives hunk mode
 // over an addition larger than maxReusedHunkPayloadBytes followed by a small
 // one, so the release path runs between two real ScanBlob calls. Both payloads
-// must arrive intact — a release that dropped bytes still in flight, or left
+// must arrive intact: a release that dropped bytes still in flight, or left
 // the buffer unusable, shows up here.
 func TestHistoryScanner_Scan_HunkModeDeliversPayloadAfterRelease(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {

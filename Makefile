@@ -39,11 +39,11 @@ build:
 ## because cross-compilation disables cgo anyway, and the explicit setting
 ## keeps the legs reproducible on a native runner too (the linux/arm64 leg
 ## exercises the `!cgo` arm on the machine that would otherwise default to
-## cgo). The one arm cross-compilation cannot reach — arm64 with cgo AND
-## gitpack_libdeflate, where the tag alone must deselect the asm file — is
+## cgo). The one arm cross-compilation cannot reach (arm64 with cgo AND
+## gitpack_libdeflate, where the tag alone must deselect the asm file) is
 ## pinned by the CI libdeflate job's ARM64 leg.
 ##
-## `go build ./...` deliberately includes examples/ — they are plain Go with no
+## `go build ./...` deliberately includes examples/: they are plain Go with no
 ## cgo or platform constraints, so they must cross-compile as well.
 ##
 ## Cross-vet runs only for darwin/arm64 (asm-active leg: vets the wrapper and
@@ -109,7 +109,7 @@ tidy:
 ## the per-instruction register/ISA audit lives in
 ## inflate_fast_amd64_linkaudit_test.go, which cannot afford two full builds).
 ## Builds the test binary under both link modes and diffs `go tool objdump`
-## of the kernel symbol on the (file:line, opcode-bytes) columns — absolute
+## of the kernel symbol on the (file:line, opcode-bytes) columns: absolute
 ## addresses shift between link modes, but relative displacements live in the
 ## opcode bytes, so equal bytes mean identical instructions. Skips when the
 ## effective GOARCH is not amd64 or when no C toolchain is available

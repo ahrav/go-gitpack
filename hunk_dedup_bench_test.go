@@ -11,7 +11,7 @@
 // Two tiers, because they answer different questions:
 //
 //	dedupHunkEmission micro   what one hunk's verdict costs, by hunk size and
-//	                          duplicate regime — isolates the decision
+//	                          duplicate regime: isolates the decision
 //	                          function from git, I/O, and the pipeline.
 //	DiffHistoryHunksFunc E2E  whether that cost is visible end-to-end, as
 //	                          dedup-off vs dedup-on over a fixture built to
@@ -34,9 +34,9 @@ import (
 // Width is explicit and load-bearing, because lineFingerprint's cost is a step
 // function of it: farm.Hash64 dispatches on input length, and on this package's
 // measurements the 65-96 byte band costs about twice the <=64 byte band
-// (~19.5 ns vs ~9.9 ns for a single hash). Real source lines are mostly short —
-// this repository's own Go sources measure p50=24, p75=50, p90=73, with 84% at
-// or under 64 bytes — so a benchmark built only from wide lines overstates
+// (~19.5 ns vs ~9.9 ns for a single hash). Real source lines are mostly short
+// (this repository's own Go sources measure p50=24, p75=50, p90=73, with 84% at
+// or under 64 bytes) so a benchmark built only from wide lines overstates
 // hashing's share of the dedup decision and flatters any change that removes
 // hash calls. Cover both bands.
 func dedupBenchLines(tag string, n, width int) []string {
@@ -80,7 +80,7 @@ var dedupBenchHunkSizes = []int{1, 8, 64, 512}
 // regime: every line of the hunk was already seen, so the hunk is suppressed.
 //
 // This is both the worst case and the case the feature exists to produce. It
-// is also the only regime that is idempotent across iterations — the set
+// is also the only regime that is idempotent across iterations: the set
 // already contains every line, so no iteration inserts, grows, or saturates,
 // and iteration N costs exactly what iteration 1 did. Regimes that insert
 // would either drift or force a fresh 256 KiB table per iteration.
@@ -120,11 +120,11 @@ func BenchmarkDedupHunkEmission(b *testing.B) {
 // unique file keeps every revision's own hunk emitted, so the two counters
 // the E2E benchmark reports separate suppressed from surviving work. It is
 // the vendored-file / license-header / copied-config shape the feature
-// targets, and it is precisely what the checked-in fixtures lack — they add
+// targets, and it is precisely what the checked-in fixtures lack: they add
 // one distinct line per commit and never repeat content.
 //
 // blockLines controls the hunk size, lineWidth the per-line hashing cost (see
-// dedupBenchLines — farm.Hash64's cost steps at 64 bytes), and revisions how
+// dedupBenchLines; farm.Hash64's cost steps at 64 bytes), and revisions how
 // many duplicate hunks the scan sees.
 func (f *hunkBenchFixtures) dupChurn(tb testing.TB, blockLines, lineWidth, revisions int) string {
 	tb.Helper()
@@ -150,7 +150,7 @@ func (f *hunkBenchFixtures) dupChurn(tb testing.TB, blockLines, lineWidth, revis
 // BenchmarkDiffHistoryHunksDedup measures a full hunk scan with dedup off and
 // on over the same fixture, so the delta is the dedup pipeline's cost.
 //
-// Off vs on is not a pure overhead comparison — dedup suppresses hunks, so it
+// Off vs on is not a pure overhead comparison: dedup suppresses hunks, so it
 // also does strictly less consumer work. Both counters are reported so the
 // two effects can be separated: hunks is what reached fn, and a large drop
 // with a small time delta means the decision stage is eating the savings.
@@ -194,7 +194,7 @@ func BenchmarkDiffHistoryHunksDedup(b *testing.B) {
 				}()
 
 				// fn is invoked concurrently from multiple workers even in
-				// dedup mode — only the dedup decisions are serialized — so
+				// dedup mode (only the dedup decisions are serialized) so
 				// these counters must be atomic. Plain increments here race,
 				// and the lost updates look exactly like the scan emitting a
 				// different number of hunks each iteration.

@@ -159,8 +159,8 @@ func (c *readLoopConsumer) ScanBlob(r io.Reader, _ ScanMeta) error {
 //
 // io.Discard implements WriteString, so io.Copy(io.Discard, aStringsReader)
 // never converts the string and would hide exactly the cost this benchmark
-// exists to expose. A destination with only Write forces []byte(s) — one
-// payload-sized allocation and copy — which is what a real consumer that
+// exists to expose. A destination with only Write forces []byte(s) (one
+// payload-sized allocation and copy) which is what a real consumer that
 // wants bytes actually pays.
 //
 // Do not "simplify" this to io.Discard.
@@ -369,7 +369,7 @@ func gitCommitTB(tb testing.TB, dir, file string, rev int) {
 // The default budget is far below this: defaultPairCacheBudget gives each
 // shard 4 MiB and therefore refuses any single hunk above 1 MiB, so a
 // multi-megabyte binary hunk is never memoized by a default scanner. The Warm
-// variant raises the budget for exactly that reason — see
+// variant raises the budget for exactly that reason: see
 // TestScanHunksBench_DefaultPairCacheRefusesLargeBinaryHunks.
 func warmPairCacheBudget(hunkBytes int) int {
 	// int64 math: on a 32-bit build 8*pairCacheShards*(16<<20) is exactly 2^32
@@ -446,12 +446,12 @@ type hunkScanCase struct {
 //
 // The matrix is fixture × cache state × consumer:
 //
-//	fixture      BinaryChurn_1MiB, BinaryChurn_16MiB  — binary hunks
-//	             LargeTextSmallDiff_8MiB, TextRepo    — text hunks (controls)
+//	fixture      BinaryChurn_1MiB, BinaryChurn_16MiB: binary hunks
+//	             LargeTextSmallDiff_8MiB, TextRepo: text hunks (controls)
 //	cache state  Cold (no memoization at all)
 //	             Warm (diff memo serves every hunk; payload assembly isolated)
-//	consumer     ReadLoop               — fixed scratch, no payload-sized copy
-//	             CopyToNonStringWriter  — io.Copy into a Write-only sink
+//	consumer     ReadLoop: fixed scratch, no payload-sized copy
+//	             CopyToNonStringWriter: io.Copy into a Write-only sink
 //
 // The two text fixtures are controls: they must show no delta across a change
 // that only touches the binary branch.
@@ -539,14 +539,14 @@ func runHunkScanBench(b *testing.B, c hunkScanCase) {
 		// preferred over constructing a fresh HistoryScanner per iteration:
 		// that would put index mapping inside the timed region, and b.Loop
 		// must not be mixed with manual StopTimer/StartTimer. The offset cache
-		// has to go too — it holds materialized objects up to 4 MiB, so
+		// has to go too: it holds materialized objects up to 4 MiB, so
 		// leaving it on would silently serve the 1 MiB fixture's blobs from
 		// memory and make "Cold" cold in name only.
 		{name: "Cold", pairBudget: 0, offsetBudget: 0},
 
 		// Warm lets the diff memo serve every hunk, so no blob is loaded and
 		// no diff is recomputed inside the timed region. What remains is the
-		// commit walk, the tree diffs, payload assembly, and the consumer —
+		// commit walk, the tree diffs, payload assembly, and the consumer:
 		// which is what this measurement is for.
 		{name: "Warm", pairBudget: c.warmBudget, offsetBudget: defaultOffsetCacheBudget},
 	}
@@ -751,7 +751,7 @@ func TestScanHunksBench_SinkShapesAreLoadBearing(t *testing.T) {
 // 1 MiB at the default budget, so a default scanner never memoizes a
 // multi-megabyte binary hunk and every repeated scan re-inflates the blob. It
 // also shows the flip side: once the budget admits the entry, the memo retains
-// the hunk — and because a binary hunk's single line is a zero-copy view over
+// the hunk, and because a binary hunk's single line is a zero-copy view over
 // the whole blob, retaining it retains the whole blob.
 func TestScanHunksBench_DefaultPairCacheRefusesLargeBinaryHunks(t *testing.T) {
 	requireGit(t)

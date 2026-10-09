@@ -369,7 +369,7 @@ func TestLineScratchClearsShrunkTail(t *testing.T) {
 // Without a retention cap, build() only ever grows slots/next and the defer
 // in addedHunksWithPos re-pools the index unconditionally, so one ~2^20-line
 // file ratchets a pooled index to ~20 MiB (16 MiB slots + 4 MiB next) that
-// sync.Pool then retains across GC cycles — once per scan worker. GC is
+// sync.Pool then retains across GC cycles: once per scan worker. GC is
 // disabled for the duration of the test so the pool cannot shed entries
 // between the Put (inside addedHunksWithPos) and the Get below, making the
 // pre-fix failure deterministic when run in isolation.

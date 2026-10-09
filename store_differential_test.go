@@ -1,6 +1,6 @@
-// store_differential_test.go cross-checks the object-materialization paths —
-// iterative delta-chain resolution and zero-copy inflation out of the mmap'd
-// pack — against the authoritative Git implementation.
+// store_differential_test.go cross-checks the object-materialization paths
+// (iterative delta-chain resolution and zero-copy inflation out of the mmap'd
+// pack) against the authoritative Git implementation.
 //
 // The oracle is `git cat-file`: for every object in a repository whose pack has
 // been repacked into deep delta chains, the bytes produced by the store must be
@@ -58,7 +58,7 @@ func buildDeltaHeavyRepo(t *testing.T) (repoDir, packDir string) {
 	// Content shapes chosen to exercise distinct materialization paths:
 	//
 	//   a.txt  strict-append growth. Each version is a superset of the prior
-	//          one, which is exactly what Git's delta selector chains — this
+	//          one, which is exactly what Git's delta selector chains: this
 	//          produces the multi-hop chains (requireHasDeltas enforces a
 	//          deepest chain of at least 2 hops) that drive the ping-pong arena
 	//          and the offset-cache short-circuit. The fixture blobs stay a few
@@ -138,14 +138,14 @@ func listGitObjects(t *testing.T, repoDir string) []gitObject {
 //
 // One `git cat-file --batch` process serves the whole object list. Spawning a
 // process per object instead would cost one fork+exec per object, and these
-// tests walk every object in a 120-commit repository twice over — enough
+// tests walk every object in a 120-commit repository twice over: enough
 // subprocess churn to dominate a default `go test` run.
 //
 // The reported type is checked against the enumerated one as a side effect, as
 // a consistency check between two git responses rather than an independent
 // oracle: `cat-file --batch-all-objects --batch-check` in listGitObjects and the
 // `cat-file --batch` here are both git. The check cannot fail from the fixture
-// changing under the test — an object's type is part of the bytes hashed into
+// changing under the test: an object's type is part of the bytes hashed into
 // its OID, so a given OID can never report a different type, and an object that
 // disappeared yields a two-field `<oid> missing` record that trips the
 // three-field header assertion first. It fails only if the two readings of the
@@ -278,8 +278,8 @@ func TestStore_DifferentialAgainstGit(t *testing.T) {
 }
 
 // requireHasDeltas fails the test unless the pack contains delta objects and at
-// least one multi-hop chain, so a repack that produced no deltas — or only
-// single-hop ones, which never reach the ping-pong arena — cannot give a false
+// least one multi-hop chain, so a repack that produced no deltas (or only
+// single-hop ones, which never reach the ping-pong arena) cannot give a false
 // green. It parses the chain-length histogram that `git verify-pack -v` prints.
 func requireHasDeltas(t *testing.T, packDir string) {
 	t.Helper()

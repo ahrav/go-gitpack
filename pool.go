@@ -12,7 +12,7 @@
 //   - getZlibReader / putZlibReader are called from pack decompression
 //     paths in idx.go and delta.go.
 //   - GetBuf / PutBuf are exported for use by downstream consumers (e.g.
-//     the scanner layer) that need temporary header-sized scratch space
+//     the scanner layer) that need header-sized scratch space
 //     without importing internal pool machinery.
 
 package objstore

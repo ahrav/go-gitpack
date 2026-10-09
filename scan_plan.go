@@ -25,12 +25,12 @@
 //
 //   - Fast path (in-memory): When the total candidate footprint fits within
 //     scanFastPathMaxBytes and the blob count is below scanFastPathMaxBlobs,
-//     all records are held in memory (inMemoryScanPlan) and no temporary files
+//     all records are held in memory (inMemoryScanPlan) and no spill files
 //     are created. This eliminates disk I/O overhead for small-to-medium
 //     repositories.
 //
 //   - Spill path (disk-backed): When the fast-path thresholds are exceeded,
-//     candidates are spilled to temporary files via spillWriter. The external
+//     candidates are spilled to on-disk files via spillWriter. The external
 //     sort uses fixed-size chunks (scanPackSortChunkSize) that are individually
 //     sorted and then merged with a min-heap (packedMergeHeap) to produce a
 //     globally offset-ordered stream without requiring the entire dataset to
@@ -274,7 +274,7 @@ type inMemoryScanPlan struct {
 }
 
 // spillWriter wraps an os.File with a bufio.Writer for buffered writes to a
-// temporary spill file. The bufio layer uses scanSpillBufSize to batch small
+// spill file. The bufio layer uses scanSpillBufSize to batch small
 // writes into fewer syscalls. Close flushes the buffer before closing the
 // underlying file. A nil receiver is safe to Close (no-op).
 type spillWriter struct {

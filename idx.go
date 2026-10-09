@@ -364,7 +364,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 	entries := make([]idxEntry, objCount)
 	// tableChunk controls how many CRC / offset entries are read per I/O call.
 	// 65,536 entries (~256 KiB for 4-byte tables) balances two concerns:
-	//   - Small enough to keep the temporary read buffer (crcBuf / offsetBuf)
+	//   - Small enough to keep the scratch read buffer (crcBuf / offsetBuf)
 	//     out of the large-object heap, reducing GC pressure.
 	//   - Large enough to amortize the per-ReadAt syscall overhead so that
 	//     even multi-million-object packs are parsed in a modest number of

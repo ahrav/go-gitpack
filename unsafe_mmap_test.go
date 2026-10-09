@@ -44,7 +44,7 @@ func TestMmapData_AliasesMappedRegion(t *testing.T) {
 	//
 	// The expected pointer is re-derived through the same layout cast mmapData
 	// uses, which makes this a copy oracle and deliberately NOT a layout
-	// oracle — a changed field offset would move both sides together. The
+	// oracle: a changed field offset would move both sides together. The
 	// layout axis is covered by the value assertions here (a wrong offset
 	// yields garbage, not the file's bytes) and by checkMmapLayout /
 	// TestCheckMmapLayout.

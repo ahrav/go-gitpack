@@ -25,7 +25,7 @@
 // reference decoder, not the code under test. The default build's one-shot path
 // is zlib_purego.go delegating to this package's own inflatePackZlibGo
 // (inflate_go.go), which drives a hand-rolled bit reader rather than klauspost's
-// reader — so kpzlib is a genuinely separate implementation, which is what makes
+// reader: so kpzlib is a genuinely separate implementation, which is what makes
 // it worth comparing against. Stdlib compress/zlib writes the fixtures for the
 // error-class tests.
 
@@ -63,7 +63,7 @@ func TestInflateZlibOneShotValidatesEmptyOutput(t *testing.T) {
 // continuing past the declared size is the overrun class, and a stream ending
 // before the declared size is the short-output (unexpected-EOF) class. Each must
 // classify identically under errors.Is regardless of build tag. Truncated versus
-// structurally-invalid input is deliberately not covered — libdeflate cannot
+// structurally-invalid input is deliberately not covered: libdeflate cannot
 // separate them (see the file header).
 func TestInflateZlibOneShotErrorClassesMatchPureGo(t *testing.T) {
 	payload := []byte("hello world hello world")

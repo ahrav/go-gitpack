@@ -161,7 +161,7 @@ func TestInflateRejectsStreamMissingTerminator(t *testing.T) {
 	//   0x00        BFINAL=0, BTYPE=00 (stored)
 	//   LEN=4       little-endian
 	//   NLEN=^4
-	//   4 payload bytes, then nothing — no final block ever arrives.
+	//   4 payload bytes, then nothing: no final block ever arrives.
 	//
 	// The decoder produces the declared 4 bytes while decoding the stored
 	// block, then reads the next block header and hits end of input: the

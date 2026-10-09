@@ -104,7 +104,7 @@ func TestInflateHuffmanFastArm64CopySweep(t *testing.T) {
 // at litlen_exception and offset_exception in inflate_fast_arm64.s: 12-bit
 // litlen codes for a literal, both match lengths, and end of block, plus
 // 9-bit and 15-bit offset codes whose 13 extra bits form the worst-case
-// bit cost against the refill thresholds — including, via the
+// bit cost against the refill thresholds: including, via the
 // literal-heavy iterations near the end of the stream, the
 // inflateFastOffsetSubRefillThreshold refill on the offset_exception
 // path. The stream is verified against compress/flate as an independent
@@ -160,7 +160,7 @@ func TestInflateHuffmanFastArm64DeepTables(t *testing.T) {
 	// + 13 extra bits (28) still decode correctly without the refill;
 	// what the refill actually protects is the have_offset preload of
 	// the NEXT litlen entry, which would otherwise see only 4 valid bits
-	// of an 11-bit lookup — the litlenTableBits term in the threshold
+	// of an 11-bit lookup: the litlenTableBits term in the threshold
 	// derivation. Skipping or corrupting the refill therefore corrupts
 	// the next iteration's decode and diverges from the oracle. Repeated
 	// with both 13-extra-bit offset symbols.

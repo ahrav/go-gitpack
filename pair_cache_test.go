@@ -365,8 +365,8 @@ func TestPairCacheClear_DropsEntriesAndUsage(t *testing.T) {
 
 // TestHistoryScannerClose_ClearsPairCache asserts Close releases the pair
 // cache. The cache lives for the scanner's lifetime and a hunk scan fills it
-// with hunk lines — plus, for whole-blob entries, the object buffers those
-// lines view — so a caller that retains a closed scanner would otherwise pin
+// with hunk lines (plus, for whole-blob entries, the object buffers those
+// lines view) so a caller that retains a closed scanner would otherwise pin
 // up to the full budget indefinitely. store.Close already does this for the
 // offset cache's object bytes.
 func TestHistoryScannerClose_ClearsPairCache(t *testing.T) {

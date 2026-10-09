@@ -257,7 +257,7 @@ func newOffsetCache() *offsetCache {
 // disables the cache: existing entries are dropped and later adds become
 // no-ops (gets simply miss). budgetPerShard is written without
 // synchronization, so setBudget must run before the cache is visible to
-// concurrent readers and writers — WithOffsetCacheBudget satisfies this by
+// concurrent readers and writers: WithOffsetCacheBudget satisfies this by
 // running during store construction. Concurrent callers must synchronize
 // externally.
 func (c *offsetCache) setBudget(total int) {

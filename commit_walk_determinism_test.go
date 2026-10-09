@@ -2,7 +2,7 @@
 // commit walk introduced in 6516fc3. walkCommitsFromRefs visits commits in
 // nondeterministic order across a pool of worker goroutines; loadFromRefs then
 // re-imposes a deterministic parent-first ordering. The invariant that matters
-// is that the *observable* result — the ordered commit slice — is independent
+// is that the *observable* result (the ordered commit slice) is independent
 // of worker scheduling.
 //
 // These tests build a branching/merging DAG (removing any auto-written
@@ -46,7 +46,7 @@ func buildMergeRepo(t *testing.T) string {
 
 	repoDir := t.TempDir()
 	// A fixed committer date makes timestamps collide, which forces the
-	// ordering's OID tie-breaker to do real work — exactly the code most
+	// ordering's OID tie-breaker to do real work: exactly the code most
 	// sensitive to nondeterministic visit order.
 	env := gitFixtureEnvPinned("2005-04-07T22:13:13 +0000")
 	git := func(args ...string) {
@@ -81,8 +81,8 @@ func buildMergeRepo(t *testing.T) string {
 	}
 
 	// Repack so commit-header reads exercise the pack path. loadFromRefs
-	// (called directly below) and DiffHistoryHunks walk refs unconditionally —
-	// NewHistoryScanner never reads on-disk commit-graph files — so deleting
+	// (called directly below) and DiffHistoryHunks walk refs unconditionally
+	// (NewHistoryScanner never reads on-disk commit-graph files) so deleting
 	// any commit-graph that a git configuration auto-wrote is defense-in-depth:
 	// the fixture must not carry one that a future graph-consuming path could
 	// silently pick up.
@@ -154,8 +154,8 @@ func TestParallelCommitWalk_Deterministic(t *testing.T) {
 
 // TestParallelCommitWalk_GOMAXPROCSInvariant asserts the ordered result is
 // stable between a constrained scheduler and an unconstrained one.
-// GOMAXPROCS=1 serializes the walk's worker pool — sized off runtime.NumCPU,
-// which GOMAXPROCS does not affect — onto a single P: the same goroutines run
+// GOMAXPROCS=1 serializes the walk's worker pool (sized off runtime.NumCPU,
+// which GOMAXPROCS does not affect) onto a single P: the same goroutines run
 // without parallelism but still interleave at blocking points. Constraining
 // the schedule this way is a cheap probe for a result that secretly depends
 // on visit order.

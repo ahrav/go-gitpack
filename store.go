@@ -2,8 +2,8 @@
 // resolves objects directly from *.pack files without shelling out to the
 // Git executable.
 //
-// The store is intended for read-only scenarios—such as code search,
-// indexing, and content serving—where low-latency look-ups are required but a
+// The store is intended for read-only scenarios (such as code search,
+// indexing, and content serving) where low-latency look-ups are required but a
 // full on-disk checkout is unnecessary.
 //
 // # Implementation
@@ -254,7 +254,7 @@ func open(dir string) (*store, error) {
 
 	// Every mapping opened below is owned by this invocation until the store
 	// is successfully constructed. Any error return before that point must
-	// close all of them — not just the handle that failed — or repeated
+	// close all of them (not just the handle that failed) or repeated
 	// open() attempts leak mmap regions and file descriptors.
 	var idxHandles []*mmap.ReaderAt
 	opened := false
@@ -455,7 +455,7 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// (disabled via WithOffsetCacheBudget, entry evicted, or first read).
 	// On the hot path an offset-cache hit above returns without paying
 	// these two mutex acquisitions; on a miss the probes are noise next
-	// to the inflation they can avoid — without them, repeated reads of a
+	// to the inflation they can avoid: without them, repeated reads of a
 	// packed object would re-inflate every time in memory-constrained
 	// configurations even though inflation populates the delta window.
 	if b, ok := s.dw.acquire(oid); ok {
@@ -664,8 +664,8 @@ func (s *store) findPackedObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 	if s.memoryMidx != nil {
 		// The merged index is built from the same oidTable/entries the
 		// per-pack searches consult, so a miss here is authoritative.
-		// Falling through would repeat the identical lookup once per pack
-		// — a guaranteed-miss O(packs · log n) scan that get() would pay
+		// Falling through would repeat the identical lookup once per pack,
+		// a guaranteed-miss O(packs · log n) scan that get() would pay
 		// on every read of a loose object before probing its caches.
 		return s.memoryMidx.findObject(oid)
 	}
@@ -925,7 +925,7 @@ func checkCommitPayloadSize(size uint64, oid Hash) error {
 // Unlike readCommitHeader (which stops at the committer line and serves the
 // commit walk), this inflates the whole object; it backs metadata attribution,
 // where the message is part of the result. The returned slice is always a
-// fresh allocation owned by the caller — it never aliases pooled buffers or
+// fresh allocation owned by the caller: it never aliases pooled buffers or
 // shared cache entries, so callers may retain it (or strings sliced from it)
 // indefinitely.
 func (s *store) readCommitPayload(oid Hash) ([]byte, error) {

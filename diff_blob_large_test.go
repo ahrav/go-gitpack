@@ -456,8 +456,7 @@ func BenchmarkLargeFileDiff(b *testing.B) {
 // TestComputeAddedHunksIntegration tests the main entry point with various file sizes
 func TestComputeAddedHunksIntegration(t *testing.T) {
 	t.Run("file_size_routing", func(t *testing.T) {
-		// This test would require a proper store implementation
-		// For now, we'll test the algorithm selection logic directly
+		// Exercise the size-routing logic directly, without a store.
 
 		// Test that files over MaxDiffSize return a placeholder
 		hugOld := make([]byte, MaxDiffSize+1)

@@ -76,7 +76,7 @@ type inflateFastState struct {
 //
 // The margin guard and the inflateFastState construction below are the
 // bounds proofs that make the kernels' branchless 8-byte loads and
-// overrunning match copies memory-safe, so they live here — once — rather
+// overrunning match copies memory-safe, so they live here (once) rather
 // than per architecture: a field missed in one arch-specific copy would
 // zero-initialize silently and become a single-arch out-of-bounds bug.
 // Each architecture contributes only its kernel entry point

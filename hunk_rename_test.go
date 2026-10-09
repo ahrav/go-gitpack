@@ -338,8 +338,8 @@ func TestDiffHistoryHunks_DirectoryRenameEditPairsAgainstOldPath(t *testing.T) {
 
 // TestInferDirectoryRenames_DeterministicOrderOnTies pins the candidate
 // ordering to a total order. Two directory pairs can tie on both evidence
-// count and len(newDir) — for example when two source dirs collapse into one
-// target dir — and matchDirectoryRename is first-match-wins over this slice,
+// count and len(newDir) (for example when two source dirs collapse into one
+// target dir) and matchDirectoryRename is first-match-wins over this slice,
 // so any tie left to map iteration order makes the chosen delete (and the
 // emitted hunks) differ between runs, violating the determinism DiffHistoryHunks
 // documents.
@@ -407,7 +407,7 @@ func TestDiffHistoryHunks_DirectoryRenameDoesNotPairUnrelatedContent(t *testing.
 	linesByPath, _ := scanHunksByPath(t, filepath.Join(repo, ".git"))
 
 	// The replacement file is < 50% similar to the deleted one, so every one
-	// of its lines — including the coincidentally-shared line — is new.
+	// of its lines (including the coincidentally-shared line) is new.
 	assert.ElementsMatch(t,
 		[]string{"one", "two", "shared-line", "three", "four", "five"},
 		linesByPath["new/notes.txt"],
@@ -417,8 +417,8 @@ func TestDiffHistoryHunks_DirectoryRenameDoesNotPairUnrelatedContent(t *testing.
 }
 
 // buildInferredRenameRepo creates a repo whose second commit renames old/ ->
-// new/ with two exact-OID renames — enough evidence for directory-rename
-// inference — while replacing old/data with newData at new/data. The add at
+// new/ with two exact-OID renames (enough evidence for directory-rename
+// inference) while replacing old/data with newData at new/data. The add at
 // new/data is therefore paired against the deleted old/data blob purely from
 // path structure, which is the guess gateInferredRenameHunks must validate.
 func buildInferredRenameRepo(t *testing.T, oldData, newData []byte) string {
@@ -466,7 +466,7 @@ func scanHunksByPath(t *testing.T, gitDir string) (map[string][]string, map[stri
 // TestDiffHistoryHunks_InferredRenameFromBinaryOldBlobReportsTextLines covers
 // the binary escape hatch in gateInferredRenameHunks. When the guessed old
 // blob is binary, computeAddedHunks reports the whole new file as one binary
-// hunk — a shape decided entirely by the old side. Accepting that on an
+// hunk: a shape decided entirely by the old side. Accepting that on an
 // inferred pairing loses the new text file's line structure, and any consumer
 // that skips binary hunks loses the file's content outright.
 func TestDiffHistoryHunks_InferredRenameFromBinaryOldBlobReportsTextLines(t *testing.T) {
@@ -488,7 +488,7 @@ func TestDiffHistoryHunks_InferredRenameFromBinaryOldBlobReportsTextLines(t *tes
 // "[File too large to diff]" placeholder. That placeholder carries one line,
 // which satisfies the >= 50%-common similarity test for any new file with two
 // or more lines, so the pairing is kept and the placeholder becomes the file's
-// only output — the new content never reaches the stream.
+// only output: the new content never reaches the stream.
 func TestDiffHistoryHunks_InferredRenameFromOversizedOldBlobReportsTextLines(t *testing.T) {
 	// Shrink the limit rather than materialize a gigabyte. Safe because this
 	// test is serial; see the maxDiffSize doc comment.
@@ -536,8 +536,8 @@ func TestDiffHistoryHunks_InferredRenameOntoMuchSmallerFileReportsTextLines(t *t
 
 // TestDiffHistoryHunks_DroppedDeletePathsStillSuppressExactMoves pins the
 // degradation contract of maxRetainedDeletePathBytes. Past that bound a commit
-// stops retaining deleted paths, which costs directory-rename inference — it
-// has no source path left to build evidence from — but must not cost exact-OID
+// stops retaining deleted paths, which costs directory-rename inference (it
+// has no source path left to build evidence from) but must not cost exact-OID
 // move suppression, which needs only a per-identity credit.
 func TestDiffHistoryHunks_DroppedDeletePathsStillSuppressExactMoves(t *testing.T) {
 	requireGit(t)

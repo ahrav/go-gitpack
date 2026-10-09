@@ -611,7 +611,7 @@ func TestApplyDeltaStreamingRejectsUntrustedSizesAndCommands(t *testing.T) {
 		// physically supply (DEFLATE expands at most 1032:1). Without the
 		// feasibility check, a few header bytes force getDeltaScratch to
 		// materialize the full advertised amount before any compressed
-		// byte is read — here 1 GiB, and with maxObjectSize=0 the 8× bound
+		// byte is read: here 1 GiB, and with maxObjectSize=0 the 8× bound
 		// is disabled entirely, so this check is the only allocation guard.
 		pack, typ := openPayload(t, nil, 1<<30)
 		_, err := applyDeltaStreaming(pack, 0, typ, nil, nil, 0)

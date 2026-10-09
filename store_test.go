@@ -192,7 +192,7 @@ func TestGetFallsBackToOIDCachesWhenOffsetCacheDisabled(t *testing.T) {
 	require.NoError(t, err)
 
 	// Second read must be served by the delta window, whose hit path
-	// promotes the object into the ARC cache — observable proof the
+	// promotes the object into the ARC cache: observable proof the
 	// OID-keyed fallback ran instead of a straight re-inflation.
 	got, _, err := store.get(targetHash)
 	require.NoError(t, err)
@@ -415,7 +415,7 @@ func ExampleHistoryScanner() {
 	fmt.Printf("Object size: %d bytes\n", len(data))
 }
 
-// setupBenchmarkRepo creates a temporary Git repository with five top-level
+// setupBenchmarkRepo creates a throwaway Git repository with five top-level
 // files and three nested files, initialises it with "git init", commits the
 // files, and repacks them into a single pack file. It returns the path to
 // the "objects/pack" directory suitable for passing to OpenForTesting.
@@ -742,7 +742,7 @@ func TestStore_DeltaObjectRetrieval(t *testing.T) {
 
 // TestGet_ReturnsConsistentData verifies that successive calls to get() for
 // the same OID return correct data from the cache. The returned slices may
-// alias internal cache buffers — callers must treat them as read-only.
+// alias internal cache buffers: callers must treat them as read-only.
 func TestGet_ReturnsConsistentData(t *testing.T) {
 	packPath, _, cleanup := createTestPackWithDelta(t)
 	defer cleanup()
@@ -754,13 +754,13 @@ func TestGet_ReturnsConsistentData(t *testing.T) {
 	blobData := []byte("base content")
 	blobHash := calculateHash(ObjBlob, blobData)
 
-	// First get — populates the caches.
+	// First get: populates the caches.
 	data1, typ1, err := s.get(blobHash)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ1)
 	assert.Equal(t, blobData, data1)
 
-	// Second get — hits the cache, must return correct content.
+	// Second get: hits the cache, must return correct content.
 	data2, typ2, err := s.get(blobHash)
 	require.NoError(t, err)
 	assert.Equal(t, ObjBlob, typ2)
@@ -786,7 +786,7 @@ func TestReadRawObject_OfsDeltaReadError(t *testing.T) {
 
 	_, _, err = readRawObject(pack, 0)
 	require.Error(t, err)
-	// The error should NOT be ErrOfsDeltaBaseRefTooLong — it should be the
+	// The error should NOT be ErrOfsDeltaBaseRefTooLong: it should be the
 	// actual I/O error from the failed ReadAt.
 	assert.NotErrorIs(t, err, ErrOfsDeltaBaseRefTooLong,
 		"expected I/O error, not ErrOfsDeltaBaseRefTooLong; got: %v", err)
@@ -796,8 +796,8 @@ func TestReadRawObject_OfsDeltaReadError(t *testing.T) {
 // bounds the header-declared decompressed size by what the remaining pack
 // bytes could possibly inflate to (DEFLATE expands at most 1032:1) before
 // sizing any allocation from it. Without the bound, a few corrupt header
-// bytes force an allocation of the full advertised amount — up to an
-// instant OOM or, above MaxInt, a make() panic — long before inflation
+// bytes force an allocation of the full advertised amount (up to an
+// instant OOM or, above MaxInt, a make() panic) long before inflation
 // fails on the same input.
 func TestReadRawObject_RejectsHostileDeclaredSize(t *testing.T) {
 	open := func(t *testing.T, obj []byte) *mmap.ReaderAt {

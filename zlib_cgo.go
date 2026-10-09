@@ -7,7 +7,7 @@ package objstore
 // Pack object bodies are always inflated into a buffer of exactly the size
 // declared by the object header, and the compressed bytes are already
 // resident in the mmap'd pack. That matches libdeflate's whole-buffer model
-// exactly — no streaming state machine, no bufio layer, no window copies —
+// exactly (no streaming state machine, no bufio layer, no window copies)
 // and libdeflate's DEFLATE decoder is roughly 2x faster than any streaming
 // implementation because it decodes into the output buffer in place.
 //

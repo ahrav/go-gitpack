@@ -61,14 +61,14 @@ func joinPath(prefix, name string) string {
 // NUL. A name that does carry '/' collides with the tree whose name it extends,
 // because both sides then compare '/' at that offset: compareTreeEntryNames
 // answers 0 for the blob "pkg/x" against the tree "pkg", and the relation is a
-// preorder rather than an order — "pkg/y" and "pkg/x" both compare equal to
+// preorder rather than an order: "pkg/y" and "pkg/x" both compare equal to
 // "pkg" while "pkg/y" sorts after "pkg/x". Only a corrupt tree reaches that,
 // since TreeIter parses names without rejecting '/', and base_name_compare
 // answers the same way, so such a diff still matches what git shows for the
 // same objects; breaking the tie here instead would make this walk disagree
 // with git on input git itself reads. The cost is bounded: the merge-join pairs
 // the colliding entries and enumerates each side whole, so a '/'-bearing name
-// shadowing a 1024-file subtree reports 2049 changes for one real addition —
+// shadowing a 1024-file subtree reports 2049 changes for one real addition:
 // the amplification an ordinary directory deletion already pays, with no
 // recursion across the two sides and no unbounded walk.
 func compareTreeEntryNames(name1 string, mode1 uint32, name2 string, mode2 uint32) int {
@@ -130,7 +130,7 @@ func impliedNameByte(mode uint32) byte {
 // stored in, so the sides of a valid name that exists in both trees always meet
 // on the same iteration and are compared as one pair.
 //
-// For every changed file, `fn` is invoked once — an addition, a deletion, or a
+// For every changed file, `fn` is invoked once: an addition, a deletion, or a
 // same-type modification is one event carrying whichever OIDs exist, and a
 // permission-only change stays a single event. One case splits a file across
 // two events: a path whose entry type changes in place. Nothing is carried
@@ -143,8 +143,8 @@ func impliedNameByte(mode uint32) byte {
 //
 // The order of that pair follows the entry order the merge-join walks. A
 // transition between two non-tree types is one name on both sides, so its
-// deletion precedes its addition. A transition involving a tree is two names —
-// a tree sorts as if its name ended in '/' — so the non-tree side, which sorts
+// deletion precedes its addition. A transition involving a tree is two names
+// (a tree sorts as if its name ended in '/') so the non-tree side, which sorts
 // first, is reported before the files of the tree side.
 //
 // Directories are handled transparently: additions or deletions of a directory

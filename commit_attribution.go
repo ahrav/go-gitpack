@@ -340,8 +340,8 @@ func (c *metaCache) timestampLocked(oid Hash, ai AuthorInfo) int64 {
 
 // splitCommitPayload splits a raw commit payload into its header half and
 // message half at the first blank line (the "\n\n" separator defined by the
-// commit object format). The message keeps its raw bytes — no encoding
-// normalization, no NUL truncation, trailing newline preserved — because
+// commit object format). The message keeps its raw bytes (no encoding
+// normalization, no NUL truncation, trailing newline preserved) because
 // those are presentation behaviors of git-log, not object format.
 //
 // A payload without a separator (header-only commit) yields the full payload

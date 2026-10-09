@@ -54,8 +54,8 @@ func mmapData(r *mmap.ReaderAt) []byte {
 //     and the trailing checksum comparison. Pack integrity is instead
 //     covered by the optional CRC-32 verification against the pack index
 //     (store.VerifyCRC): verifyCRC32 streams the object's full on-disk
-//     byte range — zlib header, deflate payload, AND the adler32 trailer
-//     bytes — so trailer corruption is caught there, and CRC-32 over the
+//     byte range (zlib header, deflate payload, AND the adler32 trailer
+//     bytes) so trailer corruption is caught there, and CRC-32 over the
 //     compressed bytes subsumes what adler32 would catch in the output.
 //
 // Callers must release both returned values: first putFlateReader(zr), then
@@ -87,7 +87,7 @@ var errMmapLayout = errors.New("objstore: x/exp/mmap ReaderAt layout changed; up
 // checkMmapLayout verifies at pack-open time that the unsafe cast in mmapData
 // still matches x/exp/mmap's ReaderAt layout, so a layout change in a future
 // dependency bump (including a newer x/exp selected by a downstream module's
-// MVS resolution — our go.mod pin is not a ceiling for consumers) surfaces as
+// MVS resolution, since our go.mod pin is not a ceiling for consumers) surfaces as
 // a deterministic open error instead of silent memory corruption on the read
 // path.
 //
@@ -96,7 +96,7 @@ var errMmapLayout = errors.New("objstore: x/exp/mmap ReaderAt layout changed; up
 //
 //  1. Shape (reflection, no unsafe): mmap.ReaderAt must be a struct with
 //     exactly one field, of type []byte, at offset 0. Reflection reads only
-//     type metadata — never field values — so this cannot fault, and it
+//     type metadata (never field values) so this cannot fault, and it
 //     gates the unsafe cast: a changed layout is rejected here before any
 //     forged slice header exists.
 //  2. Length: the forged header's len must equal the public Len().

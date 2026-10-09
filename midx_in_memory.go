@@ -35,7 +35,7 @@ type inMemoryMidx struct {
 	entries  []inMemoryMidxEntry
 }
 
-// inMemoryMidxRecord is a temporary intermediate used only during
+// inMemoryMidxRecord is a scratch intermediate used only during
 // buildInMemoryMidx construction. It pairs an object ID with the pack's
 // ordinal position so that the sort-then-dedup pass can break ties
 // deterministically (lowest pack order wins).

@@ -457,7 +457,7 @@ func TestMetaCacheConcurrentAccess(t *testing.T) {
 // NULs, trailing newlines), and a payload without a separator yields an
 // empty message. The gpgsig and mergetag cases matter because their
 // multi-line values embed blank-looking lines that are actually
-// space-prefixed continuations — the first true "\n\n" is still the
+// space-prefixed continuations: the first true "\n\n" is still the
 // header/message boundary.
 func TestSplitCommitPayload(t *testing.T) {
 	const (

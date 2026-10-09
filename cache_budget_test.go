@@ -109,7 +109,7 @@ func TestPairCacheSetBudget_TinyPositiveBudgetStaysEnabled(t *testing.T) {
 // before setBudget returns. Deferring to add is not sound: add rejects entries
 // costing more than a quarter of the per-shard budget, so after a large
 // reduction that gate can reject every later entry and the eviction loop inside
-// add would never run — leaving the shard above its configured bound for the
+// add would never run: leaving the shard above its configured bound for the
 // life of the cache.
 func TestPairCacheSetBudget_ShrinkEvictsToNewBound(t *testing.T) {
 	t.Parallel()

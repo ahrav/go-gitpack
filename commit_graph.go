@@ -314,7 +314,7 @@ func loadCommitGraph(objectsDir string) (*commitGraphData, error) {
 //     the same commit-graph file or, after offset adjustment, to rows in the
 //     concatenated commit list supplied to resolveParentsInto.
 //   - mr must be closed by the caller once the parsedGraph is no longer
-//     needed—typically right after the data has been copied or merged.
+//     needed: typically right after the data has been copied or merged.
 //
 // No method mutates the slices after construction, so a parsedGraph is
 // safe for concurrent read-only access.

@@ -20,8 +20,8 @@ const pairCacheShards = 32
 
 // defaultPairCacheBudget bounds the bytes retained across all shards of one
 // scanner's pair cache. Entries are compacted copies (see add) and every
-// component of an entry's footprint — text bytes, per-line string headers,
-// per-hunk and per-entry overhead — is charged, so the accounted size tracks
+// component of an entry's footprint (text bytes, per-line string headers,
+// per-hunk and per-entry overhead) is charged, so the accounted size tracks
 // actual retention. Each scanner owns an independent cache, so processes that
 // open many repositories concurrently should lower the budget via
 // WithPairCacheBudget to bound aggregate growth.
@@ -130,7 +130,7 @@ func newPairCache() *pairCache {
 //
 // A budget <= 0 disables the cache: existing entries are dropped and later
 // adds store nothing (gets simply miss). Disabling does not change what a
-// caller receives — add still compacts and returns the owned hunks, because
+// caller receives: add still compacts and returns the owned hunks, because
 // the aliasing views computeAddedHunks produces would otherwise pin a whole
 // blob per delivered hunk whether or not the memo is on.
 //
@@ -138,10 +138,10 @@ func newPairCache() *pairCache {
 // any entry costing more than a quarter of the per-shard budget. After a large
 // reduction that gate can reject every subsequent entry, so add's eviction loop
 // would never run and a shard could stay above its configured budget for the
-// life of the cache — the one thing a memory bound must not do.
+// life of the cache: the one thing a memory bound must not do.
 //
 // budgetPerShard is written without synchronization, so setBudget must run
-// before the cache is visible to concurrent readers and writers —
+// before the cache is visible to concurrent readers and writers:
 // WithPairCacheBudget satisfies this by running during scanner construction.
 // Concurrent callers must synchronize externally.
 func (c *pairCache) setBudget(total int) {
@@ -209,8 +209,8 @@ func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
 	return e.view(), true
 }
 
-// clear drops every cached entry, releasing the retained hunk lines — and the
-// whole-blob buffers the aliasing entries view — to the GC. The cache remains
+// clear drops every cached entry, releasing the retained hunk lines (and the
+// whole-blob buffers the aliasing entries view) to the GC. The cache remains
 // usable afterwards.
 func (c *pairCache) clear() {
 	if c == nil {
@@ -243,18 +243,18 @@ func (c *pairCache) clear() {
 // Compaction is skipped when the added lines already cover the whole new
 // blob: the copy would then retain the same bytes it aliases while costing a
 // memcpy of up to MaxDiffSize. Both qualifying cases follow from
-// computeAddedHunks' contract rather than from a heuristic — a zero old OID
+// computeAddedHunks' contract rather than from a heuristic: a zero old OID
 // (a file addition) makes every line of the new blob an addition, and a
 // binary result carries the whole new blob as its single line. Blob buffers
-// are exact-sized allocations on every path that produces one — readRawObject
+// are exact-sized allocations on every path that produces one (readRawObject
 // and applyDeltaStackCached return a slice whose capacity is the object size,
-// and readLooseObject trims the spare capacity io.ReadAll leaves — so aliasing
+// and readLooseObject trims the spare capacity io.ReadAll leaves) so aliasing
 // one retains precisely the bytes the hunk reports.
 //
 // Compaction happens before any admission decision, so a rejected or disabled
 // cache still returns hunks that own their bytes. Callers deliver the returned
 // slice unconditionally; making the copy contingent on admission would let a
-// zero budget — the setting chosen to cap memory — pin one whole blob per
+// zero budget (the setting chosen to cap memory) pin one whole blob per
 // in-flight hunk instead.
 func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 	lineBytes := 0
@@ -278,7 +278,7 @@ func (c *pairCache) add(k pairKey, hunks []AddedHunk) []AddedHunk {
 	entry.size = size
 
 	// A disabled cache stores nothing. One giant diff must not evict a whole
-	// shard, so it is not stored either — but both are still compacted above
+	// shard, so it is not stored either. Both are still compacted above
 	// and returned: the largest diffs are exactly the ones whose aliasing
 	// views pin the most memory per delivered hunk. size is at least
 	// pairCacheEntryOverhead, so a zero budget rejects every entry here even

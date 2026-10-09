@@ -1,7 +1,7 @@
 // concurrent_read_test.go is the standing data-race gate for the store's
 // materialization fast paths. The optimizations under scrutiny share mutable
-// structures across readers — the (pack,offset) offset cache, the sharded delta
-// window, and the ping-pong arena free-list — so many goroutines resolving the
+// structures across readers (the (pack,offset) offset cache, the sharded delta
+// window, and the ping-pong arena free-list), so many goroutines resolving the
 // same delta chains concurrently is the scenario most likely to expose a race.
 //
 // Run under the race detector to get value from it:
@@ -128,7 +128,7 @@ func TestStore_ConcurrentReaders(t *testing.T) {
 			// spending it on cache hits; cold_waves proves contention during
 			// first materialization, and no_cache below covers sustained
 			// full-chain concurrency. Cold reads take the arena path too, so
-			// this subtest is bounded by the same pinned pool — the wave count
+			// this subtest is bounded by the same pinned pool: the wave count
 			// is what restores the number of cold-window observations.
 			runConcurrently(t, workers, 4, func(seed, it int) error {
 				// Rotate across all levels, deepest included, so different

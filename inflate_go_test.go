@@ -1081,13 +1081,13 @@ func assertGoMatchesReference(t *testing.T, src []byte, size int) {
 		//     produces more than the declared size, so re-decoding
 		//     into a destination sized past DEFLATE's ~1032x maximum
 		//     expansion (a 258-byte match from a 2-bit degenerate
-		//     dynamic code) — where overrun is impossible — must cross
+		//     dynamic code), where overrun is impossible, must cross
 		//     the declared size before any terminal condition. This
 		//     catches destination-dependent early exits.
 		//  2. Content corroboration: compress/flate is correct on
 		//     every byte it does produce, so everything it decodes of
 		//     the same stream must match the headroom output
-		//     byte-for-byte — and flate may stop short of the headroom
+		//     byte-for-byte, and flate may stop short of the headroom
 		//     production only at a truncation boundary (it can stop
 		//     one symbol shy of the final bits). A shorter reference
 		//     decode ending in a clean EOB or a structural rejection

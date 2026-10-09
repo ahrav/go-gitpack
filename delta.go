@@ -104,7 +104,7 @@ func putDeltaContext(ctx *deltaContext) {
 
 // reset clears per-lookup state so the context can be reused from a pool.
 // The len guard matters: most lookups never follow a ref-delta, so visited
-// is usually empty, and clear() on an empty map still walks its buckets —
+// is usually empty, and clear() on an empty map still walks its buckets:
 // which showed up as ~3% of scan CPU before the guard.
 func (ctx *deltaContext) reset() {
 	if len(ctx.visited) > 0 {
@@ -319,7 +319,7 @@ func walkUpDeltaChain(
 	// hop names its base by OID. ofs-delta hops identify the base only by
 	// byte offset, so the OID becomes unknown (zero) until a later ref-delta
 	// re-establishes it. findCRCForObject uses the OID only for its midx
-	// fallback, which requires the entry's offset to match — so a zero OID
+	// fallback, which requires the entry's offset to match: so a zero OID
 	// degrades to a conservative skip, never a wrong CRC.
 	currOID := params.oid
 	for depth := 0; depth < params.ctx.maxDepth; depth++ {
@@ -353,7 +353,7 @@ func walkUpDeltaChain(
 			// verifyPackObjectCRCIfEnabled is the shared policy also used
 			// by inflateFromPackWithOptions: verify when the CRC is
 			// known, proceed when the index has none. Reconstructed delta
-			// hops published by applyDeltaStackCached are not affected —
+			// hops published by applyDeltaStackCached are not affected:
 			// pack CRCs cover raw records only, and delta-typed reads
 			// never carried a CRC check. Note the midx CRC fallback only
 			// fires when currOID is known (see the currOID declaration);
@@ -596,7 +596,7 @@ func readOfsDeltaOffset(pack *mmap.ReaderAt, pos int64) (uint64, int, error) {
 //
 // maxObjectSize bounds both the advertised target size and the delta payload
 // itself; zero disables the bound. Enforcing it here before any allocation
-// is sized from pack-controlled headers — means a corrupt or hostile pack
+// is sized from pack-controlled headers: means a corrupt or hostile pack
 // cannot force a large allocation ahead of the limit check.
 //
 // applyDeltaStreaming returns an error if the delta instructions are malformed or reference
@@ -618,7 +618,7 @@ func applyDeltaStreaming(
 	// decompressed length of the delta payload (varint header + instruction
 	// stream), which lets the whole payload be inflated in one shot into a
 	// pooled scratch buffer. Instruction processing then runs over a flat
-	// []byte with index arithmetic — no bufio layer, no per-command
+	// []byte with index arithmetic: no bufio layer, no per-command
 	// ReadByte virtual calls, and (with the libdeflate backend) no
 	// streaming inflater state at all.
 	//
@@ -659,7 +659,7 @@ func applyDeltaStreaming(
 
 	// Cross-check the advertised payload against the bytes the pack can
 	// physically supply. DEFLATE expands at most maxDeflateExpansion:1
-	// (1032:1 — a 258-byte match from a 2-bit length/distance code pair),
+	// (1032:1, a 258-byte match from a 2-bit length/distance code pair),
 	// so payloadSize decompressed bytes require at least
 	// payloadSize/maxDeflateExpansion compressed bytes after pos; a header
 	// advertising more is provably corrupt. Rejecting it here keeps a few
@@ -668,7 +668,7 @@ func applyDeltaStreaming(
 	// 8×maxObjectSize under the bound above, unbounded when maxObjectSize
 	// is 0): a forced allocation is now proportional to the
 	// attacker-supplied pack size, not to a 9-byte header claim. The check
-	// never rejects a valid pack — a stream that inflates to payloadSize
+	// never rejects a valid pack: a stream that inflates to payloadSize
 	// cannot be shorter than this floor.
 	if avail := int64(pack.Len()) - pos; avail < int64(payloadSize/maxDeflateExpansion) {
 		return nil, fmt.Errorf(

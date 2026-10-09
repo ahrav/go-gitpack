@@ -48,7 +48,7 @@ import (
 // The maximum is copy_wide's 39 bytes = deflateFastMatchCopy-1 (the block
 // width is the same 40 bytes the Go fast loop copies unconditionally).
 // Any write at or beyond out+amd64KernelWriteSlack is therefore a kernel
-// bug. This bound is tight: distance 8 with length 41 writes the byte at
+// defect. This bound is tight: distance 8 with length 41 writes the byte at
 // out+38, which the negative-check procedure exploits.
 const amd64KernelWriteSlack = deflateFastMatchCopy - 1
 
@@ -128,7 +128,7 @@ func TestInflateHuffmanFastAMD64CopySweep(t *testing.T) {
 // at litlen_exception and offset_exception in inflate_fast_amd64.s: 12-bit
 // litlen codes for a literal, both match lengths, and end of block, plus
 // 9-bit and 15-bit offset codes whose 13 extra bits form the worst-case
-// bit cost against the refill thresholds — including the DX<=30
+// bit cost against the refill thresholds: including the DX<=30
 // direct-offset refill and, via the literal-heavy iterations near the end
 // of the stream, the DX<=37 offset_exception refill. The stream is
 // verified against compress/flate as an independent oracle before the
@@ -183,7 +183,7 @@ func TestInflateHuffmanFastAMD64DeepTables(t *testing.T) {
 	// 13 extra bits (28) still decode correctly without the refill; what
 	// the refill actually protects is the have_offset preload of the NEXT
 	// litlen entry, which would otherwise see only 4 valid bits of an
-	// 11-bit lookup — the litlenTableBits term in the threshold
+	// 11-bit lookup: the litlenTableBits term in the threshold
 	// derivation. Skipping or corrupting the refill therefore corrupts
 	// the next iteration's decode and diverges from the oracle. Repeated
 	// with both 13-extra-bit offset symbols.
@@ -279,10 +279,10 @@ func TestInflateHuffmanFastAMD64DeepTablesSubtableEOB(t *testing.T) {
 // return_bad_data in inflate_fast_arm64.s), so there is no reachability
 // difference between the architectures; the arm64 audit file pins sites 1
 // and 4, and its companion tests pin site 2. Sites 3 and 5 are
-// unreachable through loadFixedTables/loadDynamicTables — buildTable
+// unreachable through loadFixedTables/loadDynamicTables (buildTable
 // rejects incomplete codes except the root-level singleton and empty
 // cases, and a complete code fills every subtable slot with a valid
-// entry — so those two subtests hand-build decode tables (the same
+// entry) so those two subtests hand-build decode tables (the same
 // technique as TestInflateHuffmanFastAMD64SubtableDifferential) to reach
 // the defensive checks. The destination is large enough that the kernel,
 // not decodeHuffmanTail, must detect each site; the pure-Go

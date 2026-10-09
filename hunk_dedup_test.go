@@ -72,7 +72,7 @@ func TestLineFingerprintSet_ZeroFingerprintRemap(t *testing.T) {
 
 // TestLineFingerprintSet_SaturationFailOpen verifies that once the
 // load-factor bound is hit the set fails open: every subsequent fingerprint
-// — including previously inserted ones — reports new, so lines are emitted
+// (including previously inserted ones) reports new, so lines are emitted
 // rather than dropped.
 func TestLineFingerprintSet_SaturationFailOpen(t *testing.T) {
 	set := newLineFingerprintSet(4) // 16 slots => saturates after 16*7/10 = 11 inserts
@@ -88,7 +88,7 @@ func TestLineFingerprintSet_SaturationFailOpen(t *testing.T) {
 }
 
 // TestLineFingerprintSet_DeterministicVerdicts verifies that a fixed insert
-// sequence — including repeats, zeros, and saturation on a small table —
+// sequence (including repeats, zeros, and saturation on a small table)
 // yields an identical verdict sequence on every fresh set.
 func TestLineFingerprintSet_DeterministicVerdicts(t *testing.T) {
 	rng := rand.New(rand.NewSource(42))
@@ -176,8 +176,8 @@ func seedLines(set *lineFingerprintSet, lines ...string) {
 
 // TestDedupHunkEmission_Table pins the whole-hunk verdict rule: a hunk
 // survives iff at least one of its lines is unseen at the start of the
-// hunk, and is suppressed entirely otherwise. Intact emission is structural
-// — the verdict function cannot modify the hunk the caller forwards.
+// hunk, and is suppressed entirely otherwise. Intact emission is structural:
+// the verdict function cannot modify the hunk the caller forwards.
 func TestDedupHunkEmission_Table(t *testing.T) {
 	// keyringHunk models git.git commit 1e3eefbc's t/lib-gpg/keyring.gpg
 	// add-hunk in miniature: two armored key blocks inside ONE hunk sharing
@@ -321,7 +321,7 @@ func oracleWholeHunkVerdict(seen map[string]bool, lines []string) bool {
 
 // TestDedupHunkEmission_PropertyOracle feeds random hunk series through
 // dedupHunkEmission and cross-checks every verdict against
-// oracleWholeHunkVerdict — which, like the implementation, probes all lines
+// oracleWholeHunkVerdict: which, like the implementation, probes all lines
 // against the pre-hunk state before marking any.
 func TestDedupHunkEmission_PropertyOracle(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))
@@ -369,7 +369,7 @@ func fillToSaturation(t *testing.T, set *lineFingerprintSet) []string {
 // The hunk here is built entirely from lines the set already contains, so the
 // ordinary rule would suppress it. Saturation must flip that to emission.
 // Failing closed instead would silently drop every hunk once a large
-// repository fills the table — that is, report no secrets at all — so this
+// repository fills the table (that is, report no secrets at all) so this
 // asserts emission rather than merely "some verdict".
 func TestDedupHunkEmission_SaturatedSetFailsOpen(t *testing.T) {
 	set := newLineFingerprintSet(4) // 16 slots => saturates after 11 inserts
@@ -448,8 +448,8 @@ func TestDedupHunkEmission_SaturationBoundary(t *testing.T) {
 }
 
 // saturatingOracle is the reference for the whole-hunk rule INCLUDING
-// fail-open. It keeps the probe-all-then-mark-all shape — a deliberately
-// different formulation from the implementation's single marking pass — and
+// fail-open. It keeps the probe-all-then-mark-all shape (a deliberately
+// different formulation from the implementation's single marking pass) and
 // tracks only a budget counter, with no open addressing, probing, or growth.
 type saturatingOracle struct {
 	seen      map[string]bool
@@ -616,7 +616,7 @@ func buildDedupOracleRepo(t *testing.T) string {
 	b.commit("add b")
 
 	// Feature branch introduces a multi-line block whose interior line is
-	// already known — the merge replays it against main's first parent.
+	// already known: the merge replays it against main's first parent.
 	b.git("checkout", "-q", "-b", "feature")
 	b.write("secret.txt", "-----BEGIN KEY-----\nkeydata-one\nshared-interior\nkeydata-two\n-----END KEY-----\n")
 	b.commit("feature secret")
@@ -779,7 +779,7 @@ func TestDiffHistoryHunksDedup_DeterministicMultiset(t *testing.T) {
 }
 
 // scanWithProcs runs collectHunkScan on a fresh scanner while GOMAXPROCS
-// is temporarily set to procs, restoring it before returning.
+// is set to procs, restoring the previous value before returning.
 func scanWithProcs(t *testing.T, procs int, gitDir string, opts ...ScannerOption) []string {
 	t.Helper()
 	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(procs))
@@ -787,7 +787,7 @@ func scanWithProcs(t *testing.T, procs int, gitDir string, opts ...ScannerOption
 }
 
 // TestDiffHistoryHunksDedup_GOMAXPROCSInvariant asserts a single-threaded
-// scan and a parallel scan agree — the strongest cheap probe for output
+// scan and a parallel scan agree: the strongest cheap probe for output
 // that secretly depends on worker scheduling.
 func TestDiffHistoryHunksDedup_GOMAXPROCSInvariant(t *testing.T) {
 	gitDir := buildDedupOracleRepo(t)
@@ -1004,8 +1004,8 @@ func TestDiffHistoryHunksDedup_FirstIntroductionAttribution(t *testing.T) {
 // regression scenario for WithHunkPathFilter: a line first introduced in a
 // path the consumer filters, then re-added in a path it keeps. With the
 // filter, dedup emits the line exactly once at its first UNSKIPPED
-// introduction; without the filter it is emitted only at the filtered path
-// — the composition hazard (consumer-side filtering after dedup marking)
+// introduction; without the filter it is emitted only at the filtered path:
+// the composition hazard (consumer-side filtering after dedup marking)
 // that the option exists to solve.
 func TestDiffHistoryHunksDedup_PathFilterRestoresSkippedIntroduction(t *testing.T) {
 	b := newDedupRepoBuilder(t)
@@ -1075,8 +1075,8 @@ func TestDiffHistoryHunks_PathFilterNonDedup(t *testing.T) {
 }
 
 // TestDiffHistoryHunksDedup_PathFilterDeterminism asserts the dedup+filter
-// combination keeps every determinism guarantee — stable multiset across
-// runs, GOMAXPROCS invariance — and matches the serial reference applying
+// combination keeps every determinism guarantee (stable multiset across
+// runs, GOMAXPROCS invariance) and matches the serial reference applying
 // the same predicate independently.
 func TestDiffHistoryHunksDedup_PathFilterDeterminism(t *testing.T) {
 	gitDir := buildDedupOracleRepo(t)
@@ -1199,7 +1199,7 @@ func TestDiffHistoryHunksDedup_WhaleStress(t *testing.T) {
 
 // TestDiffHistoryHunksDedup_ErrorStopsPromptlyNoLeak asserts that an fn
 // error aborts the scan with that error and that every pipeline goroutine
-// exits — the goroutine count must return to its pre-scan level.
+// exits: the goroutine count must return to its pre-scan level.
 func TestDiffHistoryHunksDedup_ErrorStopsPromptlyNoLeak(t *testing.T) {
 	gitDir := buildDedupOracleRepo(t)
 

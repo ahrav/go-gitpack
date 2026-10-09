@@ -124,7 +124,7 @@ func zlibCompress(t *testing.T, data []byte) []byte {
 // swallowed by the hop that reads it. The odd shape rotates rather than
 // truncates for exactly this reason: copying only base[skip:] would discard
 // base[:skip], and corruption confined to those bytes would vanish at the hop
-// instead of propagating to the final result — silently voiding the invariant
+// instead of propagating to the final result: silently voiding the invariant
 // the chain assertions rest on.
 //
 // The two shapes alternate so both copy-operand cases are covered: a copy at
@@ -173,8 +173,8 @@ const chainHopCopySkip = 3
 // The command byte's low 7 bits say which operand bytes follow: bits 0-3 select
 // bytes of the offset, bits 4-6 bytes of the size, little-endian, and an omitted
 // byte decodes as zero. Only non-zero bytes are emitted, matching what Git
-// writes. A size of zero is not encodable — the format reads it back as
-// 0x10000 — so it is rejected rather than silently emitted.
+// writes. A size of zero is not encodable (the format reads it back as
+// 0x10000) so it is rejected rather than silently emitted.
 func appendDeltaCopy(t *testing.T, dst []byte, off, size int) []byte {
 	t.Helper()
 	require.Positive(t, size, "copy size 0 encodes as 0x10000")
@@ -239,7 +239,7 @@ func TestMultiHopRefDeltaChain_BorrowedAndStreaming(t *testing.T) {
 	})
 
 	// Every level must materialize to its exact content via the streaming
-	// (cached) path, reading ascending on one warm store — the repeated-read
+	// (cached) path, reading ascending on one warm store: the repeated-read
 	// pattern a real scan produces. Chain depths 1..N are covered by
 	// streaming_cold_per_level below, not here; see the note there.
 	t.Run("streaming_all_levels", func(t *testing.T) {
@@ -265,7 +265,7 @@ func TestMultiHopRefDeltaChain_BorrowedAndStreaming(t *testing.T) {
 	// repeatedly, not depths 1..N. A cold store per level is what makes the
 	// streaming path build a multi-entry stack, which is also the only way to
 	// reach the intermediate-publication branch of applyDeltaStackCached
-	// (non-nil cache with more than one hop remaining) — the borrowed path
+	// (non-nil cache with more than one hop remaining): the borrowed path
 	// walks with a nil cache and can never enter it.
 	//
 	// Reaching that branch is not the same as proving it correct: the final

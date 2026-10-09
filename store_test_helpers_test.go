@@ -2,8 +2,8 @@
 // store functionality.
 //
 // This file contains functions that are only intended for use in tests to access
-// the unexported store type and open function. The _test.go suffix keeps them —
-// and the os/exec, testing, and testify dependencies they pull in — out of the
+// the unexported store type and open function. The _test.go suffix keeps them
+// (and the os/exec, testing, and testify dependencies they pull in) out of the
 // library build, so consumers never inherit them.
 //
 // Everything here is therefore visible only to this package's tests, including

@@ -223,8 +223,8 @@ func hunkRetainedBytes(h *HunkAddition) int64 {
 	return n
 }
 
-// lineFingerprint hashes one added line (without its trailing newline —
-// tokenize already strips it) to the 64-bit fingerprint used for dedup.
+// lineFingerprint hashes one added line (without its trailing newline,
+// which tokenize already strips) to the 64-bit fingerprint used for dedup.
 // FarmHash matches the package's existing line-hashing convention
 // (addedHunksWithHashing in diff_blob.go).
 func lineFingerprint(line string) uint64 {
@@ -236,7 +236,7 @@ func lineFingerprint(line string) uint64 {
 // fingerprints of zero are remapped to dedupZeroFingerprint.
 //
 // Exactly one goroutine (the decision stage) mutates the set, which keeps
-// the insert order — and therefore the growth and saturation points —
+// the insert order (and therefore the growth and saturation points)
 // fully deterministic. Other goroutines may concurrently probe a published
 // snapshot (see snapshot and fingerprintSnapshot.contains): the writer
 // stores slot values with atomic stores and readers load them with atomic
@@ -408,7 +408,7 @@ func (s *lineFingerprintSet) markNew(fp uint64) bool {
 //
 // Equivalence with dedupHunkEmission (which hashes and marks every line):
 // a line the snapshot contained is in the set at this hunk's position, so
-// markNew would report it seen and insert nothing — skipping it changes
+// markNew would report it seen and insert nothing: skipping it changes
 // neither the verdict nor the insert sequence. Saturated at entry, every
 // markNew reports true, so the verdict is "non-empty" exactly as the full
 // pass computes. Saturation tripped mid-hunk happens only via an insert of
@@ -670,8 +670,8 @@ func (w *dedupInFlightWindow) park(ready func() bool, stopCh <-chan struct{}, wo
 // parallel workers.
 //
 // Duplicate lines inside one hunk leave its verdict unchanged: a block whose
-// closing line repeats an earlier line of the same hunk — armored key blocks
-// sharing an END marker — survives whenever its first occurrence was unseen.
+// closing line repeats an earlier line of the same hunk (armored key blocks
+// sharing an END marker) survives whenever its first occurrence was unseen.
 // The first occurrence inserts the fingerprint and reports new; later
 // occurrences report seen, and the verdict is already settled by then.
 //
@@ -706,7 +706,7 @@ func dedupHunkEmission(h HunkAddition, set *lineFingerprintSet) bool {
 	for _, line := range h.lines {
 		// markNew both reports absence and inserts, in a single probe and a
 		// single hash of the line. It is the only mutator here, so the insert
-		// sequence — and with it the growth and saturation points — is fixed
+		// sequence (and with it the growth and saturation points) is fixed
 		// by the line order alone.
 		if set.markNew(lineFingerprint(line)) {
 			anyNew = true
@@ -873,7 +873,7 @@ func toKiB(n uint64) uint32 {
 // Soundness of treating a snapshot hit as a settled duplicate: the decision
 // goroutine processes pairs strictly in seq order and this hunk's pair has
 // not been handed to it yet, so every fingerprint in the snapshot was
-// inserted while processing an earlier seq — i.e. it is in the set at this
+// inserted while processing an earlier seq: i.e. it is in the set at this
 // hunk's position in the total order. A miss is only a hint and is resolved
 // authoritatively by the decision stage.
 func prefilterHunk(h *HunkAddition, sn *fingerprintSnapshot, buf []uint64) []uint64 {
@@ -957,8 +957,8 @@ func (hs *HistoryScanner) collectCommitPairs(c commitInfo, stopCh <-chan struct{
 //	yield workers           N, consume yieldChan batches, call fn concurrently
 //
 // On any error (setError closes stopCh) every stage unblocks via its stopCh
-// select and the shutdown chain — hunkWG.Wait(), close(treeIdxChan),
-// treeWG.Wait(), <-decisionDone, yieldWG.Wait() — still runs to completion,
+// select, and the shutdown chain (hunkWG.Wait(), close(treeIdxChan),
+// treeWG.Wait(), <-decisionDone, yieldWG.Wait()) still runs to completion,
 // so no goroutine outlives the call.
 func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) error {
 	defer hs.stopProfiling() // Ensure profiling is stopped even on error
@@ -1706,7 +1706,7 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 
 	// Shutdown chain: close each stage's input only after its upstream
 	// senders have exited, and wait for every goroutine so none outlives
-	// this call — on the error path stopCh has every stage unblocked.
+	// this call: on the error path stopCh has every stage unblocked.
 	hunkWG.Wait()
 	close(treeIdxChan)
 	treeWG.Wait()

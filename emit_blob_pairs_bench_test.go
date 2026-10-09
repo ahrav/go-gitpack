@@ -244,7 +244,7 @@ func runEmitCommitBlobPairsBench(b *testing.B, hs *HistoryScanner, commit commit
 // pipeline end to end on the root-heavy fixture with a fresh scanner per
 // iteration, so no pair memo or tree cache carries over. "first-hunk-ns" is
 // the time from scan start until any stage-2 worker delivers the first
-// hunk — the end-to-end view of the stage-2 stall.
+// hunk: the end-to-end view of the stage-2 stall.
 //
 // The matrix crosses file count with per-file size because stage-2 cost per
 // work unit reveals whether streaming the root walk overlaps useful stage-2

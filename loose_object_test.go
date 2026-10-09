@@ -4,8 +4,8 @@
 // allocating for it: pack reads size the target from the object header, while
 // readLooseObject streams the zlib body and validates the length afterwards.
 // That makes it the path where a returned buffer can carry spare capacity, and
-// callers that alias an object buffer instead of copying it — pairCache.add for
-// whole-blob hunk results, the offset cache's admission check — charge only the
+// callers that alias an object buffer instead of copying it (pairCache.add for
+// whole-blob hunk results, the offset cache's admission check) charge only the
 // bytes the object reports.
 package objstore
 
@@ -92,7 +92,7 @@ func TestReadLooseObject_ReturnsExactCapacityBuffer(t *testing.T) {
 			t.Fatalf("%s: len = %d, want %d", name, len(data), size)
 		}
 		if cap(data) != len(data) {
-			t.Errorf("%s: cap = %d, len = %d — spare capacity is retained by "+
+			t.Errorf("%s: cap = %d, len = %d: spare capacity is retained by "+
 				"aliasing callers but charged by none",
 				name, cap(data), len(data))
 		}

@@ -13,7 +13,7 @@
 #                 leg validates the asm wrapper's unsafe.Pointer conversions
 #                 while the amd64 leg keeps the generic decodeHuffmanGo fast
 #                 loop under checkptr with the full suite's input variety
-#   - libdeflate  the cgo libdeflate backend on both amd64 and ARM64 — a
+#   - libdeflate  the cgo libdeflate backend on both amd64 and ARM64: a
 #                 plain `go test` never compiles it (gated behind the
 #                 gitpack_libdeflate build tag), and the ARM64 leg is the only
 #                 gate for the tag's asm-deselection arm, which build-cross

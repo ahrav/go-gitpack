@@ -1,8 +1,8 @@
 // unsafe_test.go pins the safety-critical invariants of the zero-copy
 // conversion helpers in unsafe.go, which let pack reads alias the mmap'd file
 // instead of copying out of it. These helpers bypass Go's copy semantics, so
-// the invariants they promise — exact aliasing, correct length, and value
-// equality — must be asserted directly rather than left to indirect coverage.
+// the invariants they promise (exact aliasing, correct length, and value
+// equality) must be asserted directly rather than left to indirect coverage.
 //
 // This file stays free of build constraints, so everything here must compile on
 // every target the library supports. The mmapData assertions live in

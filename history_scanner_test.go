@@ -193,7 +193,7 @@ func TestLoadAllCommits_BuildsGraphWhenMissing(t *testing.T) {
 
 // TestDiffHistoryHunks_QueueDepthIsOnePerBlobWorker pins the returned queue's
 // capacity to the blob-worker count DiffHistoryHunksFunc uses. The depth is
-// derived from that width — one slot per worker and nothing more — so a change
+// derived from that width (one slot per worker and nothing more) so a change
 // to either side that breaks the derivation fails here rather than silently
 // changing how many hunk payloads the queue can pin.
 func TestDiffHistoryHunks_QueueDepthIsOnePerBlobWorker(t *testing.T) {
@@ -214,7 +214,7 @@ func TestDiffHistoryHunks_QueueDepthIsOnePerBlobWorker(t *testing.T) {
 // pipeline's goroutines exit.
 //
 // The queue holds one hunk per blob worker, so the stall is only reachable
-// while the fixture emits more hunks than the host has CPUs — the state in
+// while the fixture emits more hunks than the host has CPUs: the state in
 // which an abandoned or slow consumer would otherwise strand the worker pool.
 func TestDiffHistoryHunks_StalledConsumerStillCompletes(t *testing.T) {
 	// The fixture emits one hunk per commit. A host with enough CPUs to hold
@@ -416,8 +416,8 @@ func createScannerForRepo(t testing.TB, repoName string) *HistoryScanner {
 
 // createScannerForRepoWithError is like createScannerForRepo but returns the
 // error instead of failing the test, allowing callers to assert specific
-// error conditions. It is currently unused but retained for future negative
-// test cases that need to inspect scanner-creation failures.
+// error conditions, such as negative tests that inspect scanner-creation
+// failures.
 func createScannerForRepoWithError(t testing.TB, repoName string) (*HistoryScanner, error) {
 	repoPath := filepath.Join("testdata", "repos", repoName)
 	return NewHistoryScanner(repoPath)
@@ -777,7 +777,7 @@ func TestEmitCommitBlobPairs_SkipsDeletionsAndUnchangedPairs(t *testing.T) {
 // TestStreamBlobPairHunks_DeliveredLinesDoNotAliasBlob proves a delivered
 // HunkAddition carries only its own line bytes. computeAddedHunks tokenizes the
 // new blob into zero-copy views, so delivering those views keeps the whole blob
-// alive for as long as any consumer holds the hunk — and every hunk buffered by
+// alive for as long as any consumer holds the hunk, and every hunk buffered by
 // DiffHistoryHunks or held by a blob worker would pin one distinct blob apiece.
 //
 // The fixture's modification of main.go is the case that matters: its added
@@ -859,7 +859,7 @@ func TestDiffHistoryHunksFunc_ReleasesTreeMemo(t *testing.T) {
 // rejected as an error rather than reaching a worker.
 //
 // The blob workers call fn on the hot path without a nil check, so admitting
-// nil would surface as a nil-func call inside a worker goroutine — a panic no
+// nil would surface as a nil-func call inside a worker goroutine: a panic no
 // caller can recover, since it unwinds a goroutine the caller does not own.
 // The repository used here produces added hunks, so a missing guard would
 // actually reach the call rather than finishing with nothing to deliver.

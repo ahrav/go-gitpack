@@ -8,14 +8,14 @@
 // The algorithm uses an adaptive, multi-tier optimization strategy selected
 // by file size (see computeAddedHunks):
 //
-//   - <= SmallFileThreshold  (1 MB):   addedHunksWithPos — greedy forward scan
+//   - <= SmallFileThreshold  (1 MB):   addedHunksWithPos: greedy forward scan
 //     with optional hash-map acceleration for files with >50 lines. This is NOT
 //     a standard diff algorithm (e.g., Myers); it is a greedy heuristic that
 //     walks the old and new line sequences in order and reports lines in newB
 //     that cannot be matched to a remaining line in oldB.
-//   - <= MediumFileThreshold (50 MB):  addedHunksWithLineSet — set-membership
+//   - <= MediumFileThreshold (50 MB):  addedHunksWithLineSet: set-membership
 //     diff that discards positional information.
-//   - <= LargeFileThreshold  (500 MB): addedHunksWithHashing — stores only
+//   - <= LargeFileThreshold  (500 MB): addedHunksWithHashing: stores only
 //     64-bit FarmHash digests per line to limit memory.
 //   - > MaxDiffSize          (1 GB):   skipped entirely; a placeholder hunk is
 //     returned instead. Enforced per side as each blob is lazily loaded; see
@@ -54,7 +54,7 @@ var lineHashSeed = maphash.MakeSeed()
 // in an open-addressed, epoch-stamped table rather than a Go map: bumping
 // the epoch invalidates every slot in O(1), so a pooled index is reusable
 // across diffs with no clear() pass, no per-line allocations, and no map
-// runtime overhead on the hot lookup path. Hash collisions are harmless —
+// runtime overhead on the hot lookup path. Hash collisions are harmless:
 // lookups verify actual string equality before accepting a position.
 type lineIndex struct {
 	slots []uint64
@@ -62,7 +62,7 @@ type lineIndex struct {
 	next  []int32
 }
 
-// Slot encoding: each open-addressing bucket is a single uint64 —
+// Slot encoding: each open-addressing bucket is a single uint64:
 //
 //	[ hash tag: 24 bits | pos: 32 bits | epoch: 8 bits ]
 //
@@ -71,7 +71,7 @@ type lineIndex struct {
 // was the hottest load in the whole diff path. A slot is live only when its
 // low epoch byte matches the index's current epoch (mod 256); the table is
 // fully cleared on wraparound so stale epochs can never alias. The 24-bit
-// tag only filters probes — chain entries are verified by string equality —
+// tag only filters probes (chain entries are verified by string equality)
 // so tag collisions cost time, never correctness.
 const (
 	lineSlotEpochBits = 8
@@ -92,7 +92,7 @@ var lineIndexPool = sync.Pool{
 // may be returned to lineIndexPool. build() only ever grows slots and next,
 // and sync.Pool holds objects across GC cycles, so without a cap every
 // pooled index ratchets to the largest file it has ever indexed (~20 MiB
-// for a 2^20-line file: 16 MiB of slots plus 4 MiB of next) — retained once
+// for a 2^20-line file: 16 MiB of slots plus 4 MiB of next), retained once
 // per scan worker. Oversized indexes are dropped instead of pooled: the
 // rebuild allocation is dwarfed by the cost of diffing a file that large,
 // and re-pooling them would also make every subsequent small diff probe a
@@ -286,7 +286,7 @@ func isBinary(data []byte) bool {
 //  2. Load the new blob. Emit a placeholder if it exceeds MaxDiffSize, or a
 //     single binary hunk if it is binary. In the binary case the old blob is
 //     never loaded, so an old version above MaxDiffSize does not produce a
-//     placeholder here — the size limit applies per side, as each blob is
+//     placeholder here: the size limit applies per side, as each blob is
 //     loaded.
 //  3. For a pure addition (oldOID zero), tokenize the new blob.
 //  4. Otherwise load the old blob: a placeholder if it exceeds MaxDiffSize,
@@ -352,7 +352,7 @@ func putLineScratch(sc *lineScratch) {
 func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch) ([]AddedHunk, error) {
 	// Pure deletion (or nothing at all): no added-line side exists, so the
 	// blobs never need to be loaded. This matters for history walks where
-	// large binaries get deleted — inflating a multi-MB blob only to
+	// large binaries get deleted: inflating a multi-MB blob only to
 	// discard it dominated whole-scan tail latency.
 	//
 	// A deletion of a file larger than MaxDiffSize therefore yields no hunks
@@ -369,13 +369,13 @@ func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch
 	}
 
 	// Load only the NEW side first. Whenever the new blob is binary the
-	// result is a single binary hunk carrying the new content — the old
+	// result is a single binary hunk carrying the new content: the old
 	// blob's bytes are never consulted (content inequality is already
 	// guaranteed by oldOID != newOID under content addressing). Deferring
 	// the old-side load until it is actually needed means each version of
 	// a large checked-in binary is inflated exactly once per scan (as the
 	// "new" side), instead of again as the "old" side of the next
-	// transition — that redundant multi-MB inflation dominated whole-scan
+	// transition: that redundant multi-MB inflation dominated whole-scan
 	// tail latency.
 	newBytes, err := loadBlob(store, newOID)
 	if err != nil {
@@ -383,7 +383,7 @@ func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch
 	}
 	newSize := int64(len(newBytes))
 
-	// Hard size limit — users would rather see a placeholder than wait.
+	// Hard size limit: users would rather see a placeholder than wait.
 	if newSize > maxDiffSize {
 		return []AddedHunk{tooLargeHunk(fmt.Sprintf("[File too large to diff: new=%d bytes]", newSize))}, nil
 	}
@@ -395,8 +395,8 @@ func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch
 		// convention tokenize already uses for text.
 		//
 		// The old blob is intentionally not loaded (or size-checked) on
-		// this path: its bytes cannot change the output — the hunk carries
-		// only the new content — and checking its size would require
+		// this path: its bytes cannot change the output (the hunk carries
+		// only the new content) and checking its size would require
 		// inflating it, reinstating the redundant old-side inflation this
 		// lazy-load ordering exists to avoid. Consequently a >MaxDiffSize
 		// old version rewritten to a within-limit binary new version emits
@@ -442,7 +442,7 @@ func computeAddedHunksScratch(store *store, oldOID, newOID Hash, sc *lineScratch
 		return []AddedHunk{hunk}, nil
 	}
 
-	// Both files are text — choose the diff algorithm by size.
+	// Both files are text: choose the diff algorithm by size.
 	if oldSize <= SmallFileThreshold && newSize <= SmallFileThreshold {
 		return addedHunksWithPosScratch(oldBytes, newBytes, sc), nil
 	}

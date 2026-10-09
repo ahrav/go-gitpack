@@ -74,8 +74,8 @@ var (
 	// Truncation-class errors wrap io.ErrUnexpectedEOF so callers can
 	// separate exhausted input from structurally invalid data with
 	// errors.Is(err, io.ErrUnexpectedEOF). The invariant: every decode
-	// failure caused by the input ending early — a block header, stored
-	// block, dynamic-table field, codeword, or extra bits cut short —
+	// failure caused by the input ending early (a block header, stored
+	// block, dynamic-table field, codeword, or extra bits cut short)
 	// reports this identity, and structurally invalid data never does.
 	errDeflateTruncated   = fmt.Errorf("deflate: truncated input: %w", io.ErrUnexpectedEOF)
 	errDeflateShortOutput = fmt.Errorf("deflate: output shorter than destination: %w", io.ErrUnexpectedEOF)

@@ -18,11 +18,11 @@
 // memmove_fallback.go ensures the package still compiles on older Go versions.
 //
 // Directive reference:
-//   - //go:linkname copyMemory runtime.memmove — instructs the linker to
+//   - //go:linkname copyMemory runtime.memmove: instructs the linker to
 //     resolve the symbol "copyMemory" in this package to "runtime.memmove"
 //     in the runtime package, effectively aliasing our function to the
 //     runtime's assembly-optimized memmove.
-//   - //go:noescape — tells the compiler that none of the pointer arguments
+//   - //go:noescape: tells the compiler that none of the pointer arguments
 //     escape to the heap through this function call. This is safe because
 //     runtime.memmove only reads from 'from' and writes to 'to' without
 //     retaining either pointer. Without this directive, the compiler would

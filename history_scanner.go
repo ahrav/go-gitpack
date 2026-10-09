@@ -210,8 +210,8 @@ func WithOffsetCacheBudget(bytes int) ScannerOption {
 // should lower the budget to bound aggregate memory growth. A budget <= 0
 // disables the memo entirely: every pair is recomputed.
 //
-// Disabling costs throughput on histories with merges — the memo exists
-// because ~1/3 of pair diffs in a typical walk are repeats — but it does not
+// Disabling costs throughput on histories with merges (the memo exists
+// because ~1/3 of pair diffs in a typical walk are repeats) but it does not
 // change delivered hunks or their retention: a hunk's lines are compacted into
 // their own buffer whether or not the memo stores them.
 func WithPairCacheBudget(bytes int) ScannerOption {
@@ -384,8 +384,8 @@ func (h *HunkAddition) IsBinary() bool { return h.isBinary }
 // entire blob as its payload. The queue is not the dominant term: a queue slot
 // holds one finished hunk, while each blob worker holds the hunks it just
 // produced plus the decompressed blobs it diffed them from.
-// DiffHistoryHunksFunc removes the queue term and only that term — the
-// blob-worker term follows from the pipeline width — so it is the API for
+// DiffHistoryHunksFunc removes the queue term and only that term (the
+// blob-worker term follows from the pipeline width) so it is the API for
 // callers who want no queue between a worker and the consumer. Neither API
 // lets a caller measure a hunk's retained payload: compactHunks gives all
 // hunks of one pair a single shared backing array, so the lengths reported by
@@ -434,7 +434,7 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 // Returning a non-nil error from fn aborts the scan; the first error is
 // returned. Compared to draining the DiffHistoryHunks channel with one
 // consumer goroutine, this eliminates the channel hand-off entirely and
-// lets hunk processing scale across every worker — the preferred API for
+// lets hunk processing scale across every worker: the preferred API for
 // CPU-bound consumers.
 //
 // Ordering: fn receives the hunks for one (commit, path) pair sequentially
@@ -445,7 +445,7 @@ func (hs *HistoryScanner) DiffHistoryHunks() (<-chan HunkAddition, <-chan error)
 //
 // A nil fn is rejected before any worker starts. The workers call fn without
 // a nil check on the hot path, so admitting one would surface as a panic in a
-// worker goroutine — unrecoverable for the calling process — rather than as
+// worker goroutine (unrecoverable for the calling process) rather than as
 // this method's error return.
 func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) error {
 	if fn == nil {
@@ -775,8 +775,8 @@ const (
 // placeholder files (empty __init__.py, .gitkeep, generated boilerplate) all
 // collapse to one credit. Inference is what needs the paths, and paths are
 // O(deleted files) with no such collapse. Retaining them unconditionally would
-// make a deletion-only vendor-tree cleanup — a commit where no candidate exists
-// for inference to help — allocate per deleted file for nothing. Past this
+// make a deletion-only vendor-tree cleanup (a commit where no candidate exists
+// for inference to help) allocate per deleted file for nothing. Past this
 // bound the paths are dropped and only the credits are kept.
 //
 // It is a variable only so tests can reach the drop path without building a
@@ -1089,7 +1089,7 @@ func (hs *HistoryScanner) emitCommitBlobPairsTo(c commitInfo, parentTree Hash, e
 // inferredRename so stage 2 can content-validate the guess); every other
 // candidate passes through unchanged, in input order.
 //
-// Pure over its inputs — no I/O, no store access — which keeps it directly
+// Pure over its inputs (no I/O, no store access) which keeps it directly
 // unit-testable and benchmarkable. It filters candidates in place, reusing the
 // backing array, and consumes deletesByIdentity and used.
 // suppressExactMoves filters out the candidates whose bytes an unconsumed
@@ -1138,8 +1138,8 @@ func pairCommitRenames(
 		unmatched = append(unmatched, candidates[i])
 	}
 
-	// A commit whose every candidate was an exact-OID move — a plain directory
-	// move — leaves nothing for directory inference to pair, so skip both the
+	// A commit whose every candidate was an exact-OID move (a plain directory
+	// move) leaves nothing for directory inference to pair, so skip both the
 	// inference and the by-path index it feeds.
 	if len(unmatched) == 0 {
 		return unmatched
@@ -1210,8 +1210,8 @@ type deleteGroup struct {
 	// indices (head+next representation rather than map[string][]int so a
 	// group with thousands of distinct basenames costs two allocations, not
 	// one slice per basename). Built lazily on the first lookup that sees
-	// more than one candidate: singleton groups — the overwhelmingly common
-	// case — never pay for it. baseNext[pos] == -1 terminates a chain.
+	// more than one candidate: singleton groups (the overwhelmingly common
+	// case) never pay for it. baseNext[pos] == -1 terminates a chain.
 	baseHead map[string]int
 	baseNext []int
 }
@@ -1596,7 +1596,7 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 //     can measure.
 //
 // An empty hunk list is not a shortcut to "trustworthy". Exact-OID moves never
-// reach here — stage 1 suppresses them — so a pairing that arrives with zero
+// reach here (stage 1 suppresses them) so a pairing that arrives with zero
 // added lines has two different blobs whose new side is a line-wise subset of
 // the old one. That is what an unrelated pairing looks like when the new file
 // is much smaller, so it is measured like any other.
@@ -1653,7 +1653,7 @@ func (hs *HistoryScanner) gateInferredRenameHunks(oldOID, newOID Hash, hunks []A
 	// alone, because a new-side-only score cannot see a pairing that merely
 	// shrinks. An unrelated one-line new file whose single line happens to
 	// occur somewhere in a 100-line deleted file produces ZERO added lines, so
-	// scoring added-over-newTotal keeps the pairing and emits no hunk at all —
+	// scoring added-over-newTotal keeps the pairing and emits no hunk at all:
 	// the new file's only line never reaches the stream. Git treats that case
 	// as a delete plus a create for the same reason: its similarity
 	// denominator is max(src, dst), so a large deletion counts against the
@@ -1700,8 +1700,8 @@ func (hs *HistoryScanner) SetVerifyCRC(verify bool) { hs.store.VerifyCRC = verif
 //
 // The pair cache and the commit cache are cleared as well. Callers may retain
 // a HistoryScanner value after Close, and a hunk scan leaves the pair cache
-// holding up to its full budget of hunk lines — plus, for whole-blob entries,
-// the object buffers those lines view — and a dedup scan leaves the commit
+// holding up to its full budget of hunk lines (plus, for whole-blob entries,
+// the object buffers those lines view) and a dedup scan leaves the commit
 // list and graph for the whole history; both would otherwise stay reachable
 // until the scanner itself does. This mirrors store.Close releasing the
 // offset cache's object bytes.

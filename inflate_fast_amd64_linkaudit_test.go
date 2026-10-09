@@ -207,7 +207,7 @@ func amd64ParseLinkAuditObjdump(out string) ([]amd64LinkAuditBlock, error) {
 
 // amd64SelectLinkAuditKernelInsns picks the kernel's instructions out of the
 // parsed blocks. A block qualifies when its symbol names the kernel AND
-// every instruction is attributed to inflate_fast_amd64.s — the latter
+// every instruction is attributed to inflate_fast_amd64.s: the latter
 // excludes compiler-generated ABI wrappers or similarly named symbols. An
 // empty result is itself a finding: the kernel was dead-stripped, renamed,
 // or moved out of inflate_fast_amd64.s.
@@ -245,7 +245,7 @@ func amd64SelectLinkAuditKernelInsns(blocks []amd64LinkAuditBlock) ([]amd64LinkA
 // final (Go/Plan-9 destination-position) operand. Valid only for mnemonics
 // that can appear in the audit: every allowlisted mnemonic either writes
 // exactly its final operand (including the read-modify-write ALU ops, which
-// also read it — conservative for write detection) or writes none.
+// also read it, which is conservative for write detection) or writes none.
 // Mnemonics with several or implicit destinations are kept off the
 // allowlist so this model is never applied to them silently.
 func amd64LinkAuditWritesFinalOperand(mnemonic string) bool {
@@ -451,7 +451,7 @@ func TestInflateHuffmanFastAMD64LinkAuditKernel(t *testing.T) {
 	}
 
 	// Parser-integrity canaries. The kernel is KNOWN to (1) write R14 once
-	// ("MOVQ CX, R14", the ABI0-sanctioned input limit — see the .s header),
+	// ("MOVQ CX, R14", the ABI0-sanctioned input limit: see the .s header),
 	// (2) load its argument through SP ("MOVQ 0x8(SP), R12" = state+0(FP)),
 	// and (3) return. If the audit stops seeing these, the objdump format
 	// drifted and every assertion above would be vacuously green.
@@ -517,7 +517,7 @@ func amd64LinkAuditDoctoredLine(srcLine int, text string) string {
 
 // amd64LinkAuditDoctoredObjdump builds a minimal syntactically faithful
 // objdump dump for the kernel symbol: a clean prologue (including the two
-// deliberate edge cases — the SP-relative argument load and the sanctioned
+// deliberate edge cases: the SP-relative argument load and the sanctioned
 // R14 write, which must NOT be flagged), any doctored extra instructions,
 // and a RET.
 func amd64LinkAuditDoctoredObjdump(extra ...string) string {

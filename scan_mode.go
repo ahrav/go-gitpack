@@ -141,7 +141,7 @@ func WithSkipMergeDiffs(skip bool) ScannerOption {
 //     introduction.
 //   - Merging in foreign history with older timestamps can insert commits
 //     earlier in the parent-first order and re-attribute a line's first
-//     introduction — inherent to first-introduction semantics.
+//     introduction: inherent to first-introduction semantics.
 //
 // Fingerprint-table size and the pipeline's look-ahead window are internal
 // constants.
@@ -159,8 +159,8 @@ func WithHunkLineDedup(dedup bool) ScannerOption {
 // The option affects hunk scans only (DiffHistoryHunks, DiffHistoryHunksFunc,
 // and Scan in ScanModeHunks); blob-mode scans are unchanged. When skip is
 // non-nil, every changed blob pair is offered to skip with the introducing
-// commit and the post-image path — the same path the resulting
-// HunkAddition.Path() would report — and pairs reporting true are dropped
+// commit and the post-image path (the same path the resulting
+// HunkAddition.Path() would report), and pairs reporting true are dropped
 // BEFORE diffing, so filtered paths also skip diff cost in both dedup and
 // non-dedup hunk scans.
 //
@@ -172,7 +172,7 @@ func WithHunkLineDedup(dedup bool) ScannerOption {
 // seen, suppressing every later occurrence in paths the consumer keeps.
 //
 // skip MUST be a pure, deterministic function of its arguments and safe for
-// concurrent calls — it is invoked from multiple workers, and the scanner's
+// concurrent calls: it is invoked from multiple workers, and the scanner's
 // determinism guarantees only hold under that contract.
 //
 // A nil skip means no filtering (the default) and preserves existing
@@ -222,8 +222,8 @@ func (hs *HistoryScanner) Scan(seen SeenSet, scanner BlobScanner) error {
 }
 
 // maxReusedHunkPayloadBytes bounds the capacity scanHunks carries from one
-// hunk to the next. Reuse is what makes the buffer worth having — a history
-// of small hunks assembles every payload into the same array — but a single
+// hunk to the next. Reuse is what makes the buffer worth having (a history
+// of small hunks assembles every payload into the same array) but a single
 // whole-file text hunk can reach MaxDiffSize (1 GiB), and Reset keeps the
 // grown array. Without a cap, one large hunk early in a scan pins its payload
 // until the scan returns, which the per-hunk buffer this replaced did not do.
@@ -258,7 +258,7 @@ func releaseOversizedPayload(payload *bytes.Buffer) bool {
 //
 // A binary hunk bypasses the buffer entirely. Its single line already holds the
 // whole new blob, so it is streamed straight to ScanBlob instead of being
-// copied into the payload — the case that would otherwise grow the buffer to
+// copied into the payload: the case that would otherwise grow the buffer to
 // MaxDiffSize on every checked-in binary.
 //
 // A scan error aborts the walk, and DiffHistoryHunksFunc returns the first
