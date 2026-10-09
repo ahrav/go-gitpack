@@ -517,6 +517,11 @@ type blobPairWork struct {
 	path   string
 	oldOID Hash
 	newOID Hash
+
+	// renameCandidate marks a pair whose oldOID came from a deleted path
+	// matched only by directory-rename evidence; the hunk stage pairs it
+	// against oldOID only when the contents are similar.
+	renameCandidate bool
 }
 
 type exactRenameEvidence struct {
@@ -616,20 +621,11 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, emi
 
 	for i := range unmatchedAdds {
 		if deleteIdx, ok := matchDirectoryRename(unmatchedAdds[i].path, dirRenames, unusedDeletesByPath, usedDeletes); ok {
-			isRename, err := hs.hasDirectoryRenameSimilarity(deletes[deleteIdx].oldOID, unmatchedAdds[i].newOID)
-			if err != nil {
-				return err
-			}
-			if !isRename {
-				if err := emit(unmatchedAdds[i]); err != nil {
-					return err
-				}
-				continue
-			}
 			usedDeletes[deleteIdx] = true
 			delete(unusedDeletesByPath, deletes[deleteIdx].path)
 			work := unmatchedAdds[i]
 			work.oldOID = deletes[deleteIdx].oldOID
+			work.renameCandidate = true
 			if err := emit(work); err != nil {
 				return err
 			}
@@ -640,45 +636,6 @@ func (hs *HistoryScanner) emitCommitBlobPairs(c commitInfo, parentTree Hash, emi
 		}
 	}
 	return nil
-}
-
-// hasDirectoryRenameSimilarity confirms that a path-based directory rename
-// candidate also resembles the deleted blob. Exact-OID renames were removed
-// earlier; this check is intentionally conservative so uncertain candidates
-// remain full additions rather than hiding content.
-func (hs *HistoryScanner) hasDirectoryRenameSimilarity(oldOID, newOID Hash) (bool, error) {
-	oldData, oldType, err := hs.store.get(oldOID)
-	if err != nil {
-		return false, err
-	}
-	newData, newType, err := hs.store.get(newOID)
-	if err != nil {
-		return false, err
-	}
-	if oldType != ObjBlob || newType != ObjBlob || len(oldData) > SmallFileThreshold || len(newData) > SmallFileThreshold {
-		return false, nil
-	}
-	if isBinary(oldData) || isBinary(newData) {
-		return false, nil
-	}
-
-	oldLines := tokenize(oldData)
-	newLines := tokenize(newData)
-	if len(oldLines) == 0 || len(newLines) == 0 {
-		return false, nil
-	}
-	counts := make(map[string]int, len(oldLines))
-	for _, line := range oldLines {
-		counts[line]++
-	}
-	matches := 0
-	for _, line := range newLines {
-		if counts[line] > 0 {
-			counts[line]--
-			matches++
-		}
-	}
-	return matches*2 >= max(len(oldLines), len(newLines)), nil
 }
 
 func takeExactRenameDelete(add blobPairWork, deletes []blobPairWork, used []bool, deletesByOID map[Hash][]int) (int, bool) {
@@ -787,15 +744,28 @@ func trimPathPrefix(p, prefix string) (string, bool) {
 // only on the two blob contents, and histories with merges replay the same
 // transition repeatedly.
 func (hs *HistoryScanner) streamBlobPairHunks(work blobPairWork, fn func(HunkAddition) error) error {
-	pk := makePairKey(work.oldOID, work.newOID)
-	hunks, cached := hs.pairs.get(pk)
-	if !cached {
+	var hunks []AddedHunk
+	if work.renameCandidate {
+		// The pair memo is keyed by (old, new) and holds a plain diff; a
+		// candidate's result also depends on its similarity verdict, so
+		// candidates bypass the memo in both directions.
 		var err error
-		hunks, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
+		hunks, err = computeRenameCandidateHunks(hs.store, work.oldOID, work.newOID)
 		if err != nil {
 			return fmt.Errorf("compute added hunks: %w", err)
 		}
-		hs.pairs.add(pk, hunks)
+	} else {
+		pk := makePairKey(work.oldOID, work.newOID)
+		var cached bool
+		hunks, cached = hs.pairs.get(pk)
+		if !cached {
+			var err error
+			hunks, err = computeAddedHunks(hs.store, work.oldOID, work.newOID)
+			if err != nil {
+				return fmt.Errorf("compute added hunks: %w", err)
+			}
+			hs.pairs.add(pk, hunks)
+		}
 	}
 
 	for _, hunk := range hunks {

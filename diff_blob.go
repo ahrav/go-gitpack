@@ -325,6 +325,54 @@ func isBinary(data []byte) bool {
 // The returned slice is nil when there are no additions, or contains at least
 // one hunk (possibly a single placeholder line) in every other case.
 func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
+	newBytes, hunks, done, err := newSideHunks(store, oldOID, newOID)
+	if done || err != nil {
+		return hunks, err
+	}
+
+	// Pure addition of a text file: everything in newBytes is new.
+	if oldOID.IsZero() {
+		return pureAdditionHunks(newBytes), nil
+	}
+
+	// New side is text; the old side is now needed for the line diff (or
+	// to detect a binary→text transition).
+	oldBytes, err := loadBlob(store, oldOID)
+	if err != nil {
+		return nil, fmt.Errorf("getting old blob: %w", err)
+	}
+	return textAgainstOldHunks(oldBytes, newBytes), nil
+}
+
+// computeRenameCandidateHunks is computeAddedHunks for a directory-rename
+// candidate: a new path matched to a deleted path only by directory
+// evidence. The pair is diffed against the old blob only when the two
+// texts share at least half their lines (see renameLinesSimilar); any other
+// candidate is reported as a full addition, so an unrelated old file never
+// hides lines the new file adds. The new blob is loaded first, so a binary
+// or oversized new side never loads the old blob.
+func computeRenameCandidateHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
+	newBytes, hunks, done, err := newSideHunks(store, oldOID, newOID)
+	if done || err != nil {
+		return hunks, err
+	}
+	if oldOID.IsZero() {
+		return pureAdditionHunks(newBytes), nil
+	}
+	oldBytes, err := loadBlob(store, oldOID)
+	if err != nil {
+		return nil, fmt.Errorf("getting old blob: %w", err)
+	}
+	if !renameLinesSimilar(oldBytes, newBytes) {
+		return pureAdditionHunks(newBytes), nil
+	}
+	return textAgainstOldHunks(oldBytes, newBytes), nil
+}
+
+// newSideHunks runs the steps of computeAddedHunks that need only the new
+// blob. done reports that hunks is the final result; otherwise newBytes is
+// the new side's text and the caller continues with the old side.
+func newSideHunks(store *store, oldOID, newOID Hash) (newBytes []byte, hunks []AddedHunk, done bool, err error) {
 	// Pure deletion (or nothing at all): no added-line side exists, so the
 	// blobs never need to be loaded. This matters for history walks where
 	// large binaries get deleted — inflating a multi-MB blob only to
@@ -334,13 +382,13 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 	// rather than the "[File too large to diff]" placeholder: an added-lines
 	// diff of a pure deletion has no added side to show.
 	if newOID.IsZero() {
-		return nil, nil
+		return nil, nil, true, nil
 	}
 	// Identical content on both sides (mode-only change, e.g. chmod):
 	// content addressing guarantees an empty diff without loading either
 	// blob.
 	if oldOID == newOID {
-		return nil, nil
+		return nil, nil, true, nil
 	}
 
 	// Load only the NEW side first. Whenever the new blob is binary the
@@ -352,9 +400,9 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 	// "new" side), instead of again as the "old" side of the next
 	// transition — that redundant multi-MB inflation dominated whole-scan
 	// tail latency.
-	newBytes, err := loadBlob(store, newOID)
+	newBytes, err = loadBlob(store, newOID)
 	if err != nil {
-		return nil, fmt.Errorf("getting new blob: %w", err)
+		return nil, nil, true, fmt.Errorf("getting new blob: %w", err)
 	}
 	newSize := int64(len(newBytes))
 
@@ -365,7 +413,7 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 			Lines:     []string{fmt.Sprintf("[File too large to diff: new=%d bytes]", newSize)},
 			IsBinary:  false,
 		}
-		return []AddedHunk{placeholder}, nil
+		return nil, []AddedHunk{placeholder}, true, nil
 	}
 
 	if len(newBytes) > 0 && isBinary(newBytes) {
@@ -378,34 +426,31 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 			Lines:     []string{btostr(newBytes)},
 			IsBinary:  true,
 		}
-		return []AddedHunk{hunk}, nil
+		return nil, []AddedHunk{hunk}, true, nil
 	}
+	return newBytes, nil, false, nil
+}
 
-	// Pure addition of a text file: everything in newBytes is new.
-	if oldOID.IsZero() {
-		lines := tokenize(newBytes)
-		if len(lines) == 0 {
-			return nil, nil // Empty file added.
-		}
-		hunk := AddedHunk{StartLine: 1, Lines: lines, IsBinary: false}
-		return []AddedHunk{hunk}, nil
+func pureAdditionHunks(newBytes []byte) []AddedHunk {
+	lines := tokenize(newBytes)
+	if len(lines) == 0 {
+		return nil // Empty file added.
 	}
+	return []AddedHunk{{StartLine: 1, Lines: lines, IsBinary: false}}
+}
 
-	// New side is text; the old side is now needed for the line diff (or
-	// to detect a binary→text transition).
-	oldBytes, err := loadBlob(store, oldOID)
-	if err != nil {
-		return nil, fmt.Errorf("getting old blob: %w", err)
-	}
-	oldSize := int64(len(oldBytes))
-
+// textAgainstOldHunks diffs a text new side against the old blob: a
+// placeholder if the old side exceeds MaxDiffSize, one binary hunk on a
+// binary→text transition, else a size-selected text diff.
+func textAgainstOldHunks(oldBytes, newBytes []byte) []AddedHunk {
+	oldSize, newSize := int64(len(oldBytes)), int64(len(newBytes))
 	if oldSize > MaxDiffSize {
 		placeholder := AddedHunk{
 			StartLine: 1,
 			Lines:     []string{fmt.Sprintf("[File too large to diff: old=%d new=%d bytes]", oldSize, newSize)},
 			IsBinary:  false,
 		}
-		return []AddedHunk{placeholder}, nil
+		return []AddedHunk{placeholder}
 	}
 
 	if len(oldBytes) > 0 && isBinary(oldBytes) {
@@ -416,15 +461,45 @@ func computeAddedHunks(store *store, oldOID, newOID Hash) ([]AddedHunk, error) {
 			Lines:     []string{btostr(newBytes)},
 			IsBinary:  true,
 		}
-		return []AddedHunk{hunk}, nil
+		return []AddedHunk{hunk}
 	}
 
 	// Both files are text — choose the diff algorithm by size.
 	if oldSize <= SmallFileThreshold && newSize <= SmallFileThreshold {
-		return addedHunksWithPos(oldBytes, newBytes), nil
+		return addedHunksWithPos(oldBytes, newBytes)
 	}
 
-	return addedHunksForLargeFiles(oldBytes, newBytes), nil
+	return addedHunksForLargeFiles(oldBytes, newBytes)
+}
+
+// renameLinesSimilar reports whether at least half the lines of the longer
+// side also occur in the other side, counting each line occurrence once.
+// Lines are compared by 64-bit FarmHash, so the check uses one map entry
+// per distinct old line at any size; a hash collision can only overstate
+// similarity by one line. An old side that is binary or larger than
+// MaxDiffSize is never similar.
+func renameLinesSimilar(oldBytes, newBytes []byte) bool {
+	if len(oldBytes) > MaxDiffSize || isBinary(oldBytes) {
+		return false
+	}
+	oldLines := tokenize(oldBytes)
+	newLines := tokenize(newBytes)
+	if len(oldLines) == 0 || len(newLines) == 0 {
+		return false
+	}
+	counts := make(map[uint64]int32, len(oldLines))
+	for _, line := range oldLines {
+		counts[farm.Hash64([]byte(line))]++
+	}
+	matches := 0
+	for _, line := range newLines {
+		h := farm.Hash64([]byte(line))
+		if counts[h] > 0 {
+			counts[h]--
+			matches++
+		}
+	}
+	return matches*2 >= max(len(oldLines), len(newLines))
 }
 
 // loadBlob retrieves the raw content of a single object ID from store.
