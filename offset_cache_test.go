@@ -1,6 +1,10 @@
 package objstore
 
 import (
+	"bytes"
+	"compress/zlib"
+	"crypto/sha1"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"sync"
@@ -9,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/mmap"
 )
@@ -178,6 +183,91 @@ func TestWhalePrefetchCoversDeltifiedBlob(t *testing.T) {
 		require.Equal(t, ObjBlob, typ)
 		require.Equal(t, want, got)
 	}
+}
+
+// buildCopyHeavyDeltaPack builds a delta fixture whose 7 MiB target exceeds
+// twice the largest header size in its chain.
+func buildCopyHeavyDeltaPack(t *testing.T) (string, []byte) {
+	t.Helper()
+	rng := uint64(0x9E3779B97F4A7C15)
+	random := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			rng ^= rng << 13
+			rng ^= rng >> 7
+			rng ^= rng << 17
+			b[i] = byte(rng)
+		}
+		return b
+	}
+	base := random(1 << 16)
+	literal := random(3 << 20)
+	const copies = 64
+	target := append([]byte(nil), literal...)
+	for range copies {
+		target = append(target, base...)
+	}
+
+	var delta bytes.Buffer
+	writeVarInt(&delta, uint64(len(base)))
+	writeVarInt(&delta, uint64(len(target)))
+	for rest := literal; len(rest) > 0; {
+		n := min(len(rest), 127)
+		delta.WriteByte(byte(n))
+		delta.Write(rest[:n])
+		rest = rest[n:]
+	}
+	for range copies {
+		// Opcode 0x80 copies 0x10000 bytes from offset zero, covering the
+		// whole base.
+		delta.WriteByte(0x80)
+	}
+
+	baseOID, targetOID := calculateHash(ObjBlob, base), calculateHash(ObjBlob, target)
+	var pack bytes.Buffer
+	pack.WriteString("PACK")
+	require.NoError(t, binary.Write(&pack, binary.BigEndian, uint32(2)))
+	require.NoError(t, binary.Write(&pack, binary.BigEndian, uint32(2)))
+	baseOff := uint64(pack.Len())
+	pack.Write(encodeObjHeader(uint8(ObjBlob), uint64(len(base))))
+	zw := zlib.NewWriter(&pack)
+	_, err := zw.Write(base)
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	deltaOff := uint64(pack.Len())
+	obj, err := packRefDeltaObject(baseOID, delta.Bytes())
+	require.NoError(t, err)
+	pack.Write(obj)
+	sum := sha1.Sum(pack.Bytes())
+	pack.Write(sum[:])
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "pack-copy.pack"), pack.Bytes(), 0o644))
+	require.NoError(t, createV2IndexFile(filepath.Join(dir, "pack-copy.idx"), []Hash{baseOID, targetOID}, []uint64{baseOff, deltaOff}))
+	return dir, target
+}
+
+func TestWhalePrefetchChargesDeltaTarget(t *testing.T) {
+	dir, target := buildCopyHeavyDeltaPack(t)
+	s, err := open(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	p, off, ok := s.findPackedObject(calculateHash(ObjBlob, target))
+	require.True(t, ok)
+	headerMax, typ, ok := s.whaleSizeAt(p, off)
+	require.True(t, ok)
+	require.Equal(t, ObjBlob, typ)
+	require.Less(t, 2*headerMax, uint64(len(target)), "the fixture's target dwarfs its header sizes")
+
+	assert.Nil(t, s.newWhaleCacheWithBudget(uint64(len(target))-1), "a budget below the target size admits the delta")
+
+	c := s.newWhaleCacheWithBudget(uint64(len(target)))
+	require.NotNil(t, c)
+	got, typ, ok := c.get(p, off, nil)
+	require.True(t, ok)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, target, got)
 }
 
 // TestDedupScanPrefetchesWhales pins that the dedup pipeline runs the whale

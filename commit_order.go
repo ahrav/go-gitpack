@@ -22,7 +22,6 @@ package objstore
 
 import (
 	"bytes"
-	"encoding/binary"
 	"slices"
 )
 
@@ -81,67 +80,12 @@ func (h *commitOrderHeap) pop() int32 {
 	return top
 }
 
-// orderCommitsParentFirst returns a deterministic parent-before-child ordering
-// of the input commits using Kahn's algorithm with a min-heap priority queue.
-//
-// Algorithm:
-//  1. Index every commit by OID and compute its in-degree (number of parents
-//     that are also in the input set). Child lists are stored in one flat
-//     array indexed by parent (CSR layout), so the graph costs two int32
-//     slices and one OID-to-index map.
-//  2. Push all zero-in-degree (root) commits into a min-heap ordered by
-//     (timestamp, OID).
-//  3. Repeatedly pop the minimum element, emit it, and decrement the
-//     in-degree of each of its children. When a child reaches in-degree 0,
-//     push it onto the heap.
-//
-// Cycle fallback: if the input graph contains cycles (e.g. grafted history),
-// the main loop will terminate before emitting every commit. The remaining
-// commits are sorted by (timestamp, OID) and appended so that the caller
-// always receives exactly len(commits) results.
-//
-// Determinism guarantee: for any fixed input set the output order is fully
-// reproducible, regardless of Go map iteration order, because the heap
-// tie-breaks on OID bytes.
-func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
-	if len(commits) < 2 {
-		out := make([]commitInfo, len(commits))
-		copy(out, commits)
-		return out
-	}
-	parents := commitParentIndexes(commits)
-	out, _ := orderCommitsParentFirstIndexed(commits, parents)
-	return out
-}
-
 // commitParents holds every commit's parents as positions in the commits
 // slice, -1 for a parent outside it, in one flat array:
 // idx[start[i]:start[i+1]] are commit i's parents, in header order.
 type commitParents struct {
 	start []int32
 	idx   []int32
-}
-
-// commitParentIndexes resolves the parents of commits to positions through
-// a temporary OID index.
-func commitParentIndexes(commits []commitInfo) commitParents {
-	byOID := newCommitIndex(commits)
-	start := make([]int32, len(commits)+1)
-	for i := range commits {
-		start[i+1] = start[i] + int32(len(commits[i].ParentOIDs))
-	}
-	idx := make([]int32, start[len(commits)])
-	for i := range commits {
-		dst := idx[start[i]:start[i+1]]
-		for j, p := range commits[i].ParentOIDs {
-			if pi, ok := byOID.lookup(p); ok {
-				dst[j] = pi
-			} else {
-				dst[j] = -1
-			}
-		}
-	}
-	return commitParents{start: start, idx: idx}
 }
 
 // orderCommitsParentFirstIndexed is orderCommitsParentFirst over parents
@@ -240,42 +184,4 @@ func orderCommitsParentFirstIndexed(commits []commitInfo, parents commitParents)
 	}
 
 	return out, perm
-}
-
-// commitIndex maps commit OIDs to their positions in a commits slice with an
-// open-addressing table keyed by the OID's leading word. Slots hold the
-// position plus one, so zero marks an empty slot; a probe compares the full
-// OID against the commits slice before accepting a hit.
-type commitIndex struct {
-	commits []commitInfo
-	slots   []int32
-	mask    uint64
-}
-
-func newCommitIndex(commits []commitInfo) *commitIndex {
-	size := 1
-	for size < 2*len(commits) {
-		size <<= 1
-	}
-	ix := &commitIndex{commits: commits, slots: make([]int32, size), mask: uint64(size - 1)}
-	for i := range commits {
-		j := binary.BigEndian.Uint64(commits[i].OID[:8]) & ix.mask
-		for ix.slots[j] != 0 {
-			j = (j + 1) & ix.mask
-		}
-		ix.slots[j] = int32(i) + 1
-	}
-	return ix
-}
-
-func (ix *commitIndex) lookup(oid Hash) (int32, bool) {
-	for j := binary.BigEndian.Uint64(oid[:8]) & ix.mask; ; j = (j + 1) & ix.mask {
-		slot := ix.slots[j]
-		if slot == 0 {
-			return 0, false
-		}
-		if ix.commits[slot-1].OID == oid {
-			return slot - 1, true
-		}
-	}
 }

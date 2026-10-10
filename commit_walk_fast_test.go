@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"slices"
 	"sort"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -139,24 +138,6 @@ func TestOrderCommitsParentFirst_MatchesReference(t *testing.T) {
 	}
 }
 
-func TestCommitIndexLookup(t *testing.T) {
-	rng := rand.New(rand.NewSource(9))
-	commits := randomHistory(rng, 3000)
-	// Hashes sharing a leading word probe past collisions.
-	commits[1].OID = commits[0].OID
-	commits[1].OID[19] ^= 0xff
-	ix := newCommitIndex(commits)
-	for i, c := range commits {
-		pos, ok := ix.lookup(c.OID)
-		require.True(t, ok)
-		assert.Equal(t, int32(i), pos)
-	}
-	var missing Hash
-	rng.Read(missing[:])
-	_, ok := ix.lookup(missing)
-	assert.False(t, ok)
-}
-
 func TestCompactParentOIDsPreservesParents(t *testing.T) {
 	rng := rand.New(rand.NewSource(11))
 	commits := randomHistory(rng, 500)
@@ -171,33 +152,44 @@ func TestCompactParentOIDsPreservesParents(t *testing.T) {
 	}
 }
 
-func TestWalkCommitsFromRefs_VisitsEveryCommitOnce(t *testing.T) {
+func TestWalkCommitsFromRefsOrdered_VisitsEveryCommitOnce(t *testing.T) {
 	for _, repo := range []string{"simple-linear", "with-merges", "large-repo", "very-large-repo-1k"} {
 		s := createScannerForRepo(t, repo)
-		var mu sync.Mutex
 		seen := make(map[Hash]int)
-		require.NoError(t, s.walkCommitsFromRefs(func(c commitInfo) error {
-			mu.Lock()
+		require.NoError(t, s.walkCommitsFromRefsOrdered(func(c commitInfo) error {
 			seen[c.OID]++
-			mu.Unlock()
 			return nil
 		}))
 		for oid, n := range seen {
 			assert.Equalf(t, 1, n, "%s: commit %s visited %d times", repo, oid, n)
 		}
-		commits, err := s.loadAllCommits()
+		commits, _, err := s.loadCommitsAndGraph()
 		require.NoError(t, err)
 		assert.Len(t, seen, len(commits), repo)
 		s.Close()
 	}
 }
 
-func TestWalkCommitsFromRefs_PropagatesVisitError(t *testing.T) {
-	s := createScannerForRepo(t, "very-large-repo-1k")
+func TestWalkCommitsFromRefsOrdered_StopsAtFirstVisitError(t *testing.T) {
+	s, err := NewHistoryScanner(buildMergeRepo(t))
+	require.NoError(t, err)
 	defer s.Close()
-	want := assert.AnError
-	err := s.walkCommitsFromRefs(func(c commitInfo) error { return want })
-	assert.ErrorIs(t, err, want)
+	total := 0
+	require.NoError(t, s.walkCommitsFromRefsOrdered(func(commitInfo) error { total++; return nil }))
+	require.Greater(t, total, 2)
+
+	for failAt := 1; failAt <= total; failAt++ {
+		calls := 0
+		err := s.walkCommitsFromRefsOrdered(func(commitInfo) error {
+			calls++
+			if calls == failAt {
+				return assert.AnError
+			}
+			return nil
+		})
+		require.ErrorIs(t, err, assert.AnError)
+		require.Equalf(t, failAt, calls, "visit ran %d times after failing at call %d", calls-failAt, failAt)
+	}
 }
 
 func TestSearchHashesMatchesLinearSearch(t *testing.T) {

@@ -130,24 +130,11 @@ func (g *commitGraphData) parentsOf(idx int) []Hash {
 	return parents
 }
 
-// buildCommitGraphFromCommits synthesizes a commitGraphData from an
-// already-collected slice of commitInfo values (typically obtained via the
-// ref-walk fallback in commit_fallback.go).
-//
-// This constructor exists so that both the commit-graph file reader and the
-// fallback ref-walker produce the same data structure, allowing the rest of
-// the codebase to be agnostic to the source. The resulting commitGraphData
-// shares the input's ParentOIDs slices, which are immutable after
-// construction, and is safe for concurrent reads.
-func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
-	return buildCommitGraph(commits, nil)
-}
-
-// buildCommitGraphIndexed is buildCommitGraphFromCommits for commits that
-// were ordered by orderCommitsParentFirstIndexed: parents gives the parents
-// of the pre-order input as positions in it and perm the input position of
-// each ordered commit, so the parent indexes are remapped through perm
-// instead of looked up by OID.
+// buildCommitGraphIndexed takes commits ordered by
+// orderCommitsParentFirstIndexed: parents gives the parents of the pre-order
+// input as positions in it and perm the input position of each ordered
+// commit. buildCommitGraphIndexed remaps parent indexes through perm to
+// match the parent-first commit order.
 func buildCommitGraphIndexed(ordered []commitInfo, parents commitParents, perm []int32) *commitGraphData {
 	n := len(ordered)
 	// inv maps a pre-order position to its ordered position.
@@ -177,8 +164,8 @@ func buildCommitGraphIndexed(ordered []commitInfo, parents commitParents, perm [
 }
 
 // buildCommitGraph assembles the graph over commits in their given order;
-// parentIndices, when non-nil, supplies the resolved parent positions and
-// otherwise they are looked up by OID.
+// parentIndices[i] holds commit i's parent positions, -1 for a parent
+// outside commits.
 func buildCommitGraph(commits []commitInfo, parentIndices [][]int32) *commitGraphData {
 	n := len(commits)
 	parents := make(Parents, n)
@@ -203,35 +190,11 @@ func buildCommitGraph(commits []commitInfo, parentIndices [][]int32) *commitGrap
 			}
 		}
 	}()
-	totalParents := 0
 	for i, c := range commits {
 		ordered[i] = c.OID
 		trees[i] = c.TreeOID
 		times[i] = c.Timestamp
 		oidToIdx[c.OID] = i
-		totalParents += len(c.ParentOIDs)
-	}
-
-	if parentIndices == nil {
-		// Build flat parent indices; every commit's list is a window of
-		// one shared backing array.
-		parentIndices = make([][]int32, n)
-		backing := make([]int32, totalParents)
-		for i, c := range commits {
-			if len(c.ParentOIDs) == 0 {
-				continue
-			}
-			idxs := backing[:len(c.ParentOIDs):len(c.ParentOIDs)]
-			backing = backing[len(c.ParentOIDs):]
-			for j, p := range c.ParentOIDs {
-				if pi, ok := oidToIdx[p]; ok {
-					idxs[j] = int32(pi)
-				} else {
-					idxs[j] = -1 // Sentinel: parent not in graph.
-				}
-			}
-			parentIndices[i] = idxs
-		}
 	}
 
 	parentsDone.Wait()

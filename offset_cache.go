@@ -600,6 +600,10 @@ func (s *store) releaseWhales() {
 }
 
 func (s *store) newWhaleCache() *whaleCache {
+	return s.newWhaleCacheWithBudget(whalePrefetchBudget)
+}
+
+func (s *store) newWhaleCacheWithBudget(budget uint64) *whaleCache {
 	cands := s.whaleCandidates()
 	if len(cands) == 0 {
 		return nil
@@ -627,10 +631,22 @@ func (s *store) newWhaleCache() *whaleCache {
 			return data, typ, err
 		},
 	}
-	var budget uint64 = whalePrefetchBudget
 	for _, cand := range cands {
 		size, typ, ok := s.whaleSizeAt(cand.pack, cand.off)
-		if !ok || typ != ObjBlob || size > budget {
+		if !ok || typ != ObjBlob {
+			continue
+		}
+		// A copy-heavy delta can produce a target larger than its chain's
+		// header sizes, so deltified candidates are charged the target size
+		// declared by their instruction stream.
+		if first, _, err := peekObjectType(cand.pack, cand.off); err != nil {
+			continue
+		} else if first == ObjOfsDelta || first == ObjRefDelta {
+			if size, err = deltaTargetSize(cand.pack, cand.off, first); err != nil {
+				continue
+			}
+		}
+		if size > budget {
 			continue
 		}
 		budget -= size

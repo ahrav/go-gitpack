@@ -46,6 +46,10 @@ const pairCacheLineOverhead = 2 * int(unsafe.Sizeof(uint32(0)))
 // map's cardinality stays bounded by the byte budget.
 const pairCacheEntryOverhead = 128
 
+// pairFirstSeenEntryBytes charges one pairFirstSeen entry: its pairKey, its
+// pairFirstSeenEntry value, and the map's per-slot bookkeeping.
+const pairFirstSeenEntryBytes = 128
+
 // pairKey is the concatenation of the old and new blob OIDs.
 type pairKey [2 * hashSize]byte
 
@@ -166,6 +170,13 @@ func (c *pairCache) setBudget(total int) {
 	c.evictToBudget()
 }
 
+func (c *pairCache) budget() int {
+	if c == nil {
+		return 0
+	}
+	return c.budgetPerShard * pairCacheShards
+}
+
 // evictToBudget drops entries from every over-budget shard until it fits.
 // Victim choice is map-order like add's eviction, which is what the cache's
 // approximate-replacement contract already promises.
@@ -192,10 +203,14 @@ func makePairKey(oldOID, newOID Hash) pairKey {
 }
 
 func (c *pairCache) shard(k *pairKey) *pairCacheShard {
+	return &c.shards[pairShardIndex(k)]
+}
+
+func pairShardIndex(k *pairKey) int {
 	// Mix one byte from each OID: additions carry a zero old OID and
 	// deletions a zero new OID, so either byte alone would funnel an
 	// entire class of pairs into shard 0.
-	return &c.shards[int(k[0]^k[hashSize])&(pairCacheShards-1)]
+	return int(k[0]^k[hashSize]) & (pairCacheShards - 1)
 }
 
 func (c *pairCache) get(k pairKey) ([]AddedHunk, bool) {
@@ -469,8 +484,13 @@ func aliasingEntry(hunks []AddedHunk) pairCacheEntry {
 // entry with a lower position knows that result reaches the decision stage
 // first. A reader that finds no entry, or an entry with a higher position,
 // computes its own result and registers it; registerMin keeps the minimum.
+//
+// Each entry consumes pairFirstSeenEntryBytes of the scanner's pair-cache
+// budget (WithPairCacheBudget). A pair that finds its shard full is diffed
+// on each repeat.
 type pairFirstSeen struct {
-	shards [pairCacheShards]pairFirstSeenShard
+	shards   [pairCacheShards]pairFirstSeenShard
+	perShard int
 }
 
 type pairFirstSeenShard struct {
@@ -485,16 +505,19 @@ type pairFirstSeenEntry struct {
 	exempt bool
 }
 
-func newPairFirstSeen() *pairFirstSeen {
-	r := &pairFirstSeen{}
+func newPairFirstSeen(budget int) *pairFirstSeen {
+	r := &pairFirstSeen{perShard: max(0, budget/pairFirstSeenEntryBytes/pairCacheShards)}
+	if r.perShard == 0 {
+		return r
+	}
 	for i := range r.shards {
-		r.shards[i].m = make(map[pairKey]pairFirstSeenEntry, 1024)
+		r.shards[i].m = make(map[pairKey]pairFirstSeenEntry, min(r.perShard, 1024))
 	}
 	return r
 }
 
 func (r *pairFirstSeen) shard(k *pairKey) *pairFirstSeenShard {
-	return &r.shards[int(k[0])&(pairCacheShards-1)]
+	return &r.shards[pairShardIndex(k)]
 }
 
 // lookup returns the registered entry for k.
@@ -511,8 +534,23 @@ func (r *pairFirstSeen) lookup(k pairKey) (pairFirstSeenEntry, bool) {
 func (r *pairFirstSeen) registerMin(k pairKey, pos uint64, exempt bool) {
 	s := r.shard(&k)
 	s.mu.Lock()
-	if e, ok := s.m[k]; !ok || pos < e.pos {
-		s.m[k] = pairFirstSeenEntry{pos: pos, exempt: exempt}
+	if s.m != nil {
+		if e, ok := s.m[k]; ok {
+			if pos < e.pos {
+				s.m[k] = pairFirstSeenEntry{pos: pos, exempt: exempt}
+			}
+		} else if len(s.m) < r.perShard {
+			s.m[k] = pairFirstSeenEntry{pos: pos, exempt: exempt}
+		}
 	}
 	s.mu.Unlock()
+}
+
+func (r *pairFirstSeen) release() {
+	for i := range r.shards {
+		s := &r.shards[i]
+		s.mu.Lock()
+		s.m = nil
+		s.mu.Unlock()
+	}
 }

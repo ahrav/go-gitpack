@@ -9,7 +9,7 @@ import (
 )
 
 func TestPairFirstSeen_RegisterMinKeepsLowestPosition(t *testing.T) {
-	r := newPairFirstSeen()
+	r := newPairFirstSeen(defaultPairCacheBudget)
 	k := makePairKey(Hash{1}, Hash{2})
 
 	_, ok := r.lookup(k)
@@ -80,6 +80,58 @@ func TestDiffHistoryHunksDedup_RepeatedPairMatchesSerialReference(t *testing.T) 
 	assert.Equal(t, 3, binary, "binary hunks are emitted at every occurrence")
 }
 
+func TestPairFirstSeen_SpreadsAdditionsAndDeletionsAcrossShards(t *testing.T) {
+	r := newPairFirstSeen(defaultPairCacheBudget)
+	const perShard = 64
+	for i := range pairCacheShards * perShard {
+		var oid Hash
+		oid[0], oid[1] = byte(i), byte(i>>8)
+		r.registerMin(makePairKey(Hash{}, oid), uint64(i), false)
+		r.registerMin(makePairKey(oid, Hash{}), uint64(i), false)
+	}
+	for i := range r.shards {
+		assert.LessOrEqualf(t, len(r.shards[i].m), 4*2*perShard, "shard %d holds %d of %d entries", i, len(r.shards[i].m), 2*pairCacheShards*perShard)
+	}
+}
+
+func TestPairFirstSeen_StaysWithinBudget(t *testing.T) {
+	const budget = 64 << 10
+	r := newPairFirstSeen(budget)
+	key := func(i int) pairKey {
+		var oid Hash
+		oid[0], oid[1], oid[2] = byte(i), byte(i>>8), byte(i>>16)
+		return makePairKey(Hash{}, oid)
+	}
+	const n = 10 * budget / pairFirstSeenEntryBytes
+	for i := range n {
+		r.registerMin(key(i), uint64(i+1), false)
+	}
+	entries := 0
+	for i := range r.shards {
+		entries += len(r.shards[i].m)
+	}
+	assert.LessOrEqual(t, entries*pairFirstSeenEntryBytes, budget, "%d entries", entries)
+	assert.Positive(t, entries)
+
+	// A registered pair still takes a lower position once the table is full.
+	r.registerMin(key(0), 0, true)
+	e, ok := r.lookup(key(0))
+	require.True(t, ok)
+	assert.Equal(t, uint64(0), e.pos)
+
+	r.release()
+	_, ok = r.lookup(key(0))
+	assert.False(t, ok, "release drops the entries")
+	r.registerMin(key(0), 0, false)
+	_, ok = r.lookup(key(0))
+	assert.False(t, ok, "release stops registration")
+
+	disabled := newPairFirstSeen(0)
+	disabled.registerMin(key(1), 1, false)
+	_, ok = disabled.lookup(key(1))
+	assert.False(t, ok, "a zero budget registers nothing")
+}
+
 func TestDiffHistoryHunksDedup_SaturatedSetEmitsSkippedRepeats(t *testing.T) {
 	gitDir := repeatedPairRepo(t)
 	// A 16-byte budget saturates the fingerprint table within the first
@@ -90,4 +142,19 @@ func TestDiffHistoryHunksDedup_SaturatedSetEmitsSkippedRepeats(t *testing.T) {
 	got := collectHunkScanWith(t, s)
 	want := collectHunkScan(t, gitDir)
 	require.Equal(t, want, got, "saturated dedup scan equals the plain scan")
+}
+
+// With one pair in flight, the set saturates before later pairs reach
+// workers, so workers diff repeated pairs.
+func TestDiffHistoryHunksDedup_SaturatedSetStopsSkippingRepeats(t *testing.T) {
+	gitDir := repeatedPairRepo(t)
+	s, err := NewHistoryScanner(gitDir, WithHunkLineDedup(true), WithHunkDedupBudget(16))
+	require.NoError(t, err)
+	defer s.Close()
+	s.dedupLimits.inFlightPairs = 1
+	probe := &dedupProbe{}
+	s.dedupProbe = probe
+	got := collectHunkScanWith(t, s)
+	require.Equal(t, collectHunkScan(t, gitDir), got)
+	assert.Zero(t, probe.decisionRediffs.Load(), "the decision stage re-diffed skipped repeats")
 }

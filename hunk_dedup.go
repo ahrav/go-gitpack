@@ -198,6 +198,7 @@ type dedupProbe struct {
 
 	peakPendingPairs  atomic.Int64
 	peakRetainedBytes atomic.Int64
+	decisionRediffs   atomic.Uint64
 }
 
 func notePeak(peak *atomic.Int64, v int64) {
@@ -964,18 +965,13 @@ func pairCandidates(hunks []HunkAddition, sn *fingerprintSnapshot) (cands []dedu
 	return cands, total
 }
 
-// collectCommitPairs resolves c's first-parent tree and collects the
-// commit's changed blob pairs in deterministic tree order. Errors come back
-// pre-wrapped with the same message formats the streaming pipeline uses, so
-// tree workers only record and propagate them. A closed stopCh aborts the
-// tree walk with errScanAborted. admit, when non-nil, runs before each pair
-// is appended and may block or return an error to abort.
-func (hs *HistoryScanner) collectCommitPairs(c commitInfo, stopCh <-chan struct{}, admit func() error) ([]blobPairWork, error) {
-	return hs.collectCommitPairsIn(nil, c, stopCh, admit)
-}
-
-// collectCommitPairsIn is collectCommitPairs resolving the first-parent tree
-// through graph, the loaded commit set's graph.
+// collectCommitPairsIn resolves c's first-parent tree through graph, the
+// loaded commit set's graph, and collects the commit's changed blob pairs in
+// deterministic tree order. Errors come back pre-wrapped with the same
+// message formats the streaming pipeline uses, so tree workers only record
+// and propagate them. A closed stopCh aborts the tree walk with
+// errScanAborted. admit, when non-nil, runs before each pair is appended and
+// may block or return an error to abort.
 func (hs *HistoryScanner) collectCommitPairsIn(graph *commitGraphData, c commitInfo, stopCh <-chan struct{}, admit func() error) ([]blobPairWork, error) {
 	parentTree, err := hs.firstParentTreeIn(graph, c)
 	if err != nil {
@@ -1139,7 +1135,8 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 	// The fingerprint set is owned by the decision goroutine; hunk workers
 	// only read its published snapshot.
 	set := newLineFingerprintSetWithBudget(dedupInitialSlotsLog2, hs.hunkDedupBudget)
-	firstSeen := newPairFirstSeen()
+	firstSeen := newPairFirstSeen(hs.pairs.budget())
+	firstSeenReleased := false
 	var skippedWork dedupSkippedWork
 	inFlight := newDedupInFlightWindow(window, hs.dedupProbe)
 	// releaseRetained wakes the sequencer only when the release brings the
@@ -1694,14 +1691,25 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 							setError(fmt.Errorf("failed diffing %s in commit %s: %w", work.path, work.commit, err))
 							return false
 						}
+						if probe != nil {
+							probe.decisionRediffs.Add(1)
+						}
 						hunks := make([]HunkAddition, len(added))
+						var total int64
 						for i := range added {
 							hunks[i] = newHunkAddition(work, added[i])
+							total += hunkRetainedBytes(&hunks[i])
 						}
+						r.retainedKiB = toKiB(uint64(total))
+						retainedKiB.Add(int64(r.retainedKiB))
 						batch.hunks = set.decideResult(dedupPairResult{seq: r.seq, hunks: hunks}, batch.hunks)
 					}
 				} else {
 					batch.hunks = set.decideResult(r, batch.hunks)
+				}
+				if set.saturated && !firstSeenReleased {
+					firstSeen.release()
+					firstSeenReleased = true
 				}
 				switch {
 				case len(batch.hunks) > before:

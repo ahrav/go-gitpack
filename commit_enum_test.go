@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -26,16 +25,11 @@ func requireSameCommitSet(t *testing.T, want, got []commitInfo) {
 	}
 }
 
-// refWalkCommits is the reference the pack-enumeration load must match: the
-// reachable set as the parallel DAG walk discovers it.
 func refWalkCommits(t *testing.T, s *HistoryScanner) []commitInfo {
 	t.Helper()
-	var mu sync.Mutex
 	var out []commitInfo
-	require.NoError(t, s.walkCommitsFromRefs(func(c commitInfo) error {
-		mu.Lock()
+	require.NoError(t, s.walkCommitsFromRefsOrdered(func(c commitInfo) error {
 		out = append(out, c)
-		mu.Unlock()
 		return nil
 	}))
 	return out

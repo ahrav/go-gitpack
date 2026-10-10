@@ -214,6 +214,9 @@ func WithOffsetCacheBudget(bytes int) ScannerOption {
 // because ~1/3 of pair diffs in a typical walk are repeats) but it does not
 // change delivered hunks or their retention: a hunk's lines are compacted into
 // their own buffer whether or not the memo stores them.
+//
+// A deduplicating scan uses the same budget for its table of computed pairs,
+// which lets it skip repeated pairs without diffing them.
 func WithPairCacheBudget(bytes int) ScannerOption {
 	return func(hs *HistoryScanner) {
 		hs.pairs.setBudget(bytes)
@@ -1757,8 +1760,8 @@ func (hs *HistoryScanner) Close() error {
 		hs.meta.clear()
 		hs.meta.attachGraph(nil)
 	}
-	// A dedup scan materializes the commit list and the graph built from
-	// it (loadAllCommits); both scale with history and have no use after
+	// A scan materializes the commit list and the graph built from it
+	// (loadCommitsAndGraph); both scale with history and have no use after
 	// the object store is closed.
 	hs.commitsMu.Lock()
 	hs.commits, hs.commitsTips, hs.commitsShallow, hs.graphData = nil, nil, nil, nil
@@ -1800,31 +1803,24 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
-// loadAllCommits enumerates every reachable commit, caching the result for
-// as long as the repository's ref tips and shallow boundary stay unchanged.
-// The streaming hunk pipeline uses walkCommitsFromRefs directly; this
-// materialized form serves the dedup pipeline (which needs a total order up
-// front) and package tests.
+// loadCommitsAndGraph enumerates every reachable commit in parent-first
+// order together with the commit graph synthesized from the same load, so a
+// scan can resolve parents through the graph without re-reading hs.graphData
+// under the commit cache lock. Both scan pipelines consume it; the result is
+// cached for as long as the repository's ref tips and shallow boundary stay
+// unchanged.
 //
 // Every call reads the ref tips and the shallow file. A scanner reused after
 // new commits land, or after a shallow clone is deepened, re-walks the
-// history on its next call, so a dedup scan sees the same commits a fresh
-// walk would. Objects that appear with neither change (a partial clone
-// fetching missing ancestors on demand) are outside this key.
+// history on its next call, so a scan sees the same commits a fresh walk
+// would. Objects that appear with neither change (a partial clone fetching
+// missing ancestors on demand) are outside this key.
 //
 // Copy semantics: the returned []commitInfo is a shallow copy of the internal
 // cache. This prevents callers from mutating the scanner's cached state (e.g.
 // reordering or truncating the slice). The commitInfo values themselves are
 // safe to share because their mutable parts (the ParentOIDs slice) are never
 // modified after construction.
-func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
-	commits, _, err := hs.loadCommitsAndGraph()
-	return commits, err
-}
-
-// loadCommitsAndGraph is loadAllCommits plus the commit graph synthesized
-// from the same load, so a scan can resolve parents through the graph
-// without re-reading hs.graphData under the commit cache lock.
 func (hs *HistoryScanner) loadCommitsAndGraph() ([]commitInfo, *commitGraphData, error) {
 	tips, err := collectRefTips(hs.gitDir)
 	if err != nil {
@@ -1838,13 +1834,9 @@ func (hs *HistoryScanner) loadCommitsAndGraph() ([]commitInfo, *commitGraphData,
 
 	hs.commitsMu.Lock()
 	defer hs.commitsMu.Unlock()
-	switch {
-	case hs.commits != nil && slices.Equal(tips, hs.commitsTips) && bytes.Equal(shallow, hs.commitsShallow):
-		// Cache hit.
-	case hs.graphData != nil && hs.commits == nil:
-		hs.commits = hs.loadFromGraph()
-		hs.commitsTips, hs.commitsShallow = tips, shallow
-	default:
+	// Loading a repository with no refs leaves hs.commits nil; hs.graphData
+	// marks the cached load.
+	if hs.graphData == nil || !slices.Equal(tips, hs.commitsTips) || !bytes.Equal(shallow, hs.commitsShallow) {
 		commits, parents, perm, err := hs.loadFromRefs()
 		if err != nil {
 			return nil, nil, err
@@ -1859,20 +1851,4 @@ func (hs *HistoryScanner) loadCommitsAndGraph() ([]commitInfo, *commitGraphData,
 	out := make([]commitInfo, len(hs.commits))
 	copy(out, hs.commits)
 	return out, hs.graphData, nil
-}
-
-// loadFromGraph converts commit‑graph rows into commitInfo values.
-func (hs *HistoryScanner) loadFromGraph() []commitInfo {
-	n := len(hs.graphData.OrderedOIDs)
-	out := make([]commitInfo, n)
-
-	for i, oid := range hs.graphData.OrderedOIDs {
-		out[i] = commitInfo{
-			OID:        oid,
-			TreeOID:    hs.graphData.TreeOIDs[i],
-			ParentOIDs: hs.graphData.parentsOf(i),
-			Timestamp:  hs.graphData.Timestamps[i],
-		}
-	}
-	return orderCommitsParentFirst(out)
 }

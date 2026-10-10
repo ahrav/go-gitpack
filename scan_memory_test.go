@@ -1,6 +1,8 @@
 package objstore
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -58,6 +60,35 @@ func TestLoadCommitsAndGraph_MatchesLoadAllCommits(t *testing.T) {
 				assert.Less(t, j, i, "parent precedes child")
 			}
 		}
+	}
+}
+
+func TestLoadCommitsAndGraph_SeesCommitsAfterEmptyLoad(t *testing.T) {
+	requireGit(t)
+	for _, dedup := range []bool{false, true} {
+		repo := t.TempDir()
+		runGit(t, repo, "init", "--quiet", "-b", "main")
+		var opts []ScannerOption
+		if dedup {
+			opts = append(opts, WithHunkLineDedup(true))
+		}
+		s, err := NewHistoryScanner(filepath.Join(repo, ".git"), opts...)
+		require.NoError(t, err)
+		scan := func() int {
+			n := 0
+			require.NoError(t, s.DiffHistoryHunksFunc(func(HunkAddition) error { n++; return nil }))
+			return n
+		}
+		require.Zero(t, scan(), "dedup=%v: a repository without refs has no hunks", dedup)
+
+		require.NoError(t, os.WriteFile(filepath.Join(repo, "a.txt"), []byte("token=abc\n"), 0o644))
+		runGit(t, repo, "add", "a.txt")
+		runGit(t, repo, "commit", "-q", "-m", "add a")
+		assert.Equal(t, 1, scan(), "dedup=%v: the scan after the first commit sees it", dedup)
+		commits, _, err := s.loadCommitsAndGraph()
+		require.NoError(t, err)
+		assert.Len(t, commits, 1, "dedup=%v", dedup)
+		s.Close()
 	}
 }
 

@@ -868,6 +868,28 @@ func deltaPayloadStart(pack *mmap.ReaderAt, offset uint64, deltaType ObjectType)
 	return pos, payloadSize, nil
 }
 
+func deltaTargetSize(pack *mmap.ReaderAt, offset uint64, deltaType ObjectType) (uint64, error) {
+	pos, _, err := deltaPayloadStart(pack, offset, deltaType)
+	if err != nil {
+		return 0, err
+	}
+	zr, release, err := openCommitHeaderStream(pack, pos)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	br := getBR(zr)
+	defer putBR(br)
+	if _, err := readVarInt(br); err != nil {
+		return 0, fmt.Errorf("read delta base size: %w", err)
+	}
+	targetSize, err := readVarInt(br)
+	if err != nil {
+		return 0, fmt.Errorf("read delta target size: %w", err)
+	}
+	return targetSize, nil
+}
+
 // applyDeltaPrefix reconstructs the first limit bytes of the target of the
 // delta at offset, streaming the instruction stream and stopping once the
 // prefix is complete. A copy or insert that crosses the limit is truncated.
