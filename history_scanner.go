@@ -1845,12 +1845,12 @@ func (hs *HistoryScanner) loadCommitsAndGraph() ([]commitInfo, *commitGraphData,
 		hs.commits = hs.loadFromGraph()
 		hs.commitsTips, hs.commitsShallow = tips, shallow
 	default:
-		commits, err := hs.loadFromRefs()
+		commits, parents, perm, err := hs.loadFromRefs()
 		if err != nil {
 			return nil, nil, err
 		}
 		hs.commits, hs.commitsTips, hs.commitsShallow = commits, tips, shallow
-		hs.graphData = buildCommitGraphFromCommits(commits)
+		hs.graphData = buildCommitGraphIndexed(commits, parents, perm)
 		if hs.meta != nil {
 			hs.meta.attachGraph(hs.graphData)
 		}

@@ -36,24 +36,26 @@ import (
 // It discovers all ref tips, walks the reachable commit DAG, and returns
 // commits ordered parent-first (i.e. every parent appears before its
 // children) so that downstream consumers can process them in a single
-// forward pass.
-func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
+// forward pass, with the parent positions and permutation
+// buildCommitGraphIndexed needs to index the result without OID lookups.
+func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, commitParents, []int32, error) {
 	tips, err := collectRefTips(hs.gitDir)
 	if err != nil {
-		return nil, err
+		return nil, commitParents{}, nil, err
 	}
 	if len(tips) == 0 {
-		return nil, nil
+		return nil, commitParents{start: []int32{0}}, nil, nil
 	}
 	// The packs' whole commits are read in parallel up front and the
 	// reachable walk runs over them in memory (commit_enum.go); the
 	// parallel DAG walk is latency-bound on the first-parent chain.
-	out, err := hs.loadCommitsReachable(tips)
+	out, parents, err := hs.loadCommitsReachable(tips)
 	if err != nil {
-		return nil, err
+		return nil, commitParents{}, nil, err
 	}
 	compactParentOIDs(out)
-	return orderCommitsParentFirst(out), nil
+	ordered, perm := orderCommitsParentFirstIndexed(out, parents)
+	return ordered, parents, perm, nil
 }
 
 // compactParentOIDs moves every commit's ParentOIDs into one shared backing

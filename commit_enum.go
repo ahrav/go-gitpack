@@ -109,11 +109,11 @@ func (s *store) enumeratePackedCommits(numWorkers int) []commitInfo {
 // two.
 const enumShards = 16
 
-// enumBatch is how many uncovered OIDs the reachable walk gathers before
-// reading them from the store in parallel. Uncovered commits are rare, so a
-// batch is usually a few delta-encoded commits or tags; reading them one at
-// a time serialized about a third of the load on the rails history.
-const enumBatch = 256
+// enumReadQueue bounds the uncovered OIDs queued for the reader pool and
+// the finished reads waiting to be folded back into the walk. Uncovered
+// commits are rare (delta-encoded commits, tags, loose commits), and the walk
+// keeps going over the enumerated commits while they are read.
+const enumReadQueue = 256
 
 // enumIndex maps enumerated commit OIDs to their positions, sharded by the
 // leading OID bits.
@@ -125,11 +125,12 @@ func (ix *enumIndex) lookup(oid Hash) (int32, bool) {
 }
 
 // loadCommitsReachable returns every commit reachable from tips, in no
-// particular order. Commits the pack enumeration covered are followed in
-// memory over their parent indexes; the walk reads the rest through walkOne,
-// in parallel batches, with the same handling of tags, stale refs and shallow
-// boundaries as the ref walk.
-func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, error) {
+// particular order, with each commit's parents resolved to positions in the
+// result (-1 for a parent absent from the store). Commits the pack
+// enumeration covered are followed in memory over their parent indexes; the
+// walk reads the rest through walkOne, in parallel batches, with the same
+// handling of tags, stale refs and shallow boundaries as the ref walk.
+func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, commitParents, error) {
 	numWorkers := runtime.NumCPU()
 	enumerated := hs.store.enumeratePackedCommits(numWorkers)
 
@@ -189,11 +190,83 @@ func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, error
 	visited := make([]bool, len(enumerated))
 	seenOther := make(map[Hash]struct{})
 	out := make([]commitInfo, 0, len(enumerated))
-	var stack []int32   // enumerated commits to visit
-	var pending []Hash  // uncovered OIDs to read from the store
-	var oidStack []Hash // OIDs from store reads, not yet classified
-	// classify routes an OID to the in-memory stack or the pending batch.
-	classify := func(oid Hash) {
+	// outSrc is each result's enumerated index, -1 for a store-read commit;
+	// pos is each enumerated commit's result position; otherPos positions
+	// the store-read commits by OID.
+	outSrc := make([]int32, 0, len(enumerated))
+	pos := make([]int32, len(enumerated))
+	otherPos := make(map[Hash]int32)
+	var stack []int32 // enumerated commits to visit
+	var classify func(Hash)
+
+	// Uncovered OIDs go to a reader pool through readReq while the walk
+	// continues over the enumerated commits; each read comes back on
+	// readRes with the commit (or nothing, for a stale ref or a tag whose
+	// target is pushed) and the OIDs to classify next. inFlight counts
+	// reads requested and not yet consumed.
+	type read struct {
+		infos  []commitInfo
+		pushes []Hash
+		err    error
+	}
+	readReq := make(chan Hash, enumReadQueue)
+	readRes := make(chan read, enumReadQueue)
+	readers := min(numWorkers, enumReadQueue)
+	for range readers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for oid := range readReq {
+				var r read
+				hs.walkOne(oid,
+					func(info commitInfo) error { r.infos = append(r.infos, info); return nil },
+					func(next Hash) { r.pushes = append(r.pushes, next) },
+					func(err error) {
+						if r.err == nil {
+							r.err = err
+						}
+					})
+				readRes <- r
+			}
+		}()
+	}
+	defer func() {
+		close(readReq)
+		wg.Wait()
+	}()
+	inFlight := 0
+	var firstErr error
+	// consume folds one finished read into the walk.
+	consume := func(r read) {
+		inFlight--
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+		}
+		for _, info := range r.infos {
+			otherPos[info.OID] = int32(len(out))
+			out = append(out, info)
+			outSrc = append(outSrc, -1)
+		}
+		for _, oid := range r.pushes {
+			classify(oid)
+		}
+	}
+	// request hands an uncovered OID to the readers, consuming finished
+	// reads while the queue is full so the request never deadlocks against
+	// a reader blocked on a full result channel.
+	request := func(oid Hash) {
+		for {
+			select {
+			case readReq <- oid:
+				inFlight++
+				return
+			case r := <-readRes:
+				consume(r)
+			}
+		}
+	}
+	// classify routes an OID to the in-memory stack or the readers.
+	classify = func(oid Hash) {
 		if i, ok := ix.lookup(oid); ok {
 			if !visited[i] {
 				visited[i] = true
@@ -205,92 +278,84 @@ func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, error
 			return
 		}
 		seenOther[oid] = struct{}{}
-		pending = append(pending, oid)
+		request(oid)
 	}
-	// readPending reads the gathered uncovered OIDs in parallel and feeds
-	// their commits and parents (or tag targets) back into the walk.
-	readPending := func() error {
-		type read struct {
-			infos  []commitInfo
-			pushes []Hash
-			err    error
+	// resolveParents maps every result's parents to result positions.
+	resolveParents := func() commitParents {
+		start := make([]int32, len(out)+1)
+		for i := range out {
+			start[i+1] = start[i] + int32(len(out[i].ParentOIDs))
 		}
-		reads := make([]read, len(pending))
-		var next atomic.Int64
-		for range min(numWorkers, len(pending)) {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for {
-					i := int(next.Add(1) - 1)
-					if i >= len(pending) {
-						return
+		idx := make([]int32, start[len(out)])
+		for i := range out {
+			dst := idx[start[i]:start[i+1]]
+			if src := outSrc[i]; src >= 0 {
+				for j, k := range parentIdx[parentStart[src]:parentStart[src+1]] {
+					if k >= 0 {
+						dst[j] = pos[k]
+						continue
 					}
-					r := &reads[i]
-					hs.walkOne(pending[i],
-						func(info commitInfo) error { r.infos = append(r.infos, info); return nil },
-						func(next Hash) { r.pushes = append(r.pushes, next) },
-						func(err error) {
-							if r.err == nil {
-								r.err = err
-							}
-						})
+					if p, ok := otherPos[out[i].ParentOIDs[j]]; ok {
+						dst[j] = p
+					} else {
+						dst[j] = -1
+					}
 				}
-			}()
-		}
-		wg.Wait()
-		pending = pending[:0]
-		for i := range reads {
-			if reads[i].err != nil {
-				return reads[i].err
+				continue
 			}
-			out = append(out, reads[i].infos...)
-			oidStack = append(oidStack, reads[i].pushes...)
+			for j, oid := range out[i].ParentOIDs {
+				if k, ok := ix.lookup(oid); ok {
+					dst[j] = pos[k]
+				} else if p, ok := otherPos[oid]; ok {
+					dst[j] = p
+				} else {
+					dst[j] = -1
+				}
+			}
 		}
-		return nil
+		return commitParents{start: start, idx: idx}
 	}
 	for _, tip := range tips {
 		classify(tip)
 	}
-	for {
-		for len(stack) > 0 || len(oidStack) > 0 {
-			for len(oidStack) > 0 {
-				n := len(oidStack) - 1
-				oid := oidStack[n]
-				oidStack = oidStack[:n]
-				classify(oid)
-			}
-			for len(stack) > 0 {
-				n := len(stack) - 1
-				i := stack[n]
-				stack = stack[:n]
-				out = append(out, enumerated[i])
-				for j, k := range parentIdx[parentStart[i]:parentStart[i+1]] {
-					if k < 0 {
-						oid := enumerated[i].ParentOIDs[j]
-						if _, ok := seenOther[oid]; !ok {
-							seenOther[oid] = struct{}{}
-							pending = append(pending, oid)
-						}
-						continue
+	for firstErr == nil {
+		for len(stack) > 0 {
+			n := len(stack) - 1
+			i := stack[n]
+			stack = stack[:n]
+			pos[i] = int32(len(out))
+			out = append(out, enumerated[i])
+			outSrc = append(outSrc, i)
+			for j, k := range parentIdx[parentStart[i]:parentStart[i+1]] {
+				if k < 0 {
+					oid := enumerated[i].ParentOIDs[j]
+					if _, ok := seenOther[oid]; !ok {
+						seenOther[oid] = struct{}{}
+						request(oid)
 					}
-					if !visited[k] {
-						visited[k] = true
-						stack = append(stack, k)
-					}
+					continue
 				}
-			}
-			if len(pending) >= enumBatch {
-				if err := readPending(); err != nil {
-					return nil, err
+				if !visited[k] {
+					visited[k] = true
+					stack = append(stack, k)
 				}
 			}
 		}
-		if len(pending) == 0 {
-			return out, nil
+		if inFlight == 0 {
+			break
 		}
-		if err := readPending(); err != nil {
-			return nil, err
+		// Nothing left in memory: wait for a read, then take every other
+		// finished read before resuming the walk.
+		consume(<-readRes)
+		for len(readRes) > 0 {
+			consume(<-readRes)
 		}
 	}
+	for inFlight > 0 {
+		consume(<-readRes)
+	}
+	if firstErr != nil {
+		return nil, commitParents{}, firstErr
+	}
+	return out, resolveParents(), nil
 }

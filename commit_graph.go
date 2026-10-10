@@ -140,6 +140,46 @@ func (g *commitGraphData) parentsOf(idx int) []Hash {
 // shares the input's ParentOIDs slices, which are immutable after
 // construction, and is safe for concurrent reads.
 func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
+	return buildCommitGraph(commits, nil)
+}
+
+// buildCommitGraphIndexed is buildCommitGraphFromCommits for commits that
+// were ordered by orderCommitsParentFirstIndexed: parents gives the parents
+// of the pre-order input as positions in it and perm the input position of
+// each ordered commit, so the parent indexes are remapped through perm
+// instead of looked up by OID.
+func buildCommitGraphIndexed(ordered []commitInfo, parents commitParents, perm []int32) *commitGraphData {
+	n := len(ordered)
+	// inv maps a pre-order position to its ordered position.
+	inv := make([]int32, n)
+	for k, i := range perm {
+		inv[i] = int32(k)
+	}
+	parentIndices := make([][]int32, n)
+	backing := make([]int32, len(parents.idx))
+	for k, i := range perm {
+		src := parents.idx[parents.start[i]:parents.start[i+1]]
+		if len(src) == 0 {
+			continue
+		}
+		idxs := backing[:len(src):len(src)]
+		backing = backing[len(src):]
+		for j, pi := range src {
+			if pi < 0 {
+				idxs[j] = -1 // Sentinel: parent not in graph.
+			} else {
+				idxs[j] = inv[pi]
+			}
+		}
+		parentIndices[k] = idxs
+	}
+	return buildCommitGraph(ordered, parentIndices)
+}
+
+// buildCommitGraph assembles the graph over commits in their given order;
+// parentIndices, when non-nil, supplies the resolved parent positions and
+// otherwise they are looked up by OID.
+func buildCommitGraph(commits []commitInfo, parentIndices [][]int32) *commitGraphData {
 	n := len(commits)
 	parents := make(Parents, n)
 	ordered := make([]Hash, n)
@@ -172,24 +212,26 @@ func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 		totalParents += len(c.ParentOIDs)
 	}
 
-	// Build flat parent indices; every commit's list is a window of one
-	// shared backing array.
-	parentIndices := make([][]int32, n)
-	backing := make([]int32, totalParents)
-	for i, c := range commits {
-		if len(c.ParentOIDs) == 0 {
-			continue
-		}
-		idxs := backing[:len(c.ParentOIDs):len(c.ParentOIDs)]
-		backing = backing[len(c.ParentOIDs):]
-		for j, p := range c.ParentOIDs {
-			if pi, ok := oidToIdx[p]; ok {
-				idxs[j] = int32(pi)
-			} else {
-				idxs[j] = -1 // Sentinel: parent not in graph.
+	if parentIndices == nil {
+		// Build flat parent indices; every commit's list is a window of
+		// one shared backing array.
+		parentIndices = make([][]int32, n)
+		backing := make([]int32, totalParents)
+		for i, c := range commits {
+			if len(c.ParentOIDs) == 0 {
+				continue
 			}
+			idxs := backing[:len(c.ParentOIDs):len(c.ParentOIDs)]
+			backing = backing[len(c.ParentOIDs):]
+			for j, p := range c.ParentOIDs {
+				if pi, ok := oidToIdx[p]; ok {
+					idxs[j] = int32(pi)
+				} else {
+					idxs[j] = -1 // Sentinel: parent not in graph.
+				}
+			}
+			parentIndices[i] = idxs
 		}
-		parentIndices[i] = idxs
 	}
 
 	parentsDone.Wait()

@@ -125,7 +125,7 @@ func TestParallelCommitWalk_Deterministic(t *testing.T) {
 	// Baseline: one walk on a fresh scanner.
 	base := newScanner()
 	defer base.Close()
-	want, err := base.loadFromRefs()
+	want, _, _, err := base.loadFromRefs()
 	require.NoError(t, err)
 	require.NotEmpty(t, want)
 	wantCanon := canonicalCommits(want)
@@ -135,7 +135,7 @@ func TestParallelCommitWalk_Deterministic(t *testing.T) {
 
 	// Repeated walks on the SAME scanner must be identical.
 	for run := 0; run < 8; run++ {
-		got, err := base.loadFromRefs()
+		got, _, _, err := base.loadFromRefs()
 		require.NoError(t, err)
 		require.Equalf(t, wantCanon, canonicalCommits(got),
 			"same-scanner run %d diverged", run)
@@ -144,7 +144,7 @@ func TestParallelCommitWalk_Deterministic(t *testing.T) {
 	// Fresh scanners must also be identical.
 	for run := 0; run < 4; run++ {
 		s := newScanner()
-		got, err := s.loadFromRefs()
+		got, _, _, err := s.loadFromRefs()
 		s.Close()
 		require.NoError(t, err)
 		require.Equalf(t, wantCanon, canonicalCommits(got),
@@ -167,7 +167,7 @@ func TestParallelCommitWalk_GOMAXPROCSInvariant(t *testing.T) {
 		s, err := NewHistoryScanner(gitDir)
 		require.NoError(t, err)
 		defer s.Close()
-		commits, err := s.loadFromRefs()
+		commits, _, _, err := s.loadFromRefs()
 		require.NoError(t, err)
 		return canonicalCommits(commits)
 	}

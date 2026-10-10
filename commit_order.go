@@ -109,9 +109,56 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 		copy(out, commits)
 		return out
 	}
+	parents := commitParentIndexes(commits)
+	out, _ := orderCommitsParentFirstIndexed(commits, parents)
+	return out
+}
 
-	n := len(commits)
+// commitParents holds every commit's parents as positions in the commits
+// slice, -1 for a parent outside it, in one flat array:
+// idx[start[i]:start[i+1]] are commit i's parents, in header order.
+type commitParents struct {
+	start []int32
+	idx   []int32
+}
+
+// commitParentIndexes resolves the parents of commits to positions through
+// a temporary OID index.
+func commitParentIndexes(commits []commitInfo) commitParents {
 	byOID := newCommitIndex(commits)
+	start := make([]int32, len(commits)+1)
+	for i := range commits {
+		start[i+1] = start[i] + int32(len(commits[i].ParentOIDs))
+	}
+	idx := make([]int32, start[len(commits)])
+	for i := range commits {
+		dst := idx[start[i]:start[i+1]]
+		for j, p := range commits[i].ParentOIDs {
+			if pi, ok := byOID.lookup(p); ok {
+				dst[j] = pi
+			} else {
+				dst[j] = -1
+			}
+		}
+	}
+	return commitParents{start: start, idx: idx}
+}
+
+// orderCommitsParentFirstIndexed is orderCommitsParentFirst over parents
+// already resolved to positions. It also returns perm, the position in
+// commits of each element of the result, so callers that index the result
+// can remap positions without a second OID lookup.
+func orderCommitsParentFirstIndexed(commits []commitInfo, parents commitParents) (out []commitInfo, perm []int32) {
+	n := len(commits)
+	if n < 2 {
+		out = make([]commitInfo, n)
+		copy(out, commits)
+		perm = make([]int32, n)
+		for i := range perm {
+			perm[i] = int32(i)
+		}
+		return out, perm
+	}
 
 	// Count in-degrees and children per parent, then lay the child lists
 	// out contiguously: children of commit p are
@@ -119,9 +166,8 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 	inDegree := make([]int32, n)
 	childStart := make([]int32, n+1)
 	for i := range commits {
-		for _, p := range commits[i].ParentOIDs {
-			pi, ok := byOID.lookup(p)
-			if !ok {
+		for _, pi := range parents.idx[parents.start[i]:parents.start[i+1]] {
+			if pi < 0 {
 				continue
 			}
 			inDegree[i]++
@@ -135,9 +181,8 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 	fill := make([]int32, n)
 	copy(fill, childStart[:n])
 	for i := range commits {
-		for _, p := range commits[i].ParentOIDs {
-			pi, ok := byOID.lookup(p)
-			if !ok {
+		for _, pi := range parents.idx[parents.start[i]:parents.start[i+1]] {
+			if pi < 0 {
 				continue
 			}
 			childList[fill[pi]] = int32(i)
@@ -152,11 +197,13 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 		}
 	}
 
-	out := make([]commitInfo, 0, n)
+	out = make([]commitInfo, 0, n)
+	perm = make([]int32, 0, n)
 	emitted := make([]bool, n)
 	for len(q.items) > 0 {
 		i := q.pop()
 		out = append(out, commits[i])
+		perm = append(perm, i)
 		emitted[i] = true
 		for _, child := range childList[childStart[i]:childStart[i+1]] {
 			inDegree[child]--
@@ -168,27 +215,31 @@ func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
 
 	// Defensive fallback for malformed input with cycles.
 	if len(out) < n {
-		rest := make([]commitInfo, 0, n-len(out))
+		rest := make([]int32, 0, n-len(out))
 		for i := range commits {
 			if emitted[i] {
 				continue
 			}
-			rest = append(rest, commits[i])
+			rest = append(rest, int32(i))
 		}
 
-		slices.SortFunc(rest, func(a, b commitInfo) int {
-			if a.Timestamp < b.Timestamp {
+		slices.SortFunc(rest, func(a, b int32) int {
+			ca, cb := &commits[a], &commits[b]
+			if ca.Timestamp < cb.Timestamp {
 				return -1
 			}
-			if a.Timestamp > b.Timestamp {
+			if ca.Timestamp > cb.Timestamp {
 				return 1
 			}
-			return bytes.Compare(a.OID[:], b.OID[:])
+			return bytes.Compare(ca.OID[:], cb.OID[:])
 		})
-		out = append(out, rest...)
+		for _, i := range rest {
+			out = append(out, commits[i])
+			perm = append(perm, i)
+		}
 	}
 
-	return out
+	return out, perm
 }
 
 // commitIndex maps commit OIDs to their positions in a commits slice with an

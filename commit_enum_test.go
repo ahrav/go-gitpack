@@ -48,7 +48,7 @@ func TestLoadFromRefs_MatchesRefWalk(t *testing.T) {
 	for _, repo := range []string{"simple-linear", "with-merges", "no-commit-graph", "large-repo", "very-large-repo-1k", "super-large-repo-10k"} {
 		s := createScannerForRepo(t, repo)
 		want := refWalkCommits(t, s)
-		got, err := s.loadFromRefs()
+		got, _, _, err := s.loadFromRefs()
 		require.NoError(t, err, repo)
 		requireSameCommitSet(t, want, got)
 		ordered := orderCommitsParentFirst(append([]commitInfo(nil), want...))
@@ -151,7 +151,7 @@ func TestLoadFromRefs_MixedStorageAndUnreachable(t *testing.T) {
 	}
 	require.Contains(t, enumerated, unreachable)
 
-	got, err := s.loadFromRefs()
+	got, _, _, err := s.loadFromRefs()
 	require.NoError(t, err)
 	var oids []Hash
 	for _, c := range got {
@@ -182,8 +182,36 @@ func TestLoadFromRefs_LooseOnlyRepository(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 	require.Empty(t, s.store.enumeratePackedCommits(2))
-	got, err := s.loadFromRefs()
+	got, _, _, err := s.loadFromRefs()
 	require.NoError(t, err)
 	require.Len(t, got, 3)
 	requireSameCommitSet(t, refWalkCommits(t, s), got)
+}
+
+// TestBuildCommitGraphIndexed_MatchesLookupBuilder pins the remapped parent
+// indexes to the OID-lookup builder on the loaded commits of every packed
+// fixture, and the ordering permutation to the ordered list.
+func TestBuildCommitGraphIndexed_MatchesLookupBuilder(t *testing.T) {
+	for _, repo := range []string{"with-merges", "large-repo", "very-large-repo-1k"} {
+		s := createScannerForRepo(t, repo)
+		ordered, parents, perm, err := s.loadFromRefs()
+		require.NoError(t, err, repo)
+		want := buildCommitGraphFromCommits(ordered)
+		got := buildCommitGraphIndexed(ordered, parents, perm)
+		require.Equal(t, want.OrderedOIDs, got.OrderedOIDs, repo)
+		require.Equal(t, want.TreeOIDs, got.TreeOIDs, repo)
+		require.Equal(t, want.Timestamps, got.Timestamps, repo)
+		require.Equal(t, want.OIDToIndex, got.OIDToIndex, repo)
+		require.Equal(t, want.Parents, got.Parents, repo)
+		require.Equal(t, len(want.parentIndices), len(got.parentIndices), repo)
+		for i := range want.parentIndices {
+			require.Equalf(t, want.parentIndices[i], got.parentIndices[i], "%s: commit %d", repo, i)
+		}
+		// Each ordered commit sits at perm[k] in the pre-order list the
+		// walk produced, and parents index that list.
+		require.Len(t, perm, len(ordered))
+		require.Len(t, parents.start, len(ordered)+1)
+		require.Equal(t, parents.start[len(ordered)], int32(len(parents.idx)))
+		s.Close()
+	}
 }
