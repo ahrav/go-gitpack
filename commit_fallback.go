@@ -38,17 +38,18 @@ import (
 // children) so that downstream consumers can process them in a single
 // forward pass.
 func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
-	// walkCommitsFromRefs calls visit concurrently, so the append needs its
-	// own mutual exclusion. The walk joins its workers before returning, so
-	// reading out afterwards needs no further synchronization.
-	var mu sync.Mutex
-	out := make([]commitInfo, 0, 256)
-	if err := hs.walkCommitsFromRefs(func(info commitInfo) error {
-		mu.Lock()
-		out = append(out, info)
-		mu.Unlock()
-		return nil
-	}); err != nil {
+	tips, err := collectRefTips(hs.gitDir)
+	if err != nil {
+		return nil, err
+	}
+	if len(tips) == 0 {
+		return nil, nil
+	}
+	// The packs' whole commits are read in parallel up front and the
+	// reachable walk runs over them in memory (commit_enum.go); the
+	// parallel DAG walk is latency-bound on the first-parent chain.
+	out, err := hs.loadCommitsReachable(tips)
+	if err != nil {
 		return nil, err
 	}
 	compactParentOIDs(out)
@@ -86,19 +87,18 @@ func compactParentOIDs(commits []commitInfo) {
 // stack, inflate and parse headers concurrently, then push unseen parents.
 //
 // Ordering: visits happen in nondeterministic order, so every caller must be
-// insensitive to it. loadFromRefs re-establishes parent-first order via
-// orderCommitsParentFirst, and DiffHistoryHunksFunc processes commits
-// independently. Callers whose output depends on visit order (first-wins
+// insensitive to it. Callers whose output depends on visit order (first-wins
 // blob dedup in the scan planners) use walkCommitsFromRefsOrdered instead.
+// loadFromRefs reads the packs' commits directly (commit_enum.go) and uses
+// this walk as its reference in tests: the walk's critical path is the
+// first-parent chain, one header inflation per hop.
 //
 // Concurrency: visit is called from up to min(NumCPU, 16) worker goroutines at
 // the same time and MUST be safe for concurrent use; the walk holds no lock
 // across it. A single internal mutex around visit is not viable here: at 16
-// workers it serializes roughly a third of all walk-worker time, while
-// neither production caller needs it (DiffHistoryHunksFunc's visit only
-// stores into a sync.Map and sends on a channel). Callers that touch
-// unsynchronized state take their own lock, as loadFromRefs does. visit must
-// also not block indefinitely: a stalled visit occupies a walk worker.
+// workers it serializes roughly a third of all walk-worker time. Callers that
+// touch unsynchronized state take their own lock. visit must also not block
+// indefinitely: a stalled visit occupies a walk worker.
 func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) error {
 	return hs.walkCommitsFromRefsWorkers(min(runtime.NumCPU(), 16), visit)
 }
