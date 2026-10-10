@@ -189,13 +189,13 @@ func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, commi
 
 	visited := make([]bool, len(enumerated))
 	seenOther := make(map[Hash]struct{})
-	out := make([]commitInfo, 0, len(enumerated))
-	// outSrc is each result's enumerated index, -1 for a store-read commit;
-	// pos is each enumerated commit's result position; otherPos positions
-	// the store-read commits by OID.
-	outSrc := make([]int32, 0, len(enumerated))
-	pos := make([]int32, len(enumerated))
-	otherPos := make(map[Hash]int32)
+	// The walk itself touches only the int32 arrays above, which fit the
+	// cache, and records the enumerated commits it reaches as visitOrder;
+	// the result is assembled from it afterwards, in parallel. others
+	// collects the store-read commits in the order their reads were
+	// consumed; they follow the enumerated commits in the result.
+	visitOrder := make([]int32, 0, len(enumerated))
+	var others []commitInfo
 	var stack []int32 // enumerated commits to visit
 	var classify func(Hash)
 
@@ -242,11 +242,7 @@ func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, commi
 		if r.err != nil && firstErr == nil {
 			firstErr = r.err
 		}
-		for _, info := range r.infos {
-			otherPos[info.OID] = int32(len(out))
-			out = append(out, info)
-			outSrc = append(outSrc, -1)
-		}
+		others = append(others, r.infos...)
 		for _, oid := range r.pushes {
 			classify(oid)
 		}
@@ -280,40 +276,89 @@ func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, commi
 		seenOther[oid] = struct{}{}
 		request(oid)
 	}
-	// resolveParents maps every result's parents to result positions.
-	resolveParents := func() commitParents {
+	// assemble builds the result from visitOrder and others and resolves
+	// every result's parents to result positions: pos maps an enumerated
+	// commit to its position, otherPos a store-read one. The scatter and
+	// the resolution run in parallel chunks; the maps are read-only here.
+	assemble := func() ([]commitInfo, commitParents) {
+		ne := len(visitOrder)
+		out := make([]commitInfo, ne+len(others))
+		copy(out[ne:], others)
+		pos := make([]int32, len(enumerated))
+		otherPos := make(map[Hash]int32, len(others))
+		for q := range others {
+			otherPos[others[q].OID] = int32(ne + q)
+		}
+		// The reader pool is still registered on wg until the deferred
+		// close, so the chunk workers use their own group.
+		const chunk = 4096
+		var next atomic.Int64
+		var cw sync.WaitGroup
+		for range min(numWorkers, ne/chunk+1) {
+			cw.Add(1)
+			go func() {
+				defer cw.Done()
+				for {
+					lo := int(next.Add(chunk) - chunk)
+					if lo >= ne {
+						return
+					}
+					for p := lo; p < min(lo+chunk, ne); p++ {
+						i := visitOrder[p]
+						out[p] = enumerated[i]
+						pos[i] = int32(p)
+					}
+				}
+			}()
+		}
+		cw.Wait()
 		start := make([]int32, len(out)+1)
 		for i := range out {
 			start[i+1] = start[i] + int32(len(out[i].ParentOIDs))
 		}
 		idx := make([]int32, start[len(out)])
-		for i := range out {
-			dst := idx[start[i]:start[i+1]]
-			if src := outSrc[i]; src >= 0 {
-				for j, k := range parentIdx[parentStart[src]:parentStart[src+1]] {
-					if k >= 0 {
-						dst[j] = pos[k]
-						continue
+		next.Store(0)
+		for range min(numWorkers, len(out)/chunk+1) {
+			cw.Add(1)
+			go func() {
+				defer cw.Done()
+				for {
+					lo := int(next.Add(chunk) - chunk)
+					if lo >= len(out) {
+						return
 					}
-					if p, ok := otherPos[out[i].ParentOIDs[j]]; ok {
-						dst[j] = p
-					} else {
-						dst[j] = -1
+					for i := lo; i < min(lo+chunk, len(out)); i++ {
+						dst := idx[start[i]:start[i+1]]
+						if i < ne {
+							src := visitOrder[i]
+							for j, k := range parentIdx[parentStart[src]:parentStart[src+1]] {
+								if k >= 0 {
+									dst[j] = pos[k]
+									continue
+								}
+								if p, ok := otherPos[out[i].ParentOIDs[j]]; ok {
+									dst[j] = p
+								} else {
+									dst[j] = -1
+								}
+							}
+							continue
+						}
+						for j, oid := range out[i].ParentOIDs {
+							if k, ok := ix.lookup(oid); ok {
+								dst[j] = pos[k]
+							} else if p, ok := otherPos[oid]; ok {
+								dst[j] = p
+							} else {
+								dst[j] = -1
+							}
+						}
 					}
 				}
-				continue
-			}
-			for j, oid := range out[i].ParentOIDs {
-				if k, ok := ix.lookup(oid); ok {
-					dst[j] = pos[k]
-				} else if p, ok := otherPos[oid]; ok {
-					dst[j] = p
-				} else {
-					dst[j] = -1
-				}
-			}
+			}()
 		}
-		return commitParents{start: start, idx: idx}
+		cw.Wait()
+		return out, commitParents{start: start, idx: idx}
 	}
 	for _, tip := range tips {
 		classify(tip)
@@ -323,9 +368,7 @@ func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, commi
 			n := len(stack) - 1
 			i := stack[n]
 			stack = stack[:n]
-			pos[i] = int32(len(out))
-			out = append(out, enumerated[i])
-			outSrc = append(outSrc, i)
+			visitOrder = append(visitOrder, i)
 			for j, k := range parentIdx[parentStart[i]:parentStart[i+1]] {
 				if k < 0 {
 					oid := enumerated[i].ParentOIDs[j]
@@ -357,5 +400,6 @@ func (hs *HistoryScanner) loadCommitsReachable(tips []Hash) ([]commitInfo, commi
 	if firstErr != nil {
 		return nil, commitParents{}, firstErr
 	}
-	return out, resolveParents(), nil
+	out, parents := assemble()
+	return out, parents, nil
 }
