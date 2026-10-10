@@ -454,8 +454,8 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// fallback for pack-resident objects whenever the offset cache misses
 	// (disabled via WithOffsetCacheBudget, entry evicted, or first read).
 	// On the hot path an offset-cache hit above returns without paying
-	// these two mutex acquisitions; on a miss the probes are noise next
-	// to the inflation they can avoid: without them, repeated reads of a
+	// these mutex acquisitions; on a miss the delta-window probe is noise
+	// next to the inflation it can avoid: without it, repeated reads of a
 	// packed object would re-inflate every time in memory-constrained
 	// configurations even though inflation populates the delta window.
 	if b, ok := s.dw.acquire(oid); ok {
@@ -472,8 +472,16 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 		b.Release()
 		return d, t, nil
 	}
-	if b, ok := s.cache.Get(oid); ok {
-		return b.data, b.typ, nil
+	// The ARC holds no pack-resident object while the offset cache is
+	// enabled: the promotion above skips them and inflateFromPack adds
+	// only to the delta window and the offset cache. The probe, an
+	// exclusive lock on the whole ARC, is therefore taken only when it can
+	// hit: a scan's first read of every tree and blob otherwise took that
+	// lock on every worker (2% of a rails scan's CPU).
+	if !inPack || !s.offCache.enabled() {
+		if b, ok := s.cache.Get(oid); ok {
+			return b.data, b.typ, nil
+		}
 	}
 
 	if !packLookupDone {

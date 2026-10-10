@@ -3,6 +3,7 @@ package objstore
 import (
 	"bytes"
 	"sync"
+	"unsafe"
 )
 
 // myersWorkBudget bounds the line comparisons one shortest-edit-script
@@ -24,7 +25,20 @@ type diffScratch struct {
 	stack  []diffRange
 	added  []bool
 	fa, fb []uint64
+	// seen is the fingerprint bitmap editDistanceLowerBound probes.
+	seen []uint64
 }
+
+// myersBoundLines is the pair size (old plus new lines) from which
+// addedLinesMyers checks the edit-distance lower bound before searching. A
+// search that ends at the budget costs up to the whole budget, which only a
+// pair this large can reach ((n+m)·(n+m)/2 comparisons), and the bound costs
+// a few nanoseconds per line.
+const myersBoundLines = 2048
+
+// myersBoundBits sizes the fingerprint bitmap of editDistanceLowerBound:
+// 2^16 bits, 8 KiB, so clearing and probing it stay in L1.
+const myersBoundBits = 16
 
 // diffRange is one pending subproblem: old[a0:a1] against new[b0:b1].
 type diffRange struct{ a0, a1, b0, b1 int }
@@ -111,6 +125,17 @@ func addedLinesMyers(oldLines, newLines []string, sc *diffScratch) bool {
 	sc.fa = lineFingerprints(sc.fa, oldLines)
 	sc.fb = lineFingerprints(sc.fb, newLines)
 	fa, fb := sc.fa, sc.fb
+	// The top-level middle snake is found at forward step d for an odd
+	// edit distance 2d-1 and at reverse step d for an even one 2d, both
+	// within the search iff D <= 2*limit. A lower bound above that is a
+	// search that would run to the budget and fail; the greedy walk takes
+	// over without the search, with the same result.
+	if n+m >= myersBoundLines {
+		limit := min((n+m+1)/2, half)
+		if editDistanceLowerBound(fa, fb, sc) > 2*limit {
+			return false
+		}
+	}
 
 	sc.stack = append(sc.stack[:0], diffRange{0, n, 0, m})
 	for len(sc.stack) > 0 {
@@ -149,6 +174,43 @@ func addedLinesMyers(oldLines, newLines []string, sc *diffScratch) bool {
 	return true
 }
 
+// editDistanceLowerBound returns a lower bound on the edit distance between
+// the line sequences with fingerprints fa and fb. A line whose fingerprint
+// occurs nowhere on the other side is outside every common subsequence, so
+// LCS <= min(m - uniqueB, n - uniqueA) and D = n + m - 2*LCS is at least
+// max(n - m + 2*uniqueB, m - n + 2*uniqueA). Membership is tested through a
+// bitmap over the low fingerprint bits: a bitmap hit for an absent line only
+// lowers the count of lines known unique, so the bound stays a lower bound.
+func editDistanceLowerBound(fa, fb []uint64, sc *diffScratch) int {
+	const words = 1 << (myersBoundBits - 6)
+	if cap(sc.seen) < 2*words {
+		sc.seen = make([]uint64, 2*words)
+	}
+	seenA, seenB := sc.seen[:words], sc.seen[words:2*words]
+	clear(seenA)
+	clear(seenB)
+	const mask = 1<<myersBoundBits - 1
+	for _, f := range fa {
+		seenA[(f&mask)>>6] |= 1 << (f & 63)
+	}
+	for _, f := range fb {
+		seenB[(f&mask)>>6] |= 1 << (f & 63)
+	}
+	uniqueA, uniqueB := 0, 0
+	for _, f := range fa {
+		if seenB[(f&mask)>>6]&(1<<(f&63)) == 0 {
+			uniqueA++
+		}
+	}
+	for _, f := range fb {
+		if seenA[(f&mask)>>6]&(1<<(f&63)) == 0 {
+			uniqueB++
+		}
+	}
+	n, m := len(fa), len(fb)
+	return max(n-m+2*uniqueB, m-n+2*uniqueA)
+}
+
 // middleSnake finds a snake on the middle of a shortest edit path between a
 // and b: forward and reverse frontier searches advance by one edit each
 // until they overlap on a diagonal. It returns the snake's start and end
@@ -161,28 +223,43 @@ func middleSnake(a, b []string, fa, fb []uint64, vf, vr []int32, half int) (xs, 
 	odd := delta&1 != 0
 	limit := min((n+m+1)/2, half)
 	offset := limit + 1
-	vf[offset+1] = 0
-	vr[offset+1] = 0
+	// The frontier loops below are the search's inner loop: every step
+	// reads two or three frontier entries by a diagonal index the compiler
+	// cannot bound, and every snake step reads a fingerprint and a line
+	// from each side by an index it has just compared against n and m. The
+	// accesses go through raw pointers so the loop carries no bounds
+	// checks; the indexes stay in range by construction: frontier entries
+	// offset+k with k in [-d-1, d+1] and d <= limit lie in [0, 2*limit+2]
+	// and the frontiers hold 2*half+3 >= 2*limit+3 entries (the caller
+	// sizes them for half), and x < n, y < m hold at every snake step.
+	fp := frontier{unsafe.Pointer(unsafe.SliceData(vf))}
+	rp := frontier{unsafe.Pointer(unsafe.SliceData(vr))}
+	side1 := diffSide{lines: unsafe.Pointer(unsafe.SliceData(a)), fps: unsafe.Pointer(unsafe.SliceData(fa))}
+	side2 := diffSide{lines: unsafe.Pointer(unsafe.SliceData(b)), fps: unsafe.Pointer(unsafe.SliceData(fb))}
+	_ = vf[2*limit+2]
+	_ = vr[2*limit+2]
+	fp.set(offset+1, 0)
+	rp.set(offset+1, 0)
 	for d := 0; d <= limit; d++ {
 		// Forward step over diagonals k = x - y.
 		for k := -d; k <= d; k += 2 {
 			var x int
-			if k == -d || (k != d && vf[offset+k-1] < vf[offset+k+1]) {
-				x = int(vf[offset+k+1])
+			if k == -d || (k != d && fp.at(offset+k-1) < fp.at(offset+k+1)) {
+				x = fp.at(offset + k + 1)
 			} else {
-				x = int(vf[offset+k-1]) + 1
+				x = fp.at(offset+k-1) + 1
 			}
 			y := x - k
 			x0, y0 := x, y
-			for x < n && y < m && fa[x] == fb[y] && a[x] == b[y] {
+			for x < n && y < m && side1.fp(x) == side2.fp(y) && side1.line(x) == side2.line(y) {
 				x++
 				y++
 			}
-			vf[offset+k] = int32(x)
+			fp.set(offset+k, x)
 			// A reverse point on the same diagonal lies at reverse diagonal
 			// delta-k; the paths overlap once the forward x reaches it.
 			if odd {
-				if kr := delta - k; kr >= -(d-1) && kr <= d-1 && x+int(vr[offset+kr]) >= n {
+				if kr := delta - k; kr >= -(d-1) && kr <= d-1 && x+rp.at(offset+kr) >= n {
 					return x0, y0, x, y, true
 				}
 			}
@@ -191,26 +268,42 @@ func middleSnake(a, b []string, fa, fb []uint64, vf, vr []int32, half int) (xs, 
 		// x', y' counted from the ends of a and b.
 		for k := -d; k <= d; k += 2 {
 			var x int
-			if k == -d || (k != d && vr[offset+k-1] < vr[offset+k+1]) {
-				x = int(vr[offset+k+1])
+			if k == -d || (k != d && rp.at(offset+k-1) < rp.at(offset+k+1)) {
+				x = rp.at(offset + k + 1)
 			} else {
-				x = int(vr[offset+k-1]) + 1
+				x = rp.at(offset+k-1) + 1
 			}
 			y := x - k
 			x0, y0 := x, y
-			for x < n && y < m && fa[n-1-x] == fb[m-1-y] && a[n-1-x] == b[m-1-y] {
+			for x < n && y < m && side1.fp(n-1-x) == side2.fp(m-1-y) && side1.line(n-1-x) == side2.line(m-1-y) {
 				x++
 				y++
 			}
-			vr[offset+k] = int32(x)
+			rp.set(offset+k, x)
 			if !odd {
-				if kf := delta - k; kf >= -d && kf <= d && x+int(vf[offset+kf]) >= n {
+				if kf := delta - k; kf >= -d && kf <= d && x+fp.at(offset+kf) >= n {
 					return n - x, m - y, n - x0, m - y0, true
 				}
 			}
 		}
 	}
 	return 0, 0, 0, 0, false
+}
+
+// frontier is an unchecked view of a middle-snake frontier array; see the
+// bounds argument in middleSnake.
+type frontier struct{ p unsafe.Pointer }
+
+func (f frontier) at(i int) int     { return int(*(*int32)(unsafe.Add(f.p, uintptr(i)*4))) }
+func (f frontier) set(i int, v int) { *(*int32)(unsafe.Add(f.p, uintptr(i)*4)) = int32(v) }
+
+// diffSide is an unchecked view of one side's lines and fingerprints; see
+// the bounds argument in middleSnake.
+type diffSide struct{ lines, fps unsafe.Pointer }
+
+func (s diffSide) fp(i int) uint64 { return *(*uint64)(unsafe.Add(s.fps, uintptr(i)*8)) }
+func (s diffSide) line(i int) string {
+	return *(*string)(unsafe.Add(s.lines, uintptr(i)*unsafe.Sizeof("")))
 }
 
 // commonSuffixLineBoundary returns the length of the longest common byte

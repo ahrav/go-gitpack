@@ -6,6 +6,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -100,6 +101,74 @@ func TestAddedLinesMyersFallbackBeyondBudget(t *testing.T) {
 	require.Len(t, hunks, 1)
 	require.Equal(t, uint32(1), hunks[0].StartLine)
 	require.Len(t, hunks[0].Lines, n)
+}
+
+// TestEditDistanceLowerBound pins the bound against brute-force edit
+// distances on small random line sequences: never above the true distance,
+// and exact when every line is unique to its side.
+func TestEditDistanceLowerBound(t *testing.T) {
+	r := rand.New(rand.NewSource(5))
+	sc := getDiffScratch()
+	defer putDiffScratch(sc)
+	for iter := 0; iter < 500; iter++ {
+		n, m := r.Intn(12), r.Intn(12)
+		a := make([]string, n)
+		b := make([]string, m)
+		for i := range a {
+			a[i] = fmt.Sprintf("l%d", r.Intn(8))
+		}
+		for i := range b {
+			b[i] = fmt.Sprintf("l%d", r.Intn(8))
+		}
+		fa := lineFingerprints(nil, a)
+		fb := lineFingerprints(nil, b)
+		lb := editDistanceLowerBound(fa, fb, sc)
+		require.LessOrEqual(t, lb, n+m-2*lcsLength(a, b), "a=%v b=%v", a, b)
+		require.GreaterOrEqual(t, lb, 0)
+	}
+	a := []string{"a", "b", "c"}
+	b := []string{"x", "y"}
+	require.Equal(t, 5, editDistanceLowerBound(lineFingerprints(nil, a), lineFingerprints(nil, b), sc))
+	require.Equal(t, 0, editDistanceLowerBound(lineFingerprints(nil, a), lineFingerprints(nil, a), sc))
+}
+
+// lcsLength is the textbook quadratic longest-common-subsequence length.
+func lcsLength(a, b []string) int {
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			if a[i-1] == b[j-1] {
+				cur[j] = prev[j-1] + 1
+			} else {
+				cur[j] = max(prev[j], cur[j-1])
+			}
+		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)]
+}
+
+// TestAddedLinesMyersBoundSkipsHopelessSearch pins that a large pair whose
+// lower bound exceeds the budget is refused before the search, with the
+// same answer as the search at the budget would give.
+func TestAddedLinesMyersBoundSkipsHopelessSearch(t *testing.T) {
+	const n = 20000
+	oldLines := make([]string, n)
+	newLines := make([]string, n)
+	for i := range oldLines {
+		oldLines[i] = fmt.Sprintf("old-%d", i)
+		newLines[i] = fmt.Sprintf("new-%d", i)
+	}
+	sc := getDiffScratch()
+	defer putDiffScratch(sc)
+	fa := lineFingerprints(nil, oldLines)
+	fb := lineFingerprints(nil, newLines)
+	half := min((2*n+1)/2, myersWorkBudget/(2*n+1)+1)
+	require.Greater(t, editDistanceLowerBound(fa, fb, sc), 2*min((2*n+1)/2, half))
+	start := time.Now()
+	require.False(t, addedLinesMyers(oldLines, newLines, sc))
+	require.Less(t, time.Since(start), time.Second)
 }
 
 func TestAddedLinesMyersWholesaleRewriteWithinBudget(t *testing.T) {
