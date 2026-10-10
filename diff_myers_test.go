@@ -137,6 +137,63 @@ func TestCommonSuffixLineBoundary(t *testing.T) {
 	}
 }
 
+// commonSuffixLineBoundaryRef is the byte-at-a-time definition the chunked
+// implementation must match.
+func commonSuffixLineBoundaryRef(a, b []byte) int {
+	n := min(len(a), len(b))
+	i := 0
+	for i < n && a[len(a)-1-i] == b[len(b)-1-i] {
+		i++
+	}
+	if i == 0 {
+		return 0
+	}
+	startA, startB := len(a)-i, len(b)-i
+	if (startA == 0 || a[startA-1] == '\n') && (startB == 0 || b[startB-1] == '\n') {
+		return i
+	}
+	j := bytes.IndexByte(a[startA:], '\n')
+	if j < 0 {
+		return 0
+	}
+	return i - j - 1
+}
+
+// TestCommonSuffixLineBoundaryMatchesReference drives the chunked suffix
+// compare across mismatch positions on every side of its 256-byte and 8-byte
+// steps, with and without newlines near the boundary, against the byte loop.
+func TestCommonSuffixLineBoundaryMatchesReference(t *testing.T) {
+	rng := rand.New(rand.NewSource(7))
+	for iter := 0; iter < 20000; iter++ {
+		n := rng.Intn(1200)
+		tail := make([]byte, n)
+		for i := range tail {
+			if rng.Intn(6) == 0 {
+				tail[i] = '\n'
+			} else {
+				tail[i] = byte('a' + rng.Intn(4))
+			}
+		}
+		headA := make([]byte, rng.Intn(40))
+		headB := make([]byte, rng.Intn(40))
+		for i := range headA {
+			headA[i] = byte(rng.Intn(256))
+		}
+		for i := range headB {
+			headB[i] = byte(rng.Intn(256))
+		}
+		a := append(append([]byte(nil), headA...), tail...)
+		b := append(append([]byte(nil), headB...), tail...)
+		if n > 0 && rng.Intn(2) == 0 {
+			// Flip one byte inside the shared tail so the mismatch lands
+			// inside a chunk or a word.
+			k := len(b) - 1 - rng.Intn(n)
+			b[k] ^= 1
+		}
+		require.Equal(t, commonSuffixLineBoundaryRef(a, b), commonSuffixLineBoundary(a, b), "a=%q b=%q", a, b)
+	}
+}
+
 func TestLineFingerprintsEqualLinesEqualFingerprints(t *testing.T) {
 	lines := []string{"", "a", "abcdefg", "abcdefgh", "abcdefghi", "the same long line here", "the same long line here", "the same long line herE"}
 	fps := lineFingerprints(nil, lines)

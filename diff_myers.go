@@ -220,8 +220,20 @@ func middleSnake(a, b []string, fa, fb []uint64, vf, vr []int32, half int) (xs, 
 // the full inputs.
 func commonSuffixLineBoundary(a, b []byte) int {
 	n := min(len(a), len(b))
+	la, lb := len(a), len(b)
 	i := 0
-	for i < n && a[len(a)-1-i] == b[len(b)-1-i] {
+	// Consecutive versions share most of their tail once the common prefix
+	// is gone, so the bulk of it is compared a chunk at a time through the
+	// runtime's vectorized equality, then the mismatching chunk is narrowed
+	// word- and byte-wise; the byte loop alone was 15% of a scan's CPU.
+	const chunk = 256
+	for i+chunk <= n && bytes.Equal(a[la-i-chunk:la-i], b[lb-i-chunk:lb-i]) {
+		i += chunk
+	}
+	for i+8 <= n && le64(a[la-i-8:]) == le64(b[lb-i-8:]) {
+		i += 8
+	}
+	for i < n && a[la-1-i] == b[lb-1-i] {
 		i++
 	}
 	if i == 0 {
