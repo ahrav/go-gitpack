@@ -965,3 +965,14 @@ func TestDiffHistoryHunksFunc_SmallHistorySpreadsPairsAcrossWorkers(t *testing.T
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, maxInFn.Load(), int32(2), "expensive pairs of a single batch must reach more than one worker")
 }
+
+// TestTreeDiffWorkerCap pins the stage-1 ceiling: eight workers through
+// sixteen CPUs, half the CPUs beyond that, so the tree stage keeps pace with
+// an uncapped hunk stage on wide hosts.
+func TestTreeDiffWorkerCap(t *testing.T) {
+	cases := map[int]int{1: 8, 4: 8, 8: 8, 16: 8, 24: 12, 32: 16, 64: 32, 96: 48}
+	for numCPU, want := range cases {
+		assert.Equalf(t, want, treeDiffWorkerCap(numCPU), "numCPU=%d", numCPU)
+	}
+	assert.Equal(t, treeDiffWorkerCap(runtime.NumCPU()), maxTreeDiffWorkers)
+}

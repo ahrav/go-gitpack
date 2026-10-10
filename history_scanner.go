@@ -644,17 +644,26 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 	}
 }
 
-// maxTreeDiffWorkers is the absolute ceiling on the stage-1 tree-diff worker
-// pool, applied on top of the NumCPU/2 halving in DiffHistoryHunksFunc.
+// maxTreeDiffWorkers is the ceiling on the stage-1 tree-diff worker pool,
+// applied on top of the NumCPU/2 halving in DiffHistoryHunksFunc: eight
+// workers up to sixteen CPUs, half the CPUs beyond that.
 //
-// Measured on a stage-1-bound history (BenchmarkDiffHistoryHunksManySmallCommits,
-// 3000 single-file commits over a 200-file tree, 32-core arm64): raising the
-// cap to NumCPU was ~7% slower, so the cap costs no throughput even when
-// stage 1 dominates: stage-2 hunk workers, which are uncapped, set pipeline
-// throughput. On the trufflehog history at 16 logical CPUs, caps of 16 and
-// 32 measured within noise of 8. Re-run those benchmarks before changing
-// this value.
-const maxTreeDiffWorkers = 8
+// Tree diffing is about a fifth of a hunk scan's CPU (rails: 4.6 of 19.7
+// CPU-seconds), so a fixed cap of eight binds once the hunk stage has more
+// than about forty workers' worth of CPU to spread the other four fifths
+// over. Measured on the rails history at 32 cores (dedup scan, 32 hunk
+// workers): eight tree workers ran at 5.5 of 8 busy while the hunk workers
+// waited on them, 1.16 s; sixteen tree workers 1.03 s; thirty-two within
+// noise of sixteen. Measured on a stage-1-bound history
+// (BenchmarkDiffHistoryHunksManySmallCommits, 3000 single-file commits over
+// a 200-file tree, 32-core arm64): a cap of NumCPU was ~7% slower than 8,
+// and on the trufflehog history at 16 logical CPUs caps of 16 and 32 were
+// within noise of 8, so the ceiling stays at eight through sixteen CPUs.
+// Re-run those benchmarks before changing this value.
+var maxTreeDiffWorkers = treeDiffWorkerCap(runtime.NumCPU())
+
+// treeDiffWorkerCap is maxTreeDiffWorkers for a host with numCPU CPUs.
+func treeDiffWorkerCap(numCPU int) int { return max(8, numCPU/2) }
 
 // errScanAborted marks an internal early-stop condition used to unwind commit walks.
 var errScanAborted = errors.New("scan aborted")
