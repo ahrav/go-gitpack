@@ -110,6 +110,76 @@ func buildWhaleRepo(t *testing.T) (string, []byte) {
 	return repo, big
 }
 
+// TestWhalePrefetchCoversDeltifiedBlob pins that a multi-MB blob stored as a
+// delta of its previous version is a whale too: both versions of the big
+// file are candidates, the deltified one is sized through its chain, and
+// the prefetch delivers its bytes with the blob type.
+func TestWhalePrefetchCoversDeltifiedBlob(t *testing.T) {
+	requireGit(t)
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	// Three times the whale threshold of incompressible bytes; the second
+	// version rewrites the middle third, so the delta between them is
+	// itself above the threshold.
+	big := make([]byte, 3*whaleMinCompressedBytes)
+	rng := uint64(0x9E3779B97F4A7C15)
+	for i := range big {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		big[i] = byte(rng)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "big.bin"), big, 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "v1", "--quiet")
+	// The second version shares most bytes with the first, so the repack
+	// stores one of them as a delta of the other, and the delta is still
+	// megabytes because the changed region is incompressible.
+	big2 := append([]byte(nil), big...)
+	for i := len(big2) / 3; i < 2*len(big2)/3; i++ {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		big2[i] = byte(rng)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "big.bin"), big2, 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "v2", "--quiet")
+	runGit(t, repo, "repack", "-a", "-d", "-q", "--window=10", "--depth=10")
+
+	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
+	require.NoError(t, err)
+	defer s.Close()
+
+	oid1, oid2 := calculateHash(ObjBlob, big), calculateHash(ObjBlob, big2)
+	deltified := 0
+	for _, oid := range []Hash{oid1, oid2} {
+		p, off, ok := s.findPackedObject(oid)
+		require.True(t, ok)
+		typ, _, err := peekObjectType(p, off)
+		require.NoError(t, err)
+		if typ == ObjOfsDelta || typ == ObjRefDelta {
+			deltified++
+		}
+		size, root, ok := s.whaleSizeAt(p, off)
+		require.True(t, ok)
+		require.Equal(t, ObjBlob, root)
+		require.GreaterOrEqual(t, size, uint64(len(big)))
+	}
+	require.Equal(t, 1, deltified, "the repack stores one version as a delta of the other")
+
+	c := s.newWhaleCache()
+	require.NotNil(t, c)
+	require.Len(t, c.order, 2, "both versions are prefetched")
+	for _, want := range [][]byte{big, big2} {
+		p, off, _ := s.findPackedObject(calculateHash(ObjBlob, want))
+		got, typ, ok := c.get(p, off, nil)
+		require.True(t, ok)
+		require.Equal(t, ObjBlob, typ)
+		require.Equal(t, want, got)
+	}
+}
+
 // TestDedupScanPrefetchesWhales pins that the dedup pipeline runs the whale
 // prefetch for the duration of its scan and releases it on return: a
 // multi-MB blob's inflation then starts at scan start instead of when the
@@ -176,14 +246,14 @@ func TestWhaleGetInflatesUnstartedEntry(t *testing.T) {
 			keyB: {done: make(chan struct{})},
 		},
 		order: []offCacheKey{keyA, keyB},
-		load: func(pack *mmap.ReaderAt, _ uint64) ([]byte, error) {
+		load: func(pack *mmap.ReaderAt, _ uint64) ([]byte, ObjectType, error) {
 			if pack == packA {
 				close(entered)
 				<-release
-				return []byte("a"), nil
+				return []byte("a"), ObjBlob, nil
 			}
 			loadsB.Add(1)
-			return []byte("b"), nil
+			return []byte("b"), ObjBlob, nil
 		},
 	}
 	stop := make(chan struct{})

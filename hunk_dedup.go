@@ -114,10 +114,6 @@ const (
 	// ordinary work instead.
 	dedupExpensivePairBytes = 4 << 20
 
-	// dedupSizeProbeHops bounds the delta-chain headers estimatePackedSize
-	// follows; a long chain's early hops already reveal a large base.
-	dedupSizeProbeHops = 8
-
 	// dedupEarlyBytesCap bounds the estimated blob bytes of expensive pairs
 	// forwarded ahead of order and not yet decided. Their results, and the
 	// blobs their lines reference, sit in the reorder ring until their
@@ -750,9 +746,9 @@ type dedupCommitSlot struct {
 // estimatePackedSize returns an estimate of oid's materialized size from pack
 // headers alone, without inflating anything: the header size of a
 // non-delta object, or for a delta the largest header size seen while
-// following up to dedupSizeProbeHops base links. It reports 0 for objects it
-// cannot find or follow (loose objects, broken chains); the estimate is a
-// scheduling hint and never affects results.
+// following up to whaleSizeProbeHops base links (whaleSizeAt). It reports 0
+// for objects it cannot find (loose objects); the estimate is a scheduling
+// hint and never affects results.
 func (hs *HistoryScanner) estimatePackedSize(oid Hash) uint64 {
 	if oid.IsZero() {
 		return 0
@@ -761,38 +757,8 @@ func (hs *HistoryScanner) estimatePackedSize(oid Hash) uint64 {
 	if !ok {
 		return 0
 	}
-	var best uint64
-	for hop := 0; hop < dedupSizeProbeHops; hop++ {
-		var buf [32]byte
-		n, err := pack.ReadAt(buf[:], int64(off))
-		if n == 0 || (err != nil && n < 1) {
-			return best
-		}
-		typ, size, hdrLen := parseObjectHeaderUnsafe(buf[:n])
-		if hdrLen <= 0 {
-			return best
-		}
-		best = max(best, size)
-		switch typ {
-		case ObjOfsDelta:
-			back, _, err := readOfsDeltaOffset(pack, int64(off)+int64(hdrLen))
-			if err != nil || back == 0 || back > off {
-				return best
-			}
-			off -= back
-		case ObjRefDelta:
-			var base Hash
-			if _, err := pack.ReadAt(base[:], int64(off)+int64(hdrLen)); err != nil {
-				return best
-			}
-			if pack, off, ok = hs.store.findPackedObject(base); !ok {
-				return best
-			}
-		default:
-			return best
-		}
-	}
-	return best
+	size, _, _ := hs.store.whaleSizeAt(pack, off)
+	return size
 }
 
 // dedupExpensivePair names one pair of a commit whose blobs are estimated
