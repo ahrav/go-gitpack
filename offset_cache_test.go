@@ -77,6 +77,17 @@ func TestOffsetCacheAddStaysWithinBudget(t *testing.T) {
 // file, and returns the store with the large blob's content.
 func openWhaleStore(t *testing.T) (*store, []byte) {
 	t.Helper()
+	repo, big := buildWhaleRepo(t)
+	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+	return s, big
+}
+
+// buildWhaleRepo creates the one-commit repository behind openWhaleStore and
+// returns its work tree with the large blob's content.
+func buildWhaleRepo(t *testing.T) (string, []byte) {
+	t.Helper()
 	requireGit(t)
 	repo := t.TempDir()
 	runGit(t, repo, "init", "--quiet")
@@ -96,11 +107,34 @@ func openWhaleStore(t *testing.T) (*store, []byte) {
 	runGit(t, repo, "add", "-A")
 	runGit(t, repo, "commit", "-m", "add", "--quiet")
 	runGit(t, repo, "repack", "-a", "-d", "-q")
+	return repo, big
+}
 
-	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
+// TestDedupScanPrefetchesWhales pins that the dedup pipeline runs the whale
+// prefetch for the duration of its scan and releases it on return: a
+// multi-MB blob's inflation then starts at scan start instead of when the
+// tree stage reaches its commit, and the scanner holds no whale bytes
+// between scans.
+func TestDedupScanPrefetchesWhales(t *testing.T) {
+	repo, big := buildWhaleRepo(t)
+	hs, err := NewHistoryScanner(filepath.Join(repo, ".git"), WithHunkLineDedup(true))
 	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
-	return s, big
+	defer hs.Close()
+	require.NotEmpty(t, hs.store.whaleCandidates())
+
+	var sawPrefetch, sawBig atomic.Bool
+	require.NoError(t, hs.DiffHistoryHunksFunc(func(h HunkAddition) error {
+		if hs.store.whales.Load() != nil {
+			sawPrefetch.Store(true)
+		}
+		if h.IsBinary() && len(h.Lines()) == 1 && h.Lines()[0] == string(big) {
+			sawBig.Store(true)
+		}
+		return nil
+	}))
+	require.True(t, sawPrefetch.Load(), "whale prefetch was not active during the dedup scan")
+	require.True(t, sawBig.Load(), "the whale blob was not delivered")
+	require.Nil(t, hs.store.whales.Load(), "whale prefetch outlived the scan")
 }
 
 // TestWhalePrefetchSkippedWhenOffsetCacheDisabled pins that a disabled offset

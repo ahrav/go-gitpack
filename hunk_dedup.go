@@ -1085,6 +1085,12 @@ func (hs *HistoryScanner) diffHistoryHunksDedup(fn func(HunkAddition) error) err
 		order = filtered
 	}
 
+	// Whale blobs inflate for tens of milliseconds each; inflating them
+	// from the start overlaps that work with the rest of the scan (see
+	// prefetchWhales).
+	waitWhales := hs.store.prefetchWhales()
+	defer waitWhales()
+
 	limits := hs.dedupLimits
 	window := limits.inFlightPairs
 	ringMask := window - 1
