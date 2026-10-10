@@ -33,6 +33,8 @@ type inMemoryMidx struct {
 	fanout   [fanoutEntries]uint32
 	objectID []Hash
 	entries  []inMemoryMidxEntry
+	// prefixes narrows lookups past the byte fanout; see oidPrefixIndex.
+	prefixes oidPrefixIndex
 }
 
 // inMemoryMidxRecord is a scratch intermediate used only during
@@ -154,6 +156,7 @@ func buildInMemoryMidx(packs []*idxFile) *inMemoryMidx {
 		fanout:   fanout,
 		objectID: objectIDs,
 		entries:  entries,
+		prefixes: buildOIDPrefixIndex(objectIDs),
 	}
 }
 
@@ -175,12 +178,16 @@ func (m *inMemoryMidx) findObject(oid Hash) (*mmap.ReaderAt, uint64, bool) {
 //
 // Returns the entry and true on hit, or a zero-value entry and false on miss.
 func (m *inMemoryMidx) findEntry(oid Hash) (inMemoryMidxEntry, bool) {
-	first := oid[0]
-	start := uint32(0)
-	if first > 0 {
-		start = m.fanout[first-1]
+	var start, end uint32
+	if m.prefixes.starts != nil {
+		start, end = m.prefixes.bucket(&oid)
+	} else {
+		first := oid[0]
+		if first > 0 {
+			start = m.fanout[first-1]
+		}
+		end = m.fanout[first]
 	}
-	end := m.fanout[first]
 	if start == end {
 		return inMemoryMidxEntry{}, false
 	}

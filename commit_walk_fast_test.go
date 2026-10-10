@@ -230,3 +230,54 @@ func TestSearchHashesMatchesLinearSearch(t *testing.T) {
 	_, ok := searchHashes(nil, Hash{1})
 	assert.False(t, ok)
 }
+
+// TestOIDPrefixIndexMatchesFanout drives idxFile.findObject through the
+// prefix index against a byte-fanout-only copy of the same table: every hit
+// and miss agrees, across table sizes on both sides of a prefix-width step
+// and with OIDs sharing long prefixes.
+func TestOIDPrefixIndexMatchesFanout(t *testing.T) {
+	rng := rand.New(rand.NewSource(29))
+	for _, n := range []int{0, 1, 2, 255, 256, 257, 5000, 70000} {
+		hashes := make([]Hash, n)
+		for i := range hashes {
+			rng.Read(hashes[i][:])
+			if i > 0 && i%7 == 0 {
+				copy(hashes[i][:3], hashes[i-1][:3])
+			}
+		}
+		sort.Slice(hashes, func(i, j int) bool { return bytes.Compare(hashes[i][:], hashes[j][:]) < 0 })
+		hashes = slices.Compact(hashes)
+		entries := make([]idxEntry, len(hashes))
+		var fanout [fanoutEntries]uint32
+		for i, h := range hashes {
+			entries[i].offset = uint64(i) + 1
+			fanout[h[0]]++
+		}
+		for i := 1; i < fanoutEntries; i++ {
+			fanout[i] += fanout[i-1]
+		}
+		plain := &idxFile{fanout: fanout, entries: entries, oidTable: hashes}
+		fine := &idxFile{fanout: fanout, entries: entries, oidTable: hashes, prefixes: buildOIDPrefixIndex(hashes)}
+		require.GreaterOrEqual(t, fine.prefixes.bits, uint(minOIDPrefixBits))
+		require.LessOrEqual(t, fine.prefixes.bits, uint(maxOIDPrefixBits))
+		require.Equal(t, uint32(len(hashes)), fine.prefixes.starts[len(fine.prefixes.starts)-1])
+		for _, h := range hashes {
+			off, ok := fine.findObject(h)
+			require.True(t, ok)
+			wantOff, _ := plain.findObject(h)
+			require.Equal(t, wantOff, off)
+		}
+		for iter := 0; iter < 2000; iter++ {
+			var probe Hash
+			rng.Read(probe[:])
+			if iter%3 == 0 && len(hashes) > 0 {
+				// A near miss: share the first bytes of a present OID.
+				copy(probe[:4], hashes[rng.Intn(len(hashes))][:4])
+			}
+			wantOff, want := plain.findObject(probe)
+			off, ok := fine.findObject(probe)
+			require.Equal(t, want, ok)
+			require.Equal(t, wantOff, off)
+		}
+	}
+}
