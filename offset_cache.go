@@ -303,6 +303,13 @@ func (c *offsetCache) admits(size int) bool {
 	return c.enabled() && size <= maxCacheableSize && size <= c.budgetPerShard
 }
 
+// admitsCacheable reports whether every object up to maxCacheableSize is
+// admitted, so callers that have no size yet can skip the ARC for packed
+// objects.
+func (c *offsetCache) admitsCacheable() bool {
+	return c.enabled() && c.budgetPerShard >= maxCacheableSize
+}
+
 // get returns the materialized object stored at (pack, off), if present.
 // The returned slice is shared and MUST NOT be mutated.
 // A nil receiver reports a miss so contexts without a store can share code.

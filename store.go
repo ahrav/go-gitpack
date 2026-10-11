@@ -463,22 +463,22 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 		// Promote to the ARC cache on second access (delta window hit).
 		// A pack-resident object under an enabled offset cache is already
 		// retained there by (pack, offset), so the ARC holds loose objects
-		// and, with the offset cache disabled, packed ones; the entry-count
+		// and the packed ones the offset cache rejects; the entry-count
 		// bound of the ARC otherwise pinned hundreds of megabytes of blobs
 		// the offset cache was already serving.
-		if len(d) <= maxCacheableSize && !inPack {
+		if len(d) <= maxCacheableSize && (!inPack || !s.offCache.admits(len(d))) {
 			s.cache.Add(oid, cachedObj{data: d, typ: t})
 		}
 		b.Release()
 		return d, t, nil
 	}
-	// The ARC holds no pack-resident object while the offset cache is
-	// enabled: the promotion above skips them and inflateFromPack adds
-	// only to the delta window and the offset cache. The probe, an
-	// exclusive lock on the whole ARC, is therefore taken only when it can
-	// hit: a scan's first read of every tree and blob otherwise took that
-	// lock on every worker (2% of a rails scan's CPU).
-	if !inPack || !s.offCache.enabled() {
+	// When the offset cache admits every cacheable size, ARC promotion is
+	// restricted to loose objects, and inflateFromPack adds only to the
+	// delta window and the offset cache. The probe, an exclusive lock on
+	// the whole ARC, is therefore taken only when it can hit: a scan's
+	// first read of every tree and blob otherwise took that lock on every
+	// worker (2% of a rails scan's CPU).
+	if !inPack || !s.offCache.admitsCacheable() {
 		if b, ok := s.cache.Get(oid); ok {
 			return b.data, b.typ, nil
 		}

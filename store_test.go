@@ -228,6 +228,35 @@ func TestGetKeepsPackedObjectsOutOfARCWhenOffsetCacheEnabled(t *testing.T) {
 	require.False(t, ok, "packed object must be served by the offset cache, not pinned by the ARC")
 }
 
+func TestGetPromotesPackedObjectsTheOffsetCacheRejects(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	store, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer store.Close()
+	// A one-byte budget per shard keeps the offset cache enabled while
+	// forcing it to reject the target object.
+	store.offCache.setBudget(offsetCacheShards)
+	require.True(t, store.offCache.enabled())
+
+	targetHash := calculateHash(ObjBlob, []byte("modified data"))
+	want, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	require.False(t, store.offCache.admits(len(want)))
+	got, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	cached, ok := store.cache.Get(targetHash)
+	require.True(t, ok, "a packed object the offset cache rejects must be promoted to the ARC")
+	require.Equal(t, want, cached.data)
+
+	got, _, err = store.get(targetHash)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}
+
 // TestParseIdx validates the v2 pack-index parser against invalid magic bytes,
 // unsupported versions, minimal valid indices, large-offset handling,
 // multi-object sorted order, and truncated files.
