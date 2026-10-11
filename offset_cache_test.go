@@ -260,7 +260,7 @@ func TestWhalePrefetchChargesDeltaTarget(t *testing.T) {
 	require.Equal(t, ObjBlob, typ)
 	require.Less(t, 2*headerMax, uint64(len(target)), "the fixture's target dwarfs its header sizes")
 
-	assert.Nil(t, s.newWhaleCacheWithBudget(uint64(len(target))-1), "a budget below the target size admits the delta")
+	assert.Nil(t, s.newWhaleCacheWithBudget(uint64(len(target))-1), "a budget below the target size rejects the delta")
 
 	c := s.newWhaleCacheWithBudget(uint64(len(target)))
 	require.NotNil(t, c)
@@ -268,6 +268,20 @@ func TestWhalePrefetchChargesDeltaTarget(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, ObjBlob, typ)
 	assert.Equal(t, target, got)
+}
+
+func TestWhalePrefetchSkipsDeltaAboveObjectLimit(t *testing.T) {
+	dir, target := buildCopyHeavyDeltaPack(t)
+	s, err := open(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	budget := uint64(len(target))
+	s.SetMaxDeltaObjectSize(budget - 1)
+	assert.Nil(t, s.newWhaleCacheWithBudget(budget), "a delta limit below the target size rejects the delta")
+
+	s.SetMaxDeltaObjectSize(budget)
+	require.NotNil(t, s.newWhaleCacheWithBudget(budget), "a delta limit at the target size admits the delta")
 }
 
 // TestDedupScanPrefetchesWhales pins that the dedup pipeline runs the whale

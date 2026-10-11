@@ -123,30 +123,13 @@ func TestEditDistanceLowerBound(t *testing.T) {
 		fa := lineFingerprints(nil, a)
 		fb := lineFingerprints(nil, b)
 		lb := editDistanceLowerBound(fa, fb, sc)
-		require.LessOrEqual(t, lb, n+m-2*lcsLength(a, b), "a=%v b=%v", a, b)
+		require.LessOrEqual(t, lb, n+m-2*lcsLen(a, b), "a=%v b=%v", a, b)
 		require.GreaterOrEqual(t, lb, 0)
 	}
 	a := []string{"a", "b", "c"}
 	b := []string{"x", "y"}
 	require.Equal(t, 5, editDistanceLowerBound(lineFingerprints(nil, a), lineFingerprints(nil, b), sc))
 	require.Equal(t, 0, editDistanceLowerBound(lineFingerprints(nil, a), lineFingerprints(nil, a), sc))
-}
-
-// lcsLength is the textbook quadratic longest-common-subsequence length.
-func lcsLength(a, b []string) int {
-	prev := make([]int, len(b)+1)
-	cur := make([]int, len(b)+1)
-	for i := 1; i <= len(a); i++ {
-		for j := 1; j <= len(b); j++ {
-			if a[i-1] == b[j-1] {
-				cur[j] = prev[j-1] + 1
-			} else {
-				cur[j] = max(prev[j], cur[j-1])
-			}
-		}
-		prev, cur = cur, prev
-	}
-	return prev[len(b)]
 }
 
 // TestAddedLinesMyersBoundSkipsHopelessSearch pins that a large pair whose

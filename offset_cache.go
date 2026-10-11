@@ -645,6 +645,9 @@ func (s *store) newWhaleCacheWithBudget(budget uint64) *whaleCache {
 			if size, err = deltaTargetSize(cand.pack, cand.off, first); err != nil {
 				continue
 			}
+			if s.maxDeltaObjectSize > 0 && size > s.maxDeltaObjectSize {
+				continue
+			}
 		}
 		if size > budget {
 			continue
