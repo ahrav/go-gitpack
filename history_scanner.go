@@ -214,6 +214,9 @@ func WithOffsetCacheBudget(bytes int) ScannerOption {
 // because ~1/3 of pair diffs in a typical walk are repeats) but it does not
 // change delivered hunks or their retention: a hunk's lines are compacted into
 // their own buffer whether or not the memo stores them.
+//
+// A deduplicating scan uses the same budget for its table of computed pairs,
+// which lets it skip repeated pairs without diffing them.
 func WithPairCacheBudget(bytes int) ScannerOption {
 	return func(hs *HistoryScanner) {
 		hs.pairs.setBudget(bytes)
@@ -473,6 +476,17 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		fmt.Fprintf(os.Stderr, "Warning: failed to start profiling: %v\n", err)
 	}
 
+	// Commits are diffed in parent-first timestamp order. Consecutive
+	// commits in that order touch consecutive versions of the same files,
+	// so their delta chains share tails that are still in the offset cache;
+	// the ref-walk visit order interleaves unrelated lineages and roughly
+	// triples the bytes materialized on a rails scan. The graph resolves
+	// every loaded commit's first-parent tree without a header read.
+	commits, graph, err := hs.loadCommitsAndGraph()
+	if err != nil {
+		return err
+	}
+
 	{
 		type workItem struct {
 			commit commitInfo
@@ -486,10 +500,9 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 		// (cheap) and fans out per-file blob pairs; stage 2 computes hunks
 		// (expensive: inflation + line diff) at blob-pair granularity, which
 		// spreads a whale commit across every worker.
-		// workChan is deep so that the walk's visit callback, which runs on
-		// a walk worker, hands off without waiting on the tree stage: a few
-		// thousand commitInfo headers (~100 bytes each) buy full walk/tree
-		// decoupling for typical repositories.
+		// workChan is deep so the dispatcher stays ahead of the tree
+		// workers: a few thousand commitInfo headers (~100 bytes each) buy
+		// full dispatch/tree-stage decoupling for typical repositories.
 		workChan := make(chan workItem, 8192)
 		blobChan := make(chan []blobPairWork, 1024)
 		// outstanding counts records sent on blobChan and not yet diffed.
@@ -545,7 +558,7 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 						// the producer: the header inflation it requires is
 						// the dominant cost of the walk and parallelizes
 						// cleanly across the tree workers.
-						parentTree, err := hs.firstParentTree(work.commit)
+						parentTree, err := hs.firstParentTreeIn(graph, work.commit)
 						if err != nil {
 							c := work.commit
 							setError(fmt.Errorf("resolve first-parent tree for commit %s: %w", c.OID, err))
@@ -613,45 +626,47 @@ func (hs *HistoryScanner) DiffHistoryHunksFunc(fn func(HunkAddition) error) erro
 			}()
 		}
 
-		walkErr := hs.walkCommitsFromRefs(func(c commitInfo) error {
-			// Publish the tree OID before dispatch so children resolving
-			// firstParentTree find it without re-inflating the header.
-			hs.treeOIDs.Store(c.OID, c.TreeOID)
+	dispatch:
+		for _, c := range commits {
 			if hs.skipMergeDiffs && len(c.ParentOIDs) > 1 {
-				return nil
+				continue
 			}
 			select {
 			case <-stopCh:
-				return errScanAborted
+				break dispatch
 			case workChan <- workItem{commit: c}:
-				return nil
 			}
-		})
+		}
 		close(workChan)
 		treeWG.Wait()
 		stage1Done.Store(true)
 		finishIfDrained()
 		blobWG.Wait()
 
-		if walkErr != nil && !errors.Is(walkErr, errScanAborted) {
-			setError(walkErr)
-		}
-
 		return firstErr
 	}
 }
 
-// maxTreeDiffWorkers is the absolute ceiling on the stage-1 tree-diff worker
-// pool, applied on top of the NumCPU/2 halving in DiffHistoryHunksFunc.
+// maxTreeDiffWorkers is the ceiling on the stage-1 tree-diff worker pool,
+// applied on top of the NumCPU/2 halving in DiffHistoryHunksFunc: eight
+// workers up to sixteen CPUs, half the CPUs beyond that.
 //
-// Measured on a stage-1-bound history (BenchmarkDiffHistoryHunksManySmallCommits,
-// 3000 single-file commits over a 200-file tree, 32-core arm64): raising the
-// cap to NumCPU was ~7% slower, so the cap costs no throughput even when
-// stage 1 dominates: stage-2 hunk workers, which are uncapped, set pipeline
-// throughput. On the trufflehog history at 16 logical CPUs, caps of 16 and
-// 32 measured within noise of 8. Re-run those benchmarks before changing
-// this value.
-const maxTreeDiffWorkers = 8
+// Tree diffing is about a fifth of a hunk scan's CPU (rails: 4.6 of 19.7
+// CPU-seconds), so a fixed cap of eight binds once the hunk stage has more
+// than about forty workers' worth of CPU to spread the other four fifths
+// over. Measured on the rails history at 32 cores (dedup scan, 32 hunk
+// workers): eight tree workers ran at 5.5 of 8 busy while the hunk workers
+// waited on them, 1.16 s; sixteen tree workers 1.03 s; thirty-two within
+// noise of sixteen. Measured on a stage-1-bound history
+// (BenchmarkDiffHistoryHunksManySmallCommits, 3000 single-file commits over
+// a 200-file tree, 32-core arm64): a cap of NumCPU was ~7% slower than 8,
+// and on the trufflehog history at 16 logical CPUs caps of 16 and 32 were
+// within noise of 8, so the ceiling stays at eight through sixteen CPUs.
+// Re-run those benchmarks before changing this value.
+var maxTreeDiffWorkers = treeDiffWorkerCap(runtime.NumCPU())
+
+// treeDiffWorkerCap is maxTreeDiffWorkers for a host with numCPU CPUs.
+func treeDiffWorkerCap(numCPU int) int { return max(8, numCPU/2) }
 
 // errScanAborted marks an internal early-stop condition used to unwind commit walks.
 var errScanAborted = errors.New("scan aborted")
@@ -668,11 +683,24 @@ var errScanAborted = errors.New("scan aborted")
 // This gracefully handles shallow clones and truncated history where parent
 // objects may be absent.
 func (hs *HistoryScanner) firstParentTree(c commitInfo) (Hash, error) {
+	return hs.firstParentTreeIn(nil, c)
+}
+
+// firstParentTreeIn is firstParentTree with the loaded commit set's graph:
+// a parent inside the set resolves with one map lookup, and only parents
+// outside it (shallow history, refs walked without a load) go through the
+// treeOIDs memo and header reads.
+func (hs *HistoryScanner) firstParentTreeIn(graph *commitGraphData, c commitInfo) (Hash, error) {
 	if len(c.ParentOIDs) == 0 {
 		return Hash{}, nil
 	}
 
 	parentOID := c.ParentOIDs[0]
+	if graph != nil {
+		if idx, ok := graph.OIDToIndex[parentOID]; ok {
+			return graph.TreeOIDs[idx], nil
+		}
+	}
 	// The commit walk records every visited commit's tree OID; a hit here
 	// avoids re-inflating the parent's header (which would otherwise
 	// happen once per child).
@@ -1569,6 +1597,27 @@ func (hs *HistoryScanner) pairAddedHunks(oldOID, newOID Hash) ([]AddedHunk, erro
 	return stored, nil
 }
 
+// pairHunksUncached is pairHunks for the dedup pipeline: the diff is
+// computed and compacted exactly as the pair memo would store it, so every
+// returned hunk owns its line bytes, but the memo is neither consulted nor
+// filled. In first-introduction order a repeated (old, new) transition
+// contributes no text lines, so the dedup pipeline tracks repeats by key
+// (pairFirstSeen) and has no use for memoized hunks.
+func (hs *HistoryScanner) pairHunksUncached(work blobPairWork) ([]AddedHunk, error) {
+	sc := getLineScratch()
+	computed, err := computeAddedHunksScratch(hs.store, work.oldOID, work.newOID, sc)
+	if err != nil {
+		putLineScratch(sc)
+		return nil, fmt.Errorf("compute added hunks: %w", err)
+	}
+	hunks := compactPairHunks(makePairKey(work.oldOID, work.newOID), computed)
+	putLineScratch(sc)
+	if work.inferredRename {
+		return hs.gateInferredRenameHunks(work.oldOID, work.newOID, hunks)
+	}
+	return hunks, nil
+}
+
 // gateInferredRenameHunks validates a directory-rename pairing by content.
 // The pairing was inferred purely from paths, so the two blobs may be
 // unrelated; trusting the pair diff would silently drop any coincidentally
@@ -1711,8 +1760,8 @@ func (hs *HistoryScanner) Close() error {
 		hs.meta.clear()
 		hs.meta.attachGraph(nil)
 	}
-	// A dedup scan materializes the commit list and the graph built from
-	// it (loadAllCommits); both scale with history and have no use after
+	// A scan materializes the commit list and the graph built from it
+	// (loadCommitsAndGraph); both scale with history and have no use after
 	// the object store is closed.
 	hs.commitsMu.Lock()
 	hs.commits, hs.commitsTips, hs.commitsShallow, hs.graphData = nil, nil, nil, nil
@@ -1754,49 +1803,46 @@ func (s *HistoryScanner) GetCommitMetadata(oid Hash) (CommitMetadata, error) {
 	return s.meta.get(oid)
 }
 
-// loadAllCommits enumerates every reachable commit, caching the result for
-// as long as the repository's ref tips and shallow boundary stay unchanged.
-// The streaming hunk pipeline uses walkCommitsFromRefs directly; this
-// materialized form serves the dedup pipeline (which needs a total order up
-// front) and package tests.
+// loadCommitsAndGraph enumerates every reachable commit in parent-first
+// order together with the commit graph synthesized from the same load, so a
+// scan can resolve parents through the graph without re-reading hs.graphData
+// under the commit cache lock. Both scan pipelines consume it; the result is
+// cached for as long as the repository's ref tips and shallow boundary stay
+// unchanged.
 //
 // Every call reads the ref tips and the shallow file. A scanner reused after
 // new commits land, or after a shallow clone is deepened, re-walks the
-// history on its next call, so a dedup scan sees the same commits a fresh
-// walk would. Objects that appear with neither change (a partial clone
-// fetching missing ancestors on demand) are outside this key.
+// history on its next call, so a scan sees the same commits a fresh walk
+// would. Objects that appear with neither change (a partial clone fetching
+// missing ancestors on demand) are outside this key.
 //
 // Copy semantics: the returned []commitInfo is a shallow copy of the internal
 // cache. This prevents callers from mutating the scanner's cached state (e.g.
 // reordering or truncating the slice). The commitInfo values themselves are
 // safe to share because their mutable parts (the ParentOIDs slice) are never
 // modified after construction.
-func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
+func (hs *HistoryScanner) loadCommitsAndGraph() ([]commitInfo, *commitGraphData, error) {
 	tips, err := collectRefTips(hs.gitDir)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	slices.SortFunc(tips, func(a, b Hash) int { return bytes.Compare(a[:], b[:]) })
 	shallow, err := os.ReadFile(filepath.Join(hs.gitDir, "shallow"))
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
+		return nil, nil, err
 	}
 
 	hs.commitsMu.Lock()
 	defer hs.commitsMu.Unlock()
-	switch {
-	case hs.commits != nil && slices.Equal(tips, hs.commitsTips) && bytes.Equal(shallow, hs.commitsShallow):
-		// Cache hit.
-	case hs.graphData != nil && hs.commits == nil:
-		hs.commits = hs.loadFromGraph()
-		hs.commitsTips, hs.commitsShallow = tips, shallow
-	default:
-		commits, err := hs.loadFromRefs()
+	// Loading a repository with no refs leaves hs.commits nil; hs.graphData
+	// marks the cached load.
+	if hs.graphData == nil || !slices.Equal(tips, hs.commitsTips) || !bytes.Equal(shallow, hs.commitsShallow) {
+		commits, parents, perm, err := hs.loadFromRefs()
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		hs.commits, hs.commitsTips, hs.commitsShallow = commits, tips, shallow
-		hs.graphData = buildCommitGraphFromCommits(commits)
+		hs.graphData = buildCommitGraphIndexed(commits, parents, perm)
 		if hs.meta != nil {
 			hs.meta.attachGraph(hs.graphData)
 		}
@@ -1804,21 +1850,5 @@ func (hs *HistoryScanner) loadAllCommits() ([]commitInfo, error) {
 
 	out := make([]commitInfo, len(hs.commits))
 	copy(out, hs.commits)
-	return out, nil
-}
-
-// loadFromGraph converts commit‑graph rows into commitInfo values.
-func (hs *HistoryScanner) loadFromGraph() []commitInfo {
-	n := len(hs.graphData.OrderedOIDs)
-	out := make([]commitInfo, n)
-
-	for i, oid := range hs.graphData.OrderedOIDs {
-		out[i] = commitInfo{
-			OID:        oid,
-			TreeOID:    hs.graphData.TreeOIDs[i],
-			ParentOIDs: hs.graphData.parentsOf(i),
-			Timestamp:  hs.graphData.Timestamps[i],
-		}
-	}
-	return orderCommitsParentFirst(out)
+	return out, hs.graphData, nil
 }

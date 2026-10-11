@@ -28,6 +28,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/exp/mmap"
@@ -129,16 +130,43 @@ func (g *commitGraphData) parentsOf(idx int) []Hash {
 	return parents
 }
 
-// buildCommitGraphFromCommits synthesizes a commitGraphData from an
-// already-collected slice of commitInfo values (typically obtained via the
-// ref-walk fallback in commit_fallback.go).
-//
-// This constructor exists so that both the commit-graph file reader and the
-// fallback ref-walker produce the same data structure, allowing the rest of
-// the codebase to be agnostic to the source. The resulting commitGraphData
-// owns all of its slices (no aliasing with the input) and is safe for
-// concurrent reads.
-func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
+// buildCommitGraphIndexed takes commits ordered by
+// orderCommitsParentFirstIndexed: parents gives the parents of the pre-order
+// input as positions in it and perm the input position of each ordered
+// commit. buildCommitGraphIndexed remaps parent indexes through perm to
+// match the parent-first commit order.
+func buildCommitGraphIndexed(ordered []commitInfo, parents commitParents, perm []int32) *commitGraphData {
+	n := len(ordered)
+	// inv maps a pre-order position to its ordered position.
+	inv := make([]int32, n)
+	for k, i := range perm {
+		inv[i] = int32(k)
+	}
+	parentIndices := make([][]int32, n)
+	backing := make([]int32, len(parents.idx))
+	for k, i := range perm {
+		src := parents.idx[parents.start[i]:parents.start[i+1]]
+		if len(src) == 0 {
+			continue
+		}
+		idxs := backing[:len(src):len(src)]
+		backing = backing[len(src):]
+		for j, pi := range src {
+			if pi < 0 {
+				idxs[j] = -1 // Sentinel: parent not in graph.
+			} else {
+				idxs[j] = inv[pi]
+			}
+		}
+		parentIndices[k] = idxs
+	}
+	return buildCommitGraph(ordered, parentIndices)
+}
+
+// buildCommitGraph assembles the graph over commits in their given order;
+// parentIndices[i] holds commit i's parent positions, -1 for a parent
+// outside commits.
+func buildCommitGraph(commits []commitInfo, parentIndices [][]int32) *commitGraphData {
 	n := len(commits)
 	parents := make(Parents, n)
 	ordered := make([]Hash, n)
@@ -146,35 +174,30 @@ func buildCommitGraphFromCommits(commits []commitInfo) *commitGraphData {
 	times := make([]int64, n)
 	oidToIdx := make(map[Hash]int, n)
 
+	// The two maps are built concurrently; each is a few hundred thousand
+	// inserts on a large history and they share no state.
+	var parentsDone sync.WaitGroup
+	parentsDone.Add(1)
+	go func() {
+		defer parentsDone.Done()
+		for _, c := range commits {
+			// commitInfo.ParentOIDs is immutable after construction, so
+			// the graph shares the slice.
+			if len(c.ParentOIDs) > 0 {
+				parents[c.OID] = c.ParentOIDs
+			} else {
+				parents[c.OID] = nil
+			}
+		}
+	}()
 	for i, c := range commits {
 		ordered[i] = c.OID
 		trees[i] = c.TreeOID
 		times[i] = c.Timestamp
-		if len(c.ParentOIDs) > 0 {
-			parents[c.OID] = append([]Hash(nil), c.ParentOIDs...)
-		} else {
-			parents[c.OID] = nil
-		}
 		oidToIdx[c.OID] = i
 	}
 
-	// Build flat parent indices.
-	parentIndices := make([][]int32, n)
-	for i, c := range commits {
-		if len(c.ParentOIDs) == 0 {
-			continue
-		}
-		idxs := make([]int32, len(c.ParentOIDs))
-		for j, p := range c.ParentOIDs {
-			if pi, ok := oidToIdx[p]; ok {
-				idxs[j] = int32(pi)
-			} else {
-				idxs[j] = -1 // Sentinel: parent not in graph.
-			}
-		}
-		parentIndices[i] = idxs
-	}
-
+	parentsDone.Wait()
 	return &commitGraphData{
 		Parents:       parents,
 		OrderedOIDs:   ordered,

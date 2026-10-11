@@ -1,6 +1,10 @@
 package objstore
 
 import (
+	"bytes"
+	"compress/zlib"
+	"crypto/sha1"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"sync"
@@ -9,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/exp/mmap"
 )
@@ -77,6 +82,17 @@ func TestOffsetCacheAddStaysWithinBudget(t *testing.T) {
 // file, and returns the store with the large blob's content.
 func openWhaleStore(t *testing.T) (*store, []byte) {
 	t.Helper()
+	repo, big := buildWhaleRepo(t)
+	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
+	require.NoError(t, err)
+	t.Cleanup(func() { s.Close() })
+	return s, big
+}
+
+// buildWhaleRepo creates the one-commit repository behind openWhaleStore and
+// returns its work tree with the large blob's content.
+func buildWhaleRepo(t *testing.T) (string, []byte) {
+	t.Helper()
 	requireGit(t)
 	repo := t.TempDir()
 	runGit(t, repo, "init", "--quiet")
@@ -96,11 +112,203 @@ func openWhaleStore(t *testing.T) (*store, []byte) {
 	runGit(t, repo, "add", "-A")
 	runGit(t, repo, "commit", "-m", "add", "--quiet")
 	runGit(t, repo, "repack", "-a", "-d", "-q")
+	return repo, big
+}
+
+// TestWhalePrefetchCoversDeltifiedBlob pins that a multi-MB blob stored as a
+// delta of its previous version is a whale too: both versions of the big
+// file are candidates, the deltified one is sized through its chain, and
+// the prefetch delivers its bytes with the blob type.
+func TestWhalePrefetchCoversDeltifiedBlob(t *testing.T) {
+	requireGit(t)
+	repo := t.TempDir()
+	runGit(t, repo, "init", "--quiet")
+	// Three times the whale threshold of incompressible bytes; the second
+	// version rewrites the middle third, so the delta between them is
+	// itself above the threshold.
+	big := make([]byte, 3*whaleMinCompressedBytes)
+	rng := uint64(0x9E3779B97F4A7C15)
+	for i := range big {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		big[i] = byte(rng)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "big.bin"), big, 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "v1", "--quiet")
+	// The second version shares most bytes with the first, so the repack
+	// stores one of them as a delta of the other, and the delta is still
+	// megabytes because the changed region is incompressible.
+	big2 := append([]byte(nil), big...)
+	for i := len(big2) / 3; i < 2*len(big2)/3; i++ {
+		rng ^= rng << 13
+		rng ^= rng >> 7
+		rng ^= rng << 17
+		big2[i] = byte(rng)
+	}
+	require.NoError(t, os.WriteFile(filepath.Join(repo, "big.bin"), big2, 0o644))
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-m", "v2", "--quiet")
+	runGit(t, repo, "repack", "-a", "-d", "-q", "--window=10", "--depth=10")
 
 	s, err := open(filepath.Join(repo, ".git", "objects", "pack"))
 	require.NoError(t, err)
-	t.Cleanup(func() { s.Close() })
-	return s, big
+	defer s.Close()
+
+	oid1, oid2 := calculateHash(ObjBlob, big), calculateHash(ObjBlob, big2)
+	deltified := 0
+	for _, oid := range []Hash{oid1, oid2} {
+		p, off, ok := s.findPackedObject(oid)
+		require.True(t, ok)
+		typ, _, err := peekObjectType(p, off)
+		require.NoError(t, err)
+		if typ == ObjOfsDelta || typ == ObjRefDelta {
+			deltified++
+		}
+		size, root, ok := s.whaleSizeAt(p, off)
+		require.True(t, ok)
+		require.Equal(t, ObjBlob, root)
+		require.GreaterOrEqual(t, size, uint64(len(big)))
+	}
+	require.Equal(t, 1, deltified, "the repack stores one version as a delta of the other")
+
+	c := s.newWhaleCache()
+	require.NotNil(t, c)
+	require.Len(t, c.order, 2, "both versions are prefetched")
+	for _, want := range [][]byte{big, big2} {
+		p, off, _ := s.findPackedObject(calculateHash(ObjBlob, want))
+		got, typ, ok := c.get(p, off, nil)
+		require.True(t, ok)
+		require.Equal(t, ObjBlob, typ)
+		require.Equal(t, want, got)
+	}
+}
+
+// buildCopyHeavyDeltaPack builds a delta fixture whose 7 MiB target exceeds
+// twice the largest header size in its chain.
+func buildCopyHeavyDeltaPack(t *testing.T) (string, []byte) {
+	t.Helper()
+	rng := uint64(0x9E3779B97F4A7C15)
+	random := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			rng ^= rng << 13
+			rng ^= rng >> 7
+			rng ^= rng << 17
+			b[i] = byte(rng)
+		}
+		return b
+	}
+	base := random(1 << 16)
+	literal := random(3 << 20)
+	const copies = 64
+	target := append([]byte(nil), literal...)
+	for range copies {
+		target = append(target, base...)
+	}
+
+	var delta bytes.Buffer
+	writeVarInt(&delta, uint64(len(base)))
+	writeVarInt(&delta, uint64(len(target)))
+	for rest := literal; len(rest) > 0; {
+		n := min(len(rest), 127)
+		delta.WriteByte(byte(n))
+		delta.Write(rest[:n])
+		rest = rest[n:]
+	}
+	for range copies {
+		// Opcode 0x80 copies 0x10000 bytes from offset zero, covering the
+		// whole base.
+		delta.WriteByte(0x80)
+	}
+
+	baseOID, targetOID := calculateHash(ObjBlob, base), calculateHash(ObjBlob, target)
+	var pack bytes.Buffer
+	pack.WriteString("PACK")
+	require.NoError(t, binary.Write(&pack, binary.BigEndian, uint32(2)))
+	require.NoError(t, binary.Write(&pack, binary.BigEndian, uint32(2)))
+	baseOff := uint64(pack.Len())
+	pack.Write(encodeObjHeader(uint8(ObjBlob), uint64(len(base))))
+	zw := zlib.NewWriter(&pack)
+	_, err := zw.Write(base)
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+	deltaOff := uint64(pack.Len())
+	obj, err := packRefDeltaObject(baseOID, delta.Bytes())
+	require.NoError(t, err)
+	pack.Write(obj)
+	sum := sha1.Sum(pack.Bytes())
+	pack.Write(sum[:])
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "pack-copy.pack"), pack.Bytes(), 0o644))
+	require.NoError(t, createV2IndexFile(filepath.Join(dir, "pack-copy.idx"), []Hash{baseOID, targetOID}, []uint64{baseOff, deltaOff}))
+	return dir, target
+}
+
+func TestWhalePrefetchChargesDeltaTarget(t *testing.T) {
+	dir, target := buildCopyHeavyDeltaPack(t)
+	s, err := open(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	p, off, ok := s.findPackedObject(calculateHash(ObjBlob, target))
+	require.True(t, ok)
+	headerMax, typ, ok := s.whaleSizeAt(p, off)
+	require.True(t, ok)
+	require.Equal(t, ObjBlob, typ)
+	require.Less(t, 2*headerMax, uint64(len(target)), "the fixture's target dwarfs its header sizes")
+
+	assert.Nil(t, s.newWhaleCacheWithBudget(uint64(len(target))-1), "a budget below the target size rejects the delta")
+
+	c := s.newWhaleCacheWithBudget(uint64(len(target)))
+	require.NotNil(t, c)
+	got, typ, ok := c.get(p, off, nil)
+	require.True(t, ok)
+	assert.Equal(t, ObjBlob, typ)
+	assert.Equal(t, target, got)
+}
+
+func TestWhalePrefetchSkipsDeltaAboveObjectLimit(t *testing.T) {
+	dir, target := buildCopyHeavyDeltaPack(t)
+	s, err := open(dir)
+	require.NoError(t, err)
+	defer s.Close()
+
+	budget := uint64(len(target))
+	s.SetMaxDeltaObjectSize(budget - 1)
+	assert.Nil(t, s.newWhaleCacheWithBudget(budget), "a delta limit below the target size rejects the delta")
+
+	s.SetMaxDeltaObjectSize(budget)
+	require.NotNil(t, s.newWhaleCacheWithBudget(budget), "a delta limit at the target size admits the delta")
+}
+
+// TestDedupScanPrefetchesWhales pins that the dedup pipeline runs the whale
+// prefetch for the duration of its scan and releases it on return: a
+// multi-MB blob's inflation then starts at scan start instead of when the
+// tree stage reaches its commit, and the scanner holds no whale bytes
+// between scans.
+func TestDedupScanPrefetchesWhales(t *testing.T) {
+	repo, big := buildWhaleRepo(t)
+	hs, err := NewHistoryScanner(filepath.Join(repo, ".git"), WithHunkLineDedup(true))
+	require.NoError(t, err)
+	defer hs.Close()
+	require.NotEmpty(t, hs.store.whaleCandidates())
+
+	var sawPrefetch, sawBig atomic.Bool
+	require.NoError(t, hs.DiffHistoryHunksFunc(func(h HunkAddition) error {
+		if hs.store.whales.Load() != nil {
+			sawPrefetch.Store(true)
+		}
+		if h.IsBinary() && len(h.Lines()) == 1 && h.Lines()[0] == string(big) {
+			sawBig.Store(true)
+		}
+		return nil
+	}))
+	require.True(t, sawPrefetch.Load(), "whale prefetch was not active during the dedup scan")
+	require.True(t, sawBig.Load(), "the whale blob was not delivered")
+	require.Nil(t, hs.store.whales.Load(), "whale prefetch outlived the scan")
 }
 
 // TestWhalePrefetchSkippedWhenOffsetCacheDisabled pins that a disabled offset
@@ -142,14 +350,14 @@ func TestWhaleGetInflatesUnstartedEntry(t *testing.T) {
 			keyB: {done: make(chan struct{})},
 		},
 		order: []offCacheKey{keyA, keyB},
-		load: func(pack *mmap.ReaderAt, _ uint64) ([]byte, error) {
+		load: func(pack *mmap.ReaderAt, _ uint64) ([]byte, ObjectType, error) {
 			if pack == packA {
 				close(entered)
 				<-release
-				return []byte("a"), nil
+				return []byte("a"), ObjBlob, nil
 			}
 			loadsB.Add(1)
-			return []byte("b"), nil
+			return []byte("b"), ObjBlob, nil
 		},
 	}
 	stop := make(chan struct{})

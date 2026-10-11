@@ -303,6 +303,13 @@ func (c *offsetCache) admits(size int) bool {
 	return c.enabled() && size <= maxCacheableSize && size <= c.budgetPerShard
 }
 
+// admitsCacheable reports whether every object up to maxCacheableSize is
+// admitted, so callers that have no size yet can skip the ARC for packed
+// objects.
+func (c *offsetCache) admitsCacheable() bool {
+	return c.enabled() && c.budgetPerShard >= maxCacheableSize
+}
+
 // get returns the materialized object stored at (pack, off), if present.
 // The returned slice is shared and MUST NOT be mutated.
 // A nil receiver reports a miss so contexts without a store can share code.
@@ -380,6 +387,54 @@ type whaleCandidate struct {
 	compressed uint64
 }
 
+// whaleSizeProbeHops bounds the delta-chain headers whaleSizeAt follows for
+// a deltified candidate; a whale's chain reveals its base within a few hops.
+const whaleSizeProbeHops = 8
+
+// whaleSizeAt estimates the materialized size of the object at (pack, off)
+// from pack headers alone: the declared size of a non-delta object, or the
+// largest declared size along up to whaleSizeProbeHops base links of a
+// delta. It reports the type of the first non-delta header reached and true,
+// or the size seen so far and false when the chain cannot be followed that
+// far (a scheduling hint either way). A multi-MB blob stored as a delta of
+// its previous version (two versions of a committed binary) is a whale as
+// much as one stored whole: its delta payload is itself megabytes and the
+// chain inflates for as long.
+func (s *store) whaleSizeAt(pack *mmap.ReaderAt, off uint64) (size uint64, typ ObjectType, ok bool) {
+	for hop := 0; hop < whaleSizeProbeHops; hop++ {
+		var buf [32]byte
+		n, err := pack.ReadAt(buf[:], int64(off))
+		if n == 0 || (err != nil && n < 1) {
+			return size, ObjBad, false
+		}
+		t, declared, hdrLen := parseObjectHeaderUnsafe(buf[:n])
+		if hdrLen <= 0 {
+			return size, ObjBad, false
+		}
+		size = max(size, declared)
+		switch t {
+		case ObjOfsDelta:
+			back, _, err := readOfsDeltaOffset(pack, int64(off)+int64(hdrLen))
+			if err != nil || back == 0 || back > off {
+				return size, ObjBad, false
+			}
+			off -= back
+		case ObjRefDelta:
+			var base Hash
+			if _, err := pack.ReadAt(base[:], int64(off)+int64(hdrLen)); err != nil {
+				return size, ObjBad, false
+			}
+			var found bool
+			if pack, off, found = s.findPackedObject(base); !found {
+				return size, ObjBad, false
+			}
+		default:
+			return size, t, true
+		}
+	}
+	return size, ObjBad, false
+}
+
 // whaleEntry is one prefetched object. Whoever sets claimed first, the
 // prefetch goroutine or a reader, inflates the entry; done closes once data,
 // typ, and err are final. A reader therefore waits only on an inflation that
@@ -400,8 +455,8 @@ type whaleCache struct {
 	m map[offCacheKey]*whaleEntry
 	// order lists m's keys in prefetch order, largest first.
 	order []offCacheKey
-	// load materializes one whale.
-	load func(pack *mmap.ReaderAt, off uint64) ([]byte, error)
+	// load materializes one whale and reports its type.
+	load func(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, error)
 }
 
 // get returns the prefetched object at (pack, off). It inflates an entry no
@@ -452,8 +507,7 @@ func (c *whaleCache) run(stop <-chan struct{}) {
 
 // fill inflates e and publishes the result; the caller holds e's claim.
 func (c *whaleCache) fill(key offCacheKey, e *whaleEntry) {
-	e.data, e.err = c.load(key.pack, key.off)
-	e.typ = ObjBlob
+	e.data, e.typ, e.err = c.load(key.pack, key.off)
 	close(e.done)
 }
 
@@ -553,29 +607,55 @@ func (s *store) releaseWhales() {
 }
 
 func (s *store) newWhaleCache() *whaleCache {
+	return s.newWhaleCacheWithBudget(whalePrefetchBudget)
+}
+
+func (s *store) newWhaleCacheWithBudget(budget uint64) *whaleCache {
 	cands := s.whaleCandidates()
 	if len(cands) == 0 {
 		return nil
 	}
 	c := &whaleCache{
 		m: make(map[offCacheKey]*whaleEntry, len(cands)),
-		load: func(pack *mmap.ReaderAt, off uint64) ([]byte, error) {
+		load: func(pack *mmap.ReaderAt, off uint64) ([]byte, ObjectType, error) {
+			typ, hdrLen, err := peekObjectType(pack, off)
+			if err != nil {
+				return nil, ObjBad, err
+			}
+			if typ == ObjOfsDelta || typ == ObjRefDelta {
+				// A deltified whale reconstructs through the chain; the
+				// result is too large for the offset cache and the delta
+				// window, so the caches see only the chain's hops.
+				ctx := getDeltaContext(s.maxDeltaDepth)
+				defer putDeltaContext(ctx)
+				return s.inflateFromPackWithOptions(inflationParams{p: pack, off: off, ctx: ctx, maxObjectSize: s.maxDeltaObjectSize}, false, true)
+			}
+			_ = hdrLen
 			_, data, err := readRawObject(pack, off)
 			if err == nil {
 				err = s.verifyPackObjectCRCIfEnabled(pack, off, Hash{})
 			}
-			return data, err
+			return data, typ, err
 		},
 	}
-	var budget uint64 = whalePrefetchBudget
 	for _, cand := range cands {
-		typ, hdrLen, err := peekObjectType(cand.pack, cand.off)
-		if err != nil || typ != ObjBlob || hdrLen <= 0 {
+		size, typ, ok := s.whaleSizeAt(cand.pack, cand.off)
+		if !ok || typ != ObjBlob {
 			continue
 		}
-		var hdr [32]byte
-		n, _ := cand.pack.ReadAt(hdr[:], int64(cand.off))
-		_, size, _ := parseObjectHeaderUnsafe(hdr[:n])
+		// A copy-heavy delta can produce a target larger than its chain's
+		// header sizes, so deltified candidates are charged the target size
+		// declared by their instruction stream.
+		if first, _, err := peekObjectType(cand.pack, cand.off); err != nil {
+			continue
+		} else if first == ObjOfsDelta || first == ObjRefDelta {
+			if size, err = deltaTargetSize(cand.pack, cand.off, first); err != nil {
+				continue
+			}
+			if s.maxDeltaObjectSize > 0 && size > s.maxDeltaObjectSize {
+				continue
+			}
+		}
 		if size > budget {
 			continue
 		}

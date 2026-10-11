@@ -203,6 +203,60 @@ func TestGetFallsBackToOIDCachesWhenOffsetCacheDisabled(t *testing.T) {
 		"second read must hit the delta window and promote to the ARC cache")
 }
 
+// TestGetKeepsPackedObjectsOutOfARCWhenOffsetCacheEnabled verifies that a
+// pack-resident object re-read under an enabled offset cache stays out of
+// the entry-count-bounded ARC: the offset cache already retains it by
+// (pack, offset), and a second copy pinned by the ARC was the largest
+// avoidable heap component of a history scan.
+func TestGetKeepsPackedObjectsOutOfARCWhenOffsetCacheEnabled(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	store, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer store.Close()
+	require.True(t, store.offCache.enabled())
+
+	targetHash := calculateHash(ObjBlob, []byte("modified data"))
+	want, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	got, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	_, ok := store.cache.Get(targetHash)
+	require.False(t, ok, "packed object must be served by the offset cache, not pinned by the ARC")
+}
+
+func TestGetPromotesPackedObjectsTheOffsetCacheRejects(t *testing.T) {
+	packPath, _, cleanup := createTestPackWithDelta(t)
+	defer cleanup()
+
+	store, err := OpenForTesting(filepath.Dir(packPath))
+	require.NoError(t, err)
+	defer store.Close()
+	// A one-byte budget per shard keeps the offset cache enabled while
+	// forcing it to reject the target object.
+	store.offCache.setBudget(offsetCacheShards)
+	require.True(t, store.offCache.enabled())
+
+	targetHash := calculateHash(ObjBlob, []byte("modified data"))
+	want, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	require.False(t, store.offCache.admits(len(want)))
+	got, _, err := store.get(targetHash)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	cached, ok := store.cache.Get(targetHash)
+	require.True(t, ok, "a packed object the offset cache rejects must be promoted to the ARC")
+	require.Equal(t, want, cached.data)
+
+	got, _, err = store.get(targetHash)
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+}
+
 // TestParseIdx validates the v2 pack-index parser against invalid magic bytes,
 // unsupported versions, minimal valid indices, large-offset handling,
 // multi-object sorted order, and truncated files.

@@ -454,21 +454,34 @@ func (s *store) get(oid Hash) ([]byte, ObjectType, error) {
 	// fallback for pack-resident objects whenever the offset cache misses
 	// (disabled via WithOffsetCacheBudget, entry evicted, or first read).
 	// On the hot path an offset-cache hit above returns without paying
-	// these two mutex acquisitions; on a miss the probes are noise next
-	// to the inflation they can avoid: without them, repeated reads of a
+	// these mutex acquisitions; on a miss the delta-window probe is noise
+	// next to the inflation it can avoid: without it, repeated reads of a
 	// packed object would re-inflate every time in memory-constrained
 	// configurations even though inflation populates the delta window.
 	if b, ok := s.dw.acquire(oid); ok {
 		d, t := b.Data(), b.Type()
-		// Promote to ARC cache on second access (delta window hit).
-		if len(d) <= maxCacheableSize {
+		// Promote to the ARC cache on second access (delta window hit).
+		// A pack-resident object under an enabled offset cache is already
+		// retained there by (pack, offset), so the ARC holds loose objects
+		// and the packed ones the offset cache rejects; the entry-count
+		// bound of the ARC otherwise pinned hundreds of megabytes of blobs
+		// the offset cache was already serving.
+		if len(d) <= maxCacheableSize && (!inPack || !s.offCache.admits(len(d))) {
 			s.cache.Add(oid, cachedObj{data: d, typ: t})
 		}
 		b.Release()
 		return d, t, nil
 	}
-	if b, ok := s.cache.Get(oid); ok {
-		return b.data, b.typ, nil
+	// When the offset cache admits every cacheable size, ARC promotion is
+	// restricted to loose objects, and inflateFromPack adds only to the
+	// delta window and the offset cache. The probe, an exclusive lock on
+	// the whole ARC, is therefore taken only when it can hit: a scan's
+	// first read of every tree and blob otherwise took that lock on every
+	// worker (2% of a rails scan's CPU).
+	if !inPack || !s.offCache.admitsCacheable() {
+		if b, ok := s.cache.Get(oid); ok {
+			return b.data, b.typ, nil
+		}
 	}
 
 	if !packLookupDone {

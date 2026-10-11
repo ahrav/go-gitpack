@@ -9,7 +9,8 @@
 // predictable order.
 //
 // The algorithm works in three steps:
-//  1. Build an in-degree map over commits whose parents are in the input set.
+//  1. Build in-degree and child lists over commits whose parents are in the
+//     input set.
 //  2. Seed a min-heap with all root commits (in-degree == 0).
 //  3. Pop the minimum-timestamp commit, decrement children's in-degree, and
 //     push newly zero-in-degree children onto the heap.
@@ -21,147 +22,166 @@ package objstore
 
 import (
 	"bytes"
-	"container/heap"
 	"slices"
 )
 
-// commitQueueItem is a lightweight pair of (object-ID, committer-timestamp)
-// used as the element type for the min-heap priority queue. Keeping only
-// these two fields avoids storing full commitInfo values in the heap, which
-// would increase memory pressure during large traversals.
-type commitQueueItem struct {
-	oid Hash
-	ts  int64
+// commitOrderHeap is a min-heap of commit indices ordered by ascending
+// committer timestamp, with lexicographic OID comparison as the tie-breaker
+// so the output order is fully deterministic regardless of input order.
+// Indices refer to the commits slice; the heap holds int32 values so pushes
+// and pops move four bytes and allocate nothing.
+type commitOrderHeap struct {
+	commits []commitInfo
+	items   []int32
 }
 
-// commitQueue implements heap.Interface as a min-heap of commitQueueItems.
-// The ordering is by ascending timestamp first, with lexicographic OID
-// comparison as a tie-breaker to guarantee deterministic output regardless
-// of map iteration order.
-type commitQueue []commitQueueItem
-
-func (q commitQueue) Len() int { return len(q) }
-
-// Less defines the min-heap ordering: earlier timestamps surface first.
-// When two commits share the same timestamp (common in squash-merges and
-// fast-imports), the raw OID bytes are compared lexicographically so that
-// the output order is fully deterministic and reproducible across runs.
-func (q commitQueue) Less(i, j int) bool {
-	if q[i].ts != q[j].ts {
-		return q[i].ts < q[j].ts
+func (h *commitOrderHeap) less(a, b int32) bool {
+	ca, cb := &h.commits[a], &h.commits[b]
+	if ca.Timestamp != cb.Timestamp {
+		return ca.Timestamp < cb.Timestamp
 	}
-	return bytes.Compare(q[i].oid[:], q[j].oid[:]) < 0
+	return bytes.Compare(ca.OID[:], cb.OID[:]) < 0
 }
 
-func (q commitQueue) Swap(i, j int) { q[i], q[j] = q[j], q[i] }
-
-func (q *commitQueue) Push(x any) {
-	*q = append(*q, x.(commitQueueItem))
+func (h *commitOrderHeap) push(i int32) {
+	h.items = append(h.items, i)
+	j := len(h.items) - 1
+	for j > 0 {
+		parent := (j - 1) / 2
+		if !h.less(h.items[j], h.items[parent]) {
+			break
+		}
+		h.items[j], h.items[parent] = h.items[parent], h.items[j]
+		j = parent
+	}
 }
 
-func (q *commitQueue) Pop() any {
-	old := *q
-	n := len(old)
-	item := old[n-1]
-	*q = old[:n-1]
-	return item
+func (h *commitOrderHeap) pop() int32 {
+	top := h.items[0]
+	last := len(h.items) - 1
+	h.items[0] = h.items[last]
+	h.items = h.items[:last]
+	j := 0
+	for {
+		l := 2*j + 1
+		if l >= last {
+			break
+		}
+		m := l
+		if r := l + 1; r < last && h.less(h.items[r], h.items[l]) {
+			m = r
+		}
+		if !h.less(h.items[m], h.items[j]) {
+			break
+		}
+		h.items[j], h.items[m] = h.items[m], h.items[j]
+		j = m
+	}
+	return top
 }
 
-// orderCommitsParentFirst returns a deterministic parent-before-child ordering
-// of the input commits using Kahn's algorithm with a min-heap priority queue.
-//
-// Algorithm:
-//  1. Index every commit by OID and compute its in-degree (number of parents
-//     that are also in the input set).
-//  2. Push all zero-in-degree (root) commits into a min-heap ordered by
-//     (timestamp, OID).
-//  3. Repeatedly pop the minimum element, emit it, and decrement the
-//     in-degree of each of its children. When a child reaches in-degree 0,
-//     push it onto the heap.
-//
-// Cycle fallback: if the input graph contains cycles (e.g. grafted history),
-// the main loop will terminate before emitting every commit. The remaining
-// commits are sorted by (timestamp, OID) and appended so that the caller
-// always receives exactly len(commits) results.
-//
-// Determinism guarantee: for any fixed input set the output order is fully
-// reproducible, regardless of Go map iteration order, because the heap
-// tie-breaks on OID bytes.
-func orderCommitsParentFirst(commits []commitInfo) []commitInfo {
-	if len(commits) < 2 {
-		out := make([]commitInfo, len(commits))
+// commitParents holds every commit's parents as positions in the commits
+// slice, -1 for a parent outside it, in one flat array:
+// idx[start[i]:start[i+1]] are commit i's parents, in header order.
+type commitParents struct {
+	start []int32
+	idx   []int32
+}
+
+// orderCommitsParentFirstIndexed is orderCommitsParentFirst over parents
+// already resolved to positions. It also returns perm, the position in
+// commits of each element of the result, so callers that index the result
+// can remap positions without a second OID lookup.
+func orderCommitsParentFirstIndexed(commits []commitInfo, parents commitParents) (out []commitInfo, perm []int32) {
+	n := len(commits)
+	if n < 2 {
+		out = make([]commitInfo, n)
 		copy(out, commits)
-		return out
+		perm = make([]int32, n)
+		for i := range perm {
+			perm[i] = int32(i)
+		}
+		return out, perm
 	}
 
-	byOID := make(map[Hash]commitInfo, len(commits))
-	children := make(map[Hash][]Hash, len(commits))
-	inDegree := make(map[Hash]int, len(commits))
-
-	for _, c := range commits {
-		byOID[c.OID] = c
-		inDegree[c.OID] = 0
-	}
-
-	for _, c := range commits {
-		for _, p := range c.ParentOIDs {
-			if _, ok := byOID[p]; !ok {
+	// Count in-degrees and children per parent, then lay the child lists
+	// out contiguously: children of commit p are
+	// childList[childStart[p]:childStart[p+1]].
+	inDegree := make([]int32, n)
+	childStart := make([]int32, n+1)
+	for i := range commits {
+		for _, pi := range parents.idx[parents.start[i]:parents.start[i+1]] {
+			if pi < 0 {
 				continue
 			}
-			inDegree[c.OID]++
-			children[p] = append(children[p], c.OID)
+			inDegree[i]++
+			childStart[pi+1]++
+		}
+	}
+	for i := 1; i <= n; i++ {
+		childStart[i] += childStart[i-1]
+	}
+	childList := make([]int32, childStart[n])
+	fill := make([]int32, n)
+	copy(fill, childStart[:n])
+	for i := range commits {
+		for _, pi := range parents.idx[parents.start[i]:parents.start[i+1]] {
+			if pi < 0 {
+				continue
+			}
+			childList[fill[pi]] = int32(i)
+			fill[pi]++
 		}
 	}
 
-	q := make(commitQueue, 0, len(commits))
-	for _, c := range commits {
-		if inDegree[c.OID] == 0 {
-			q = append(q, commitQueueItem{oid: c.OID, ts: c.Timestamp})
+	q := commitOrderHeap{commits: commits, items: make([]int32, 0, n)}
+	for i := range commits {
+		if inDegree[i] == 0 {
+			q.push(int32(i))
 		}
 	}
-	heap.Init(&q)
 
-	out := make([]commitInfo, 0, len(commits))
-	for q.Len() > 0 {
-		item := heap.Pop(&q).(commitQueueItem)
-		c := byOID[item.oid]
-		out = append(out, c)
-
-		for _, child := range children[item.oid] {
+	out = make([]commitInfo, 0, n)
+	perm = make([]int32, 0, n)
+	emitted := make([]bool, n)
+	for len(q.items) > 0 {
+		i := q.pop()
+		out = append(out, commits[i])
+		perm = append(perm, i)
+		emitted[i] = true
+		for _, child := range childList[childStart[i]:childStart[i+1]] {
 			inDegree[child]--
 			if inDegree[child] == 0 {
-				cc := byOID[child]
-				heap.Push(&q, commitQueueItem{oid: child, ts: cc.Timestamp})
+				q.push(child)
 			}
 		}
 	}
 
 	// Defensive fallback for malformed input with cycles.
-	if len(out) < len(commits) {
-		seen := make(map[Hash]struct{}, len(out))
-		for _, c := range out {
-			seen[c.OID] = struct{}{}
-		}
-
-		rest := make([]commitInfo, 0, len(commits)-len(out))
-		for _, c := range commits {
-			if _, ok := seen[c.OID]; ok {
+	if len(out) < n {
+		rest := make([]int32, 0, n-len(out))
+		for i := range commits {
+			if emitted[i] {
 				continue
 			}
-			rest = append(rest, c)
+			rest = append(rest, int32(i))
 		}
 
-		slices.SortFunc(rest, func(a, b commitInfo) int {
-			if a.Timestamp < b.Timestamp {
+		slices.SortFunc(rest, func(a, b int32) int {
+			ca, cb := &commits[a], &commits[b]
+			if ca.Timestamp < cb.Timestamp {
 				return -1
 			}
-			if a.Timestamp > b.Timestamp {
+			if ca.Timestamp > cb.Timestamp {
 				return 1
 			}
-			return bytes.Compare(a.OID[:], b.OID[:])
+			return bytes.Compare(ca.OID[:], cb.OID[:])
 		})
-		out = append(out, rest...)
+		for _, i := range rest {
+			out = append(out, commits[i])
+			perm = append(perm, i)
+		}
 	}
 
-	return out
+	return out, perm
 }

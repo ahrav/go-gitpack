@@ -565,6 +565,13 @@ func addedHunksWithPosScratch(oldB, newB []byte, sc *lineScratch) []AddedHunk {
 		oldB, newB = oldB[p:], newB[p:]
 	}
 
+	// Skip the common byte suffix on a line boundary as well: a shared
+	// tail is matched in lockstep by any alignment, so eliding it is
+	// output-preserving and shrinks the edit-distance search below.
+	if q := commonSuffixLineBoundary(oldB, newB); q > 0 {
+		oldB, newB = oldB[:len(oldB)-q], newB[:len(newB)-q]
+	}
+
 	// Tokenize the old and new byte slices into lines for comparison.
 	// This is a zero-copy operation, creating string views into the original slices.
 	var oldLines, newLines []string
@@ -574,6 +581,14 @@ func addedHunksWithPosScratch(oldB, newB []byte, sc *lineScratch) []AddedHunk {
 		oldLines, newLines = sc.old, sc.new
 	} else {
 		oldLines, newLines = tokenize(oldB), tokenize(newB)
+	}
+
+	// A shortest edit script decides which new lines are additions: lines
+	// outside a longest common subsequence of the two sides. Pairs whose
+	// edit distance exceeds the search bound fall through to the greedy
+	// forward walk below.
+	if hunks, ok := addedHunksShortestEdit(oldLines, newLines, skippedLines); ok {
+		return hunks
 	}
 
 	// For larger files, a hash index over old lines provides O(1) lookups.
@@ -671,6 +686,45 @@ func addedHunksWithPosScratch(oldB, newB []byte, sc *lineScratch) []AddedHunk {
 	flushHunk(len(newLines))
 
 	return hunks
+}
+
+// addedHunksShortestEdit groups the new lines outside a longest common
+// subsequence into hunks of consecutive line numbers; skippedLines is the
+// count of common-prefix lines removed before tokenizing. It reports false
+// when the edit distance exceeds the search bound.
+func addedHunksShortestEdit(oldLines, newLines []string, skippedLines int) ([]AddedHunk, bool) {
+	if len(newLines) == 0 {
+		return nil, true
+	}
+	if len(oldLines) == 0 {
+		return []AddedHunk{{
+			StartLine: uint32(skippedLines) + 1,
+			Lines:     append([]string(nil), newLines...),
+		}}, true
+	}
+	sc := getDiffScratch()
+	defer putDiffScratch(sc)
+	if !addedLinesMyers(oldLines, newLines, sc) {
+		return nil, false
+	}
+	added := sc.added[:len(newLines)]
+	var hunks []AddedHunk
+	for i := 0; i < len(newLines); {
+		if !added[i] {
+			i++
+			continue
+		}
+		j := i + 1
+		for j < len(newLines) && added[j] {
+			j++
+		}
+		hunks = append(hunks, AddedHunk{
+			StartLine: uint32(i+skippedLines) + 1,
+			Lines:     append([]string(nil), newLines[i:j]...),
+		})
+		i = j
+	}
+	return hunks, true
 }
 
 // nlByte is '\n' as a []byte, for the bytes.Count newline scans.

@@ -9,87 +9,62 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// referenceAddedHunksWithPos is the addedHunksWithPos implementation exactly
-// as it existed at commit 73a0f5f, before the prefix-skip, lazy-index, and
-// open-addressed lineIndex optimizations. It serves as the behavioral oracle
-// for differential testing: the optimized path must produce identical hunks
-// for every input.
-func referenceAddedHunksWithPos(oldB, newB []byte) []AddedHunk {
-	if bytes.Equal(oldB, newB) {
-		return nil
-	}
-
-	oldLines, newLines := tokenize(oldB), tokenize(newB)
-
-	const threshold = 50
-	var oldLinePositions map[string][]uint32
-	if len(oldLines) > threshold {
-		oldLinePositions = make(map[string][]uint32)
-		for i, line := range oldLines {
-			oldLinePositions[line] = append(oldLinePositions[line], uint32(i))
-		}
-	}
-
-	var hunks []AddedHunk
-	var cur *AddedHunk
-	oldIdx := 0
-
-	for newIdx, newLine := range newLines {
-		lineNum := uint32(newIdx) + 1
-		isAdded := false
-
-		if oldIdx >= len(oldLines) {
-			isAdded = true
-		} else if newLine != oldLines[oldIdx] {
-			foundLater := false
-
-			if oldLinePositions != nil {
-				if positions, exists := oldLinePositions[newLine]; exists {
-					for _, pos := range positions {
-						if pos >= uint32(oldIdx) {
-							foundLater = true
-							oldIdx = int(pos)
-							break
-						}
-					}
-				}
+// lcsLen is the O(NM) dynamic-programming longest-common-subsequence length,
+// the oracle for the minimality of an added-line set.
+func lcsLen(a, b []string) int {
+	prev := make([]int, len(b)+1)
+	cur := make([]int, len(b)+1)
+	for i := 1; i <= len(a); i++ {
+		for j := 1; j <= len(b); j++ {
+			if a[i-1] == b[j-1] {
+				cur[j] = prev[j-1] + 1
 			} else {
-				for j := oldIdx; j < len(oldLines); j++ {
-					if newLine == oldLines[j] {
-						foundLater = true
-						oldIdx = j
-						break
-					}
-				}
-			}
-
-			if !foundLater {
-				isAdded = true
+				cur[j] = max(prev[j], cur[j-1])
 			}
 		}
+		prev, cur = cur, prev
+	}
+	return prev[len(b)]
+}
 
-		if isAdded {
-			if cur == nil || lineNum != cur.EndLine()+1 {
-				if cur != nil {
-					hunks = append(hunks, *cur)
-				}
-				cur = &AddedHunk{StartLine: lineNum}
-			}
-			cur.Lines = append(cur.Lines, newLine)
-		} else {
-			if cur != nil {
-				hunks = append(hunks, *cur)
-				cur = nil
-			}
-			oldIdx++
+// requireMinimalAddedHunks checks hunks against the definition of the diff:
+// every hunk line is the new line at its position, no line is reported
+// twice, the unreported new lines form a subsequence of the old lines, the
+// reported count equals len(new) - LCS(old, new), and hunks are maximal runs
+// in increasing order. Any longest common subsequence satisfies this, so the
+// check is insensitive to tie-breaking between equally short edit scripts.
+func requireMinimalAddedHunks(t testing.TB, oldB, newB []byte, hunks []AddedHunk) {
+	t.Helper()
+	oldLines, newLines := tokenize(oldB), tokenize(newB)
+	addedAt := make([]bool, len(newLines))
+	addedCount := 0
+	for i, h := range hunks {
+		require.NotEmpty(t, h.Lines, "hunk %d is empty\nold=%q\nnew=%q", i, oldB, newB)
+		if i > 0 {
+			prev := hunks[i-1]
+			require.Greater(t, h.StartLine, prev.StartLine+uint32(len(prev.Lines)), "hunks %d and %d are adjacent or out of order\nold=%q\nnew=%q\nhunks=%v", i-1, i, oldB, newB, hunks)
+		}
+		for j, l := range h.Lines {
+			idx := int(h.StartLine) - 1 + j
+			require.True(t, idx >= 0 && idx < len(newLines), "hunk line %d outside new file\nold=%q\nnew=%q", idx+1, oldB, newB)
+			require.Equal(t, newLines[idx], l, "hunk line %d\nold=%q\nnew=%q", idx+1, oldB, newB)
+			require.False(t, addedAt[idx], "line %d reported twice", idx+1)
+			addedAt[idx] = true
+			addedCount++
 		}
 	}
-
-	if cur != nil {
-		hunks = append(hunks, *cur)
+	j := 0
+	for i, l := range newLines {
+		if addedAt[i] {
+			continue
+		}
+		for j < len(oldLines) && oldLines[j] != l {
+			j++
+		}
+		require.Less(t, j, len(oldLines), "unreported lines are not a subsequence of old\nold=%q\nnew=%q\nhunks=%v", oldB, newB, hunks)
+		j++
 	}
-
-	return hunks
+	require.Equal(t, len(newLines)-lcsLen(oldLines, newLines), addedCount, "added-line count\nold=%q\nnew=%q\nhunks=%v", oldB, newB, hunks)
 }
 
 // genFile builds a synthetic text file from a small line vocabulary so that
@@ -128,11 +103,9 @@ func mutate(r *rand.Rand, src []byte, vocab []string) []byte {
 	return bytes.Join(lines, []byte{'\n'})
 }
 
-// TestAddedHunksWithPos_DifferentialAgainstReference fuzzes the optimized
-// diff against the pre-optimization implementation across a wide range of
-// shapes: tiny files (linear-search path), large files (indexed path),
-// heavy duplication, shared prefixes, missing trailing newlines, and empty
-// sides.
+// TestAddedHunksWithPos_DifferentialAgainstReference fuzzes the diff against
+// the LCS oracle across a wide range of shapes: tiny and large files, heavy
+// duplication, shared prefixes, missing trailing newlines, and empty sides.
 func TestAddedHunksWithPos_DifferentialAgainstReference(t *testing.T) {
 	t.Parallel()
 
@@ -168,11 +141,7 @@ func TestAddedHunksWithPos_DifferentialAgainstReference(t *testing.T) {
 			newB = append(append([]byte{}, oldB...), tail...)
 		}
 
-		want := referenceAddedHunksWithPos(oldB, newB)
-		got := addedHunksWithPos(oldB, newB)
-
-		require.Equal(t, want, got,
-			"iter=%d\nold=%q\nnew=%q", iter, oldB, newB)
+		requireMinimalAddedHunks(t, oldB, newB, addedHunksWithPos(oldB, newB))
 	}
 }
 
@@ -194,10 +163,8 @@ func TestAddedHunksWithPos_DifferentialEdgeCases(t *testing.T) {
 		{"a\nb\n", "b\na\n"},          // swap
 		{"common\ncommon\nold\n", "common\ncommon\nnew\n"}, // shared prefix
 	}
-	for i, c := range cases {
+	for _, c := range cases {
 		oldB, newB := []byte(c[0]), []byte(c[1])
-		want := referenceAddedHunksWithPos(oldB, newB)
-		got := addedHunksWithPos(oldB, newB)
-		require.Equal(t, want, got, "case %d: old=%q new=%q", i, c[0], c[1])
+		requireMinimalAddedHunks(t, oldB, newB, addedHunksWithPos(oldB, newB))
 	}
 }

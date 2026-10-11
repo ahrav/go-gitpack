@@ -25,79 +25,63 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 )
 
 // loadFromRefs is the entry point for the commit-graph fallback path.
 // It discovers all ref tips, walks the reachable commit DAG, and returns
 // commits ordered parent-first (i.e. every parent appears before its
 // children) so that downstream consumers can process them in a single
-// forward pass.
-func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, error) {
-	// walkCommitsFromRefs calls visit concurrently, so the append needs its
-	// own mutual exclusion. The walk joins its workers before returning, so
-	// reading out afterwards needs no further synchronization.
-	var mu sync.Mutex
-	out := make([]commitInfo, 0, 256)
-	if err := hs.walkCommitsFromRefs(func(info commitInfo) error {
-		mu.Lock()
-		out = append(out, info)
-		mu.Unlock()
-		return nil
-	}); err != nil {
-		return nil, err
+// forward pass, with the parent positions and permutation
+// buildCommitGraphIndexed needs to index the result without OID lookups.
+func (hs *HistoryScanner) loadFromRefs() ([]commitInfo, commitParents, []int32, error) {
+	tips, err := collectRefTips(hs.gitDir)
+	if err != nil {
+		return nil, commitParents{}, nil, err
 	}
-	return orderCommitsParentFirst(out), nil
+	if len(tips) == 0 {
+		return nil, commitParents{start: []int32{0}}, nil, nil
+	}
+	// The packs' whole commits are read in parallel up front and the
+	// reachable walk runs over them in memory (commit_enum.go); the
+	// parallel DAG walk is latency-bound on the first-parent chain.
+	out, parents, err := hs.loadCommitsReachable(tips)
+	if err != nil {
+		return nil, commitParents{}, nil, err
+	}
+	compactParentOIDs(out)
+	ordered, perm := orderCommitsParentFirstIndexed(out, parents)
+	return ordered, parents, perm, nil
 }
 
-// walkCommitsFromRefs performs a ref-based reachable commit walk and calls
-// visit once per commit, using one worker per CPU (capped at 16).
-//
-// The walk is a parallel BFS over the commit DAG: header inflation (a zlib
-// decompression per commit) dominates the cost and is embarrassingly
-// parallel, so a serial walk leaves the machine idle while downstream
-// pipeline stages starve. Worker goroutines pop frontier OIDs from a shared
-// stack, inflate and parse headers concurrently, then push unseen parents.
-//
-// Ordering: visits happen in nondeterministic order, so every caller must be
-// insensitive to it. loadFromRefs re-establishes parent-first order via
-// orderCommitsParentFirst, and DiffHistoryHunksFunc processes commits
-// independently. Callers whose output depends on visit order (first-wins
-// blob dedup in the scan planners) use walkCommitsFromRefsOrdered instead.
-//
-// Concurrency: visit is called from up to min(NumCPU, 16) worker goroutines at
-// the same time and MUST be safe for concurrent use; the walk holds no lock
-// across it. A single internal mutex around visit is not viable here: at 16
-// workers it serializes roughly a third of all walk-worker time, while
-// neither production caller needs it (DiffHistoryHunksFunc's visit only
-// stores into a sync.Map and sends on a channel). Callers that touch
-// unsynchronized state take their own lock, as loadFromRefs does. visit must
-// also not block indefinitely: a stalled visit occupies a walk worker.
-func (hs *HistoryScanner) walkCommitsFromRefs(visit func(commitInfo) error) error {
-	return hs.walkCommitsFromRefsWorkers(min(runtime.NumCPU(), 16), visit)
+// compactParentOIDs moves every commit's ParentOIDs into one shared backing
+// array. The walk allocates each list separately; the scanner retains the
+// commit set for its lifetime, and one array costs the garbage collector a
+// single object instead of one per commit.
+func compactParentOIDs(commits []commitInfo) {
+	total := 0
+	for i := range commits {
+		total += len(commits[i].ParentOIDs)
+	}
+	backing := make([]Hash, total)
+	for i := range commits {
+		n := len(commits[i].ParentOIDs)
+		if n == 0 {
+			continue
+		}
+		copy(backing[:n], commits[i].ParentOIDs)
+		commits[i].ParentOIDs = backing[:n:n]
+		backing = backing[n:]
+	}
 }
 
-// walkCommitsFromRefsOrdered performs the same reachable walk with a single
-// worker, which yields a deterministic depth-first visit order: ref tips
-// sorted by hash seed the stack, the last tip is explored first, and a
-// commit's parents are explored before remaining siblings. Callers that
-// attribute deduplicated results to the first commit visited rely on this
-// order being reproducible across runs.
-//
-// Concurrency: one worker means visit is never called concurrently, so it may
-// touch caller state without additional locking.
+// walkCommitsFromRefsOrdered visits each commit reachable from the ref tips
+// once, on the calling goroutine, in an order that repeats across runs: the
+// first-wins blob dedupe in scan_plan.go depends on it. The first error from
+// visit or a commit read ends the walk.
 func (hs *HistoryScanner) walkCommitsFromRefsOrdered(visit func(commitInfo) error) error {
-	return hs.walkCommitsFromRefsWorkers(1, visit)
-}
-
-// walkCommitsFromRefsWorkers implements the reachable commit walk shared by
-// walkCommitsFromRefs and walkCommitsFromRefsOrdered. visit is called from
-// numWorkers goroutines concurrently (hence serially when numWorkers is 1).
-func (hs *HistoryScanner) walkCommitsFromRefsWorkers(numWorkers int, visit func(commitInfo) error) error {
 	if visit == nil {
 		return nil
 	}
@@ -106,143 +90,82 @@ func (hs *HistoryScanner) walkCommitsFromRefsWorkers(numWorkers int, visit func(
 	if err != nil {
 		return err
 	}
-	if len(tips) == 0 {
-		return nil
-	}
 
-	var (
-		mu       sync.Mutex // guards seen, stack, active, firstErr
-		cond     = sync.NewCond(&mu)
-		seen     = make(map[Hash]struct{}, len(tips)*4)
-		stack    = append([]Hash(nil), tips...)
-		active   int
-		firstErr error
-	)
-
+	var firstErr error
 	fail := func(err error) {
-		mu.Lock()
 		if firstErr == nil {
 			firstErr = err
 		}
-		mu.Unlock()
-		cond.Broadcast()
 	}
-
-	worker := func() {
-		for {
-			mu.Lock()
-			for len(stack) == 0 && active > 0 && firstErr == nil {
-				cond.Wait()
-			}
-			if firstErr != nil || len(stack) == 0 {
-				// Done: either an error occurred, or the stack is empty with
-				// no worker still processing (which could add more work).
-				// Broadcast so peers blocked in Wait also observe the
-				// termination condition and exit.
-				mu.Unlock()
-				cond.Broadcast()
-				return
-			}
-			n := len(stack) - 1
-			oid := stack[n]
-			stack = stack[:n]
-			if _, ok := seen[oid]; ok {
-				mu.Unlock()
-				continue
-			}
-			seen[oid] = struct{}{}
-			active++
-			mu.Unlock()
-
-			pushed := hs.walkOne(oid, visit, func(next Hash) {
-				mu.Lock()
-				if _, ok := seen[next]; !ok {
-					stack = append(stack, next)
-				}
-				mu.Unlock()
-			}, fail)
-
-			mu.Lock()
-			active--
-			mu.Unlock()
-			// Wake waiters: either new work was pushed or active hit zero.
-			if pushed {
-				cond.Broadcast()
-			} else {
-				cond.Signal()
-			}
+	seen := make(map[Hash]struct{}, len(tips)*4)
+	stack := append([]Hash(nil), tips...)
+	push := func(next Hash) {
+		if _, ok := seen[next]; !ok {
+			stack = append(stack, next)
 		}
 	}
-
-	var wg sync.WaitGroup
-	for range numWorkers {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			worker()
-		}()
+	for len(stack) > 0 && firstErr == nil {
+		n := len(stack) - 1
+		oid := stack[n]
+		stack = stack[:n]
+		if _, ok := seen[oid]; ok {
+			continue
+		}
+		seen[oid] = struct{}{}
+		hs.walkOne(oid, visit, push, fail)
 	}
-	wg.Wait()
-
 	return firstErr
 }
 
 // walkOne processes a single OID popped from the walk frontier: it inflates
 // the commit header, invokes visit, and enqueues parents via push. Tag
-// objects are peeled to their target. The return value reports whether any
-// new OIDs were pushed. Errors are reported through fail.
-//
-// visit runs unsynchronized: it is the caller's contract (see
-// walkCommitsFromRefs) that it is safe for concurrent use.
+// objects are peeled to their target. Errors are reported through fail.
 func (hs *HistoryScanner) walkOne(
 	oid Hash,
 	visit func(commitInfo) error,
 	push func(Hash),
 	fail func(error),
-) (pushed bool) {
+) {
 	hdr, err := hs.store.readCommitHeader(oid)
 	if err != nil {
 		if errors.Is(err, ErrObjectNotFound) {
 			// Stale refs and shallow parents can legitimately point to objects
 			// absent from local packs. Skip and continue the reachable walk.
-			return false
+			return
 		}
 		if !errors.Is(err, ErrObjectNotCommit) {
 			fail(fmt.Errorf("read commit header %s: %w", oid, err))
-			return false
+			return
 		}
 		// Non-commit refs (tags, trees, etc.) are allowed.
 		target, ok, tagErr := hs.resolveTagTarget(oid)
 		if tagErr != nil {
 			if errors.Is(tagErr, ErrObjectNotFound) {
-				return false
+				return
 			}
 			fail(tagErr)
-			return false
+			return
 		}
 		if ok {
 			push(target)
-			return true
 		}
-		return false
+		return
 	}
 
 	info, err := parseCommitInfoFromHeader(oid, hdr)
 	if err != nil {
 		fail(err)
-		return false
+		return
 	}
 
 	if err := visit(info); err != nil {
 		fail(err)
-		return false
+		return
 	}
 
 	for _, p := range info.ParentOIDs {
 		push(p)
-		pushed = true
 	}
-	return pushed
 }
 
 // resolveTagTarget attempts to peel an annotated tag object to find its
@@ -458,10 +381,17 @@ func parseCommitInfoFromHeader(oid Hash, hdr []byte) (commitInfo, error) {
 		ParentOIDs: make([]Hash, 0, 2),
 	}
 
-	sc := bufio.NewScanner(bytes.NewReader(hdr))
 	var haveTree, haveTS bool
-	for sc.Scan() {
-		line := sc.Bytes()
+	for rest := hdr; len(rest) > 0; {
+		var line []byte
+		if nl := bytes.IndexByte(rest, '\n'); nl >= 0 {
+			line, rest = rest[:nl], rest[nl+1:]
+		} else {
+			line, rest = rest, nil
+		}
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
 		if len(line) == 0 {
 			break
 		}
@@ -488,9 +418,6 @@ func parseCommitInfoFromHeader(oid Hash, hdr []byte) (commitInfo, error) {
 			info.Timestamp = ts
 			haveTS = true
 		}
-	}
-	if err := sc.Err(); err != nil {
-		return commitInfo{}, err
 	}
 
 	if !haveTree {

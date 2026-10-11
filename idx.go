@@ -95,6 +95,59 @@ type idxFile struct {
 	// file (true) versus synthesized from sortedOffsets (false). Only trusted
 	// reverse indexes can map offset order back to idx-entry order for CRC lookups.
 	ridxCRCTrusted bool
+
+	// prefixes narrows lookups to the entries sharing a longer OID prefix
+	// than the 256-entry fanout does; see oidPrefixIndex.
+	prefixes oidPrefixIndex
+}
+
+// oidPrefixIndex is a fanout over the leading bits of the OIDs in a sorted
+// table, sized so that a bucket holds about one entry: starts[p] is the
+// position of the first OID whose leading bits are at least p, and
+// starts[p+1] ends the bucket. The idx file's own fanout covers one byte,
+// which on a million-object pack leaves a bucket of four thousand OIDs and a
+// binary search of twelve cache-missing probes per lookup; a bucket of one
+// or two entries settles the lookup in a probe or two. A zero value (nil
+// starts) means the index was not built and callers use the byte fanout.
+type oidPrefixIndex struct {
+	bits   uint
+	starts []uint32
+}
+
+// oidPrefixBits bounds the prefix width: at least the byte fanout's eight
+// bits, at most 22 (a 16 MiB table), which keeps buckets under three
+// entries up to ten million objects.
+const (
+	minOIDPrefixBits = 8
+	maxOIDPrefixBits = 22
+)
+
+// buildOIDPrefixIndex indexes the sorted table with ceil(log2(len)) prefix
+// bits, clamped to [minOIDPrefixBits, maxOIDPrefixBits].
+func buildOIDPrefixIndex(table []Hash) oidPrefixIndex {
+	bits := uint(minOIDPrefixBits)
+	for bits < maxOIDPrefixBits && 1<<bits < len(table) {
+		bits++
+	}
+	starts := make([]uint32, 1<<bits+1)
+	for i := range table {
+		starts[oidPrefix(&table[i], bits)+1]++
+	}
+	for p := 1; p < len(starts); p++ {
+		starts[p] += starts[p-1]
+	}
+	return oidPrefixIndex{bits: bits, starts: starts}
+}
+
+// oidPrefix returns the leading bits of h as a bucket number.
+func oidPrefix(h *Hash, bits uint) uint32 {
+	return (uint32(h[0])<<16 | uint32(h[1])<<8 | uint32(h[2])) >> (24 - bits)
+}
+
+// bucket returns the table range that can hold h.
+func (ix *oidPrefixIndex) bucket(h *Hash) (start, end uint32) {
+	p := oidPrefix(h, ix.bits)
+	return ix.starts[p], ix.starts[p+1]
 }
 
 // findObject looks up hash in the tables that belong to a single
@@ -111,14 +164,18 @@ type idxFile struct {
 // The receiver is immutable after Open has returned, therefore the method is
 // safe for concurrent callers.
 func (f *idxFile) findObject(hash Hash) (offset uint64, found bool) {
-	// Identify the search range via the fan-out table.
-	first := hash[0]
-
-	start := uint32(0)
-	if first > 0 {
-		start = f.fanout[first-1]
+	// Identify the search range via the prefix index, or the fan-out table
+	// of an idxFile assembled without one.
+	var start, end uint32
+	if f.prefixes.starts != nil {
+		start, end = f.prefixes.bucket(&hash)
+	} else {
+		first := hash[0]
+		if first > 0 {
+			start = f.fanout[first-1]
+		}
+		end = f.fanout[first]
 	}
-	end := f.fanout[first]
 	if start == end {
 		return 0, false // bucket empty
 	}
@@ -470,6 +527,7 @@ func parseIdx(ix *mmap.ReaderAt) (*idxFile, error) {
 		entries:      entries,
 		oidTable:     oids,
 		largeOffsets: largeOffsets,
+		prefixes:     buildOIDPrefixIndex(oids),
 	}, nil
 }
 
